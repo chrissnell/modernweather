@@ -1,0 +1,40 @@
+{
+  "name": "span-station-not-found",
+  "description": "",
+  "provenance": "derived from the SQLite configuration database only",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/span/24h",
+    "query": "station=does-not-exist",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 404,
+    "headers": {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "text",
+    "body_bytes": 18,
+    "body_sha256": "70a0d647878417c18032e6d268c8c5750485d8071a32ce78465c8e4ddb3c1dbe",
+    "trailing_newline": true,
+    "body": "station not found\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": false,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": true,
+    "required_substrings": []
+  }
+}

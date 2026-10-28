@@ -1,0 +1,44 @@
+{
+  "name": "alerts-active",
+  "description": "Active alerts only (begins_at <= now < expires_at), newest first. Timestamps are RFC3339 from Go's time.Time.",
+  "provenance": "seeded directly into aeris_weather_forecasts / aeris_weather_alerts (Aeris API key not available)",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/alerts",
+    "query": "station_id=1",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "max-age=300",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "json",
+    "body_bytes": 417,
+    "body_sha256": "e15102c81c2918f0a9f473e53f4b6de366987e036659802251981d04f12f4b79",
+    "trailing_newline": true,
+    "body": "[{\"alert_id\":\"CONTRACT-WSW-001\",\"station_id\":1,\"location\":\"39.900000,-105.500000\",\"name\":\"WINTER STORM WARNING\",\"color\":\"FF69B4\",\"body\":\"* WHAT...Heavy snow expected. Total snow accumulations of 8 to 14 inches.\",\"body_full\":\"URGENT - WINTER WEATHER MESSAGE\\nNational Weather Service Boulder CO\",\"issued_at\":\"2026-10-28T15:00:00Z\",\"begins_at\":\"2026-10-28T14:13:32.049952Z\",\"expires_at\":\"2026-10-29T14:13:32.049952Z\"}]\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Cache-Control",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": true,
+    "json_key_order": true,
+    "numeric_format": true,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

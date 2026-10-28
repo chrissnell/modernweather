@@ -1,0 +1,41 @@
+{
+  "name": "asset-static-js",
+  "description": "Static asset from the embedded FS: text/javascript; charset=utf-8.",
+  "provenance": "derived from the SQLite configuration database only",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/js/weather-charts.js",
+    "query": "",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "text/javascript; charset=utf-8",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "html",
+    "body_bytes": 18596,
+    "body_sha256": "3680e910615c436371aeb6bb52ab00ad6f30a9afd57cf2344735dc0c51b95414",
+    "trailing_newline": false
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": false,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": false,
+    "body_equals": false,
+    "required_substrings": [
+      "WeatherCharts"
+    ]
+  }
+}

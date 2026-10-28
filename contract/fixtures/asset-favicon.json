@@ -1,0 +1,39 @@
+{
+  "name": "asset-favicon",
+  "description": "",
+  "provenance": "derived from the SQLite configuration database only",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/favicon.ico",
+    "query": "",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "image/vnd.microsoft.icon",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "binary",
+    "body_bytes": 15086,
+    "body_sha256": "2b272d3c0641c38721b4570cc17435fe90284d45d51a6638fd0468f3d5ddf680",
+    "trailing_newline": false
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": false,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": false,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}
