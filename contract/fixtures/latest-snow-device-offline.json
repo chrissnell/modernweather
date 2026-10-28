@@ -1,0 +1,40 @@
+{
+  "name": "latest-snow-device-offline",
+  "description": "Snow device configured but offline: last reading is older than the 10-minute window, so /latest is 404, not an empty reading.",
+  "provenance": "seeded directly into the weather hypertable (no Go driver exists that can be emulated here)",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/latest",
+    "query": "station=snowgauge-stale",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 404,
+    "headers": {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "text",
+    "body_bytes": 50,
+    "body_sha256": "d3e15d2908090c5d798049f7c2f939d6544f97361eec45c2128a657bc65e7f13",
+    "trailing_newline": true,
+    "body": "no recent weather data available for this station\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": false,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": true,
+    "required_substrings": []
+  }
+}

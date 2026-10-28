@@ -1,0 +1,44 @@
+{
+  "name": "snow-device-never-reported",
+  "description": "Snow device configured but physically absent: no row with snowdistance > 0 exists, so every field is zero and the response is still 200.",
+  "provenance": "derived from the SQLite configuration database only",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/snow",
+    "query": "",
+    "headers": {
+      "Host": "deadsnow.test"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "json",
+    "body_bytes": 137,
+    "body_sha256": "77735ab3f1b5744739a5578316f8f166af6599e22b2f78fe34fed6537772734f",
+    "trailing_newline": true,
+    "body": "{\"stationname\":\"snowgauge-dead\",\"snowdepth\":0,\"snowtoday\":0,\"snowlast24\":0,\"snowlast72\":0,\"snowseason\":0,\"snowstorm\":0,\"snowfallrate\":0}\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Cache-Control",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": true,
+    "json_key_order": true,
+    "numeric_format": true,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

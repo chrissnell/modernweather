@@ -1,0 +1,40 @@
+{
+  "name": "span-exceeds-one-year",
+  "description": "",
+  "provenance": "derived from the SQLite configuration database only",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/span/9000h",
+    "query": "station=davis-full",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 400,
+    "headers": {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "text",
+    "body_bytes": 53,
+    "body_sha256": "dbbb2daa7a076fe74cdd21d301e283dff79a41bdbda9280b4a9512afb1f78e8d",
+    "trailing_newline": true,
+    "body": "time span exceeds maximum allowed duration of 1 year\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": false,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": true,
+    "required_substrings": []
+  }
+}

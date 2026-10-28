@@ -1,0 +1,44 @@
+{
+  "name": "latest-minimal-complement",
+  "description": "Station reporting a minimal sensor complement (Campbell: temp, humidity, wind, barometer, solar, rain only).",
+  "provenance": "campbell-emulator (cmd/campbell-emulator), JSON records over TCP",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/latest",
+    "query": "station=csi-minimal",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "json",
+    "body_bytes": 1429,
+    "body_sha256": "4f11314a2f7156728a7d9c976fd7fcea92250d2b4e1800fb52b055fd07bd5719",
+    "trailing_newline": true,
+    "body": "{\"stationname\":\"csi-minimal\",\"stationtype\":\"campbell\",\"ts\":1793206602126,\"otemp\":59.199993,\"extratemp1\":61.173317,\"extratemp2\":0,\"extratemp3\":0,\"extratemp4\":0,\"extratemp5\":0,\"extratemp6\":0,\"extratemp7\":0,\"soiltemp1\":0,\"soiltemp2\":0,\"soiltemp3\":0,\"soiltemp4\":0,\"leaftemp1\":0,\"leaftemp2\":0,\"leaftemp3\":0,\"leaftemp4\":0,\"outhumidity\":51.731995,\"extrahumidity1\":0,\"extrahumidity2\":0,\"extrahumidity3\":0,\"extrahumidity4\":0,\"extrahumidity5\":0,\"extrahumidity6\":0,\"extrahumidity7\":0,\"ohum\":51.731995,\"rainrate\":6.3242235,\"rainincremental\":0.0017208077,\"period_rain\":0,\"solarwatts\":299.05258,\"potentialsolarwatts\":533.20355,\"solarjoules\":0.2990526,\"uv\":0,\"radiation\":0,\"stormrain\":0,\"dayrain\":4.100311,\"monthrain\":4.8477073,\"yearrain\":7.8695483,\"bar\":29.81644,\"rainfall24h\":4.3550453,\"rainfall48h\":4.7582154,\"rainfall72h\":4.7582154,\"rainfallstorm\":4.355053,\"winds\":8.744696,\"windgust\":9.214558,\"windd\":268,\"windcard\":\"W\",\"rainday\":4.100311,\"windch\":0,\"heatidx\":0,\"itemp\":0,\"ihum\":0,\"consbatteryvoltage\":0,\"stationbatteryvoltage\":13.512772,\"snowdepth\":1500,\"snowdistance\":0,\"pm25\":0,\"co2\":0,\"aqi_pm25_aqin\":0,\"aqi_pm10_aqin\":0,\"extrafloat1\":0,\"extrafloat2\":0,\"extrafloat3\":0,\"extrafloat4\":0,\"extrafloat5\":0,\"extrafloat6\":0,\"extrafloat7\":0,\"extrafloat8\":0,\"extrafloat9\":0,\"extrafloat10\":0,\"sunrise\":\"7:29 AM\",\"sunset\":\"6:02 PM\",\"moonPhaseName\":\"Waning Gibbous\",\"moonIllumination\":0.9148452,\"moonAge\":17.548801,\"moonCrescentAngle\":-121.45631}\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Cache-Control",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": true,
+    "json_key_order": true,
+    "numeric_format": true,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

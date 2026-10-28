@@ -1,0 +1,44 @@
+{
+  "name": "snow-station-param-overrides-depth-only",
+  "description": "station/station_id only redirect the depth query; stationname and every total still come from the website's snow_device_name.",
+  "provenance": "seeded directly into the weather hypertable (no Go driver exists that can be emulated here)",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/snow",
+    "query": "station=davis-full",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "json",
+    "body_bytes": 138,
+    "body_sha256": "700c6e09de58f48dc12a73c3fbde7b95ac24cd62b4048391f5ca92844f91f2f5",
+    "trailing_newline": true,
+    "body": "{\"stationname\":\"snowgauge\",\"snowdepth\":0,\"snowtoday\":0,\"snowlast24\":0.6,\"snowlast72\":2.7,\"snowseason\":4,\"snowstorm\":0.6,\"snowfallrate\":0}\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Cache-Control",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": true,
+    "json_key_order": true,
+    "numeric_format": true,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}
