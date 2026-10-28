@@ -1,0 +1,42 @@
+{
+  "name": "html-privacy",
+  "description": "",
+  "provenance": "derived from the SQLite configuration database only",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/privacy",
+    "query": "",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "text/html; charset=utf-8",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "html",
+    "body_bytes": 5663,
+    "body_sha256": "0be99c190333d24fc1d6741a2d1c02ee8eb1e4373c1b476afd99197717fbe1c3",
+    "trailing_newline": true,
+    "body": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Privacy Policy</title>\n    <link rel=\"icon\" type=\"image/png\" href=\"/favicon-96x96.png\" sizes=\"96x96\" />\n    <link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\" />\n    <link rel=\"shortcut icon\" href=\"/favicon.ico\" />\n    <link rel=\"apple-touch-icon\" sizes=\"180x180\" href=\"/apple-touch-icon.png\" />\n    <link rel=\"manifest\" href=\"/site.webmanifest\" />\n    <style>\n        body {\n            font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif;\n            line-height: 1.6;\n            max-width: 800px;\n            margin: 0 auto;\n            padding: 20px;\n            color: #333;\n        }\n        h1 {\n            color: #2c3e50;\n            border-bottom: 2px solid #3498db;\n            padding-bottom: 10px;\n        }\n        h2 {\n            color: #34495e;\n            margin-top: 30px;\n        }\n        .last-updated {\n            color: #7f8c8d;\n            font-style: italic;\n            margin-bottom: 30px;\n        }\n        ul {\n            margin: 15px 0;\n        }\n        li {\n            margin: 8px 0;\n        }\n        strong {\n            color: #2c3e50;\n        }\n    </style>\n</head>\n<body>\n    <h1>Privacy Policy</h1>\n    <p class=\"last-updated\">Last Updated: November 29, 2025</p>\n\n    <h2>Overview</h2>\n    <p>This Privacy Policy describes how we collect, use, and protect information when you access our weather data service through our web interface or iOS application.</p>\n\n    <h2>Information We Collect</h2>\n    <p>When you use our service, we automatically collect standard HTTP access log data, which includes:</p>\n    <ul>\n        <li><strong>IP Address:</strong> Your device's IP address used to communicate with our service</li>\n        <li><strong>Timestamp:</strong> The date and time of your request</li>\n        <li><strong>User Agent:</strong> Information about your web browser or iOS app version</li>\n        <li><strong>Requested Resources:</strong> The specific weather data or pages you access</li>\n    </ul>\n    <p>We do <strong>not</strong> automatically collect:</p>\n    <ul>\n        <li>Personal identification information (name, email, phone number)</li>\n        <li>Account credentials or login information</li>\n        <li>Location data beyond what is implicit in your IP address</li>\n        <li>Cookies or tracking identifiers</li>\n        <li>Device identifiers</li>\n    </ul>\n    <p><strong>Voluntary Information:</strong> If you contact our support email or submit a bug report, we may collect personal information that you voluntarily provide (such as your name, email address, or other contact details) to the extent necessary to respond to your inquiry or resolve the reported issue. This information is used solely for support purposes and is subject to the same protections described in this policy.</p>\n\n    <h2>How We Use Your Information</h2>\n    <p>The information we collect is used solely for:</p>\n    <ul>\n        <li><strong>Service Operation:</strong> Ensuring proper functioning of our weather data service</li>\n        <li><strong>Security:</strong> Detecting and preventing unauthorized access or abuse</li>\n        <li><strong>Technical Troubleshooting:</strong> Diagnosing and fixing technical issues</li>\n        <li><strong>Service Improvements:</strong> Understanding usage patterns to improve performance and reliability</li>\n        <li><strong>Feature Development:</strong> Analyzing user needs and feedback to guide development of new features and enhancements</li>\n    </ul>\n\n    <h2>Information Sharing</h2>\n    <p><strong>We will never sell, share, exchange, or rent the information we collect to third parties without your consent.</strong></p>\n    <p>We may only disclose information if:</p>\n    <ul>\n        <li>Required by law or valid legal process</li>\n        <li>Necessary to protect our rights, property, or safety, or that of our users or the public</li>\n    </ul>\n\n    <h2>Data Retention</h2>\n    <p>HTTP access logs are retained only as long as necessary for the purposes described above. We periodically review and delete older log data that is no longer needed.</p>\n\n    <h2>Data Security</h2>\n    <p>We implement reasonable security measures to protect the information we collect from unauthorized access, alteration, or destruction. However, no method of transmission over the Internet is 100% secure, and we cannot guarantee absolute security.</p>\n\n    <h2>Your Rights</h2>\n    <p>Since we do not collect personally identifiable information, there are no user accounts or personal data profiles associated with your use of this service. The access log data we collect is technical in nature and used solely for operational purposes.</p>\n\n    <h2>Children's Privacy</h2>\n    <p>Our service does not target children and does not knowingly collect any information from children under the age of 13 beyond the HTTP access log data described above, which is collected automatically from all users regardless of age. Our service is intended for general audiences.</p>\n\n    <h2>Changes to This Privacy Policy</h2>\n    <p>We may update this Privacy Policy from time to time. The \"Last Updated\" date at the top of this page indicates when this policy was last revised. We encourage you to review this policy periodically.</p>\n\n    <h2>Contact Us</h2>\n    <p>If you have questions or concerns about this Privacy Policy or our data practices, please contact us at: <a href=\"mailto:support@remoteweather.com\">support@remoteweather.com</a></p>\n</body>\n</html>\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": false,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": false,
+    "body_equals": false,
+    "required_substrings": [
+      "Privacy"
+    ]
+  }
+}

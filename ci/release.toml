@@ -1,0 +1,69 @@
+# The release target matrix, in one place, read by `cargo xtask dist` and by the release
+# workflow's job matrix. Adding or dropping a target is a one-line change here.
+#
+# Every Linux target is a *statically linked musl* build. The reason is measured, not
+# stylistic: see docs/release.md §4 and Appendix A. In short, a glibc armv6 cross build
+# made from Debian's armhf toolchain produces a binary tagged ARMv7 that dies with an
+# illegal instruction on a Raspberry Pi 1/Zero, while the static musl build runs. Using
+# the same linkage for all four architectures means one set of packaging rules and no
+# glibc-version skew between the builder and the Pi.
+
+[release]
+# The daemon binary. W3 §1 owns the crate layout (DESIGN.md R-4); `crate_manifest` is the
+# file whose existence tells the release pipeline the daemon exists to be released.
+binary = "modernweather"
+package = "modernweather"
+crate_manifest = "crates/modernweather/Cargo.toml"
+profile = "dist"
+
+[[target]]
+triple = "x86_64-unknown-linux-musl"
+label = "linux-amd64"
+docker_platform = "linux/amd64"
+deb_arch = "amd64"
+rpm_arch = "x86_64"
+arch_arch = "x86_64"
+
+[[target]]
+triple = "aarch64-unknown-linux-musl"
+label = "linux-arm64"
+docker_platform = "linux/arm64"
+deb_arch = "arm64"
+rpm_arch = "aarch64"
+arch_arch = "aarch64"
+
+[[target]]
+triple = "armv7-unknown-linux-musleabihf"
+label = "linux-armv7"
+docker_platform = "linux/arm/v7"
+deb_arch = "armhf"
+rpm_arch = "armv7hl"
+arch_arch = "armv7h"
+
+[[target]]
+triple = "arm-unknown-linux-musleabihf"
+label = "linux-armv6"
+docker_platform = "linux/arm/v6"
+# armhf, NOT armel. The triple is `musleabihf` — hard-float — and the artifact
+# carries Tag_ABI_VFP_args: VFP registers. `armel` is Debian's SOFT-float ARMv5TE
+# port, so declaring it here would describe the wrong ABI. Raspberry Pi OS calls
+# its ARMv6 port armhf too, which is why both armv6 and armv7 are armhf.
+#
+# CONSEQUENCE, measured: `cargo deb --target` derives the architecture from the
+# triple, so armv6 and armv7 BOTH produce modernweather_<version>_armhf.deb.
+# Running both in one output directory leaves one file. dpkg cannot tell the two
+# apart either — Debian has no separate ARMv6 architecture name — so the
+# FILENAME is the only thing that can, and release.yml passes an explicit
+# --output per target to make it. Do not remove that.
+deb_arch = "armhf"
+rpm_arch = "armv6hl"
+# Arch Linux ARM does have an armv6h port (it is their Raspberry Pi 1/Zero
+# target). The Arch package is published by hand from packaging/arch/PKGBUILD,
+# so this value is metadata for whoever does that.
+arch_arch = "armv6h"
+
+# Windows amd64 was dropped by owner decision on 2026-10-28 (OQ-3, now Decision 32).
+# It cross-compiled, but nothing in the capability inventory needs it — every station
+# driver is serial, TCP, UDP or HTTP — and this pipeline has no Windows runner, so it
+# would have shipped untested. Re-adding it is a [[target]] block here plus a zip
+# branch in xtask/src/dist.rs; docs/release.md §4 records what was removed.

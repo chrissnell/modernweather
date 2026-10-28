@@ -1,0 +1,44 @@
+{
+  "name": "snow-msgpack",
+  "description": "",
+  "provenance": "seeded directly into the weather hypertable (no Go driver exists that can be emulated here)",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/snow",
+    "query": "format=msgpack",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/x-msgpack",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "binary",
+    "body_bytes": 134,
+    "body_sha256": "65fb7a74c404e52357a36e7b66addbc907f493078e41e963d161983627068dfe",
+    "trailing_newline": false,
+    "body_base64": "iKtzdGF0aW9ubmFtZalzbm93Z2F1Z2Wpc25vd2RlcHRoykCWZmapc25vd3RvZGF5ygAAAACqc25vd2xhc3QyNMo/GZmaqnNub3dsYXN0NzLKQCzMzapzbm93c2Vhc29uykCAAACpc25vd3N0b3Jtyj8ZmZqsc25vd2ZhbGxyYXRlygAAAAA="
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Cache-Control",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": false,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": false,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

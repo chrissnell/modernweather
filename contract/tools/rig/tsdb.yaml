@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mw-w1-contract
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tsdb
+  namespace: mw-w1-contract
+  labels: { app: tsdb }
+spec:
+  restartPolicy: Never
+  containers:
+    - name: tsdb
+      image: timescale/timescaledb-ha:pg17
+      env:
+        - name: POSTGRES_PASSWORD
+          value: contract
+        - name: POSTGRES_DB
+          value: remoteweather
+        - name: PGDATA
+          value: /var/lib/postgresql/pgdata
+      ports:
+        - containerPort: 5432
+      volumeMounts:
+        - { name: data, mountPath: /var/lib/postgresql }
+      resources:
+        requests: { cpu: "1", memory: 2Gi }
+        limits: { cpu: "4", memory: 8Gi }
+  volumes:
+    - name: data
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tsdb
+  namespace: mw-w1-contract
+spec:
+  selector: { app: tsdb }
+  ports:
+    - { port: 5432, targetPort: 5432 }

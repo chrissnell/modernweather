@@ -1,0 +1,40 @@
+{
+  "name": "forecast-period-out-of-range",
+  "description": "QUIRK: a JSON error body served as Content-Type text/plain, because WriteHeader runs before the formatter sets the type.",
+  "provenance": "seeded directly into aeris_weather_forecasts / aeris_weather_alerts (Aeris API key not available)",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/forecast/240",
+    "query": "period=99",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 400,
+    "headers": {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "text",
+    "body_bytes": 67,
+    "body_sha256": "7e76fb124f278b656069a2b83bde0780b4ecde7f4fa76db459e8590792497b3f",
+    "trailing_newline": true,
+    "body": "{\"error\":\"period 99 exceeds available periods (valid range: 0-9)\"}\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": false,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": true,
+    "required_substrings": []
+  }
+}

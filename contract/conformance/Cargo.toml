@@ -1,0 +1,23 @@
+# Standalone crate on purpose: the workspace and crate layout of the new daemon is W3's
+# decision (DESIGN R-4), and the conformance runner must stay runnable against the Go
+# binary before any Rust daemon exists.
+[workspace]
+
+[package]
+name = "legacy-conformance"
+version = "0.1.0"
+edition = "2021"
+description = "Replays the frozen legacy REST fixtures against any HTTP base URL and asserts JSON compatibility."
+publish = false
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+[[bin]]
+name = "legacy-conformance"
+path = "src/main.rs"
+
+[lib]
+name = "legacy_conformance"
+path = "src/lib.rs"

@@ -1,0 +1,40 @@
+{
+  "name": "forecast-period-not-a-number",
+  "description": "",
+  "provenance": "seeded directly into aeris_weather_forecasts / aeris_weather_alerts (Aeris API key not available)",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/forecast/240",
+    "query": "period=abc",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 400,
+    "headers": {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "text",
+    "body_bytes": 56,
+    "body_sha256": "6d00b62613aa8bcb46c0ce700364eb9768a21daa1ea0ebeaef03a7755f5d956e",
+    "trailing_newline": true,
+    "body": "{\"error\":\"Invalid period parameter - must be a number\"}\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": false,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": true,
+    "required_substrings": []
+  }
+}

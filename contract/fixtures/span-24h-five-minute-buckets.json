@@ -1,0 +1,47 @@
+{
+  "name": "span-24h-five-minute-buckets",
+  "description": "6h < span <= 48h reads weather_5m. This is the website's default chart span.",
+  "provenance": "davis-emulator (cmd/davis-emulator), LOOP packets over TCP",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/span/24h",
+    "query": "station=davis-full",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "max-age=299",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "json",
+    "body_bytes": 323305,
+    "body_sha256": "3c8db538e3bc84ee9bf567ab38e2e3dd8aa222c2ce56eaf30a51f950e980b643",
+    "trailing_newline": true,
+    "body": "[{\"stationname\":\"davis-full\",\"stationtype\":\"davis\",\"ts\":1793120400000,\"otemp\":64.4,\"extratemp1\":0,\"extratemp2\":0,\"extratemp3\":0,\"extratemp4\":0,\"extratemp5\":0,\"extratemp6\":0,\"extratemp7\":0,\"soiltemp1\":0,\"soiltemp2\":0,\"soiltemp3\":0,\"soiltemp4\":0,\"leaftemp1\":0,\"leaftemp2\":0,\"leaftemp3\":0,\"leaftemp4\":0,\"outhumidity\":55,\"extrahumidity1\":0,\"extrahumidity2\":0,\"extrahumidity3\":0,\"extrahumidity4\":0,\"extrahumidity5\":0,\"extrahumidity6\":0,\"extrahumidity7\":0,\"ohum\":55,\"rainrate\":0.01,\"rainincremental\":0,\"period_rain\":0,\"solarwatts\":367,\"potentialsolarwatts\":0,\"solarjoules\":0,\"uv\":0.3,\"radiation\":0,\"stormrain\":0,\"dayrain\":0.14,\"monthrain\":1.59,\"yearrain\":4.82,\"bar\":30.002,\"rainfall24h\":0,\"rainfall48h\":0,\"rainfall72h\":0,\"rainfallstorm\":0,\"winds\":6,\"windgust\":0,\"windd\":92,\"windcard\":\"E\",\"rainday\":0.14,\"windch\":0,\"heatidx\":0,\"itemp\":66.4,\"ihum\":50,\"consbatteryvoltage\":0,\"stationbatteryvoltage\":23.730469,\"snowdepth\":0,\"snowdistance\":0,\"pm25\":0,\"co2\":0,\"aqi_pm25_aqin\":0,\"aqi_pm10_aqin\":0,\"extrafloat1\":0,\"extrafloat2\":0,\"extrafloat3\":0,\"extrafloat4\":0,\"extrafloat5\":0,\"extrafloat6\":0,\"extrafloat7\":0,\"extrafloat8\":0,\"extrafloat9\":0,\"extrafloat10\":0},{\"stationname\":\"davis-full\",\"stationtype\":\"davis\",\"ts\":1793120700000,\"otemp\":64.2,\"extratemp1\":0,\"extratemp2\":0,\"extratemp3\":0,\"extratemp4\":0,\"extratemp5\":0,\"extratemp6\":0,\"extratemp7\":0,\"soiltemp1\":0,\"soiltemp2\":0,\"soiltemp3\":0,\"soiltemp4\":0,\"leaftemp1\":0,\"leaftemp2\":0,\"leaftemp3\":0,\"leaftemp4\":0,\"outhumidity\":53,\"extrahumidity1\":0,\"extrahumidity2\":0,\"extrahumidity3\":0,\"extrahumidity4\":0,\"extrahumidity5\":0,\"extrahumidity6\":0,\"extrahumidity7\":0,\"ohum\":53,\"rainrate\":0.01,\"rainincremental\":0,\"period_rain\":0,\"solarwatts\":376,\"potentialsolarwatts\":0,\"solarjoules\":0,\"uv\":0.3,\"radiation\":0,\"stormrain\":0,\"dayrain\":0.06,\"monthrain\":0.81,\"yearrain\":0.78,\"bar\":30.001,\"rainfall24h\":0,\"rainfall48h\":0,\"rainfall72h\":0,\"rainfallstorm\":0,\"winds\":13,\"windgust\":0,\"windd\":71,\"windcard\":\"ENE\",\"rainday\":0.06,\"windch\":0,\"heatidx\":0,\"itemp\":66.2,\"ihum\":48,\"consbatteryvoltage\":0,\"stationbatteryvoltage\":23.730469,\"snowdepth\":0,\"snowdistance\":0,\"pm25\":0,\"co2\":0,\"aqi_pm25_aqin\":0,\"aqi_pm10_aqin\":0,\"extrafloat1\":0,\"extrafloat2\":0,\"extrafloat3\":0,\"extrafloat4\":0,\"extrafloat5\":0,\"extrafloat6\":0,\"extrafloat7\":0,\"extrafloat8\":0,\"extrafloat9\":0,\"extrafloat10\":0},{\"stationname\":\"davis-full\",\"stationtype\":\"davis\",\"ts\":1793121000000,\"otemp\":63,\"extratemp1\":0,\"extratemp2\":0,\"extratemp3\":0,\"extratemp4\":0,\"extratemp5\":0,\"extratemp6\":0,\"extratemp7\":0,\"soiltemp1\":0,\"soiltemp2\":0,\"soiltemp3\":0,\"soiltemp4\":0,\"leaftemp1\":0,\"leaftemp2\":0,\"leaftemp3\":0,\"leaftemp4\":0,\"outhumidity\":57,\"extrahumidity1\":0,\"extrahumidity2\":0,\"extrahumidity3\":0,\"extrahumidity4\":0,\"extrahumidity5\":0,\"extrahumidity6\":0,\"extrahumidity7\":0,\"ohum\":57,\"rainrate\":0,\"rainincremental\":0,\"period_rain\":0,\"solarwatts\":416,\"potentialsolarwatts\":0,\"solarjoules\":0,\"uv\":0.4,\"radiation\":0,\"stormrain\":0,\"dayrain\":0.05,\"monthrain\":0.86,\"yearrain\":7.07,\"bar\":29.992,\"rainfall24h\":0,\"rainfall48h\":0,\"rainfall72h\":0,\"rainfallstorm\":0,\"winds\":21,\"windgust\":0,\"windd\":25,\"windcard\":\"NNE\",\"rainday\":0.05,\"windch\":0,\"heatidx\":0,\"itemp\":65,\"ihum\":52,\"consbatteryvoltage\":0,\"stationbatteryvoltage\":23.730469,\"snowdepth\":0,\"snowdistance\":0,\"pm25\":0,\"co2\":0,\"aqi_pm25_aqin\":0,\"aqi_pm10_aqin\":0,\"extrafloat1\":0,\"extrafloat2\":0,\"extrafloat3\":0,\"extrafloat4\":0,\"extrafloat5\":0,\"extrafloat6\":0,\"extrafloat7\":0,\"extrafloat8\":0,\"extrafloat9\":0,\"extrafloat10\":0},{\"stationname\":\"davis-full\",\"stationtype\":\"davis\",\"ts\":1793121300000,\"otemp\":66.1,\"extratemp1\":0,\"extratemp2\":0,\"extratemp3\":0,\"extratemp4\":0,\"extratemp5\":0,\"extratemp6\":0,\"extratemp7\":0,\"soiltemp1\":0,\"soiltemp2\":0,\"soiltemp3\":0,\"soiltemp4\":0,\"leaftemp1\":0,\"leaftemp2\":0,\"leaftemp3\":0,\"leaftemp4\":0,\"outhumidity\":57,\"extrahumidity1\":0,\"extrahumidity2\":0,\"extrahumidity3\":0,\"extrahumidity4\":0,\"extrahumidity5\":0,\"extrahumidity6\":0,\"extrahumidity7\":0,\"ohum\":57,\"rainrate\":0,\"rainincremental\":0,\"period_rain\":0,\"solarwatts\":460,\"potentialsolarwatts\":0,\"solarjoules\":0,\"uv\":0.4,\"radiation\":0,\"stormrain\":0,\"dayrain\":0.12,\"monthrain\":1.9,\"yearrain\":0.18,\"bar\":29.998,\"rainfall24h\":0,\"rainfall48h\":0,\"rainfall72h\":0,\"rainfallstorm\":0,\"winds\":20,\"windgust\":0,\"windd\":54,\"windcard\":\"NE\",\"rainday\":0.12,\"windch\":0,\"heatidx\":0,\"itemp\":68.1,\"ihum\":52,\"consbatteryvoltage\":0,\"stationbatteryvoltage\":23.730469,\"snowdepth\":0,\"snowdistance\":0,\"pm25\":0,\"co2\":0,\"aqi_pm25_aqin\":0,\"aqi_pm10_aqin\":0,\"extrafloat1\":0,\"extrafloat2\":0,\"extrafloat3\":0,\"extrafloat4\":0,\"extrafloat5\":0,\"extrafloat6\":0,\"extrafloat7\":0,\"extrafloat8\":0,\"extrafloat9\":0,\"extrafloat10\":0},{\"stationname\":\"davis-full\",\"stationtype\":\"davis\",\"ts\":1793121600000,\"otemp\":65.7,\"extratemp1\":0,\"extratemp2\":0,\"extratemp3\":0,\"extratemp4\":0,\"extratemp5\":0,\"extratemp6\":0,\"extratemp7\":0,\"soiltemp1\":0,\"soiltemp2\":0,\"soiltemp3\":0,\"soiltemp4\":0,\"leaftemp1\":0,\"leaftemp2\":0,\"leaftemp3\":0,\"leaftemp4\":0,\"outhumidity\":49,\"extrahumidity1\":0,\"extrahumidity2\":0,\"extrahumidity3\":0,\"extrahumidity4\":0,\"extrahumidity5\":0,\"extrahumidity6\":0,\"extrahumidity7\":0,\"ohum\":49,\"rainrate\":0.02,\"rainincremental\":0,\"period_rain\":0,\"solarwatts\":395,\"potentialsolarwatts\":0,\"solarjoules\":0,\"uv\":0.3,\"radiation\":0,\"stormrain\":0,\"dayrain\":0.07,\"monthrain\":0.34,\"yearrain\":7.59,\"bar\":30.002,\"rainfall24h\":0,\"rainfall48h\":0,\"rainfall72h\":0,\"rainfallstorm\":0,\"winds\":11,\"windgust\":0,\"windd\":265,\"windcard\":\"W\",\"rainday\":0.07,\"windch\":0,\"heatidx\":0,\"itemp\":67.7,\"ihum\":44,\"consbatteryvoltage\":0,\"stationbatteryvoltage\":23.730469,\"snowdepth\":0,\"snowdistance\":0,\"pm25\":0,\"co2\":0,\"aqi_pm25_aqin\":0,\"aqi_pm10_aqin\":0,\"extrafloat1\":0,\"extrafloat2\":0,\"extrafloat3\":0,\"extrafloat4\":0,\"extrafloat5\":0,\"extrafloat6\":0,\"extrafloat7\":0,\"extrafloat8\":0,\"extrafloat9\":0,\"extrafloat10\":0},{\"stationname\":\"davis-full\",\"stationtype\":\"davis\",\"ts\":1793121900000,\"otemp\":65.2,\"extratemp1\":0,\"extratemp2\":0,\"extratemp3\":0,\"extratemp4\":0,\"extratemp5\":0,\"extratemp6\":0,\"extratemp7\":0,\"soiltemp1\":0,\"soiltemp2\":0,\"soiltemp3\":0,\"soiltemp4\":0,\"leaftemp1\":0,\"leaftemp2\":0,\"leaftemp3\":0,\"leaftemp4\":0,\"outhumidity\":55,\"extrahumidity1\":0,\"extrahumidity2\":0,\"extrahumidity3\":0,\"extrahumidity4\":0,\"extrahumidity5\":0,\"extrahumidity6\":0,\"extrahumidity7\":0,\"ohum\":55,\"rainrate\":0.02,\"rainincremental\":0,\"period_rain\":0,\"solarwatts\":357,\"potentialsolarwatts\":0,\"solarjoules\":0,\"uv\":0.3,\"radiation\":0,\"stormrain\":0,\"dayrain\":0.14,\"monthrain\":1.19,\"yearrain\":9.65,\"bar\":30.008,\"rainfall24h\":0,\"rainfall48h\":0,\"rainfall72h\":0,\"rainfallstorm\":0,\"winds\":8,\"windgust\":0,\"windd\":269,\"windcard\":\"W\",\"rainday\":0.14,\"windch\":0,\"heatidx\":0,\"itemp\":67.2,\"ihum\":50,\"consbatteryvoltage\":0,\"stationbatteryvoltage\":23.730469,\"snowdepth\":0,\"snowdistance\":0,\"pm25\":0,\"co2\":0,\"aqi_pm25_aqin\":0,\"aqi_pm10_aqin\":0,\"extrafloat1\":0,\"extrafloat2\":0,\"extrafloat3\":0,\"extrafloat4\":0,\"extrafloat5\":0,\"extrafloat6\":0,\"extrafloat7\":0,\"extrafloat8\":0,\"extrafloat9\":0,\"extrafloat10\":0}]\n",
+    "body_array_length": 282,
+    "body_array_truncated_to": 6,
+    "note": "Body truncated to the first 6 array elements; the full response had 282. Every element has the same shape, and the conformance runner compares shape, not length. body_sha256/body_bytes describe the UNTRUNCATED capture."
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Cache-Control",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": true,
+    "json_key_order": true,
+    "numeric_format": true,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

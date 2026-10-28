@@ -1,0 +1,42 @@
+{
+  "name": "api-remote-stations-populated",
+  "description": "No shipped client reads this: the only in-repo consumer is the management UI, which fetches it relative to the management server, where the route does not exist.",
+  "provenance": "remote_stations rows in the SQLite config database",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/api/remote-stations",
+    "query": "",
+    "headers": {
+      "Host": "portal.test"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "json",
+    "body_bytes": 525,
+    "body_sha256": "1607cde72f6fb332bd12c3767c3b9fda2d4eba77daba790301672b403a5eefef",
+    "trailing_newline": true,
+    "body": "[{\"station_id\":\"b7c1e9f4-0e2d-4a7b-9c31-5f6a2d8e1b04\",\"station_name\":\"ridge-remote\",\"station_type\":\"davis\",\"last_seen\":\"2026-10-28T16:14:51Z\",\"services\":{\"aprs_enabled\":true,\"wu_enabled\":true,\"aeris_enabled\":false,\"pws_enabled\":true},\"status\":\"offline\"},{\"station_id\":\"3f2a7c18-55b9-4d0e-8a16-9c4471d2e5aa\",\"station_name\":\"valley-remote\",\"station_type\":\"campbellscientific\",\"last_seen\":\"2026-10-28T13:15:51Z\",\"services\":{\"aprs_enabled\":false,\"wu_enabled\":false,\"aeris_enabled\":false,\"pws_enabled\":false},\"status\":\"offline\"}]\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": true,
+    "json_key_order": true,
+    "numeric_format": true,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

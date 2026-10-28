@@ -1,0 +1,73 @@
+# /usr/lib/systemd/system/modernweather.service
+#
+# Carried forward from the Go unit with the same hardening, because that part of it was
+# right. Two differences are deliberate and noted inline.
+#
+# The ExecStart flag spelling is W3's to confirm — this unit assumes `--config <path>`.
+# See docs/release.md §6.
+
+[Unit]
+Description=ModernWeather - weather station data collection and distribution
+Documentation=https://github.com/chrissnell/modernweather
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+# The daemon signals readiness once its components have started, so that a unit ordered
+# after this one does not race the first reading. Type=simple in the Go unit meant
+# "started" was indistinguishable from "about to fail".
+NotifyAccess=main
+User=modernweather
+Group=modernweather
+WorkingDirectory=/var/lib/modernweather
+ExecStart=/usr/bin/modernweather --config /var/lib/modernweather/config.db
+Restart=always
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/modernweather
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Serial station drivers need the tty devices; everything else is closed.
+PrivateDevices=false
+DevicePolicy=closed
+DeviceAllow=/dev/ttyS0 rw
+DeviceAllow=/dev/ttyUSB* rw
+DeviceAllow=/dev/ttyACM* rw
+
+LimitNOFILE=65536
+# No MemoryMax. The Go unit capped at 512M, which on a Raspberry Pi Zero is most of the
+# machine and turns a transient spike into an OOM kill of the only thing running. Sizing
+# this belongs with W3's buffer and spool decisions, not with packaging.
+TasksMax=256
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=modernweather
+
+Environment=HOME=/var/lib/modernweather
+
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

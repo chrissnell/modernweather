@@ -1,0 +1,40 @@
+{
+  "name": "alerts-invalid-station-id",
+  "description": "",
+  "provenance": "derived from the SQLite configuration database only",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/alerts",
+    "query": "station_id=abc",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 400,
+    "headers": {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "text",
+    "body_bytes": 29,
+    "body_sha256": "04dc915086677ad13f2f82f1a2b9e9c97552d3d36f7420683c96d611f12f87bc",
+    "trailing_newline": true,
+    "body": "invalid station_id parameter\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": false,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": true,
+    "required_substrings": []
+  }
+}

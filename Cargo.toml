@@ -1,8 +1,47 @@
-# Minimal root workspace. It exists only to hold `xtask`.
+# Workspace root.
 #
-# W3 §1 (R-4) owns the real crate and workspace layout. When W3 lands, this file is
-# expected to grow the application crates around `xtask`; nothing here is a layout
-# decision. See docs/metric-registry.md § "Assumptions about other work items".
+# The crate and workspace layout inside `crates/` is W3 §1's decision (DESIGN.md R-4).
+# This file deliberately fixes only what the CI gate needs: a workspace that builds, a
+# glob member pattern so W3 can add crates without touching this file, and the lint and
+# release profiles the gate enforces.
+
 [workspace]
-members = ["xtask"]
 resolver = "2"
+members = ["xtask", "crates/*"]
+
+[workspace.package]
+edition = "2021"
+# There is no separate MSRV policy: the supported compiler is the pinned one in
+# rust-toolchain.toml, and nothing in this program needs to build on an older one.
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/chrissnell/modernweather"
+
+# W3 populates this as crates arrive. Pinning versions here keeps one version of each
+# crate across the workspace, which is what makes `cargo xtask codegen --check` and the
+# conformance replay compare like with like.
+[workspace.dependencies]
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+# `-D warnings` on the command line covers the default set; these raise a few groups that
+# are allow-by-default and cheap to keep clean from the first commit.
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[profile.release]
+# Release artefacts ship to Raspberry Pi class hardware, so size and a usable backtrace
+# both matter more than the last few percent of throughput.
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+strip = "debuginfo"
+
+[profile.dist]
+inherits = "release"
+debug = false

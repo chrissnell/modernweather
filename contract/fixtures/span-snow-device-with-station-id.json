@@ -1,0 +1,47 @@
+{
+  "name": "span-snow-device-with-station-id",
+  "description": "The iOS fetchDeviceSpan form. station_id is accepted and ignored by this handler; only station is used.",
+  "provenance": "seeded directly into the weather hypertable (no Go driver exists that can be emulated here)",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/span/24h",
+    "query": "station=snowgauge&station_id=3",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "max-age=299",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "json",
+    "body_bytes": 323816,
+    "body_sha256": "9889bbb4544959169ae8b195300d64c2600a39e98136a9c51cb3514cbd129a57",
+    "trailing_newline": true,
+    "body": "[{\"stationname\":\"snowgauge\",\"stationtype\":\"snowgauge\",\"ts\":1793120400000,\"otemp\":22.820744,\"extratemp1\":0,\"extratemp2\":0,\"extratemp3\":0,\"extratemp4\":0,\"extratemp5\":0,\"extratemp6\":0,\"extratemp7\":0,\"soiltemp1\":0,\"soiltemp2\":0,\"soiltemp3\":0,\"soiltemp4\":0,\"leaftemp1\":0,\"leaftemp2\":0,\"leaftemp3\":0,\"leaftemp4\":0,\"outhumidity\":88.08975,\"extrahumidity1\":0,\"extrahumidity2\":0,\"extrahumidity3\":0,\"extrahumidity4\":0,\"extrahumidity5\":0,\"extrahumidity6\":0,\"extrahumidity7\":0,\"ohum\":88.08975,\"rainrate\":0,\"rainincremental\":0,\"period_rain\":0,\"solarwatts\":0,\"potentialsolarwatts\":0,\"solarjoules\":0,\"uv\":0,\"radiation\":0,\"stormrain\":0,\"dayrain\":0,\"monthrain\":0,\"yearrain\":0,\"bar\":29.42,\"rainfall24h\":0,\"rainfall48h\":0,\"rainfall72h\":0,\"rainfallstorm\":0,\"winds\":0,\"windgust\":0,\"windd\":0,\"windcard\":\"N\",\"rainday\":0,\"windch\":0,\"heatidx\":0,\"itemp\":0,\"ihum\":0,\"consbatteryvoltage\":0,\"stationbatteryvoltage\":0,\"snowdepth\":3.6,\"snowdistance\":1407.7028,\"pm25\":0,\"co2\":0,\"aqi_pm25_aqin\":0,\"aqi_pm10_aqin\":0,\"extrafloat1\":0,\"extrafloat2\":0,\"extrafloat3\":0,\"extrafloat4\":0,\"extrafloat5\":0,\"extrafloat6\":0,\"extrafloat7\":0,\"extrafloat8\":0,\"extrafloat9\":0,\"extrafloat10\":0},{\"stationname\":\"snowgauge\",\"stationtype\":\"snowgauge\",\"ts\":1793120700000,\"otemp\":22.699064,\"extratemp1\":0,\"extratemp2\":0,\"extratemp3\":0,\"extratemp4\":0,\"extratemp5\":0,\"extratemp6\":0,\"extratemp7\":0,\"soiltemp1\":0,\"soiltemp2\":0,\"soiltemp3\":0,\"soiltemp4\":0,\"leaftemp1\":0,\"leaftemp2\":0,\"leaftemp3\":0,\"leaftemp4\":0,\"outhumidity\":88.36843,\"extrahumidity1\":0,\"extrahumidity2\":0,\"extrahumidity3\":0,\"extrahumidity4\":0,\"extrahumidity5\":0,\"extrahumidity6\":0,\"extrahumidity7\":0,\"ohum\":88.36843,\"rainrate\":0,\"rainincremental\":0,\"period_rain\":0,\"solarwatts\":0,\"potentialsolarwatts\":0,\"solarjoules\":0,\"uv\":0,\"radiation\":0,\"stormrain\":0,\"dayrain\":0,\"monthrain\":0,\"yearrain\":0,\"bar\":29.42,\"rainfall24h\":0,\"rainfall48h\":0,\"rainfall72h\":0,\"rainfallstorm\":0,\"winds\":0,\"windgust\":0,\"windd\":0,\"windcard\":\"N\",\"rainday\":0,\"windch\":0,\"heatidx\":0,\"itemp\":0,\"ihum\":0,\"consbatteryvoltage\":0,\"stationbatteryvoltage\":0,\"snowdepth\":3.6,\"snowdistance\":1407.5676,\"pm25\":0,\"co2\":0,\"aqi_pm25_aqin\":0,\"aqi_pm10_aqin\":0,\"extrafloat1\":0,\"extrafloat2\":0,\"extrafloat3\":0,\"extrafloat4\":0,\"extrafloat5\":0,\"extrafloat6\":0,\"extrafloat7\":0,\"extrafloat8\":0,\"extrafloat9\":0,\"extrafloat10\":0},{\"stationname\":\"snowgauge\",\"stationtype\":\"snowgauge\",\"ts\":1793121000000,\"otemp\":22.586586,\"extratemp1\":0,\"extratemp2\":0,\"extratemp3\":0,\"extratemp4\":0,\"extratemp5\":0,\"extratemp6\":0,\"extratemp7\":0,\"soiltemp1\":0,\"soiltemp2\":0,\"soiltemp3\":0,\"soiltemp4\":0,\"leaftemp1\":0,\"leaftemp2\":0,\"leaftemp3\":0,\"leaftemp4\":0,\"outhumidity\":88.62746,\"extrahumidity1\":0,\"extrahumidity2\":0,\"extrahumidity3\":0,\"extrahumidity4\":0,\"extrahumidity5\":0,\"extrahumidity6\":0,\"extrahumidity7\":0,\"ohum\":88.62746,\"rainrate\":0,\"rainincremental\":0,\"period_rain\":0,\"solarwatts\":0,\"potentialsolarwatts\":0,\"solarjoules\":0,\"uv\":0,\"radiation\":0,\"stormrain\":0,\"dayrain\":0,\"monthrain\":0,\"yearrain\":0,\"bar\":29.42,\"rainfall24h\":0,\"rainfall48h\":0,\"rainfall72h\":0,\"rainfallstorm\":0,\"winds\":0,\"windgust\":0,\"windd\":0,\"windcard\":\"N\",\"rainday\":0,\"windch\":0,\"heatidx\":0,\"itemp\":0,\"ihum\":0,\"consbatteryvoltage\":0,\"stationbatteryvoltage\":0,\"snowdepth\":3.6,\"snowdistance\":1407.4324,\"pm25\":0,\"co2\":0,\"aqi_pm25_aqin\":0,\"aqi_pm10_aqin\":0,\"extrafloat1\":0,\"extrafloat2\":0,\"extrafloat3\":0,\"extrafloat4\":0,\"extrafloat5\":0,\"extrafloat6\":0,\"extrafloat7\":0,\"extrafloat8\":0,\"extrafloat9\":0,\"extrafloat10\":0},{\"stationname\":\"snowgauge\",\"stationtype\":\"snowgauge\",\"ts\":1793121300000,\"otemp\":22.483505,\"extratemp1\":0,\"extratemp2\":0,\"extratemp3\":0,\"extratemp4\":0,\"extratemp5\":0,\"extratemp6\":0,\"extratemp7\":0,\"soiltemp1\":0,\"soiltemp2\":0,\"soiltemp3\":0,\"soiltemp4\":0,\"leaftemp1\":0,\"leaftemp2\":0,\"leaftemp3\":0,\"leaftemp4\":0,\"outhumidity\":88.866035,\"extrahumidity1\":0,\"extrahumidity2\":0,\"extrahumidity3\":0,\"extrahumidity4\":0,\"extrahumidity5\":0,\"extrahumidity6\":0,\"extrahumidity7\":0,\"ohum\":88.866035,\"rainrate\":0,\"rainincremental\":0,\"period_rain\":0,\"solarwatts\":0,\"potentialsolarwatts\":0,\"solarjoules\":0,\"uv\":0,\"radiation\":0,\"stormrain\":0,\"dayrain\":0,\"monthrain\":0,\"yearrain\":0,\"bar\":29.42,\"rainfall24h\":0,\"rainfall48h\":0,\"rainfall72h\":0,\"rainfallstorm\":0,\"winds\":0,\"windgust\":0,\"windd\":0,\"windcard\":\"N\",\"rainday\":0,\"windch\":0,\"heatidx\":0,\"itemp\":0,\"ihum\":0,\"consbatteryvoltage\":0,\"stationbatteryvoltage\":0,\"snowdepth\":3.6,\"snowdistance\":1407.2972,\"pm25\":0,\"co2\":0,\"aqi_pm25_aqin\":0,\"aqi_pm10_aqin\":0,\"extrafloat1\":0,\"extrafloat2\":0,\"extrafloat3\":0,\"extrafloat4\":0,\"extrafloat5\":0,\"extrafloat6\":0,\"extrafloat7\":0,\"extrafloat8\":0,\"extrafloat9\":0,\"extrafloat10\":0},{\"stationname\":\"snowgauge\",\"stationtype\":\"snowgauge\",\"ts\":1793121600000,\"otemp\":22.39,\"extratemp1\":0,\"extratemp2\":0,\"extratemp3\":0,\"extratemp4\":0,\"extratemp5\":0,\"extratemp6\":0,\"extratemp7\":0,\"soiltemp1\":0,\"soiltemp2\":0,\"soiltemp3\":0,\"soiltemp4\":0,\"leaftemp1\":0,\"leaftemp2\":0,\"leaftemp3\":0,\"leaftemp4\":0,\"outhumidity\":89.08342,\"extrahumidity1\":0,\"extrahumidity2\":0,\"extrahumidity3\":0,\"extrahumidity4\":0,\"extrahumidity5\":0,\"extrahumidity6\":0,\"extrahumidity7\":0,\"ohum\":89.08342,\"rainrate\":0,\"rainincremental\":0,\"period_rain\":0,\"solarwatts\":0,\"potentialsolarwatts\":0,\"solarjoules\":0,\"uv\":0,\"radiation\":0,\"stormrain\":0,\"dayrain\":0,\"monthrain\":0,\"yearrain\":0,\"bar\":29.42,\"rainfall24h\":0,\"rainfall48h\":0,\"rainfall72h\":0,\"rainfallstorm\":0,\"winds\":0,\"windgust\":0,\"windd\":0,\"windcard\":\"N\",\"rainday\":0,\"windch\":0,\"heatidx\":0,\"itemp\":0,\"ihum\":0,\"consbatteryvoltage\":0,\"stationbatteryvoltage\":0,\"snowdepth\":3.7,\"snowdistance\":1407.1621,\"pm25\":0,\"co2\":0,\"aqi_pm25_aqin\":0,\"aqi_pm10_aqin\":0,\"extrafloat1\":0,\"extrafloat2\":0,\"extrafloat3\":0,\"extrafloat4\":0,\"extrafloat5\":0,\"extrafloat6\":0,\"extrafloat7\":0,\"extrafloat8\":0,\"extrafloat9\":0,\"extrafloat10\":0},{\"stationname\":\"snowgauge\",\"stationtype\":\"snowgauge\",\"ts\":1793121900000,\"otemp\":22.306232,\"extratemp1\":0,\"extratemp2\":0,\"extratemp3\":0,\"extratemp4\":0,\"extratemp5\":0,\"extratemp6\":0,\"extratemp7\":0,\"soiltemp1\":0,\"soiltemp2\":0,\"soiltemp3\":0,\"soiltemp4\":0,\"leaftemp1\":0,\"leaftemp2\":0,\"leaftemp3\":0,\"leaftemp4\":0,\"outhumidity\":89.27895,\"extrahumidity1\":0,\"extrahumidity2\":0,\"extrahumidity3\":0,\"extrahumidity4\":0,\"extrahumidity5\":0,\"extrahumidity6\":0,\"extrahumidity7\":0,\"ohum\":89.27895,\"rainrate\":0,\"rainincremental\":0,\"period_rain\":0,\"solarwatts\":0,\"potentialsolarwatts\":0,\"solarjoules\":0,\"uv\":0,\"radiation\":0,\"stormrain\":0,\"dayrain\":0,\"monthrain\":0,\"yearrain\":0,\"bar\":29.42,\"rainfall24h\":0,\"rainfall48h\":0,\"rainfall72h\":0,\"rainfallstorm\":0,\"winds\":0,\"windgust\":0,\"windd\":0,\"windcard\":\"N\",\"rainday\":0,\"windch\":0,\"heatidx\":0,\"itemp\":0,\"ihum\":0,\"consbatteryvoltage\":0,\"stationbatteryvoltage\":0,\"snowdepth\":3.7,\"snowdistance\":1407.027,\"pm25\":0,\"co2\":0,\"aqi_pm25_aqin\":0,\"aqi_pm10_aqin\":0,\"extrafloat1\":0,\"extrafloat2\":0,\"extrafloat3\":0,\"extrafloat4\":0,\"extrafloat5\":0,\"extrafloat6\":0,\"extrafloat7\":0,\"extrafloat8\":0,\"extrafloat9\":0,\"extrafloat10\":0}]\n",
+    "body_array_length": 284,
+    "body_array_truncated_to": 6,
+    "note": "Body truncated to the first 6 array elements; the full response had 284. Every element has the same shape, and the conformance runner compares shape, not length. body_sha256/body_bytes describe the UNTRUNCATED capture."
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Cache-Control",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": true,
+    "json_key_order": true,
+    "numeric_format": true,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

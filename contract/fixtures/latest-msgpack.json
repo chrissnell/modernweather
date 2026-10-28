@@ -1,0 +1,44 @@
+{
+  "name": "latest-msgpack",
+  "description": "format=msgpack switches the encoder for every endpoint that goes through responseformat.Formatter.",
+  "provenance": "davis-emulator (cmd/davis-emulator), LOOP packets over TCP",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/latest",
+    "query": "station=davis-full&format=msgpack",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/x-msgpack",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "binary",
+    "body_bytes": 1272,
+    "body_sha256": "c025c3ae534634e424a277378f29c6fed42971f292c42e3bbf6a84dea8088864",
+    "trailing_newline": false,
+    "body_base64": "3gBOq3N0YXRpb25uYW1lqmRhdmlzLWZ1bGyrc3RhdGlvbnR5cGWlZGF2aXOidHPTAAABoYNxSXylb3RlbXDKQnYAAKpleHRyYXRlbXAxygAAAACqZXh0cmF0ZW1wMsoAAAAAqmV4dHJhdGVtcDPKAAAAAKpleHRyYXRlbXA0ygAAAACqZXh0cmF0ZW1wNcoAAAAAqmV4dHJhdGVtcDbKAAAAAKpleHRyYXRlbXA3ygAAAACpc29pbHRlbXAxykJgAACpc29pbHRlbXAyygAAAACpc29pbHRlbXAzygAAAACpc29pbHRlbXA0ygAAAACpbGVhZnRlbXAxykJ0AACpbGVhZnRlbXAyygAAAACpbGVhZnRlbXAzygAAAACpbGVhZnRlbXA0ygAAAACrb3V0aHVtaWRpdHnKQmwAAK5leHRyYWh1bWlkaXR5McoAAAAArmV4dHJhaHVtaWRpdHkyygAAAACuZXh0cmFodW1pZGl0eTPKAAAAAK5leHRyYWh1bWlkaXR5NMoAAAAArmV4dHJhaHVtaWRpdHk1ygAAAACuZXh0cmFodW1pZGl0eTbKAAAAAK5leHRyYWh1bWlkaXR5N8oAAAAApG9odW3KQmwAAKhyYWlucmF0ZcoAAAAAr3JhaW5pbmNyZW1lbnRhbMoAAAAAq3BlcmlvZF9yYWluygAAAACqc29sYXJ3YXR0c8pDfAAAs3BvdGVudGlhbHNvbGFyd2F0dHPKAAAAAKtzb2xhcmpvdWxlc8oAAAAAonV2yj5MzM2pcmFkaWF0aW9uygAAAACpc3Rvcm1yYWluyj7hR66nZGF5cmFpbso+hR63qW1vbnRocmFpbso+x64PqHllYXJyYWluyj7HrhOjYmFyykHvwo+rcmFpbmZhbGwyNGjKPoUet6tyYWluZmFsbDQ4aMo+x64Tq3JhaW5mYWxsNzJoyj7HrhOtcmFpbmZhbGxzdG9ybco+hR63pXdpbmRzykDgAACod2luZGd1c3TKQOAAAKV3aW5kZMpDEAAAqHdpbmRjYXJkolNFp3JhaW5kYXnKPoUet6Z3aW5kY2jKAAAAAKdoZWF0aWR4ygAAAAClaXRlbXDKQn4AAKRpaHVtykJYAACyY29uc2JhdHRlcnl2b2x0YWdlygAAAAC1c3RhdGlvbmJhdHRlcnl2b2x0YWdlykG92ACpc25vd2RlcHRoykS7gACsc25vd2Rpc3RhbmNlygAAAACkcG0yNcoAAAAAo2NvMsoAAAAArWFxaV9wbTI1X2FxaW7KAAAAAK1hcWlfcG0xMF9hcWluygAAAACrZXh0cmFmbG9hdDHKAAAAAKtleHRyYWZsb2F0MsoAAAAAq2V4dHJhZmxvYXQzygAAAACrZXh0cmFmbG9hdDTKAAAAAKtleHRyYWZsb2F0NcoAAAAAq2V4dHJhZmxvYXQ2ygAAAACrZXh0cmFmbG9hdDfKAAAAAKtleHRyYWZsb2F0OMoAAAAAq2V4dHJhZmxvYXQ5ygAAAACsZXh0cmFmbG9hdDEwygAAAACnc3VucmlzZac3OjMwIEFNpnN1bnNldKc2OjAyIFBNrW1vb25QaGFzZU5hbWWuV2FuaW5nIEdpYmJvdXOwbW9vbklsbHVtaW5hdGlvbso/ajNMp21vb25BZ2XKQYxj8rFtb29uQ3Jlc2NlbnRBbmdsZcrC8umh"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Cache-Control",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": false,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": false,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

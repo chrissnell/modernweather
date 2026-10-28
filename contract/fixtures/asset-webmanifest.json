@@ -1,0 +1,43 @@
+{
+  "name": "asset-webmanifest",
+  "description": "Served as text/plain; charset=utf-8, not application/manifest+json.",
+  "provenance": "derived from the SQLite configuration database only",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/site.webmanifest",
+    "query": "",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "html",
+    "body_bytes": 436,
+    "body_sha256": "91a78d4fe16316df93ec91b33a15c7ed84aab2b0de8a9959da40f108dfc2154e",
+    "trailing_newline": false,
+    "body": "{\n  \"name\": \"MyWebSite\",\n  \"short_name\": \"MySite\",\n  \"icons\": [\n    {\n      \"src\": \"/web-app-manifest-192x192.png\",\n      \"sizes\": \"192x192\",\n      \"type\": \"image/png\",\n      \"purpose\": \"maskable\"\n    },\n    {\n      \"src\": \"/web-app-manifest-512x512.png\",\n      \"sizes\": \"512x512\",\n      \"type\": \"image/png\",\n      \"purpose\": \"maskable\"\n    }\n  ],\n  \"theme_color\": \"#ffffff\",\n  \"background_color\": \"#ffffff\",\n  \"display\": \"standalone\"\n}"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": false,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": false,
+    "body_equals": false,
+    "required_substrings": [
+      "short_name",
+      "icons"
+    ]
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "name": "asset-static-css",
+  "description": "",
+  "provenance": "derived from the SQLite configuration database only",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/css/weather.css",
+    "query": "",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "text/css; charset=utf-8",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "html",
+    "body_bytes": 41815,
+    "body_sha256": "6b8e147af99e9ced9a79f2f4fecafd0bf7e6c6937652a0c6cdb407adbd885cc4",
+    "trailing_newline": true
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": false,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": false,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

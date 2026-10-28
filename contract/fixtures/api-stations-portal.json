@@ -1,0 +1,42 @@
+{
+  "name": "api-stations-portal",
+  "description": "Portal-only. Devices without a location are excluded; disabled devices are included with enabled: false.",
+  "provenance": "derived from the SQLite configuration database only",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/api/stations",
+    "query": "",
+    "headers": {
+      "Host": "portal.test"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "json",
+    "body_bytes": 874,
+    "body_sha256": "98be9618a08c41b3c7c25174c921400d553a4360545c12a9111673fa39307aef",
+    "trailing_newline": true,
+    "body": "[{\"id\":4,\"name\":\"aqmon\",\"type\":\"airgradient\",\"latitude\":39.905,\"longitude\":-105.505,\"enabled\":false},{\"id\":2,\"name\":\"csi-minimal\",\"type\":\"campbellscientific\",\"latitude\":39.8,\"longitude\":-105.4,\"enabled\":true,\"website\":{\"name\":\"Minimal Station\",\"hostname\":\"minimal.test\",\"page_title\":\"Minimal Station\",\"protocol\":\"http\",\"port\":18080}},{\"id\":1,\"name\":\"davis-full\",\"type\":\"davis\",\"latitude\":39.9,\"longitude\":-105.5,\"enabled\":true,\"website\":{\"name\":\"Suncrest Live Weather\",\"hostname\":\"localhost\",\"page_title\":\"Suncrest Live Weather\",\"protocol\":\"http\",\"port\":18080}},{\"id\":3,\"name\":\"snowgauge\",\"type\":\"snowgauge\",\"latitude\":39.91,\"longitude\":-105.51,\"enabled\":false},{\"id\":6,\"name\":\"snowgauge-dead\",\"type\":\"snowgauge\",\"latitude\":39.92,\"longitude\":-105.52,\"enabled\":false},{\"id\":7,\"name\":\"snowgauge-stale\",\"type\":\"snowgauge\",\"latitude\":39.93,\"longitude\":-105.53,\"enabled\":false}]\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": true,
+    "json_key_order": true,
+    "numeric_format": true,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

@@ -1,9 +1,15 @@
 [package]
 name = "xtask"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 publish = false
-description = "Code generator for the ModernWeather metric registry"
+description = "Repository tasks: the metric-registry code generator, the CI gates and the release pipeline"
+
+[lints]
+workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
