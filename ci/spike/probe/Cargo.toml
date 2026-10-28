@@ -1,0 +1,44 @@
+# Own workspace on purpose: this is platform test infrastructure, and the crate layout
+# under crates/ is W3 §1's decision (DESIGN.md R-4).
+[workspace]
+
+[package]
+name = "mw-platform-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The versions here are the ones in DESIGN.md §6. They are deliberately not pinned to
+# the workspace, so that the probe can be run against a candidate version before the
+# daemon adopts it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "fs", "signal"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "macros", "migrate", "chrono"] }
+axum = "0.8"
+argon2 = "0.5"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[dependencies.rustls]
+version = "0.23"
+default-features = false
+features = ["std", "tls12"]
+optional = true
+
+# Only to produce a throwaway certificate so the probe can run a complete TLS handshake
+# rather than merely initialising a crypto provider. The AEAD assembly is the part of a
+# provider most likely to be ARMv7-only, and nothing short of a handshake executes it.
+[dependencies.rcgen]
+version = "0.14"
+default-features = false
+features = ["crypto", "ring", "pem"]
+optional = true
+
+[features]
+default = []
+tls-ring = ["rustls", "rustls/ring", "rcgen"]
+tls-awslc = ["rustls", "rustls/aws-lc-rs", "rcgen"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

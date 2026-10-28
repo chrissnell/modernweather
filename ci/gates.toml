@@ -1,0 +1,73 @@
+# Deferred-gate manifest.
+#
+# W8 lands before the work items whose output several of the gate's checks exist to
+# check. A gate that simply skips in that situation is worse than no gate, because it
+# keeps reporting green after the thing it guards arrives. So every such check is
+# declared here with the file whose existence arms it, and `cargo xtask gate <id>` reads
+# this file rather than a human's memory:
+#
+#   arms_when path absent  -> print DEFERRED, exit 0
+#   arms_when path present -> run `cmd`, exit with its status
+#
+# Nobody has to remember to turn a gate on. The work item that creates the file turns it
+# on, and `cargo xtask gates` prints the current state into every PR's job summary so the
+# deferred set is visible rather than forgotten.
+#
+# Adding a gate here is not a way to defer work you own. It is for checks whose subject
+# is owned by another work item.
+
+[[gate]]
+id = "codegen-drift"
+description = "Generated output matches what the metric registry generates today"
+owner = "W2 (metric registry)"
+arms_when = "metrics/registry.toml"
+cmd = ["cargo", "xtask", "codegen", "--check"]
+note = """
+DESIGN.md R-2: the check regenerates into a temporary directory and diffs. It must never
+write into the working tree, because a check that fixes the problem it is checking for
+always passes."""
+
+[[gate]]
+id = "conformance"
+description = "Frozen legacy REST contract replayed against the built binary"
+owner = "W1 (frozen contract)"
+arms_when = "tests/conformance/manifest.toml"
+cmd = ["cargo", "xtask", "conformance", "--target-binary", "target/debug/modernweather"]
+note = """
+DESIGN.md R-3: the runner takes a base URL, so the same fixtures run against the Go
+daemon (which proves the fixtures describe reality) and against the Rust daemon (which
+proves the rewrite matches). Only the Rust run belongs in the PR gate; the Go run is a
+fixture-validity check and lives in the scheduled workflow."""
+
+[[gate]]
+id = "db-migrate-twice"
+description = "Migrations apply from empty and from the previous release's snapshot"
+owner = "W4 (database schema)"
+arms_when = "migrations"
+cmd = ["ci/db/migrate-twice.sh"]
+note = """
+Two paths, one schema. See docs/release.md §2 for why the comparison is schema-and-
+aggregate equivalence rather than the union-view assertions the W8 prompt asked for:
+DESIGN.md D-5 rejected the union-view scheme, so there are no union views to assert on."""
+
+[[gate]]
+id = "driver-emulators"
+description = "Go emulators from the remoteweather tree driven against the Rust drivers"
+owner = "W2a §4a (station drivers)"
+arms_when = "tests/emulators/manifest.toml"
+cmd = ["cargo", "xtask", "emulator-tests"]
+note = """
+The emulators stay in Go on purpose (DESIGN.md D-40): an independently written emulator
+is a stronger oracle than one written alongside the driver. CI checks the Go reference
+out at a pinned commit and runs it as fixed external test infrastructure."""
+
+[[gate]]
+id = "coverage-ratchet"
+description = "Line coverage has not decreased against the committed floor"
+owner = "W8 (this item); becomes meaningful once there are tests"
+arms_when = "ci/coverage-floor.txt"
+cmd = ["cargo", "xtask", "coverage", "--check"]
+note = """
+A ratchet, not a threshold. DESIGN.md's prompt for this item is explicit that a fixed
+target invites tests written to hit a number; a floor that can only rise cannot be
+gamed downward and needs no arbitrary target."""

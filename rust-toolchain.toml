@@ -1,0 +1,7 @@
+# Pinned so that `cargo fmt --check` and `cargo clippy -- -D warnings` mean the same
+# thing on a developer's machine as in CI. Bumping this is a reviewed change, because a
+# new clippy release can turn a green PR red on a commit that touched nothing.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy", "llvm-tools"]
+profile = "minimal"

@@ -1,0 +1,31 @@
+post_install() {
+    systemd-sysusers modernweather.conf >/dev/null 2>&1 || systemd-sysusers || true
+    chown -R modernweather:modernweather /var/lib/modernweather 2>/dev/null || true
+    chmod 750 /var/lib/modernweather 2>/dev/null || true
+    cat <<'MSG'
+ModernWeather is installed but not started: it has no configuration yet.
+
+  1. create the configuration store and set the administrator password
+  2. systemctl enable --now modernweather
+
+Docs: /usr/share/doc/modernweather/
+MSG
+}
+
+post_upgrade() {
+    # Never touches /var/lib/modernweather/config.db.
+    chown -R modernweather:modernweather /var/lib/modernweather 2>/dev/null || true
+    systemctl try-restart modernweather.service >/dev/null 2>&1 || true
+}
+
+pre_remove() {
+    systemctl stop modernweather.service >/dev/null 2>&1 || true
+    systemctl disable modernweather.service >/dev/null 2>&1 || true
+}
+
+post_remove() {
+    cat <<'MSG'
+Configuration and data remain in /var/lib/modernweather. To remove them:
+  rm -rf /var/lib/modernweather && userdel modernweather
+MSG
+}

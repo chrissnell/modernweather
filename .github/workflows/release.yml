@@ -1,0 +1,335 @@
+# The release pipeline. Replaces the Go `.goreleaser.yml`'s *outputs*, not its structure.
+#
+# ## Publishing is off until the owner turns it on
+#
+# The W8 prompt is explicit: do not sign, publish or push anything from CI without the
+# owner's explicit configuration. The Go pipeline pushed to ghcr.io and created GitHub
+# releases on every tag, and that behaviour is re-established deliberately rather than
+# inherited. So by default this workflow builds everything, attaches it to the workflow
+# run, and publishes nothing. Three repository variables switch each surface on
+# independently (Settings -> Actions -> Variables):
+#
+#   MW_PUBLISH_RELEASE     = true   create the GitHub Release and upload the artefacts
+#   MW_PUBLISH_CONTAINERS  = true   push images and the multi-arch manifest to ghcr.io
+#   MW_SIGN_ARTIFACTS      = true   cosign keyless signatures and an SBOM
+#
+# Unset is the same as false. The `config` job prints which are on, so a release that
+# published nothing says so at the top of its log rather than leaving you to guess.
+#
+# ## Why there is no QEMU here
+#
+# Every Linux target is cross-compiled to a static musl binary on the amd64 runner, so the
+# container images are assembled from binaries that are never executed during the build.
+# The Go pipeline needed buildx with QEMU, which is slow and flaky. See docs/release.md §4.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (defaults to the tag, or 0.0.0-dev)"
+        required: false
+        type: string
+      dry_run:
+        description: "Build only; publish nothing regardless of the repository variables"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  config:
+    name: resolve configuration
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.r.outputs.version }}
+      publish_release: ${{ steps.r.outputs.publish_release }}
+      publish_containers: ${{ steps.r.outputs.publish_containers }}
+      sign: ${{ steps.r.outputs.sign }}
+      matrix: ${{ steps.m.outputs.matrix }}
+      linux_matrix: ${{ steps.m.outputs.linux_matrix }}
+      daemon_present: ${{ steps.r.outputs.daemon_present }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - id: r
+        name: Resolve version and publishing switches
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_VERSION: ${{ inputs.version }}
+          V_RELEASE: ${{ vars.MW_PUBLISH_RELEASE }}
+          V_CONTAINERS: ${{ vars.MW_PUBLISH_CONTAINERS }}
+          V_SIGN: ${{ vars.MW_SIGN_ARTIFACTS }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            version="${INPUT_VERSION}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0-dev"
+          fi
+
+          # workflow_dispatch defaults dry_run to true, so a rehearsal cannot publish by
+          # forgetting a checkbox. A tag push has no dry_run input, which reads as empty.
+          dry="${DRY_RUN:-false}"
+          enabled() { [ "$dry" != "true" ] && [ "${1:-}" = "true" ] && echo true || echo false; }
+
+          {
+            echo "version=$version"
+            echo "publish_release=$(enabled "${V_RELEASE:-}")"
+            echo "publish_containers=$(enabled "${V_CONTAINERS:-}")"
+            echo "sign=$(enabled "${V_SIGN:-}")"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -f crates/modernweather/Cargo.toml ]; then
+            echo "daemon_present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "daemon_present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo "## Release configuration"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| version | \`$version\` |"
+            echo "| dry run | \`$dry\` |"
+            echo "| publish GitHub Release | \`$(enabled "${V_RELEASE:-}")\` |"
+            echo "| push containers | \`$(enabled "${V_CONTAINERS:-}")\` |"
+            echo "| sign artefacts | \`$(enabled "${V_SIGN:-}")\` |"
+            echo
+            echo "Unset repository variables mean *do not publish*; see the header of"
+            echo ".github/workflows/release.yml."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - id: m
+        name: Read the target matrix from ci/release.toml
+        # One source of truth for the matrix. The workflow does not restate the target
+        # list, so it cannot drift from the file the release actually uses.
+        run: |
+          echo "matrix=$(cargo xtask targets)" >> "$GITHUB_OUTPUT"
+          echo "linux_matrix=$(cargo xtask targets --linux-only)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.label }}
+    needs: config
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.config.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          targets: ${{ matrix.triple }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.triple }}
+      - uses: taiki-e/install-action@cross
+      - name: Install zip
+        if: contains(matrix.triple, 'windows')
+        # cross supplies the mingw toolchain inside its image; zip runs on the host,
+        # because `cargo xtask dist` packages after the build.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zip
+      - name: Explain the no-op
+        if: needs.config.outputs.daemon_present != 'true'
+        run: |
+          echo "::notice::crates/modernweather does not exist yet, so there is no daemon"
+          echo "::notice::to build. The crate layout under crates/ is W3's decision"
+          echo "::notice::(DESIGN.md R-4); the toolchains are validated by platform.yml."
+      - name: Build and package
+        if: needs.config.outputs.daemon_present == 'true'
+        env:
+          # Every target here is a cross target, so xtask always reaches for `cross`.
+          MW_HOST_TRIPLE: x86_64-unknown-linux-gnu
+        run: |
+          cargo xtask dist --target ${{ matrix.triple }} \
+            --version ${{ needs.config.outputs.version }} --out dist
+      - name: Build Linux packages
+        if: needs.config.outputs.daemon_present == 'true' && matrix.deb_arch != ''
+        run: |
+          # cargo-deb and cargo-generate-rpm read their configuration from the daemon
+          # crate's [package.metadata] (docs/release.md §6 gives the exact blocks), so
+          # they cannot run before that crate exists.
+          cargo install --locked cargo-deb cargo-generate-rpm
+          # --no-build: the binary is already cross-compiled above, and cargo-deb cannot
+          # cross-compile it itself. --no-strip because the dist profile already strips
+          # debug info and cargo-deb's strip is the host's, which cannot touch an ARM ELF.
+          cargo deb --no-build --no-strip -p modernweather \
+            --target ${{ matrix.triple }} --output dist/
+          cargo generate-rpm -p crates/modernweather \
+            --target ${{ matrix.triple }} --output dist/
+      - name: List what was produced
+        if: needs.config.outputs.daemon_present == 'true'
+        run: ls -l dist/
+      - uses: actions/upload-artifact@v4
+        if: needs.config.outputs.daemon_present == 'true'
+        with:
+          name: dist-${{ matrix.label }}
+          path: dist/
+          if-no-files-found: error
+
+  packages:
+    name: validate the Arch PKGBUILD
+    needs: config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The AUR package is published by hand: pushing to the AUR needs the maintainer's
+      # SSH key, and keeping that out of CI is the same rule as everything else here.
+      # What CI can do is refuse to let the PKGBUILD fall out of step with the tag.
+      - name: Check pkgver against the release version
+        run: |
+          want='${{ needs.config.outputs.version }}'
+          got="$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)"
+          echo "PKGBUILD pkgver=$got, release version=$want"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "$got" != "$want" ]; then
+            echo "::error::packaging/arch/PKGBUILD says pkgver=$got but this release is $want"
+            exit 1
+          fi
+
+  containers:
+    name: container images
+    needs: [config, build]
+    if: needs.config.outputs.daemon_present == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-linux-*
+          path: artifacts
+      - name: Lay out one directory per platform
+        # The Dockerfile copies ${TARGETPLATFORM}/modernweather, so the context mirrors
+        # buildx's platform naming: linux/amd64, linux/arm64, linux/arm/v7, linux/arm/v6.
+        run: |
+          set -euo pipefail
+          ctx=packaging/docker
+          echo '${{ needs.config.outputs.linux_matrix }}' > /tmp/matrix.json
+          python3 - <<'PY'
+          import json, os, shutil, tarfile, glob
+          m = json.load(open('/tmp/matrix.json'))['include']
+          ctx = 'packaging/docker'
+          for t in m:
+              tars = glob.glob(f"artifacts/dist-{t['label']}/*.tar.gz")
+              if not tars:
+                  raise SystemExit(f"no tarball for {t['label']}")
+              dest = os.path.join(ctx, t['docker_platform'])
+              os.makedirs(dest, exist_ok=True)
+              with tarfile.open(tars[0]) as tf:
+                  for member in tf.getmembers():
+                      if member.name.endswith('/modernweather'):
+                          member.name = 'modernweather'
+                          tf.extract(member, dest, filter='data')
+                          break
+                  else:
+                      raise SystemExit(f"no binary inside {tars[0]}")
+              print('staged', dest)
+          PY
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: needs.config.outputs.publish_containers == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build (and push, if enabled)
+        uses: docker/build-push-action@v6
+        with:
+          context: packaging/docker
+          file: packaging/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6
+          push: ${{ needs.config.outputs.publish_containers == 'true' }}
+          # A multi-platform manifest cannot be loaded into the local daemon, so when
+          # publishing is off the images are built and discarded. That still proves the
+          # Dockerfile and the staged context are correct, which is the point.
+          build-args: |
+            VERSION=${{ needs.config.outputs.version }}
+            REVISION=${{ github.sha }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/modernweather:${{ needs.config.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/modernweather:latest
+      - name: Say what was not pushed
+        if: needs.config.outputs.publish_containers != 'true'
+        run: |
+          echo "::notice::images built but not pushed; set the MW_PUBLISH_CONTAINERS"
+          echo "::notice::repository variable to true to publish them"
+
+  publish:
+    name: GitHub Release
+    needs: [config, build, packages]
+    if: needs.config.outputs.publish_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: artifacts
+          merge-multiple: true
+      - name: One checksum file for the whole release
+        run: |
+          cd artifacts
+          rm -f checksums-*.txt checksums.txt
+          sha256sum * > checksums.txt
+          cat checksums.txt
+      - uses: sigstore/cosign-installer@v3
+        if: needs.config.outputs.sign == 'true'
+      - name: Sign the checksum file
+        if: needs.config.outputs.sign == 'true'
+        # Signing the checksum file rather than every artefact: the checksums cover the
+        # artefacts, so one keyless signature over that file is a complete chain and there
+        # is only one thing for a verifier to check.
+        run: |
+          cosign sign-blob --yes artifacts/checksums.txt \
+            --output-signature artifacts/checksums.txt.sig \
+            --output-certificate artifacts/checksums.txt.pem
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" artifacts/* \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag
+
+  summary:
+    name: release summary
+    needs: [config, build, packages, containers, publish]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          {
+            echo "## Release result"
+            echo
+            echo "| Stage | Result |"
+            echo "|---|---|"
+            echo "| build matrix | ${{ needs.build.result }} |"
+            echo "| Arch PKGBUILD check | ${{ needs.packages.result }} |"
+            echo "| containers | ${{ needs.containers.result }} |"
+            echo "| GitHub Release | ${{ needs.publish.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # A skipped publish is the configured default and not a failure; a failed one is.
+          for r in "${{ needs.build.result }}" "${{ needs.packages.result }}" \
+                   "${{ needs.containers.result }}" "${{ needs.publish.result }}"; do
+            case "$r" in success|skipped) ;; *) echo "::error::stage $r"; exit 1 ;; esac
+          done

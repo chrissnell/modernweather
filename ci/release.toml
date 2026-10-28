@@ -1,0 +1,61 @@
+# The release target matrix, in one place, read by `cargo xtask dist` and by the release
+# workflow's job matrix. Adding or dropping a target is a one-line change here.
+#
+# Every Linux target is a *statically linked musl* build. The reason is measured, not
+# stylistic: see docs/release.md §4 and Appendix A. In short, a glibc armv6 cross build
+# made from Debian's armhf toolchain produces a binary tagged ARMv7 that dies with an
+# illegal instruction on a Raspberry Pi 1/Zero, while the static musl build runs. Using
+# the same linkage for all four architectures means one set of packaging rules and no
+# glibc-version skew between the builder and the Pi.
+
+[release]
+# The daemon binary. W3 §1 owns the crate layout (DESIGN.md R-4); `crate_manifest` is the
+# file whose existence tells the release pipeline the daemon exists to be released.
+binary = "modernweather"
+package = "modernweather"
+crate_manifest = "crates/modernweather/Cargo.toml"
+profile = "dist"
+
+[[target]]
+triple = "x86_64-unknown-linux-musl"
+label = "linux-amd64"
+docker_platform = "linux/amd64"
+deb_arch = "amd64"
+rpm_arch = "x86_64"
+arch_arch = "x86_64"
+
+[[target]]
+triple = "aarch64-unknown-linux-musl"
+label = "linux-arm64"
+docker_platform = "linux/arm64"
+deb_arch = "arm64"
+rpm_arch = "aarch64"
+arch_arch = "aarch64"
+
+[[target]]
+triple = "armv7-unknown-linux-musleabihf"
+label = "linux-armv7"
+docker_platform = "linux/arm/v7"
+deb_arch = "armhf"
+rpm_arch = "armv7hl"
+arch_arch = "armv7h"
+
+[[target]]
+triple = "arm-unknown-linux-musleabihf"
+label = "linux-armv6"
+docker_platform = "linux/arm/v6"
+deb_arch = "armel"
+rpm_arch = "armv6hl"
+# Arch Linux ARM has no armv6 port, so this target produces no Arch package.
+arch_arch = ""
+
+# Windows is built but not packaged beyond a zip. Whether it ships at all is OQ-3 in
+# docs/release.md: nothing in the inventory needs it, and it cannot be smoke-tested by
+# this pipeline. It is kept because dropping a published artefact is the owner's call.
+[[target]]
+triple = "x86_64-pc-windows-gnu"
+label = "windows-amd64"
+docker_platform = ""
+deb_arch = ""
+rpm_arch = ""
+arch_arch = ""

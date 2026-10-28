@@ -1,0 +1,50 @@
+#!/bin/sh
+# Never touches an existing config.db: it holds the user's configuration, and the Go
+# package's one genuinely good habit was refusing to overwrite it.
+set -e
+
+case "$1" in
+    configure)
+        if ! getent group modernweather >/dev/null; then
+            addgroup --system modernweather
+        fi
+        if ! getent passwd modernweather >/dev/null; then
+            adduser --system --ingroup modernweather --home /var/lib/modernweather \
+                --no-create-home --gecos "ModernWeather daemon" \
+                --shell /usr/sbin/nologin modernweather
+        fi
+        for g in dialout uucp; do
+            if getent group "$g" >/dev/null; then
+                adduser modernweather "$g" >/dev/null 2>&1 || true
+            fi
+        done
+
+        mkdir -p /var/lib/modernweather
+        chown modernweather:modernweather /var/lib/modernweather
+        chmod 750 /var/lib/modernweather
+        if [ -f /var/lib/modernweather/config.db ]; then
+            chown modernweather:modernweather /var/lib/modernweather/config.db
+            chmod 640 /var/lib/modernweather/config.db
+        fi
+
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload
+            # Enabled but not started: there is no configuration yet on a first install,
+            # and a service that starts and crash-loops is worse than one the operator
+            # starts when it is ready.
+            systemctl enable modernweather.service >/dev/null 2>&1 || true
+            if [ -n "$2" ]; then
+                deb-systemd-invoke try-restart modernweather.service || true
+            fi
+        fi
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+exit 0

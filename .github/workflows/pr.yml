@@ -1,0 +1,330 @@
+# The PR gate (DESIGN.md D-41). This workflow exists so the first implementation commit
+# lands in a repository that can already tell it something is wrong.
+#
+# Required check: `gate`, and only `gate`. It depends on every other job, so the branch
+# protection rule never has to be edited again when a job is added or renamed — adding the
+# job to `needs:` below is the whole change.
+#
+# What runs where:
+#
+#   pull_request   everything. A PR is the only place a human is waiting on the answer.
+#   push to main   everything. Nothing is written back to the repository from CI.
+#   merge_group    everything, so a merge queue re-checks the combined result.
+#
+# Cross-compilation is deliberately not here — it is in platform.yml. Reasoning and the
+# full required-checks set are in docs/release.md §1.
+
+name: PR gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Supersede an in-flight run for the same PR; never cancel a run on main.
+  group: gate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  # One place to bump the pinned toolchains. The stable pin must match
+  # rust-toolchain.toml; the nightly pin exists only for ThreadSanitizer.
+  RUST_STABLE: "1.96.0"
+  RUST_NIGHTLY: "nightly-2026-10-01"
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy -D warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  build:
+    name: cargo build --all-targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      # --locked throughout, so a PR that changes a dependency has to commit the lockfile
+      # change — which is the only way a reviewer gets to see it.
+      - run: cargo build --workspace --all-targets --all-features --locked
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features --locked
+
+  race:
+    name: ThreadSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # ThreadSanitizer needs an unstable flag and an instrumented std, so this is the one
+      # job that uses nightly. The pin is deliberate: an unpinned nightly turns a green PR
+      # red on a commit that touched nothing.
+      #
+      # When a nightly regression breaks this job, bump the pin in the same PR. Do not
+      # disable it — both data races DESIGN.md records (D-28, D-29) survived the life of
+      # the Go project precisely because nothing looked.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_NIGHTLY }}
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tsan
+      - name: cargo test under ThreadSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=thread
+          # A leak at process exit is not a race, and TSan's leak checker fires on
+          # perfectly ordinary Box::leak of a static.
+          TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 detect_leaks=0
+        # dtolnay/rust-toolchain exports RUSTUP_TOOLCHAIN, which overrides
+        # rust-toolchain.toml — without that this job would silently run on stable and
+        # -Zsanitizer would be rejected.
+        run: |
+          cargo test --workspace --all-features --locked \
+            -Z build-std --target x86_64-unknown-linux-gnu
+
+  loom:
+    name: loom interleavings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loom
+      # Exhaustive interleaving checks for lock-free code, on stable. There are none yet;
+      # the invocation exists so that writing the first one needs no CI change. loom and
+      # TSan are complementary: loom is exhaustive over a model, TSan observes a real run.
+      - name: cargo test --cfg loom
+        env:
+          RUSTFLAGS: --cfg loom
+        run: cargo test --workspace --locked
+
+  gates:
+    name: deferred gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      # Printed into every run's summary, so the set of not-yet-armed checks is visible on
+      # each PR rather than remembered. See the header of ci/gates.toml.
+      - name: Report gate state
+        run: |
+          {
+            echo "## CI gates"
+            echo
+            cargo xtask gates --markdown
+          } >> "$GITHUB_STEP_SUMMARY"
+          cargo xtask gates
+
+  codegen-drift:
+    name: metric registry drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask gate codegen-drift
+      # DESIGN.md R-2: the check regenerates into a temporary location and diffs. If it
+      # wrote into the tree it would fix the problem it is checking for and always pass,
+      # so this asserts that it did not.
+      - name: Assert the check left the tree clean
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::the drift check modified the working tree; it must only diff"
+            git status --porcelain
+            exit 1
+          fi
+
+  conformance:
+    name: frozen contract conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask gate conformance
+
+  driver-emulators:
+    name: Go emulators against Rust drivers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      # The emulators stay in Go deliberately (DESIGN.md D-40): an independently written
+      # emulator is a stronger oracle than one written alongside the driver. So this job
+      # needs a Go toolchain too. `cargo xtask emulator-tests` — W2a §4a's to implement —
+      # checks the reference repository out at a pinned commit and runs them.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask gate driver-emulators
+
+  database:
+    name: migrations and server version
+    runs-on: ubuntu-latest
+    services:
+      timescaledb:
+        # The -ha image: DESIGN.md D-2 requires TimescaleDB 2.31 with timescaledb_toolkit,
+        # and the plain timescale/timescaledb image has no toolkit. CI running a different
+        # server than the design specifies is not a detail — three of the six load-bearing
+        # spike answers are version-gated.
+        image: timescale/timescaledb-ha:pg17
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgresql://postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # migrate-twice.sh reconstructs the previous release's schema from git, so it
+          # needs tags and history rather than a shallow clone.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      # The runner images ship postgresql-client 16, and pg_dump refuses to dump from a
+      # newer server than itself. Without this the comparison fails with a version error
+      # that looks nothing like its cause.
+      - name: Install PostgreSQL 17 client
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+          psql --version && pg_dump --version
+      - name: Assert the server version (D-42)
+        run: psql --set ON_ERROR_STOP=1 "$DATABASE_URL" -f ci/sql/assert-timescaledb-version.sql
+      - name: Apply the migrations twice and compare
+        run: cargo xtask gate db-migrate-twice
+
+  coverage:
+    name: coverage ratchet
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # A ratchet, not a threshold: the prompt for this work item is explicit that a fixed
+      # target invites tests written to hit a number. See xtask/src/coverage.rs.
+      #
+      # The floor is raised by hand, in the PR that earns it, with
+      # `cargo xtask coverage --bump`. CI does not commit to the repository — partly
+      # because docs/release.md §5 keeps write credentials out of CI, and partly because a
+      # floor that moves on its own is not a reviewed decision.
+      - name: Check the ratchet
+        run: |
+          cargo xtask gate coverage-ratchet | tee /tmp/coverage.txt
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo "## Coverage"
+            echo
+            echo '```'
+            cat /tmp/coverage.txt 2>/dev/null || echo "not measured"
+            echo '```'
+            echo "Raise the floor with \`cargo xtask coverage --bump\` and commit"
+            echo "ci/coverage-floor.txt in the same PR."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  gate:
+    name: gate
+    # The single required check. Everything above is a dependency, so branch protection
+    # needs exactly one entry and never changes.
+    needs:
+      - fmt
+      - clippy
+      - build
+      - test
+      - race
+      - loom
+      - gates
+      - codegen-drift
+      - conformance
+      - driver-emulators
+      - database
+      - coverage
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      # A skipped or cancelled dependency is not a pass. `needs.*.result` is checked
+      # explicitly because `if: always()` would otherwise let this job succeed while a
+      # dependency failed.
+      - name: Verify every job succeeded
+        run: |
+          results='${{ join(needs.*.result, " ") }}'
+          echo "dependency results: $results"
+          for r in $results; do
+            if [ "$r" != "success" ]; then
+              echo "::error::a gate job did not succeed ($r)"
+              exit 1
+            fi
+          done
+          echo "gate green"
