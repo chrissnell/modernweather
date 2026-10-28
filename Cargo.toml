@@ -1,0 +1,8 @@
+# Minimal root workspace. It exists only to hold `xtask`.
+#
+# W3 §1 (R-4) owns the real crate and workspace layout. When W3 lands, this file is
+# expected to grow the application crates around `xtask`; nothing here is a layout
+# decision. See docs/metric-registry.md § "Assumptions about other work items".
+[workspace]
+members = ["xtask"]
+resolver = "2"
