@@ -26,6 +26,22 @@ Server-side sources of truth: `internal/controllers/restserver/types.go` (the DT
 is the **union** of both. Where a client is stricter than the server, the client wins — the server
 may emit fields nobody reads, but it must never omit or null a field any client requires.
 
+## Before you start — where the Go server comes from
+
+`docs/DESIGN.md` is merged and is your first read. One operational fact W0 established that this
+prompt predates: **the production weather server and its database are not reachable from an agent
+runtime** — W0 OQ-1 records that production is not in the homelab Kubernetes cluster. So "the current
+Go server" means one **you build and run**: `go build` the Go daemon from the read-only
+`remoteweather` checkout, point it at a throwaway TimescaleDB container, and drive it with the Go
+station emulators in `cmd/` (kept deliberately as test infrastructure). That is what deliverable 4's
+fixtures are captured from and what deliverable 5's conformance run must be green against.
+
+This is not a downgrade. Byte-level JSON compatibility is a property of the Go encoder and
+`restserver/types.go`, not of production's data, and a locally-driven server lets you *produce* the
+awkward cases the fixture list asks for — minimal sensor complement, data gaps, empty responses, and
+the snow-device-configured-but-absent case — instead of waiting for them to occur. Record the commit
+of `remoteweather` you built from, so the fixtures are traceable to an exact server.
+
 ## Known surface
 
 Starting point, not a substitute for your own enumeration.
