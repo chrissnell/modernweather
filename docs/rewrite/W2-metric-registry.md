@@ -1,5 +1,11 @@
 # W2 — Metric registry and codegen spine
 
+**Status: COMPLETE.** Delivered as `docs/metric-registry.md`, `metrics/registry.toml`,
+`metrics/snapshot.toml`, `xtask/` and `generated/`. This file is the prompt that was run, kept
+for the record; the outline it replaced is in git history.
+
+---
+
 **Depends on:** W0 — merged. `docs/DESIGN.md` and `docs/spike-findings.md` are on `main`; read both
 before writing anything. Runs in parallel with W1, W2a and W8.
 **Produces:** `docs/metric-registry.md`, the registry file itself, a working `cargo xtask codegen`,

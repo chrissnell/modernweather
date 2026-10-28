@@ -1,0 +1,2684 @@
+{
+  "components": {
+    "schemas": {
+      "LegacyWeatherReading": {
+        "description": "The frozen legacy REST reading, keyed by its shipped JSON names. The names are inconsistent and two measurements are served under two keys each ('outhumidity'/'ohum' and 'dayrain'/'rainday'); that is recorded, not fixed (D-37). Derived values that are not metrics are W1's and are not generated here.",
+        "properties": {
+          "aqi_pm10_aqin": {
+            "description": "Air quality index, PM10 (AQIN sensor)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-legacy-read-time-computed": true,
+            "x-metric": "aqi_pm10_aqin",
+            "x-unit": "aqi"
+          },
+          "aqi_pm25_aqin": {
+            "description": "Air quality index, PM2.5 (AQIN sensor)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-legacy-read-time-computed": true,
+            "x-metric": "aqi_pm25_aqin",
+            "x-unit": "aqi"
+          },
+          "bar": {
+            "description": "Pressure",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "barometer",
+            "x-unit": "inHg"
+          },
+          "co2": {
+            "description": "CO2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "co2",
+            "x-unit": "ppm"
+          },
+          "consbatteryvoltage": {
+            "description": "Console battery voltage",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "cons_battery_voltage",
+            "x-unit": "V"
+          },
+          "dayrain": {
+            "description": "Rainfall today",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "day_rain",
+            "x-unit": "in"
+          },
+          "extrafloat1": {
+            "description": "Extra value 1",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_float1"
+          },
+          "extrafloat10": {
+            "description": "Extra value 10",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_float10"
+          },
+          "extrafloat2": {
+            "description": "Extra value 2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_float2"
+          },
+          "extrafloat3": {
+            "description": "Extra value 3",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_float3"
+          },
+          "extrafloat4": {
+            "description": "Extra value 4",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_float4"
+          },
+          "extrafloat5": {
+            "description": "Extra value 5",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_float5"
+          },
+          "extrafloat6": {
+            "description": "Extra value 6",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_float6"
+          },
+          "extrafloat7": {
+            "description": "Extra value 7",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_float7"
+          },
+          "extrafloat8": {
+            "description": "Extra value 8",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_float8"
+          },
+          "extrafloat9": {
+            "description": "Extra value 9",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_float9"
+          },
+          "extrahumidity1": {
+            "description": "Extra humidity 1",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_humidity1",
+            "x-unit": "percent"
+          },
+          "extrahumidity2": {
+            "description": "Extra humidity 2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_humidity2",
+            "x-unit": "percent"
+          },
+          "extrahumidity3": {
+            "description": "Extra humidity 3",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_humidity3",
+            "x-unit": "percent"
+          },
+          "extrahumidity4": {
+            "description": "Extra humidity 4",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_humidity4",
+            "x-unit": "percent"
+          },
+          "extrahumidity5": {
+            "description": "Extra humidity 5",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_humidity5",
+            "x-unit": "percent"
+          },
+          "extrahumidity6": {
+            "description": "Extra humidity 6",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_humidity6",
+            "x-unit": "percent"
+          },
+          "extrahumidity7": {
+            "description": "Extra humidity 7",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_humidity7",
+            "x-unit": "percent"
+          },
+          "extratemp1": {
+            "description": "Extra temperature 1",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_temp1",
+            "x-unit": "degF"
+          },
+          "extratemp2": {
+            "description": "Extra temperature 2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_temp2",
+            "x-unit": "degF"
+          },
+          "extratemp3": {
+            "description": "Extra temperature 3",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_temp3",
+            "x-unit": "degF"
+          },
+          "extratemp4": {
+            "description": "Extra temperature 4",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_temp4",
+            "x-unit": "degF"
+          },
+          "extratemp5": {
+            "description": "Extra temperature 5",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_temp5",
+            "x-unit": "degF"
+          },
+          "extratemp6": {
+            "description": "Extra temperature 6",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_temp6",
+            "x-unit": "degF"
+          },
+          "extratemp7": {
+            "description": "Extra temperature 7",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "extra_temp7",
+            "x-unit": "degF"
+          },
+          "extratext1": {
+            "description": "Extra text 1",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-metric": "extra_text1",
+            "x-unit": "text"
+          },
+          "extratext10": {
+            "description": "Extra text 10",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-metric": "extra_text10",
+            "x-unit": "text"
+          },
+          "extratext2": {
+            "description": "Extra text 2",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-metric": "extra_text2",
+            "x-unit": "text"
+          },
+          "extratext3": {
+            "description": "Extra text 3",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-metric": "extra_text3",
+            "x-unit": "text"
+          },
+          "extratext4": {
+            "description": "Extra text 4",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-metric": "extra_text4",
+            "x-unit": "text"
+          },
+          "extratext5": {
+            "description": "Extra text 5",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-metric": "extra_text5",
+            "x-unit": "text"
+          },
+          "extratext6": {
+            "description": "Extra text 6",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-metric": "extra_text6",
+            "x-unit": "text"
+          },
+          "extratext7": {
+            "description": "Extra text 7",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-metric": "extra_text7",
+            "x-unit": "text"
+          },
+          "extratext8": {
+            "description": "Extra text 8",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-metric": "extra_text8",
+            "x-unit": "text"
+          },
+          "extratext9": {
+            "description": "Extra text 9",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-metric": "extra_text9",
+            "x-unit": "text"
+          },
+          "heatidx": {
+            "description": "Heat index",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-legacy-read-time-computed": true,
+            "x-metric": "heat_index",
+            "x-unit": "degF"
+          },
+          "ihum": {
+            "description": "Indoor humidity",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "in_humidity",
+            "x-unit": "percent"
+          },
+          "itemp": {
+            "description": "Indoor temperature",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "in_temp",
+            "x-unit": "degF"
+          },
+          "leaftemp1": {
+            "description": "Leaf temperature 1",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "leaf_temp1",
+            "x-unit": "degF"
+          },
+          "leaftemp2": {
+            "description": "Leaf temperature 2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "leaf_temp2",
+            "x-unit": "degF"
+          },
+          "leaftemp3": {
+            "description": "Leaf temperature 3",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "leaf_temp3",
+            "x-unit": "degF"
+          },
+          "leaftemp4": {
+            "description": "Leaf temperature 4",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "leaf_temp4",
+            "x-unit": "degF"
+          },
+          "monthrain": {
+            "description": "Rainfall this month",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "month_rain",
+            "x-unit": "in"
+          },
+          "ohum": {
+            "description": "Humidity",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "out_humidity",
+            "x-unit": "percent"
+          },
+          "otemp": {
+            "description": "Temperature",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "out_temp",
+            "x-unit": "degF"
+          },
+          "outhumidity": {
+            "description": "Humidity",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "out_humidity",
+            "x-unit": "percent"
+          },
+          "period_rain": {
+            "description": "Rainfall since last reading",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-aggregate": "total",
+            "x-metric": "rain_incremental",
+            "x-unit": "in"
+          },
+          "pm25": {
+            "description": "PM2.5",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "pm25",
+            "x-unit": "ug_per_m3"
+          },
+          "potentialsolarwatts": {
+            "description": "Clear-sky solar radiation",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "potential_solar_watts",
+            "x-unit": "W_per_m2"
+          },
+          "radiation": {
+            "description": "Solar radiation (sensor)",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "radiation",
+            "x-unit": "W_per_m2"
+          },
+          "rainday": {
+            "description": "Rainfall today",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "day_rain",
+            "x-unit": "in"
+          },
+          "rainincremental": {
+            "description": "Rainfall since last reading",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "rain_incremental",
+            "x-unit": "in"
+          },
+          "rainrate": {
+            "description": "Rain rate",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "rain_rate",
+            "x-unit": "in_per_hour"
+          },
+          "snowdepth": {
+            "description": "Snow depth",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "snow_depth",
+            "x-unit": "mm"
+          },
+          "snowdistance": {
+            "description": "Snow sensor distance",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "snow_distance",
+            "x-unit": "mm"
+          },
+          "soiltemp1": {
+            "description": "Soil temperature 1",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "soil_temp1",
+            "x-unit": "degF"
+          },
+          "soiltemp2": {
+            "description": "Soil temperature 2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "soil_temp2",
+            "x-unit": "degF"
+          },
+          "soiltemp3": {
+            "description": "Soil temperature 3",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "soil_temp3",
+            "x-unit": "degF"
+          },
+          "soiltemp4": {
+            "description": "Soil temperature 4",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "soil_temp4",
+            "x-unit": "degF"
+          },
+          "solarjoules": {
+            "description": "Solar energy",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "solar_joules",
+            "x-unit": "J_per_m2"
+          },
+          "solarwatts": {
+            "description": "Solar radiation",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "solar_watts",
+            "x-unit": "W_per_m2"
+          },
+          "stationbatteryvoltage": {
+            "description": "Station battery voltage",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "station_battery_voltage",
+            "x-unit": "V"
+          },
+          "stationname": {
+            "description": "Station name",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stationtype": {
+            "description": "Station type",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stormrain": {
+            "description": "Storm rainfall",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "storm_rain",
+            "x-unit": "in"
+          },
+          "ts": {
+            "description": "Time",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "uv": {
+            "description": "UV index",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "uv",
+            "x-unit": "index"
+          },
+          "windch": {
+            "description": "Wind chill",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-legacy-read-time-computed": true,
+            "x-metric": "wind_chill",
+            "x-unit": "degF"
+          },
+          "windd": {
+            "description": "Wind direction",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "wind_dir",
+            "x-unit": "deg"
+          },
+          "winds": {
+            "description": "Wind speed",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "wind_speed",
+            "x-unit": "mph"
+          },
+          "yearrain": {
+            "description": "Rainfall this year",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-metric": "year_rain",
+            "x-unit": "in"
+          }
+        },
+        "type": "object"
+      },
+      "Reading": {
+        "description": "One reading, keyed by registry stable key.",
+        "properties": {
+          "aqi_pm10_24h_aqin": {
+            "description": "Air quality index, PM10 24-hour (AQIN sensor)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "aqi"
+          },
+          "aqi_pm10_aqin": {
+            "description": "Air quality index, PM10 (AQIN sensor)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "aqi"
+          },
+          "aqi_pm25_24h_aqin": {
+            "description": "Air quality index, PM2.5 24-hour (AQIN sensor)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "aqi"
+          },
+          "aqi_pm25_aqin": {
+            "description": "Air quality index, PM2.5 (AQIN sensor)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "aqi"
+          },
+          "aqi_pm25_in": {
+            "description": "Air quality index, PM2.5 indoors",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "aqi"
+          },
+          "aqi_pm25_in_24h": {
+            "description": "Air quality index, PM2.5 indoors 24-hour",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "aqi"
+          },
+          "barom_abs_in": {
+            "description": "Pressure (absolute)",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "inHg"
+          },
+          "barom_rel_in": {
+            "description": "Pressure (relative)",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "inHg"
+          },
+          "barometer": {
+            "description": "Pressure",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "inHg"
+          },
+          "bat_leak1": {
+            "description": "Leak detector 1 battery",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "bat_leak2": {
+            "description": "Leak detector 2 battery",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "bat_leak3": {
+            "description": "Leak detector 3 battery",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "bat_leak4": {
+            "description": "Leak detector 4 battery",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt1": {
+            "description": "Battery 1",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt10": {
+            "description": "Battery 10",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt2": {
+            "description": "Battery 2",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt3": {
+            "description": "Battery 3",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt4": {
+            "description": "Battery 4",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt5": {
+            "description": "Battery 5",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt6": {
+            "description": "Battery 6",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt7": {
+            "description": "Battery 7",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt8": {
+            "description": "Battery 8",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt9": {
+            "description": "Battery 9",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt_25": {
+            "description": "Particulate sensor battery",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt_cellgateway": {
+            "description": "Cellular gateway battery",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt_co2": {
+            "description": "CO2 sensor battery",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt_in": {
+            "description": "Indoor sensor battery",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt_lightning": {
+            "description": "Lightning sensor battery",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt_out": {
+            "description": "Outdoor sensor battery",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt_sm1": {
+            "description": "Soil moisture sensor 1 battery",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt_sm2": {
+            "description": "Soil moisture sensor 2 battery",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt_sm3": {
+            "description": "Soil moisture sensor 3 battery",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "batt_sm4": {
+            "description": "Soil moisture sensor 4 battery",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "co2": {
+            "description": "CO2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "ppm"
+          },
+          "co2_in_24h_aqin": {
+            "description": "CO2 indoors, 24-hour average (AQIN sensor)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "ppm"
+          },
+          "co2_in_aqin": {
+            "description": "CO2 indoors (AQIN sensor)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "ppm"
+          },
+          "cons_battery_voltage": {
+            "description": "Console battery voltage",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "V"
+          },
+          "date_utc": {
+            "description": "Station-reported UTC time",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "ms_epoch"
+          },
+          "day_et": {
+            "description": "Evapotranspiration today",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "in"
+          },
+          "day_rain": {
+            "description": "Rainfall today",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "in"
+          },
+          "etos": {
+            "description": "Reference evapotranspiration (short crop)",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "in"
+          },
+          "etrs": {
+            "description": "Reference evapotranspiration (tall crop)",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "in"
+          },
+          "extra_alarm1": {
+            "description": "Extra alarm 1",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "extra_alarm2": {
+            "description": "Extra alarm 2",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "extra_alarm3": {
+            "description": "Extra alarm 3",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "extra_alarm4": {
+            "description": "Extra alarm 4",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "extra_alarm5": {
+            "description": "Extra alarm 5",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "extra_alarm6": {
+            "description": "Extra alarm 6",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "extra_alarm7": {
+            "description": "Extra alarm 7",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "extra_alarm8": {
+            "description": "Extra alarm 8",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "extra_float1": {
+            "description": "Extra value 1",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "extra_float10": {
+            "description": "Extra value 10",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "extra_float2": {
+            "description": "Extra value 2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "extra_float3": {
+            "description": "Extra value 3",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "extra_float4": {
+            "description": "Extra value 4",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "extra_float5": {
+            "description": "Extra value 5",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "extra_float6": {
+            "description": "Extra value 6",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "extra_float7": {
+            "description": "Extra value 7",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "extra_float8": {
+            "description": "Extra value 8",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "extra_float9": {
+            "description": "Extra value 9",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "extra_humidity1": {
+            "description": "Extra humidity 1",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "extra_humidity2": {
+            "description": "Extra humidity 2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "extra_humidity3": {
+            "description": "Extra humidity 3",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "extra_humidity4": {
+            "description": "Extra humidity 4",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "extra_humidity5": {
+            "description": "Extra humidity 5",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "extra_humidity6": {
+            "description": "Extra humidity 6",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "extra_humidity7": {
+            "description": "Extra humidity 7",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "extra_temp1": {
+            "description": "Extra temperature 1",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "extra_temp2": {
+            "description": "Extra temperature 2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "extra_temp3": {
+            "description": "Extra temperature 3",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "extra_temp4": {
+            "description": "Extra temperature 4",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "extra_temp5": {
+            "description": "Extra temperature 5",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "extra_temp6": {
+            "description": "Extra temperature 6",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "extra_temp7": {
+            "description": "Extra temperature 7",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "extra_text1": {
+            "description": "Extra text 1",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-unit": "text"
+          },
+          "extra_text10": {
+            "description": "Extra text 10",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-unit": "text"
+          },
+          "extra_text2": {
+            "description": "Extra text 2",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-unit": "text"
+          },
+          "extra_text3": {
+            "description": "Extra text 3",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-unit": "text"
+          },
+          "extra_text4": {
+            "description": "Extra text 4",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-unit": "text"
+          },
+          "extra_text5": {
+            "description": "Extra text 5",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-unit": "text"
+          },
+          "extra_text6": {
+            "description": "Extra text 6",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-unit": "text"
+          },
+          "extra_text7": {
+            "description": "Extra text 7",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-unit": "text"
+          },
+          "extra_text8": {
+            "description": "Extra text 8",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-unit": "text"
+          },
+          "extra_text9": {
+            "description": "Extra text 9",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-unit": "text"
+          },
+          "forecast_icon": {
+            "description": "Console forecast icon",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "code"
+          },
+          "forecast_rule": {
+            "description": "Console forecast rule",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "code"
+          },
+          "gdd": {
+            "description": "Growing degree days",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "degree_days"
+          },
+          "heat_index": {
+            "description": "Heat index",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "humidity1": {
+            "description": "Humidity sensor 1",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "humidity10": {
+            "description": "Humidity sensor 10",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "humidity2": {
+            "description": "Humidity sensor 2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "humidity3": {
+            "description": "Humidity sensor 3",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "humidity4": {
+            "description": "Humidity sensor 4",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "humidity5": {
+            "description": "Humidity sensor 5",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "humidity6": {
+            "description": "Humidity sensor 6",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "humidity7": {
+            "description": "Humidity sensor 7",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "humidity8": {
+            "description": "Humidity sensor 8",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "humidity9": {
+            "description": "Humidity sensor 9",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "in_humidity": {
+            "description": "Indoor humidity",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "in_temp": {
+            "description": "Indoor temperature",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "inside_alarm": {
+            "description": "Indoor alarm",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "leaf_temp1": {
+            "description": "Leaf temperature 1",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "leaf_temp2": {
+            "description": "Leaf temperature 2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "leaf_temp3": {
+            "description": "Leaf temperature 3",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "leaf_temp4": {
+            "description": "Leaf temperature 4",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "leaf_wetness1": {
+            "description": "Leaf wetness 1",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "index"
+          },
+          "leaf_wetness2": {
+            "description": "Leaf wetness 2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "index"
+          },
+          "leaf_wetness3": {
+            "description": "Leaf wetness 3",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "index"
+          },
+          "leaf_wetness4": {
+            "description": "Leaf wetness 4",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "index"
+          },
+          "leaf_wetness5": {
+            "description": "Leaf wetness 5",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "index"
+          },
+          "leaf_wetness6": {
+            "description": "Leaf wetness 6",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "index"
+          },
+          "leaf_wetness7": {
+            "description": "Leaf wetness 7",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "index"
+          },
+          "leaf_wetness8": {
+            "description": "Leaf wetness 8",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "index"
+          },
+          "leak1": {
+            "description": "Leak detector 1",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "leak2": {
+            "description": "Leak detector 2",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "leak3": {
+            "description": "Leak detector 3",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "leak4": {
+            "description": "Leak detector 4",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "lightning_day": {
+            "description": "Lightning strikes today",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "count"
+          },
+          "lightning_distance": {
+            "description": "Distance to last lightning strike",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "mi"
+          },
+          "lightning_hour": {
+            "description": "Lightning strikes this hour",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "count"
+          },
+          "lightning_time": {
+            "description": "Last lightning strike",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-unit": "timestamp"
+          },
+          "month_et": {
+            "description": "Evapotranspiration this month",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "in"
+          },
+          "month_rain": {
+            "description": "Rainfall this month",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "in"
+          },
+          "out_humidity": {
+            "description": "Humidity",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "out_temp": {
+            "description": "Temperature",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "outside_alarm1": {
+            "description": "Outside alarm 1",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "outside_alarm2": {
+            "description": "Outside alarm 2",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "pm10_in_24h_aqin": {
+            "description": "PM10 indoors, 24-hour average (AQIN sensor)",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "ug_per_m3"
+          },
+          "pm10_in_aqin": {
+            "description": "PM10 indoors (AQIN sensor)",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "ug_per_m3"
+          },
+          "pm25": {
+            "description": "PM2.5",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "ug_per_m3"
+          },
+          "pm25_24h": {
+            "description": "PM2.5 (24-hour average)",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "ug_per_m3"
+          },
+          "pm25_in": {
+            "description": "PM2.5 indoors",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "ug_per_m3"
+          },
+          "pm25_in_24h": {
+            "description": "PM2.5 indoors (24-hour average)",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "ug_per_m3"
+          },
+          "pm25_in_24h_aqin": {
+            "description": "PM2.5 indoors, 24-hour average (AQIN sensor)",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "ug_per_m3"
+          },
+          "pm25_in_aqin": {
+            "description": "PM2.5 indoors (AQIN sensor)",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "ug_per_m3"
+          },
+          "pm_in_humidity_aqin": {
+            "description": "Indoor humidity (AQIN sensor)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "pm_in_temp_aqin": {
+            "description": "Indoor temperature (AQIN sensor)",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "potential_solar_watts": {
+            "description": "Clear-sky solar radiation",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "W_per_m2"
+          },
+          "radiation": {
+            "description": "Solar radiation (sensor)",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "W_per_m2"
+          },
+          "rain_alarm": {
+            "description": "Rain alarm",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "rain_incremental": {
+            "description": "Rainfall since last reading",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "in"
+          },
+          "rain_rate": {
+            "description": "Rain rate",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "in_per_hour"
+          },
+          "relay1": {
+            "description": "Relay 1",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "relay10": {
+            "description": "Relay 10",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "relay2": {
+            "description": "Relay 2",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "relay3": {
+            "description": "Relay 3",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "relay4": {
+            "description": "Relay 4",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "relay5": {
+            "description": "Relay 5",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "relay6": {
+            "description": "Relay 6",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "relay7": {
+            "description": "Relay 7",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "relay8": {
+            "description": "Relay 8",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "relay9": {
+            "description": "Relay 9",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "snow_depth": {
+            "description": "Snow depth",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "mm"
+          },
+          "snow_distance": {
+            "description": "Snow sensor distance",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "mm"
+          },
+          "soil_hum1": {
+            "description": "Soil humidity 1",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "soil_hum10": {
+            "description": "Soil humidity 10",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "soil_hum2": {
+            "description": "Soil humidity 2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "soil_hum3": {
+            "description": "Soil humidity 3",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "soil_hum4": {
+            "description": "Soil humidity 4",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "soil_hum5": {
+            "description": "Soil humidity 5",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "soil_hum6": {
+            "description": "Soil humidity 6",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "soil_hum7": {
+            "description": "Soil humidity 7",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "soil_hum8": {
+            "description": "Soil humidity 8",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "soil_hum9": {
+            "description": "Soil humidity 9",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "percent"
+          },
+          "soil_leaf_alarm1": {
+            "description": "Soil/leaf alarm 1",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "soil_leaf_alarm2": {
+            "description": "Soil/leaf alarm 2",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "soil_leaf_alarm3": {
+            "description": "Soil/leaf alarm 3",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "soil_leaf_alarm4": {
+            "description": "Soil/leaf alarm 4",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "soil_moisture1": {
+            "description": "Soil moisture 1",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "cbar"
+          },
+          "soil_moisture2": {
+            "description": "Soil moisture 2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "cbar"
+          },
+          "soil_moisture3": {
+            "description": "Soil moisture 3",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "cbar"
+          },
+          "soil_moisture4": {
+            "description": "Soil moisture 4",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "cbar"
+          },
+          "soil_temp1": {
+            "description": "Soil temperature 1",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "soil_temp10": {
+            "description": "Soil temperature 10",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "soil_temp2": {
+            "description": "Soil temperature 2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "soil_temp3": {
+            "description": "Soil temperature 3",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "soil_temp4": {
+            "description": "Soil temperature 4",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "soil_temp5": {
+            "description": "Soil temperature 5",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "soil_temp6": {
+            "description": "Soil temperature 6",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "soil_temp7": {
+            "description": "Soil temperature 7",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "soil_temp8": {
+            "description": "Soil temperature 8",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "soil_temp9": {
+            "description": "Soil temperature 9",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "soil_tens1": {
+            "description": "Soil tension 1",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "cbar"
+          },
+          "soil_tens2": {
+            "description": "Soil tension 2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "cbar"
+          },
+          "soil_tens3": {
+            "description": "Soil tension 3",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "cbar"
+          },
+          "soil_tens4": {
+            "description": "Soil tension 4",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "cbar"
+          },
+          "solar_joules": {
+            "description": "Solar energy",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "J_per_m2"
+          },
+          "solar_watts": {
+            "description": "Solar radiation",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "W_per_m2"
+          },
+          "station_battery_voltage": {
+            "description": "Station battery voltage",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "V"
+          },
+          "station_id": {
+            "description": "Station",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "station_name": {
+            "description": "Station name",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "station_type": {
+            "description": "Station type",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "storm_rain": {
+            "description": "Storm rainfall",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "in"
+          },
+          "storm_start": {
+            "description": "Storm start",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-unit": "timestamp"
+          },
+          "sunrise": {
+            "description": "Sunrise",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-unit": "timestamp"
+          },
+          "sunset": {
+            "description": "Sunset",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-unit": "timestamp"
+          },
+          "temp1": {
+            "description": "Temperature sensor 1",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "temp10": {
+            "description": "Temperature sensor 10",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "temp2": {
+            "description": "Temperature sensor 2",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "temp3": {
+            "description": "Temperature sensor 3",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "temp4": {
+            "description": "Temperature sensor 4",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "temp5": {
+            "description": "Temperature sensor 5",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "temp6": {
+            "description": "Temperature sensor 6",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "temp7": {
+            "description": "Temperature sensor 7",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "temp8": {
+            "description": "Temperature sensor 8",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "temp9": {
+            "description": "Temperature sensor 9",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "time": {
+            "description": "Time",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tx_battery_status": {
+            "description": "Transmitter battery",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-unit": "state"
+          },
+          "tz": {
+            "description": "Station time zone",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-unit": "text"
+          },
+          "uv": {
+            "description": "UV index",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "index"
+          },
+          "wind_chill": {
+            "description": "Wind chill",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "degF"
+          },
+          "wind_dir": {
+            "description": "Wind direction",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "deg"
+          },
+          "wind_speed": {
+            "description": "Wind speed",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "mph"
+          },
+          "wind_speed10": {
+            "description": "Wind speed (10-minute average)",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "mph"
+          },
+          "year_et": {
+            "description": "Evapotranspiration this year",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "in"
+          },
+          "year_rain": {
+            "description": "Rainfall this year",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-unit": "in"
+          }
+        },
+        "required": [
+          "time",
+          "station_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from metrics/registry.toml by `cargo xtask codegen`. Do not edit. Paths are not described here: this document carries the reading schemas only, and the endpoint surface is W1's (frozen legacy contract) and W3's (new endpoints).",
+    "title": "ModernWeather reading schemas",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {},
+  "x-generated-by": "cargo xtask codegen",
+  "x-source": "metrics/registry.toml"
+}

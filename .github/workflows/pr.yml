@@ -277,7 +277,15 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends postgresql-client-17
-          psql --version && pg_dump --version
+          # Installing the package is not enough. /usr/bin/pg_dump is a postgresql-common
+          # wrapper, and it resolves the version from the local cluster list rather than
+          # from the server it is about to talk to — the runner has a stopped PostgreSQL 16
+          # cluster, so the wrapper picked 16 and pg_dump refused the 17 service with
+          # "aborting because of server version mismatch". Put the versioned bin directory
+          # first so every later step gets the 17 binaries.
+          echo /usr/lib/postgresql/17/bin >> "$GITHUB_PATH"
+          /usr/lib/postgresql/17/bin/psql --version
+          /usr/lib/postgresql/17/bin/pg_dump --version
       - name: Assert the server version (D-42)
         run: psql --set ON_ERROR_STOP=1 "$DATABASE_URL" -f ci/sql/assert-timescaledb-version.sql
       - name: Apply the migrations twice and compare

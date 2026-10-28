@@ -6,10 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+description = "Repository tasks: the metric-registry code generator, the CI gates and the release pipeline"
 
 [lints]
 workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-toml = "1"
+serde_json = "1"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
