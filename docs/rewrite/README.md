@@ -55,10 +55,10 @@ here rather than assumed.
    (`SELECT remove_retention_policy('weather');` — roughly 1.6 GB/month of uncompressed growth) or
    take a verified `pg_dump` snapshot, and take W9 §1's cheap `weather_1d`/`weather_1h` archive
    copies at the same time. W9 formalises the migration later; this step just stops the bleeding.
-2. **Register the iOS repo as a project resource.** `git@github.com:chrissnell/RemoteWeather.app.git`
-   is not currently in the Multica project resources, and platform agents can only check out
-   registered repos — W1's Swift-side deliverables (the hazard table in particular) are impossible
-   without it.
+2. ~~**Register the iOS repo as a project resource.**~~ **Done 2026-10-28.**
+   `git@github.com:chrissnell/RemoteWeather.app.git` is attached to the `modernweather` project as a
+   `github_repo` resource (default branch `main`) and `multica repo checkout` against it is verified
+   working, so W1's Swift-side deliverables are unblocked.
 3. **W2 and W4 are OUTLINE prompts and must be finished before their stages fire.** Both say "write
    this prompt after reading `docs/spike-findings.md`" — so between W0 merging and stage 2 being
    promoted, someone must turn W2's outline into a full prompt (and likewise W4 before stage 4).

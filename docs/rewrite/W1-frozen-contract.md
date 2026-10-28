@@ -12,11 +12,10 @@ Read `docs/DESIGN.md` first.
 
 Two independent clients must keep working after the rewrite, and **both** are frozen:
 
-1. **The iOS app** — `git@github.com:chrissnell/RemoteWeather.app.git`. **This repo is currently not
-   registered as a Multica project resource at all** (checked 2026-10-28), and platform agents can
-   only check out registered repos — so it must be added before this work item runs, or the Swift
-   side of deliverables 2 and 3 is impossible. Client code lives in
-   `RemoteWeather/Sources/RemoteWeather/Data/REST/`.
+1. **The iOS app** — `git@github.com:chrissnell/RemoteWeather.app.git`. Registered as a
+   `modernweather` project resource on 2026-10-28 and verified checkout-able, so
+   `multica repo checkout git@github.com:chrissnell/RemoteWeather.app.git` is how you get it. Client
+   code lives in `RemoteWeather/Sources/RemoteWeather/Data/REST/`.
 2. **The existing public weather website**, which is being carried forward as-is rather than
    redesigned. Its JS lives in `internal/controllers/restserver/assets/js/`.
 
@@ -26,6 +25,22 @@ Server-side sources of truth: `internal/controllers/restserver/types.go` (the DT
 **Tie-break rule.** Each client's requirements are binding for the surface it uses, and the contract
 is the **union** of both. Where a client is stricter than the server, the client wins — the server
 may emit fields nobody reads, but it must never omit or null a field any client requires.
+
+## Before you start — where the Go server comes from
+
+`docs/DESIGN.md` is merged and is your first read. One operational fact W0 established that this
+prompt predates: **the production weather server and its database are not reachable from an agent
+runtime** — W0 OQ-1 records that production is not in the homelab Kubernetes cluster. So "the current
+Go server" means one **you build and run**: `go build` the Go daemon from the read-only
+`remoteweather` checkout, point it at a throwaway TimescaleDB container, and drive it with the Go
+station emulators in `cmd/` (kept deliberately as test infrastructure). That is what deliverable 4's
+fixtures are captured from and what deliverable 5's conformance run must be green against.
+
+This is not a downgrade. Byte-level JSON compatibility is a property of the Go encoder and
+`restserver/types.go`, not of production's data, and a locally-driven server lets you *produce* the
+awkward cases the fixture list asks for — minimal sensor complement, data gaps, empty responses, and
+the snow-device-configured-but-absent case — instead of waiting for them to occur. Record the commit
+of `remoteweather` you built from, so the fixtures are traceable to an exact server.
 
 ## Known surface
 
