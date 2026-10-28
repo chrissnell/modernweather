@@ -279,7 +279,7 @@ is the only configuration measured to work on ARMv6.
 | `armv7-unknown-linux-musleabihf` | musl armv7 cross, `+crt-static` | yes | ARMv7 | yes (Cortex-A7) |
 | `aarch64-unknown-linux-musl` | musl aarch64 cross, `+crt-static` | yes | — | yes (Cortex-A53) |
 | `x86_64-unknown-linux-musl` | musl x86_64 cross, `+crt-static` | yes | — | yes (native) |
-| `x86_64-pc-windows-gnu` | Debian mingw-w64 | yes | — | not executed |
+| `x86_64-pc-windows-gnu` | Debian mingw-w64 | yes | — | *dropped — Decision 32* |
 
 Full numbers, commands and provenance are in **Appendix A**. The short version of the first
 row: Debian's `gcc-arm-linux-gnueabihf` links an ARMv6 Rust target perfectly happily, and
@@ -343,17 +343,25 @@ actually on a machine is answerable rather than inferred.
 | linux/arm64 | tar.gz, deb, rpm, container | Raspberry Pi 3 and later |
 | linux/armv7 | tar.gz, deb, rpm, container | Raspberry Pi 2 |
 | linux/armv6 | tar.gz, deb, rpm, container | Raspberry Pi 1 / Zero / Zero W |
-| windows/amd64 | zip, **build only** | OQ-3: whether this ships at all is the owner's call |
+| windows/amd64 | **dropped** | Owner decision, 2026-10-28. Decision 32 |
 | Docker image | multi-arch manifest over the four Linux platforms | **no QEMU** |
 | deb / rpm | `cargo-deb`, `cargo-generate-rpm` | plus systemd unit and sysusers |
 | Arch package | PKGBUILD in-tree, version-checked by CI, **published by hand** | `x86_64`, `aarch64`, `armv7h`, `armv6h` |
 
 Nothing in the Go matrix is silently dropped. Two are consciously narrowed, with reasons:
 
-- **Windows is built but not shipped on CI's word.** Nothing in the capability inventory
-  needs it; the station drivers are serial, TCP, UDP and HTTP, and the Go build only ever
-  produced it with `CGO_ENABLED=0`. This pipeline can cross-compile it (measured) but cannot
-  execute it, so "it compiles" is the honest extent of the claim. OQ-3.
+- **Windows amd64 is dropped**, by owner decision on 2026-10-28 in answer to what was OQ-3.
+  It did cross-compile — that was measured, and the row is kept in the table above and in
+  Appendix A.2 so the claim stays on the record — but nothing in the capability inventory
+  needs it (every station driver is serial, TCP, UDP or HTTP), the Go build only ever
+  produced it with `CGO_ENABLED=0`, and this pipeline has no Windows runner, so it would have
+  shipped untested. An untested artefact nobody runs is worse than no artefact.
+
+  **Re-adding it** is a `[[target]]` block in `ci/release.toml` plus a zip branch in
+  `xtask/src/dist.rs::pack_tar`'s caller; both were removed rather than left dormant, so that
+  the matrix in `ci/release.toml` is exactly what ships. If it comes back, give it a
+  `windows-latest` job that at least runs `--version`, and prefer
+  `x86_64-pc-windows-msvc` — the idiomatic Windows target — over the mingw cross build.
 - **The Arch package is published by hand**, because pushing to the AUR needs the
   maintainer's SSH key and keeping that out of CI is the same rule as everything else here.
   CI's contribution is to refuse to let `packaging/arch/PKGBUILD`'s `pkgver` fall out of
@@ -499,7 +507,7 @@ not have to be trusted — they can be re-taken.
 |---|---|
 | Host | x86_64 Linux, 8 vCPU, Debian 13 container |
 | Rust | 1.96.0 (`ac68faa20`, 2026-05-25) |
-| Cross toolchains | Debian `gcc-14-arm-linux-gnueabihf` 14.2.0; `musl.cc` gcc 11.2.1 for armv6/armv7/aarch64/x86_64 musl; Debian `gcc-mingw-w64-x86-64` 14.2.0 |
+| Cross toolchains | Debian `gcc-14-arm-linux-gnueabihf` 14.2.0; `musl.cc` gcc 11.2.1 for armv6/armv7/aarch64/x86_64 musl; Debian `gcc-mingw-w64-x86-64` 14.2.0 (for the Windows row only, which is no longer a release target) |
 | Emulator | qemu-user 10.0.13, `-cpu arm1176` (Pi 1/Zero), `-cpu cortex-a7` (Pi 2), `-cpu cortex-a53` (Pi 3+) |
 | Probe | `ci/spike/probe`: tokio, sqlx (SQLite bundled C + Postgres), axum, argon2, zerocopy, rustls with `ring` or `aws-lc-rs`, rcgen |
 
@@ -575,7 +583,7 @@ AES-256-GCM, all on the CPU in a Raspberry Pi Zero. Artefact sizes, `tls-ring`:
 | `armv7-unknown-linux-musleabihf` | 4.5 MB |
 | `aarch64-unknown-linux-musl` | 4.9 MB |
 | `x86_64-unknown-linux-musl` | 5.1 MB |
-| `x86_64-pc-windows-gnu` (`.exe`) | 12.5 MB |
+| `x86_64-pc-windows-gnu` (`.exe`) | 12.5 MB — measured before the target was dropped |
 
 Static musl also removes a second problem nobody had named: the Go pipeline builds its Linux
 daemon with `CGO_ENABLED=1`, which links glibc dynamically, so the artefact carries the
@@ -622,8 +630,8 @@ and this is the one claim here that emulation cannot fully close.
   Specifically unmeasured: musl's allocator is slower than glibc's under multi-threaded
   contention, which a tokio daemon can feel. The usual remedy is a `#[global_allocator]` of
   `mimalloc` on musl targets. That is OQ-2, not a decision taken here.
-- **No Windows execution.** The pipeline has no Windows runner for it and no need for one
-  until OQ-3 is answered.
+- **No Windows execution.** There was never a Windows runner to do it on, and OQ-3 has since
+  been answered by dropping the target, so this gap is now moot rather than outstanding.
 - **`cross` images were not used for the measurement**; the toolchains above were fetched
   directly. `platform.yml` uses `cross`, so the first run of that workflow is also the
   first check that `cross`'s images agree with these results.
@@ -750,8 +758,11 @@ filename collision that §4 documents, which is the real defect sitting behind i
     uid 65532 are copied from a builder stage.
 31. The target matrix lives in `ci/release.toml` and is read by both `cargo xtask` and the
     release workflow's `strategy.matrix`, so it is stated once.
-32. Windows amd64 is cross-compiled and zipped but not executed by CI, and whether it ships
-    is OQ-3.
+32. **Windows amd64 is dropped** (owner decision, 2026-10-28, answering what was OQ-3). It
+    cross-compiled, but nothing in the capability inventory needs it and the pipeline has no
+    Windows runner, so it would have shipped untested. The target block and the zip
+    packaging branch are removed rather than left dormant, so `ci/release.toml` is exactly
+    what ships.
 33. The Arch package covers `x86_64`, `aarch64`, `armv7h` and `armv6h`. Arch Linux ARM does
     have an ARMv6 port — it is their Raspberry Pi 1/Zero target.
 34. The Arch package is published to the AUR by hand. CI only asserts the PKGBUILD's
@@ -808,13 +819,16 @@ was deliberately not measured, because measuring it under emulation would produc
 `mimalloc` for musl targets if a real workload shows contention. Do not pre-emptively adopt
 one; it is a dependency with a C build for a problem not yet observed.
 
-**OQ-3. Does Windows amd64 still ship?** It cross-compiles (measured, A.0) and nothing in
-the capability inventory needs it: every station driver is serial, TCP, UDP or HTTP, and the
-Go build only ever produced Windows with `CGO_ENABLED=0`. CI cannot execute it, so it would
-ship untested. *Recommendation:* **drop it**, and re-add it if a user asks. Keeping an
-untested published artefact costs more credibility than removing one costs convenience. The
-owner decides, because dropping a published artefact is a user-facing change; until then it
-is built and zipped.
+**OQ-3. Does Windows amd64 still ship? — RESOLVED 2026-10-28: no.**
+Kept here, marked resolved rather than deleted, so the other OQ numbers stay stable and so
+the reasoning behind a user-facing removal stays findable.
+
+It cross-compiled (measured, A.0 and A.2) and nothing in the capability inventory needed it:
+every station driver is serial, TCP, UDP or HTTP, and the Go build only ever produced Windows
+with `CGO_ENABLED=0`. CI had no Windows runner, so it would have shipped untested — and an
+untested published artefact costs more credibility than removing one costs convenience.
+**The owner chose to drop it.** This is now Decision 32; §4 records what was removed and what
+re-adding it would take.
 
 **OQ-4. Does musl's resolver break WeatherLink Live discovery?** The capability inventory
 lists "WeatherLink discovery", and musl's resolver supports neither `nsswitch.conf` nor NSS

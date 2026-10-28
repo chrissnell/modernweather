@@ -89,37 +89,9 @@ jobs:
           READELF: arm-linux-gnueabihf-readelf
         run: ci/spike/armv6-cross-spike.sh ${{ matrix.target }}
 
-  windows:
-    name: x86_64-pc-windows-gnu (build only)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.96.0"
-          targets: x86_64-pc-windows-gnu
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ci/spike/probe
-          key: windows-gnu
-      - name: Install mingw-w64
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
-      # Build only, and labelled as such. Nothing in the capability inventory needs
-      # Windows and this pipeline cannot run a Windows binary, so "it compiles" is the
-      # honest extent of the claim. Whether Windows ships at all is OQ-3 in docs/release.md.
-      - name: Cross-compile the probe
-        env:
-          CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
-          AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
-          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
-        working-directory: ci/spike/probe
-        run: cargo build --release --target x86_64-pc-windows-gnu --features tls-ring
-
   summary:
     name: platform summary
-    needs: [probe, windows]
+    needs: [probe]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -131,7 +103,5 @@ jobs:
             echo "| Group | Result |"
             echo "|---|---|"
             echo "| Linux targets (static musl, run under qemu) | ${{ needs.probe.result }} |"
-            echo "| Windows (cross-compile only, not executed) | ${{ needs.windows.result }} |"
           } >> "$GITHUB_STEP_SUMMARY"
           [ "${{ needs.probe.result }}" = "success" ] || exit 1
-          [ "${{ needs.windows.result }}" = "success" ] || exit 1

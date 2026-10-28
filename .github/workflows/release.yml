@@ -138,11 +138,6 @@ jobs:
         with:
           key: release-${{ matrix.triple }}
       - uses: taiki-e/install-action@cross
-      - name: Install zip
-        if: contains(matrix.triple, 'windows')
-        # cross supplies the mingw toolchain inside its image; zip runs on the host,
-        # because `cargo xtask dist` packages after the build.
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zip
       - name: Explain the no-op
         if: needs.config.outputs.daemon_present != 'true'
         run: |

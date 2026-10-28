@@ -125,12 +125,10 @@ pub fn main(args: &[String]) -> Result<(), String> {
         return Err(format!("{builder} build exited with {status}"));
     }
 
-    let windows = triple.contains("windows");
-    let bin_name = if windows {
-        format!("{}.exe", cfg.release.binary)
-    } else {
-        cfg.release.binary.clone()
-    };
+    // Every release target is Linux. Windows amd64 was dropped by owner decision
+    // (docs/release.md Decision 32), which is what removes the `.exe`/zip branch
+    // that used to live here.
+    let bin_name = cfg.release.binary.clone();
     let built = root
         .join("target")
         .join(&triple)
@@ -146,11 +144,7 @@ pub fn main(args: &[String]) -> Result<(), String> {
     let out = root.join(&out_dir);
     std::fs::create_dir_all(&out).map_err(|e| format!("creating {}: {e}", out.display()))?;
     let stem = format!("{}_{}_{}", cfg.release.binary, version, target.label);
-    let archive = if windows {
-        pack_zip(&out, &stem, &built, &bin_name)?
-    } else {
-        pack_tar(&out, &stem, &built, &bin_name)?
-    };
+    let archive = pack_tar(&out, &stem, &built, &bin_name)?;
     let digest = sha256(&archive)?;
     std::fs::write(
         archive.with_extension(format!(
@@ -210,26 +204,6 @@ fn pack_tar(out: &Path, stem: &str, built: &Path, bin_name: &str) -> Result<Path
         .map_err(|e| format!("running tar: {e}"))?;
     if !status.success() {
         return Err(format!("tar exited with {status}"));
-    }
-    let _ = std::fs::remove_dir_all(&staging);
-    Ok(archive)
-}
-
-fn pack_zip(out: &Path, stem: &str, built: &Path, bin_name: &str) -> Result<PathBuf, String> {
-    let staging = out.join(stem);
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|e| format!("staging: {e}"))?;
-    std::fs::copy(built, staging.join(bin_name)).map_err(|e| format!("copying the binary: {e}"))?;
-    let archive = out.join(format!("{stem}.zip"));
-    let status = Command::new("zip")
-        .current_dir(out)
-        .args(["-qr", "-X"])
-        .arg(&archive)
-        .arg(stem)
-        .status()
-        .map_err(|e| format!("running zip: {e}"))?;
-    if !status.success() {
-        return Err(format!("zip exited with {status}"));
     }
     let _ = std::fs::remove_dir_all(&staging);
     Ok(archive)
