@@ -302,6 +302,39 @@ The real ARMv6 risk in the chosen stack is the **TLS crypto provider**, which th
 did not mention: `ring` and `aws-lc-rs` are hand-written assembly, not portable C. Both were
 measured, both work, and both bring a wrinkle described in Appendix A §A.3.
 
+### The same trap, one layer down: package filenames
+
+Fixing the compiler half of the ARMv6 problem does not fix the *shipping* half, and the
+second one is easy to miss because it looks like cosmetics.
+
+`cargo deb` derives the Debian architecture from the target triple. Measured:
+
+```
+$ cargo deb --no-build --target arm-unknown-linux-musleabihf   --output dist/
+dist/modernweather_0.0.0-1_armhf.deb
+$ cargo deb --no-build --target armv7-unknown-linux-musleabihf --output dist/
+dist/modernweather_0.0.0-1_armhf.deb        <- same name
+$ ls dist/
+modernweather_0.0.0-1_armhf.deb             <- one file
+```
+
+Both ARM targets are `armhf`, and correctly so: the triples are `musleabihf`, the artifacts
+carry `Tag_ABI_VFP_args: VFP registers`, and Raspberry Pi OS calls its ARMv6 port armhf as
+well. (`armel` would be wrong — that is Debian's soft-float ARMv5TE port.) But it means the
+two packages have **identical filenames**, and running both builds into one directory leaves
+one file. Whichever survives gets installed on Pi Zeros; if it is the armv7 one, that is an
+illegal instruction at startup — exactly the failure this section exists to prevent,
+reintroduced after the compiler problem was solved.
+
+`dpkg` cannot help, because Debian has no separate ARMv6 architecture name. **The filename is
+the only thing that can carry the distinction**, so `release.yml` passes an explicit
+`--output` per target built from the target's unique `label`
+(`modernweather_<version>_linux-armv6.deb`). The Go pipeline needed the same workaround and
+solved it with a goreleaser `file_name_template`.
+
+After installing, `modernweather --version` reports the target triple, so which artifact is
+actually on a machine is answerable rather than inferred.
+
 ### Target matrix and what happens to each
 
 | Target | Produced | Notes |
@@ -313,7 +346,7 @@ measured, both work, and both bring a wrinkle described in Appendix A §A.3.
 | windows/amd64 | zip, **build only** | OQ-3: whether this ships at all is the owner's call |
 | Docker image | multi-arch manifest over the four Linux platforms | **no QEMU** |
 | deb / rpm | `cargo-deb`, `cargo-generate-rpm` | plus systemd unit and sysusers |
-| Arch package | PKGBUILD in-tree, version-checked by CI, **published by hand** | no armv6: Arch Linux ARM has no ARMv6 port |
+| Arch package | PKGBUILD in-tree, version-checked by CI, **published by hand** | `x86_64`, `aarch64`, `armv7h`, `armv6h` |
 
 Nothing in the Go matrix is silently dropped. Two are consciously narrowed, with reasons:
 
@@ -321,8 +354,10 @@ Nothing in the Go matrix is silently dropped. Two are consciously narrowed, with
   needs it; the station drivers are serial, TCP, UDP and HTTP, and the Go build only ever
   produced it with `CGO_ENABLED=0`. This pipeline can cross-compile it (measured) but cannot
   execute it, so "it compiles" is the honest extent of the claim. OQ-3.
-- **The Arch package drops armv6**, because Arch Linux ARM has no ARMv6 port. The Pi Zero is
-  served by the deb, the rpm and the tarball.
+- **The Arch package is published by hand**, because pushing to the AUR needs the
+  maintainer's SSH key and keeping that out of CI is the same rule as everything else here.
+  CI's contribution is to refuse to let `packaging/arch/PKGBUILD`'s `pkgver` fall out of
+  step with the tag.
 
 ### Docker without QEMU
 
@@ -593,6 +628,51 @@ and this is the one claim here that emulation cannot fully close.
   directly. `platform.yml` uses `cross`, so the first run of that workflow is also the
   first check that `cross`'s images agree with these results.
 
+### A.5 Two things found while re-verifying the above
+
+Both were measured on a second, independent pass over the same question, and neither changes
+a decision. They are recorded because each is a trap somebody will otherwise walk into.
+
+**The Go pipeline's ARMv6 artefact cannot start on Raspberry Pi OS.** A.1 establishes that a
+glibc ARMv6 build from Debian's armhf toolchain dies with SIGILL. The Go release avoids that,
+but not by solving it: `.goreleaser.yml` builds `linux-armv6` with `CGO_ENABLED=1` and
+`CC=arm-linux-gnueabi-gcc` — the **soft-float armel** cross compiler, whose glibc is ARMv5TE
+and therefore does run on an ARM1176. The cost is the ABI. Built exactly as the Go pipeline
+specifies:
+
+```
+$ file remoteweather
+ELF 32-bit LSB executable, ARM, EABI5, dynamically linked,
+interpreter /lib/ld-linux.so.3           <- the armel loader
+$ readelf -A remoteweather | grep -E 'Tag_CPU_arch|VFP_args'
+  Tag_CPU_arch: v5TE                      <- and no Tag_ABI_VFP_args: soft-float
+```
+
+Raspberry Pi OS 32-bit is an **armhf** userland. It ships `/lib/ld-linux-armhf.so.3` and does
+not ship `/lib/ld-linux.so.3`:
+
+```
+$ qemu-arm -L <armhf-sysroot> -cpu arm1176 ./remoteweather --help
+qemu-arm: Could not open '/lib/ld-linux.so.3': No such file or directory
+$ qemu-arm -L <armel-sysroot> -cpu arm1176 ./remoteweather --help
+Usage of ./remoteweather: -config string ...
+```
+
+So the current Go ARMv6 release artefact needs a Debian armel userland and has never run on
+the intended device. Two consequences for this work item: **there is no ARMv6 behaviour to
+preserve**, only one to fix; and the W8 prompt's framing of the Go build as painless because
+`modernc.org/sqlite` is pure Go does not hold, since all four Linux targets enable cgo and
+the release workflow already installs three ARM cross toolchains. (A.2's separate point —
+that nothing in the Go dependency set *needs* cgo — stands. What the pipeline does and what
+it needs to do differ.)
+
+**The hard-float/soft-float distinction is also why `armel` is the wrong Debian architecture
+for our ARMv6 package.** Our triple is `musleabihf` and the artefact carries
+`Tag_ABI_VFP_args: VFP registers`, so it is hard-float and belongs in an `armhf` package, as
+§4 now records. `ci/release.toml` said `armel`; corrected. That value was inert — `cargo deb`
+takes the architecture from the triple — but it would have misled anyone diagnosing the
+filename collision that §4 documents, which is the real defect sitting behind it.
+
 ---
 
 # Decisions
@@ -672,8 +752,8 @@ and this is the one claim here that emulation cannot fully close.
     release workflow's `strategy.matrix`, so it is stated once.
 32. Windows amd64 is cross-compiled and zipped but not executed by CI, and whether it ships
     is OQ-3.
-33. The Arch package drops ARMv6 because Arch Linux ARM has no ARMv6 port; the Pi Zero is
-    served by the deb, rpm and tarball.
+33. The Arch package covers `x86_64`, `aarch64`, `armv7h` and `armv6h`. Arch Linux ARM does
+    have an ARMv6 port — it is their Raspberry Pi 1/Zero target.
 34. The Arch package is published to the AUR by hand. CI only asserts the PKGBUILD's
     `pkgver` matches the tag.
 35. **Publishing is off until the owner sets `MW_PUBLISH_RELEASE`, `MW_PUBLISH_CONTAINERS`
@@ -700,6 +780,15 @@ and this is the one claim here that emulation cannot fully close.
     dependency version before the daemon adopts it.
 44. The systemd unit is `Type=notify` and drops the Go unit's `MemoryMax=512M`; both are
     flagged to W3 in §6.
+45. **Package filenames are set explicitly per target.** `cargo deb` derives the Debian
+    architecture from the triple, and both ARM triples map to `armhf`, so the default names
+    collide and one build silently overwrites the other — measured. `dpkg` cannot
+    distinguish them either, because Debian has no separate ARMv6 architecture name, so the
+    filename is the only thing that can.
+46. The ARMv6 package is `armhf`, not `armel`. The triple is `musleabihf` and the artefact
+    carries `Tag_ABI_VFP_args: VFP registers`; `armel` is Debian's soft-float ARMv5TE port.
+    This is the same distinction that makes the Go pipeline's ARMv6 artefact unable to start
+    on Raspberry Pi OS (A.5).
 
 ---
 

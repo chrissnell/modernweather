@@ -167,10 +167,20 @@ jobs:
           # --no-build: the binary is already cross-compiled above, and cargo-deb cannot
           # cross-compile it itself. --no-strip because the dist profile already strips
           # debug info and cargo-deb's strip is the host's, which cannot touch an ARM ELF.
+          # Explicit --output filenames, and this is load-bearing rather than
+          # tidiness. cargo-deb derives the Debian architecture from the target
+          # triple, and both arm-unknown-linux-musleabihf and
+          # armv7-unknown-linux-musleabihf map to `armhf` — so the default names
+          # collide and one build silently overwrites the other. Installing the
+          # survivor on a Pi Zero is an illegal instruction at startup, which is
+          # the same failure mode §4 exists to prevent, reintroduced in the
+          # packaging layer. `label` is already unique per target.
           cargo deb --no-build --no-strip -p modernweather \
-            --target ${{ matrix.triple }} --output dist/
+            --target ${{ matrix.triple }} \
+            --output "dist/modernweather_${{ needs.config.outputs.version }}_${{ matrix.label }}.deb"
           cargo generate-rpm -p crates/modernweather \
-            --target ${{ matrix.triple }} --output dist/
+            --target ${{ matrix.triple }} \
+            --output "dist/modernweather-${{ needs.config.outputs.version }}-1.${{ matrix.rpm_arch }}.rpm"
       - name: List what was produced
         if: needs.config.outputs.daemon_present == 'true'
         run: ls -l dist/

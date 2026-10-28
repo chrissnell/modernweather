@@ -11,7 +11,7 @@ pkgname=modernweather
 pkgver=0.0.0
 pkgrel=1
 pkgdesc="Weather station data collection and distribution system"
-arch=('x86_64' 'aarch64' 'armv7h')
+arch=('x86_64' 'aarch64' 'armv7h' 'armv6h')
 url="https://github.com/chrissnell/modernweather"
 license=('MIT')
 # The release binaries are statically linked against musl, but this package builds from

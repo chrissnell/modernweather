@@ -44,10 +44,23 @@ arch_arch = "armv7h"
 triple = "arm-unknown-linux-musleabihf"
 label = "linux-armv6"
 docker_platform = "linux/arm/v6"
-deb_arch = "armel"
+# armhf, NOT armel. The triple is `musleabihf` — hard-float — and the artifact
+# carries Tag_ABI_VFP_args: VFP registers. `armel` is Debian's SOFT-float ARMv5TE
+# port, so declaring it here would describe the wrong ABI. Raspberry Pi OS calls
+# its ARMv6 port armhf too, which is why both armv6 and armv7 are armhf.
+#
+# CONSEQUENCE, measured: `cargo deb --target` derives the architecture from the
+# triple, so armv6 and armv7 BOTH produce modernweather_<version>_armhf.deb.
+# Running both in one output directory leaves one file. dpkg cannot tell the two
+# apart either — Debian has no separate ARMv6 architecture name — so the
+# FILENAME is the only thing that can, and release.yml passes an explicit
+# --output per target to make it. Do not remove that.
+deb_arch = "armhf"
 rpm_arch = "armv6hl"
-# Arch Linux ARM has no armv6 port, so this target produces no Arch package.
-arch_arch = ""
+# Arch Linux ARM does have an armv6h port (it is their Raspberry Pi 1/Zero
+# target). The Arch package is published by hand from packaging/arch/PKGBUILD,
+# so this value is metadata for whoever does that.
+arch_arch = "armv6h"
 
 # Windows is built but not packaged beyond a zip. Whether it ships at all is OQ-3 in
 # docs/release.md: nothing in the inventory needs it, and it cannot be smoke-tested by
