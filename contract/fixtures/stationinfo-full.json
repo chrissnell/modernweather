@@ -1,0 +1,42 @@
+{
+  "name": "stationinfo-full",
+  "description": "Every optional field populated, including radar_enabled/radar_token and the device location.",
+  "provenance": "derived from the SQLite configuration database only",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/stationinfo",
+    "query": "",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "json",
+    "body_bytes": 605,
+    "body_sha256": "1faab4a9c7150ef99b99e32afa2d9ff9f20bd7d3aac3139aa10e7edca7b0bd78",
+    "trailing_newline": true,
+    "body": "{\"website_name\":\"Suncrest Live Weather\",\"about_text\":\"\\u003cp\\u003eA Davis Vantage Pro2 on a ridge at 1800 m.\\u003c/p\\u003e\",\"stations\":[{\"id\":4,\"name\":\"aqmon\",\"type\":\"airgradient\"},{\"id\":2,\"name\":\"csi-minimal\",\"type\":\"campbellscientific\"},{\"id\":1,\"name\":\"davis-full\",\"type\":\"davis\"},{\"id\":3,\"name\":\"snowgauge\",\"type\":\"snowgauge\"},{\"id\":6,\"name\":\"snowgauge-dead\",\"type\":\"snowgauge\"},{\"id\":7,\"name\":\"snowgauge-stale\",\"type\":\"snowgauge\"}],\"weather_device\":1,\"snow_device\":\"snowgauge\",\"air_quality_device\":\"aqmon\",\"latitude\":39.9,\"longitude\":-105.5,\"radar_enabled\":true,\"radar_token\":\"contract-radar-token\"}\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": true,
+    "json_key_order": true,
+    "numeric_format": true,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

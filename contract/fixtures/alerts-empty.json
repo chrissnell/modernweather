@@ -1,0 +1,44 @@
+{
+  "name": "alerts-empty",
+  "description": "",
+  "provenance": "seeded directly into aeris_weather_forecasts / aeris_weather_alerts (Aeris API key not available)",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/alerts",
+    "query": "station_id=2",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "max-age=300",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "json",
+    "body_bytes": 3,
+    "body_sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570",
+    "trailing_newline": true,
+    "body": "[]\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Cache-Control",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": true,
+    "json_key_order": true,
+    "numeric_format": true,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

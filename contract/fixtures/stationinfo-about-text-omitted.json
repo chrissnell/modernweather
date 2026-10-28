@@ -1,0 +1,42 @@
+{
+  "name": "stationinfo-about-text-omitted",
+  "description": "HAZARD: about_station_html is empty, so about_text is omitted. iOS StationInfo.aboutText is a non-optional String, so the whole decode fails.",
+  "provenance": "derived from the SQLite configuration database only",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/stationinfo",
+    "query": "",
+    "headers": {
+      "Host": "minimal.test"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "json",
+    "body_bytes": 401,
+    "body_sha256": "cfa8879154e2b43bcad440fc78c49e92acdcf5da90a7ec506afa40cac4a177c5",
+    "trailing_newline": true,
+    "body": "{\"website_name\":\"Minimal Station\",\"stations\":[{\"id\":4,\"name\":\"aqmon\",\"type\":\"airgradient\"},{\"id\":2,\"name\":\"csi-minimal\",\"type\":\"campbellscientific\"},{\"id\":1,\"name\":\"davis-full\",\"type\":\"davis\"},{\"id\":3,\"name\":\"snowgauge\",\"type\":\"snowgauge\"},{\"id\":6,\"name\":\"snowgauge-dead\",\"type\":\"snowgauge\"},{\"id\":7,\"name\":\"snowgauge-stale\",\"type\":\"snowgauge\"}],\"weather_device\":2,\"latitude\":39.8,\"longitude\":-105.4}\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": true,
+    "json_key_order": true,
+    "numeric_format": true,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "name": "latest-default-station",
+  "description": "No station parameter: falls back to the website's primary device.",
+  "provenance": "davis-emulator (cmd/davis-emulator), LOOP packets over TCP",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/latest",
+    "query": "",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "json",
+    "body_bytes": 1363,
+    "body_sha256": "40dc027fd97193018f84f555ff7b596f732bf22fd77a563c7f5d3dc14ea9e4cc",
+    "trailing_newline": true,
+    "body": "{\"stationname\":\"davis-full\",\"stationtype\":\"davis\",\"ts\":1793206602108,\"otemp\":61.5,\"extratemp1\":0,\"extratemp2\":0,\"extratemp3\":0,\"extratemp4\":0,\"extratemp5\":0,\"extratemp6\":0,\"extratemp7\":0,\"soiltemp1\":56,\"soiltemp2\":0,\"soiltemp3\":0,\"soiltemp4\":0,\"leaftemp1\":61,\"leaftemp2\":0,\"leaftemp3\":0,\"leaftemp4\":0,\"outhumidity\":59,\"extrahumidity1\":0,\"extrahumidity2\":0,\"extrahumidity3\":0,\"extrahumidity4\":0,\"extrahumidity5\":0,\"extrahumidity6\":0,\"extrahumidity7\":0,\"ohum\":59,\"rainrate\":0,\"rainincremental\":0,\"period_rain\":0,\"solarwatts\":252,\"potentialsolarwatts\":0,\"solarjoules\":0,\"uv\":0.2,\"radiation\":0,\"stormrain\":0.44,\"dayrain\":0.25999996,\"monthrain\":0.38999984,\"yearrain\":0.38999996,\"bar\":29.97,\"rainfall24h\":0.25999996,\"rainfall48h\":0.38999996,\"rainfall72h\":0.38999996,\"rainfallstorm\":0.25999996,\"winds\":7,\"windgust\":7,\"windd\":144,\"windcard\":\"SE\",\"rainday\":0.25999996,\"windch\":0,\"heatidx\":0,\"itemp\":63.5,\"ihum\":54,\"consbatteryvoltage\":0,\"stationbatteryvoltage\":23.730469,\"snowdepth\":1500,\"snowdistance\":0,\"pm25\":0,\"co2\":0,\"aqi_pm25_aqin\":0,\"aqi_pm10_aqin\":0,\"extrafloat1\":0,\"extrafloat2\":0,\"extrafloat3\":0,\"extrafloat4\":0,\"extrafloat5\":0,\"extrafloat6\":0,\"extrafloat7\":0,\"extrafloat8\":0,\"extrafloat9\":0,\"extrafloat10\":0,\"sunrise\":\"7:30 AM\",\"sunset\":\"6:02 PM\",\"moonPhaseName\":\"Waning Gibbous\",\"moonIllumination\":0.9148452,\"moonAge\":17.548801,\"moonCrescentAngle\":-121.45631}\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Cache-Control",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": true,
+    "json_key_order": true,
+    "numeric_format": true,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

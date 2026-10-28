@@ -1,0 +1,44 @@
+{
+  "name": "snow-device-stale",
+  "description": "Snow device offline for three days: /snow has NO recency filter, so it keeps returning the last known depth indefinitely.",
+  "provenance": "seeded directly into the weather hypertable (no Go driver exists that can be emulated here)",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/snow",
+    "query": "",
+    "headers": {
+      "Host": "stalesnow.test"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "json",
+    "body_bytes": 142,
+    "body_sha256": "817565a578aa4176f2e8d0c75ec8bfbfcb0049b34c311f689d9e21fd5f596671",
+    "trailing_newline": true,
+    "body": "{\"stationname\":\"snowgauge-stale\",\"snowdepth\":2.8,\"snowtoday\":0,\"snowlast24\":0,\"snowlast72\":0,\"snowseason\":2.3,\"snowstorm\":0,\"snowfallrate\":0}\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Cache-Control",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": true,
+    "json_key_order": true,
+    "numeric_format": true,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

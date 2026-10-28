@@ -1,0 +1,40 @@
+{
+  "name": "api-remote-stations-forbidden",
+  "description": "",
+  "provenance": "derived from the SQLite configuration database only",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/api/remote-stations",
+    "query": "",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 403,
+    "headers": {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "text",
+    "body_bytes": 51,
+    "body_sha256": "cc1dd5b3c16c4062708e74d7fcbbd96eacf8375462a3ae7f07679d2b7a46d9f9",
+    "trailing_newline": true,
+    "body": "remote stations API not available for this website\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": false,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": true,
+    "required_substrings": []
+  }
+}

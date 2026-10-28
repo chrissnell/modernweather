@@ -1,0 +1,41 @@
+{
+  "name": "asset-font",
+  "description": "Fonts carry Cache-Control: public, max-age=31536000, immutable. No other asset tree does.",
+  "provenance": "derived from the SQLite configuration database only",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/fonts/Cinzel-VariableFont_wght.ttf",
+    "query": "",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "font/ttf",
+      "Cache-Control": "public, max-age=31536000, immutable",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "binary",
+    "body_bytes": 124700,
+    "body_sha256": "e7093fd80b66eeb7bf1c7614fa229331ebf72865eeaea1e1059473c1871a6178",
+    "trailing_newline": false
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Cache-Control",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": false,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": false,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

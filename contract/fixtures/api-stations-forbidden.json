@@ -1,0 +1,40 @@
+{
+  "name": "api-stations-forbidden",
+  "description": "403 on a non-portal website.",
+  "provenance": "derived from the SQLite configuration database only",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/api/stations",
+    "query": "",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 403,
+    "headers": {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "text",
+    "body_bytes": 44,
+    "body_sha256": "bb847ca1d4565f1a05373430280d69a1f97b546759a95b9507c81c2210ed2893",
+    "trailing_newline": true,
+    "body": "stations API not available for this website\n"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": false,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "go_encoder",
+    "trailing_newline": true,
+    "body_equals": true,
+    "required_substrings": []
+  }
+}

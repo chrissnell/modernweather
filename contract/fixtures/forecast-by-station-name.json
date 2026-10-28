@@ -1,0 +1,42 @@
+{
+  "name": "forecast-by-station-name",
+  "description": "The legacy `station` form: the name is resolved to a device id before the lookup.",
+  "provenance": "seeded directly into aeris_weather_forecasts / aeris_weather_alerts (Aeris API key not available)",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/forecast/240",
+    "query": "station=davis-full",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "json",
+    "body_bytes": 4012,
+    "body_sha256": "cf8a96e723cff7a1a680895d671fea9e3baf25a70146877009d9a3d1576351db",
+    "trailing_newline": false,
+    "body": "{\"lastUpdated\": \"2026-10-28 15:45:12.482913 +0000 UTC\", \"data\": [{\"pop\": 10, \"snowIN\": 0.0, \"weather\": \"Mostly Sunny\", \"windDir\": \"NW\", \"avgTempF\": 36, \"maxTempF\": 48, \"minTempF\": 24, \"precipIN\": 0.0, \"iceaccumIN\": 0.0, \"windDirDEG\": 315, \"dateTimeISO\": \"2026-10-28T00:00:00-06:00\", \"weatherIcon\": \"fair.png\", \"windSpeedMPH\": 7, \"maxFeelslikeF\": 45, \"minFeelslikeF\": 19, \"compactWeather\": \"Mostly Sunny\", \"windSpeedMaxMPH\": 14, \"weatherPrimaryCoded\": \":FW:\"}, {\"pop\": 20, \"snowIN\": 0.0, \"weather\": \"Partly Cloudy\", \"windDir\": \"N\", \"avgTempF\": 35, \"maxTempF\": 47, \"minTempF\": 23, \"precipIN\": 0.0, \"iceaccumIN\": 0.0, \"windDirDEG\": 0, \"dateTimeISO\": \"2026-10-29T00:00:00-06:00\", \"weatherIcon\": \"pcloudy.png\", \"windSpeedMPH\": 8, \"maxFeelslikeF\": 44, \"minFeelslikeF\": 18, \"compactWeather\": \"Partly Cloudy\", \"windSpeedMaxMPH\": 15, \"weatherPrimaryCoded\": \":SC:\"}, {\"pop\": 70, \"snowIN\": 3.5, \"weather\": \"Snow Showers\", \"windDir\": \"NE\", \"avgTempF\": 34, \"maxTempF\": 46, \"minTempF\": 22, \"precipIN\": 0.31, \"iceaccumIN\": 0.0, \"windDirDEG\": 45, \"dateTimeISO\": \"2026-10-30T00:00:00-06:00\", \"weatherIcon\": \"snow.png\", \"windSpeedMPH\": 9, \"maxFeelslikeF\": 43, \"minFeelslikeF\": 17, \"compactWeather\": \"Snow Showers\", \"windSpeedMaxMPH\": 16, \"weatherPrimaryCoded\": \"S:R:S\"}, {\"pop\": 30, \"snowIN\": 0.0, \"weather\": \"Cloudy\", \"windDir\": \"E\", \"avgTempF\": 33, \"maxTempF\": 45, \"minTempF\": 21, \"precipIN\": 0.02, \"iceaccumIN\": 0.0, \"windDirDEG\": 90, \"dateTimeISO\": \"2026-10-31T00:00:00-06:00\", \"weatherIcon\": \"cloudy.png\", \"windSpeedMPH\": 10, \"maxFeelslikeF\": 42, \"minFeelslikeF\": 16, \"compactWeather\": \"Cloudy\", \"windSpeedMaxMPH\": 17, \"weatherPrimaryCoded\": \":OV:\"}, {\"pop\": 60, \"snowIN\": 0.0, \"weather\": \"Rain Showers\", \"windDir\": \"SE\", \"avgTempF\": 32, \"maxTempF\": 44, \"minTempF\": 20, \"precipIN\": 0.46, \"iceaccumIN\": 0.0, \"windDirDEG\": 135, \"dateTimeISO\": \"2026-11-01T00:00:00-06:00\", \"weatherIcon\": \"rain.png\", \"windSpeedMPH\": 11, \"maxFeelslikeF\": 41, \"minFeelslikeF\": 15, \"compactWeather\": \"Rain Showers\", \"windSpeedMaxMPH\": 18, \"weatherPrimaryCoded\": \"RW:R:R\"}, {\"pop\": 15, \"snowIN\": 0.0, \"weather\": \"Mostly Cloudy\", \"windDir\": \"S\", \"avgTempF\": 31, \"maxTempF\": 43, \"minTempF\": 19, \"precipIN\": 0.0, \"iceaccumIN\": 0.0, \"windDirDEG\": 180, \"dateTimeISO\": \"2026-11-02T00:00:00-06:00\", \"weatherIcon\": \"mcloudy.png\", \"windSpeedMPH\": 12, \"maxFeelslikeF\": 40, \"minFeelslikeF\": 14, \"compactWeather\": \"Mostly Cloudy\", \"windSpeedMaxMPH\": 19, \"weatherPrimaryCoded\": \":BK:\"}, {\"pop\": 0, \"snowIN\": 0.0, \"weather\": \"Sunny\", \"windDir\": \"SW\", \"avgTempF\": 30, \"maxTempF\": 42, \"minTempF\": 18, \"precipIN\": 0.0, \"iceaccumIN\": 0.0, \"windDirDEG\": 225, \"dateTimeISO\": \"2026-11-03T00:00:00-06:00\", \"weatherIcon\": \"sunny.png\", \"windSpeedMPH\": 13, \"maxFeelslikeF\": 39, \"minFeelslikeF\": 13, \"compactWeather\": \"Sunny\", \"windSpeedMaxMPH\": 20, \"weatherPrimaryCoded\": \":CL:\"}, {\"pop\": 55, \"snowIN\": 1.2, \"weather\": \"Light Snow\", \"windDir\": \"W\", \"avgTempF\": 29, \"maxTempF\": 41, \"minTempF\": 17, \"precipIN\": 0.12, \"iceaccumIN\": 0.0, \"windDirDEG\": 270, \"dateTimeISO\": \"2026-11-04T00:00:00-06:00\", \"weatherIcon\": \"snow.png\", \"windSpeedMPH\": 14, \"maxFeelslikeF\": 38, \"minFeelslikeF\": 12, \"compactWeather\": \"Light Snow\", \"windSpeedMaxMPH\": 21, \"weatherPrimaryCoded\": \"S:L:S\"}, {\"pop\": 45, \"snowIN\": 0.0, \"weather\": \"Freezing Rain\", \"windDir\": \"WNW\", \"avgTempF\": 28, \"maxTempF\": 40, \"minTempF\": 16, \"precipIN\": 0.08, \"iceaccumIN\": 0.04, \"windDirDEG\": 292, \"dateTimeISO\": \"2026-11-05T00:00:00-06:00\", \"weatherIcon\": \"sleet.png\", \"windSpeedMPH\": 15, \"maxFeelslikeF\": 37, \"minFeelslikeF\": 11, \"compactWeather\": \"Freezing Rain\", \"windSpeedMaxMPH\": 22, \"weatherPrimaryCoded\": \"ZR:L:RS\"}, {\"pop\": 5, \"snowIN\": 0.0, \"weather\": \"Mostly Sunny\", \"windDir\": \"NNE\", \"avgTempF\": 27, \"maxTempF\": 39, \"minTempF\": 15, \"precipIN\": 0.0, \"iceaccumIN\": 0.0, \"windDirDEG\": 22, \"dateTimeISO\": \"2026-11-06T00:00:00-06:00\", \"weatherIcon\": \"fair.png\", \"windSpeedMPH\": 16, \"maxFeelslikeF\": 36, \"minFeelslikeF\": 10, \"compactWeather\": \"Mostly Sunny\", \"windSpeedMaxMPH\": 23, \"weatherPrimaryCoded\": \":FW:\"}]}"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": true,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "as_stored",
+    "trailing_newline": true,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

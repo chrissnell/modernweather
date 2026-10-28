@@ -1,0 +1,42 @@
+{
+  "name": "forecast-single-period",
+  "description": "period=N replaces the data array with a single OBJECT. The iOS client decodes data as [ForecastPeriod], so this form would fail there; no shipped client sends it.",
+  "provenance": "seeded directly into aeris_weather_forecasts / aeris_weather_alerts (Aeris API key not available)",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/forecast/240",
+    "query": "period=3",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "json",
+    "body_bytes": 409,
+    "body_sha256": "010633ee871a7858b202f4f6b17f8b1e6c6d8576cf16a08b8f4ef7d7ae363470",
+    "trailing_newline": false,
+    "body": "{\"lastUpdated\": \"2026-10-28 15:45:12.482913 +0000 UTC\", \"data\": {\"avgTempF\":33,\"compactWeather\":\"Cloudy\",\"dateTimeISO\":\"2026-10-31T00:00:00-06:00\",\"iceaccumIN\":0,\"maxFeelslikeF\":42,\"maxTempF\":45,\"minFeelslikeF\":16,\"minTempF\":21,\"pop\":30,\"precipIN\":0.02,\"snowIN\":0,\"weather\":\"Cloudy\",\"weatherIcon\":\"cloudy.png\",\"weatherPrimaryCoded\":\":OV:\",\"windDir\":\"E\",\"windDirDEG\":90,\"windSpeedMPH\":10,\"windSpeedMaxMPH\":17}}"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": true,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "as_stored",
+    "trailing_newline": true,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}

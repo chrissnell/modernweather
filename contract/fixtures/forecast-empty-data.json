@@ -1,0 +1,42 @@
+{
+  "name": "forecast-empty-data",
+  "description": "A stored-but-empty forecast: data is [].",
+  "provenance": "seeded directly into aeris_weather_forecasts / aeris_weather_alerts (Aeris API key not available)",
+  "captured_at": "2026-10-28T16:56:42Z",
+  "request": {
+    "method": "GET",
+    "path": "/forecast/240",
+    "query": "station_id=2",
+    "headers": {
+      "Host": "localhost"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding"
+    },
+    "body_kind": "json",
+    "body_bytes": 67,
+    "body_sha256": "98c02ca7e2eb78b83b375b9d9db7f9804750dde40fa660230d63bc91e9776c88",
+    "trailing_newline": false,
+    "body": "{\"lastUpdated\": \"2026-10-28 15:45:12.482913 +0000 UTC\", \"data\": []}"
+  },
+  "assert": {
+    "status": true,
+    "headers": [
+      "Access-Control-Allow-Origin",
+      "Content-Type",
+      "Vary"
+    ],
+    "json_shape": true,
+    "json_key_order": false,
+    "numeric_format": false,
+    "numeric_convention": "as_stored",
+    "trailing_newline": true,
+    "body_equals": false,
+    "required_substrings": []
+  }
+}
