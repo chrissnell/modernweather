@@ -27,6 +27,45 @@ reference how they're produced, defer to W2 by name rather than inventing a form
 
 ---
 
+## 0. What is already on `main` — read this before §1
+
+This prompt was written before stage 2 ran. Four of its instructions have been overtaken by merged
+work, and §1 in particular is no longer a blank page. Nothing below removes a decision from you; it
+tells you what you are deciding *against*.
+
+**A workspace root already exists, and it is CI-gated.** W8 committed `Cargo.toml` with
+`members = ["xtask", "crates/*"]`, `[workspace.package]`, `[workspace.lints]` and `release`/`dist`
+profiles, plus `rust-toolchain.toml` pinning the compiler and an empty `crates/.gitkeep` waiting for
+you. R-4 still makes the crate layout **your** decision — but it is now a decision about what goes
+*inside* `crates/`, and if you want to change the root you must say so explicitly and account for
+`.github/workflows/pr.yml`, which runs `--workspace --locked`. A layout that silently contradicts
+what is committed breaks the gate for everyone.
+
+**Generated code already has a home. Do not re-decide it.** W2 committed `generated/` —
+`generated/rust/{metrics,reading,aggregates}.rs`, `generated/proto/reading.proto`,
+`generated/{sql,openapi,ts}/` — each file carrying a do-not-edit header, with
+`cargo xtask codegen --check` gating drift. §1's "where generated code lives" question is answered;
+what remains yours is how hand-written modules *consume* it without hand-written code leaking back
+in. Note that `generated/rust/reading.rs` needs `chrono`, and W2 deliberately did not pick which
+crate owns the application types — that part is still yours.
+
+**`Reading` and `Metric` are no longer hypothetical.** This prompt says to assume their conceptual
+shape and defer to W2 for format. W2 is done: read `generated/rust/metrics.rs` and
+`generated/rust/aggregates.rs` and design against the actual types. Likewise §6's "one schema, two
+encodings" starts from the committed `generated/proto/reading.proto` rather than from nothing.
+
+**W1 handed you one decision explicitly.** `contract/conformance/` declares its own empty
+`[workspace]` so that it is *not* a member of the root workspace — W1's manifest says this is
+deliberate, because the runner had to work against the Go binary before any Rust daemon existed, and
+because the layout is yours. So root `cargo build --all-targets` does not see it today and CI builds
+it separately. Decide where it belongs once a Rust daemon exists, and say so in §1.
+
+Read in this order: `docs/DESIGN.md`, `docs/component-model.md` (W2a), then
+`docs/metric-registry.md` (W2) and `docs/legacy-api-contract.md` (W1) for the surfaces you plug into.
+`docs/release.md` (W8) tells you what the gate will run against whatever you propose.
+
+---
+
 ## 1. Crate and module layout
 
 Propose the structure and justify the boundaries. For each crate or module, state its single
