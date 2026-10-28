@@ -219,7 +219,6 @@ jobs:
         # buildx's platform naming: linux/amd64, linux/arm64, linux/arm/v7, linux/arm/v6.
         run: |
           set -euo pipefail
-          ctx=packaging/docker
           echo '${{ needs.config.outputs.linux_matrix }}' > /tmp/matrix.json
           python3 - <<'PY'
           import json, os, shutil, tarfile, glob
@@ -289,7 +288,7 @@ jobs:
         run: |
           cd artifacts
           rm -f checksums-*.txt checksums.txt
-          sha256sum * > checksums.txt
+          sha256sum -- * > checksums.txt
           cat checksums.txt
       - uses: sigstore/cosign-installer@v3
         if: needs.config.outputs.sign == 'true'

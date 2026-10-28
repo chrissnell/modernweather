@@ -102,8 +102,18 @@ if [ -n "$EXPECT_ARCH" ]; then
   fi
 fi
 
+# Debian's qemu-user package installs `qemu-arm`; qemu-user-static installs
+# `qemu-arm-static`. Accept either, because which one a given runner image carries is not
+# something this script should have an opinion about.
+for candidate in "$QEMU" "$QEMU-static"; do
+  if [ -n "$QEMU" ] && command -v "$candidate" >/dev/null 2>&1; then
+    QEMU="$candidate"
+    break
+  fi
+done
+
 # This is the actual verdict. A build that links is not an answer: the Debian armhf cross
-# toolchain links an ARMv6 Rust target happily and the result dies here.
+# toolchain links an ARMv6 Rust target happily and the result dies right here.
 if [ -z "$QEMU" ]; then
   echo "=== running natively"
   "$BIN"

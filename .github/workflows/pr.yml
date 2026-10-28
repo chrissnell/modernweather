@@ -138,6 +138,30 @@ jobs:
           RUSTFLAGS: --cfg loom
         run: cargo test --workspace --locked
 
+  workflows:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # This job exists because of a mistake it would have caught: a GitHub expression
+      # written with a double-quoted string literal is a parse error, and GitHub rejects
+      # the *whole file* before running any job — so the gate reported nothing at all
+      # rather than reporting a problem. A workflow that cannot fail visibly is the one
+      # kind of CI bug this work item cannot afford.
+      #
+      # actionlint also runs shellcheck over every `run:` block, which is the only linting
+      # the shell in these files would otherwise get.
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Lint the workflows
+        run: |
+          "$(go env GOPATH)/bin/actionlint" -color
+      - name: Lint the standalone scripts
+        run: shellcheck -S warning ci/spike/armv6-cross-spike.sh ci/db/migrate-twice.sh
+
   gates:
     name: deferred gates
     runs-on: ubuntu-latest
@@ -303,6 +327,7 @@ jobs:
       - clippy
       - build
       - test
+      - workflows
       - race
       - loom
       - gates
@@ -319,7 +344,7 @@ jobs:
       # dependency failed.
       - name: Verify every job succeeded
         run: |
-          results='${{ join(needs.*.result, " ") }}'
+          results='${{ join(needs.*.result, ' ') }}'
           echo "dependency results: $results"
           for r in $results; do
             if [ "$r" != "success" ]; then

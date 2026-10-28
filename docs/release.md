@@ -49,6 +49,7 @@ The workspace contains one crate, `xtask`. **No application crate was created**,
 | `clippy` | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | |
 | `build` | `cargo build --workspace --all-targets --all-features --locked` | |
 | `test` | `cargo test --workspace --all-features --locked` | |
+| `workflows` | `actionlint` plus `shellcheck` | lints the gate itself |
 | `race` | `cargo test … -Zsanitizer=thread -Z build-std` | pinned nightly |
 | `loom` | `cargo test` with `RUSTFLAGS=--cfg loom` | stable |
 | `gates` | `cargo xtask gates` | prints the deferred set into the run summary |
@@ -594,12 +595,16 @@ and this is the one claim here that emulation cannot fully close.
 
 1. The single required check is `gate`, a job that `needs:` every other job in `pr.yml` and
    fails on any result other than `success` — including `skipped` and `cancelled`.
-2. The PR gate is `fmt`, `clippy`, `build`, `test`, `race` (ThreadSanitizer), `loom`,
-   `gates`, `codegen-drift`, `conformance`, `driver-emulators`, `database` and `coverage`.
+2. The PR gate is `fmt`, `clippy`, `build`, `test`, `workflows` (actionlint and
+   shellcheck), `race` (ThreadSanitizer), `loom`, `gates`, `codegen-drift`, `conformance`,
+   `driver-emulators`, `database` and `coverage`.
 3. Every `cargo` invocation in the gate passes `--locked`, so a dependency change must be
    committed as a lockfile change and therefore reviewed.
 4. Everything the gate does is a `cargo xtask` subcommand, reproducible locally with the
-   identical command.
+   identical command. The gate also lints *itself* with `actionlint` and `shellcheck`,
+   because a GitHub expression error makes the whole workflow file be rejected before any
+   job runs — so the gate reports *nothing* rather than reporting a problem. That happened
+   on this work item's own first CI run, which is why the job exists.
 5. The whole gate runs on pull requests, on pushes to `main`, and in a merge group.
 6. Cross-compilation runs in a separate workflow (`platform.yml`) on PRs that touch
    `Cargo.lock`, `rust-toolchain.toml`, `ci/release.toml` or `ci/spike/**`, on every push to
