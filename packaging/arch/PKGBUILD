@@ -1,0 +1,57 @@
+# Maintainer: Chris Snell <chris.snell@gmail.com>
+#
+# Published to the AUR by hand. CI validates this file against the tag being released
+# (see .github/workflows/release.yml, job `packages`) but does not publish it: pushing to
+# the AUR needs the maintainer's SSH key, and docs/release.md §5 keeps publishing credentials
+# out of CI unless the owner configures them deliberately.
+#
+# Arch Linux ARM has no ARMv6 port, so there is no armv6h entry below. That is not an
+# oversight; the Raspberry Pi Zero target is served by the deb, rpm and tarball artefacts.
+pkgname=modernweather
+pkgver=0.0.0
+pkgrel=1
+pkgdesc="Weather station data collection and distribution system"
+arch=('x86_64' 'aarch64' 'armv7h' 'armv6h')
+url="https://github.com/chrissnell/modernweather"
+license=('MIT')
+# The release binaries are statically linked against musl, but this package builds from
+# source against the system toolchain, which is the Arch convention.
+depends=('glibc')
+makedepends=('rust' 'cargo' 'git')
+backup=('var/lib/modernweather/config.db')
+install=modernweather.install
+source=("$pkgname-$pkgver.tar.gz::https://github.com/chrissnell/modernweather/archive/refs/tags/v$pkgver.tar.gz"
+        "modernweather.service"
+        "modernweather.sysusers")
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+build() {
+    cd "$srcdir/modernweather-$pkgver"
+    export CARGO_TARGET_DIR=target
+    cargo build --release --locked --package modernweather
+}
+
+check() {
+    cd "$srcdir/modernweather-$pkgver"
+    cargo test --release --locked --workspace
+}
+
+package() {
+    cd "$srcdir/modernweather-$pkgver"
+    install -Dm755 "target/release/modernweather" "$pkgdir/usr/bin/modernweather"
+    install -Dm644 "$srcdir/modernweather.service" \
+        "$pkgdir/usr/lib/systemd/system/modernweather.service"
+    install -Dm644 "$srcdir/modernweather.sysusers" \
+        "$pkgdir/usr/lib/sysusers.d/modernweather.conf"
+    install -dm750 "$pkgdir/var/lib/modernweather"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/modernweather/README.md"
+    install -Dm644 docs/release.md "$pkgdir/usr/share/doc/modernweather/release.md"
+    # Migrations are shipped so that the operator can inspect what will run; the daemon
+    # applies them from its own embedded copy (DESIGN.md D-8).
+    if compgen -G "migrations/*/*.sql" > /dev/null; then
+        for dir in migrations/*/; do
+            install -dm755 "$pkgdir/usr/share/modernweather/$dir"
+            install -Dm644 "$dir"*.sql "$pkgdir/usr/share/modernweather/$dir"
+        done
+    fi
+}

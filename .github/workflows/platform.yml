@@ -1,0 +1,107 @@
+# Cross-compilation and target validation.
+#
+# Separate from the PR gate on purpose. Four `cross` builds pull four Docker images and
+# cost roughly ten minutes; paying that on every PR to answer a question that only changes
+# when a dependency or a toolchain changes is the wrong trade. So this workflow runs:
+#
+#   * on PRs that touch the dependency graph, the toolchain pin, the target matrix, or the
+#     probe itself — the only changes that can alter the answer;
+#   * on every push to main;
+#   * weekly, because the answer can also change when a *transitive* dependency publishes
+#     a new version that a caret requirement picks up;
+#   * on demand.
+#
+# It is NOT in the required-checks set. A PR cannot regress it without touching one of the
+# paths below, and when it does the job runs and blocks nothing but is visible on the PR.
+# docs/release.md §1 states this explicitly so it is a decision rather than an omission.
+#
+# What it proves is the ARMv6 question: that the chosen crate stack — including sqlx's
+# bundled C SQLite and a rustls crypto provider — builds for, and *runs on*, an ARM1176,
+# which is the CPU in a Raspberry Pi 1 and Zero. Appendix A of docs/release.md has the
+# measured results this job re-measures.
+
+name: platform
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "ci/release.toml"
+      - "ci/spike/**"
+      - ".github/workflows/platform.yml"
+  push:
+    branches: [main]
+  schedule:
+    # Mondays, 05:17 UTC. Off the hour because every cron job in the world runs at :00.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  probe:
+    name: ${{ matrix.target }} (${{ matrix.tls }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ARMv6 is the interesting case and gets both crypto providers, because the
+          # provider is a bigger ARMv6 risk than SQLite is and the choice is still open.
+          - target: arm-unknown-linux-musleabihf
+            tls: tls-ring
+          - target: arm-unknown-linux-musleabihf
+            tls: tls-awslc
+          - target: armv7-unknown-linux-musleabihf
+            tls: tls-ring
+          - target: aarch64-unknown-linux-musl
+            tls: tls-ring
+          - target: x86_64-unknown-linux-musl
+            tls: tls-ring
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ci/spike/probe
+          key: ${{ matrix.target }}-${{ matrix.tls }}
+      - uses: taiki-e/install-action@cross
+      # qemu-user-static is what turns "it linked" into "it runs". Without it the spike
+      # script exits 3 and says so rather than reporting a pass.
+      - name: Install qemu-user-static and binutils for ARM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user-static binutils-arm-linux-gnueabihf
+      - name: Build and run the platform probe
+        env:
+          TLS: ${{ matrix.tls }}
+          READELF: arm-linux-gnueabihf-readelf
+        run: ci/spike/armv6-cross-spike.sh ${{ matrix.target }}
+
+  summary:
+    name: platform summary
+    needs: [probe]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect
+        run: |
+          {
+            echo "## Target matrix"
+            echo
+            echo "| Group | Result |"
+            echo "|---|---|"
+            echo "| Linux targets (static musl, run under qemu) | ${{ needs.probe.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "${{ needs.probe.result }}" = "success" ] || exit 1

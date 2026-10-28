@@ -5,7 +5,9 @@ Next generation weather server — a Rust rewrite of
 
 ## Status
 
-Design phase. No implementation code yet.
+Design phase. No application code yet — but the PR gate and the release pipeline are real,
+so the first implementation commit lands in a repository that can already tell it something
+is wrong. See `docs/release.md`.
 
 ## Where things are
 
@@ -14,6 +16,23 @@ Design phase. No implementation code yet.
 | `docs/rewrite/` | Agent prompts, one per work item. Start with `docs/rewrite/README.md` |
 | `docs/` | Design documents produced by those work items land here |
 | `contract/` | The frozen legacy REST surface: `legacy-v1.json`, 70 golden fixtures, and a conformance runner that replays them against any base URL |
+| `.github/workflows/` | `pr.yml` is the gate, `platform.yml` the target matrix, `release.yml` the release |
+| `ci/` | gate manifest, release matrix, database checks, the cross-compilation probe |
+| `xtask/` | every gate and release step, runnable locally with the same command |
+| `packaging/` | systemd unit, sysusers, deb/rpm scriptlets, Arch PKGBUILD, Dockerfile |
+
+## Building and checking
+
+```
+cargo xtask help          # what the gate runs
+cargo xtask gates         # which checks are armed, and which work item arms the rest
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+```
+
+Nothing publishes from CI until the owner sets the repository variables listed at the top of
+`.github/workflows/release.yml`.
 
 `docs/rewrite/README.md` is the entry point: it carries the execution order, the output contract that
 makes the work items combinable, the measured facts about the existing system, and an auditable
