@@ -70,8 +70,9 @@ if [ -n "$EXPECT_ARCH" ]; then
   #   * an ARMv7 libc, crt object or libgcc, which makes the binary genuinely unrunnable
   #     on ARMv6 — this is what Debian's armhf cross toolchain does;
   #   * a crate that ships newer assembly behind a runtime CPU-feature check, which is
-  #     fine because the newer instructions are never reached. `ring` does this: its
-  #     bsaes/vpaes/ghash/sha objects assemble as ARMv7 and it selects them from HWCAP.
+  #     fine because the newer instructions are never reached. Both candidate crypto
+  #     providers do this — `ring` and `aws-lc-sys` each carry bsaes/vpaes/ghash/sha
+  #     objects that assemble as ARMv7 and are selected from HWCAP.
   #
   # So the attribute is reported, the objects responsible are named, and an unexpected
   # name fails — but the verdict on whether the binary works is the qemu run below.
@@ -82,12 +83,16 @@ if [ -n "$EXPECT_ARCH" ]; then
       while read -r o; do
         a="$("$READELF" -A "$o" 2>/dev/null | awk '/Tag_CPU_arch:/{print $2; exit}')"
         [ "$a" = "$EXPECT_ARCH" ] || echo "$o"
-      done | sed -E 's#.*/build/([^/-]+)-[^/]*/.*#\1#' | sort -u
+      done | sed -E 's#.*/build/(.+)-[0-9a-f]+/.*#\1#' | sort -u
     )"
     echo "${OFFENDERS:-(none found among C/asm objects — the cause is in a prebuilt library)}"
     for crate in $OFFENDERS; do
       case "$crate" in
-        ring) ;;  # known: runtime-gated NEON/ARMv7 assembly, selected from HWCAP
+        # Allowlisted means two things, not one: the crate gates its newer assembly on a
+        # runtime CPU-feature check, AND a binary containing it has been observed to run
+        # correctly under `-cpu arm1176`. Both providers were checked that way, including a
+        # complete TLS 1.3 handshake, which is what actually executes the AEAD assembly.
+        ring | aws-lc-sys) ;;
         *)
           echo >&2
           echo "FAIL: $crate contributes objects above $EXPECT_ARCH and is not a known" >&2

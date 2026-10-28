@@ -552,21 +552,25 @@ requirement by construction.
 ### A.3 Both crypto providers work, with one wrinkle worth knowing
 
 `ring` and `aws-lc-rs` both cross-compile for ARMv6 musl and both complete the handshake on
-an ARM1176. The wrinkle is that **`ring` ships ARMv7 assembly**, selected at runtime from
+an ARM1176. The wrinkle is that **both ship ARMv7 assembly**, selected at runtime from
 `HWCAP`:
 
 ```
 $ # objects above the target's architecture, by crate
-ring   (bsaes-armv7, vpaes-armv7, ghash-armv4, armv4-mont, chacha-armv4, sha256/512-armv4)
+ring        7 objects   bsaes-armv7, vpaes-armv7, ghash-armv4, armv4-mont,
+                        chacha-armv4, sha256-armv4, sha512-armv4
+aws-lc-sys 10 objects   the same set plus aesv8-armx, sha1-armv4-large, trampoline-armv4
 ```
 
 Those raise the final binary's `Tag_CPU_arch` to `v7` even in the musl build. It is benign —
-`ring` gates them on a NEON check and `qemu -cpu arm1176` reports no NEON, exactly as a Pi
-Zero does, which is why the handshake completes — but it means **the ELF attribute is not a
-verdict**. `ci/spike/armv6-cross-spike.sh` therefore reports the attribute, names the crates
-responsible, fails on any crate not on a short allowlist (`ring`), and treats the qemu run as
-the actual answer. A new dependency that quietly drags in ARMv7 code gets flagged; `ring`
-does not produce a permanent false alarm.
+both gate them on a NEON check, and `qemu -cpu arm1176` reports no NEON exactly as a Pi Zero
+does, which is why the handshake completes on both — but it means **the ELF attribute is not
+a verdict**. `ci/spike/armv6-cross-spike.sh` therefore reports the attribute, names the
+crates responsible, fails on any crate not on a short allowlist (`ring`, `aws-lc-sys`), and
+treats the qemu run as the actual answer. A new dependency that quietly drags in ARMv7 code
+gets flagged; the two crypto providers do not produce a permanent false alarm. Allowlisted
+means both things: the crate gates its assembly at runtime, *and* a binary containing it has
+been observed completing a TLS handshake under `-cpu arm1176`.
 
 One honest limit: `Tag_FP_arch` is `VFPv3` even without `ring`, because the `libunwind.a`
 that rustup ships for this target contains VFPv3 register save/restore helpers. Those are
@@ -650,9 +654,10 @@ and this is the one claim here that emulation cannot fully close.
     dies with SIGILL on an ARM1176; the static musl build runs.
 25. The ARMv6 verdict is the qemu run under `-cpu arm1176`, not the build and not the ELF
     attribute. A build that links is not an answer.
-26. The ELF architecture attribute is reported, not asserted: `ring` ships runtime-gated
-    ARMv7 assembly. The spike script names the crates responsible and fails on any crate not
-    on a short allowlist.
+26. The ELF architecture attribute is reported, not asserted: both `ring` and `aws-lc-sys`
+    ship runtime-gated ARMv7 assembly. The spike script names the crates responsible and
+    fails on any crate not on a short allowlist, where being allowlisted means the crate
+    gates its assembly at runtime *and* has been observed running under `-cpu arm1176`.
 27. **The ARMv6 answer does not feed back into the SQLite driver choice.** `sqlx`'s bundled C
     SQLite compiles for ARMv6 and runs on an ARM1176; D-32 stands unamended.
 28. `cross` is the cross-compilation tool, with `MW_BUILDER=cargo` as the local override.

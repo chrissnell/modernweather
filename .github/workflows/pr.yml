@@ -112,9 +112,10 @@ jobs:
           # A leak at process exit is not a race, and TSan's leak checker fires on
           # perfectly ordinary Box::leak of a static.
           TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 detect_leaks=0
-        # dtolnay/rust-toolchain exports RUSTUP_TOOLCHAIN, which overrides
-        # rust-toolchain.toml — without that this job would silently run on stable and
-        # -Zsanitizer would be rejected.
+          # Set explicitly, because rust-toolchain.toml otherwise wins and cargo runs on
+          # stable, where -Z is rejected outright. Installing a nightly toolchain is not
+          # the same as selecting it.
+          RUSTUP_TOOLCHAIN: nightly-2026-10-01
         run: |
           cargo test --workspace --all-features --locked \
             -Z build-std --target x86_64-unknown-linux-gnu
