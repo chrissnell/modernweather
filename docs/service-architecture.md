@@ -17,7 +17,7 @@ the mechanism. It contains trait and type **sketches** and no implementation cod
 
 ---
 
-## Read this before §1 — four things that are not where you expect them
+## Read this before §1 — five things that are not where you expect them
 
 ### 1. No `DESIGN.md` decision is contradicted. Four are *extended*, and they are flagged, not applied.
 
@@ -75,7 +75,21 @@ has no `{{ .AboutStationHTML }}` action, and `js/weather-app.js.tmpl` receives i
 not the current behaviour, and §7 specifies the trust boundary for what *is* happening plus a rule
 that keeps it that way.
 
-### 4. The vocabulary here is internal
+### 4. Every open question has been decided
+
+The first draft of this document raised ten questions for the owner. The owner asked for the calls to
+be made rather than referred, so they are all decided — and two of them turned out to rest on a fact
+rather than a judgement and were settled by reading the code (the conformance runner's header
+handling, and whether `grpc_port` is a real configuration column; it is). The **Open questions**
+section now records each call with its one-line reason and **what would reverse it**, because a
+decision taken on somebody else's behalf without a reversal trigger is one nobody can revisit safely.
+Decisions 88–97 carry the same ten calls in the numbered list.
+
+One of the ten is work for another work item rather than a choice here: **Decision 89**, proto3 field
+presence, needs a line per field in W2's generator — without it a collector stores `0.0` for a metric
+a satellite never reported.
+
+### 5. The vocabulary here is internal
 
 `Ingress`, `Spool`, `Cursor`, `RouteTable`, `SniResolver`, `WindowedView`, `Envelope` are names chosen
 for Rust source. **W5 §0 owns the user-facing translation table and an internal term on screen is a
@@ -885,9 +899,13 @@ iOS release that sends `If-None-Match` gets 304s with no server change and no co
 must **not** happen is "fixing" `Cache-Control`, which would be a bytes-visible change to a frozen
 header.
 
-One risk, raised as **OQ-W3-1**: W1 Decision 3 says conformance asserts *headers*, and an added
-`ETag` on a frozen endpoint could fail a strict header-set comparison. The recommendation there is
-that W1's runner assert required headers are present and correct rather than that no others exist.
+**This cannot fail conformance, and that is checked rather than assumed.**
+`contract/conformance/src/lib.rs:320` iterates `assert.headers` — a per-fixture **allowlist of header
+names** — and for each one asserts presence and a value match. It never enumerates the response's
+headers, so it cannot notice an extra one. `contract/fixtures/latest-default-station.json` lists
+exactly four (`Access-Control-Allow-Origin`, `Cache-Control`, `Content-Type`, `Vary`). An additive
+`ETag` is therefore invisible to the suite by construction, which is also why `Date` and `Server`
+have never been a problem.
 
 ### 2a.6 Graceful degradation
 
@@ -1504,11 +1522,15 @@ supervisor as a root fact.
   a span carrying it, regardless of level. The current implementation instead mutates the shared
   `*gorm.DB` logger, so one debug request changes logging for every concurrent request.
 
-**Where the handle lives in the capability graph.** It is operator control, and the only consumer is
-`api:management`. Rather than add a thirteenth capability for one consumer, it is exposed through
-**`ComponentControl`**, which is already supervisor-provided and already means "observe and control".
-This is a widening of a W2a capability's meaning, so it is flagged rather than assumed —
-**OQ-W3-3**.
+**Where the handle lives in the capability graph. Decided: `ComponentControl`.** It is operator
+control of a running process, the provider is the same root (the supervisor), and the consumer is the
+same single component (`api:management`). A thirteenth capability for one consumer is noise in a
+graph whose only two jobs are start ordering and `Waiting`.
+
+The alternative worth naming and rejecting: making it a root fact in every `Cx`, like the config
+watch. W2a's reason for the config watch being a root fact is that *every* component needs it;
+exactly one component needs this, so the same argument runs the other way. Recorded as a widening of
+`ComponentControl`'s meaning in the assumptions, so W2a can grep it.
 
 ### 5.6 Repetition control
 
@@ -1678,8 +1700,17 @@ literally as "one socket", that would move the gRPC services from their current 
 
 > **The unit that is singular is the router and the route table, not the file descriptor.**
 > `http:listener` binds **N sockets from configuration** — the main port, an optional plaintext port
-> that redirects, and an optional legacy gRPC port for existing peers — and serves **one `Router`**
-> on all of them. One place owns listening, one route table, one TLS story, one shutdown path.
+> that redirects, and the configured gRPC port — and serves **one `Router`** on all of them. One
+> place owns listening, one route table, one TLS story, one shutdown path.
+
+**The gRPC port keeps its own socket, and this is not a concession.** `grpc_port` is a real
+configuration column with a default of 50051 (`pkg/config/provider_sqlite.go:231`), and the
+management API *validates that it differs from both the HTTP and the HTTPS port*
+(`handlers_controllers.go:501`, `:506`). So a separate socket is the configured, validated,
+shipped behaviour — folding it onto 443 would mean invalidating a config column, breaking every
+machine-to-machine peer at upgrade, and making the rewrite's first operational event a flag day
+across the fleet. It stays, bound whenever the configuration names a port, and serving the same
+`Router` as everything else so there is still exactly one route table.
 
 That is recorded as proposed amendment **A-W3-4** to D-31, because the prompt's own wording is "one
 listener, not seven" and the difference matters to W7.
@@ -1721,8 +1752,12 @@ constants the handlers are registered with, so a typo exists in one place; a mis
 manifest and the registered handlers is a `BuildError::UndeclaredRoute` and a per-component unit test
 asserts the two sets are equal.
 
-Carrying a `RouteManifest` on `Provision` is an extension to W2a's `ComponentSpec`, so it is flagged
-rather than assumed — **OQ-W3-4**.
+Carrying a `RouteManifest` on `Provision` is an extension to W2a's `ComponentSpec` — one enum with
+one variant — and it is **taken**, because the two alternatives are both worse in a specific way.
+Detecting at mount time means the one component everything else's reachability depends on is the
+component that fails, and it fails *after* its siblings have started. Not detecting is the current
+behaviour, and it is how two components can silently claim `/latest` with the last registration
+winning. Recorded in the assumptions so W2a can grep it.
 
 **Mounting.** `http:listener` subscribes to the additive capability's
 `watch<Arc<Vec<RouteTable>>>`, rebuilds a `Router`, and publishes it through
@@ -1857,9 +1892,13 @@ fields as bare proto3 scalars (`float barometer = 4;`), which have **no field pr
 `0.0` are the same bytes. This document's writer stores `NULL` for an unreported metric (§2.5), so a
 reading forwarded to a collector arrives with `0.0` where the satellite held `NULL`, and the
 collector stores a zero. That is a silent data corruption across a hop, visible only as a wrong
-average months later. The fix is one line per field in W2's generator — proto3 `optional`, which is
-wire-compatible (same tags, same encoding; presence is tracked by the generated code) — and it is
-raised as **OQ-W3-2** with W2 and W7 recorded as the owners.
+average months later. **The call: W2's generator emits proto3 `optional` on every metric field.** It is wire-compatible —
+same field numbers, same tag bytes, same encoding; explicit presence is bookkeeping in the generated
+code, not a format change — so it costs nothing on the wire and is the only option that lets a
+satellite and its collector hold the same data. The work is one line per field in a generator that
+already emits the file. This is the one decision here that another work item has to execute, so it is
+recorded against W2 (the generator), W7 (the uplink must carry presence) and W4 (a collector-written
+row can now be NULL) rather than being settled unilaterally in silence.
 
 ### 6.6 gRPC on the same socket, and the rest of the transport behaviour
 
@@ -1949,13 +1988,22 @@ quirks that a mime crate will get "right" and therefore wrong:
 | `/fonts/*` | `font/ttf`, `font/woff2`, … |
 | `/images/*`, `/favicon.ico` | sniffed — `image/vnd.microsoft.icon` for `.ico` |
 
-**Cache headers: reproduce the frozen behaviour exactly, and add conditional GET.** Today only
-`/fonts/` carries `Cache-Control: public, max-age=31536000, immutable`; every other asset is served
-with no caching headers at all, on payloads that never change between releases. The frozen behaviour
-is kept byte for byte, and `ETag` (the embedded content's hash) plus `Last-Modified` (the build
-timestamp) are **added**, so a client that sends `If-None-Match` gets a 304 and one that does not
-gets today's response. Adding `max-age` to `/js`, `/css` and `/images` would be a real improvement
-and a real deviation from D-37; it is **OQ-W3-5** for the owner rather than an agent's judgement.
+**Cache headers: reproduce the frozen behaviour exactly, add conditional GET, and do not add
+`max-age`.** Today only `/fonts/` carries `Cache-Control: public, max-age=31536000, immutable`; every
+other asset is served with no caching headers at all, on payloads that change only when the binary
+does. The frozen behaviour is kept byte for byte, and `ETag` (the embedded content's hash) plus
+`Last-Modified` (the build timestamp) are **added**, so a client sending `If-None-Match` gets a 304
+and one that does not gets today's response.
+
+**`max-age` is deliberately not added, and that is a decision rather than caution.** `ETag` already
+captures the entire practical benefit: the browser revalidates and gets a 304 with no body, so the
+bytes are saved. What `max-age` adds on top is skipping the revalidation request itself — worth
+microseconds on a LAN — and what it costs is real: the asset filenames are not content-hashed, so a
+long `max-age` means a browser keeps running the *previous release's* `weather-app.js` against the
+new server until the TTL expires, which is a support call that looks like a server bug. A short
+`max-age` saves nothing `ETag` has not already saved. The right version of this change is
+content-hashed filenames plus a year-long `max-age`, and that is a website change, which D-38 puts
+out of scope.
 
 **Directory listings** (Q-20): W1's OQ-W1-4 recommends returning 404 instead of reproducing
 `http.FileServer`'s HTML index for `/js/`, `/css/`, `/images/` and `/fonts/`. This document follows
@@ -2432,7 +2480,7 @@ the registry, not the database.
 74. The HTML templates are ported to **askama**, with a **`GoHtmlEscaper`** that reproduces `html/template`'s `&#34;`/`&#39;` exactly — which is what makes the acceptance test a **byte-diff against W1's recorded bodies** rather than an eyeball.
 75. `portal.html.tmpl` consumes nothing and becomes a **static asset with no template**.
 76. Static assets are **embedded in the binary** with a hard-coded mime table (not `mime_guess`), because two frozen content types — `/js/weather-app.js` without a charset and `site.webmanifest` as `text/plain` — are quirks a mime crate would "correct".
-77. Asset cache headers are reproduced exactly and **`ETag`/`Last-Modified` are added**; `max-age` on `/js`, `/css` and `/images` is a deviation left to the owner.
+77. Asset cache headers are reproduced exactly and **`ETag`/`Last-Modified` are added, but `max-age` is not**: `ETag` already saves the bytes via a 304, while `max-age` without content-hashed filenames means a browser runs the previous release's `weather-app.js` against the new server until the TTL expires.
 78. **Directory listings return 404** (W1's OQ-W1-4 recommendation), recorded as a deliberate deviation.
 79. The config payload replacing `weather-app.js.tmpl` is **delivered inline as `<script id="mw-config" type="application/json">`**, following the page's existing `radar-config` precedent, with `GET /config.json` as the additive endpoint — avoiding an extra round trip and an async boundary in a module that is synchronous today.
 80. **The nine values are exactly W1 §9's consumed set**, with JSON keys equal to the JavaScript object's keys, so the module's body does not change.
@@ -2444,143 +2492,54 @@ the registry, not the database.
 86. All four extensibility walkthroughs touch **at most four hand-written files**; adding a metric touches one to three, against the Go calibration of roughly eight.
 87. **`admit` must do no I/O but the spool append** — identity resolution reads an `ArcSwap` of the registry, never the database. This is the one efficiency statement in §10 that is a requirement rather than a prohibition.
 
+**The following ten were raised as open questions in the first draft and decided on the owner's
+request. Each carries a reversal trigger in the Open questions section.**
+
+88. **`ETag` is emitted on `/latest`, `/snow` and the assets, and it cannot fail conformance** — verified, not assumed: the runner asserts a per-fixture *allowlist* of header names (`contract/conformance/src/lib.rs:320`) and never enumerates the response's headers.
+89. **W2's generator emits proto3 `optional` on every metric field**, because it is wire-compatible and is the only option under which a collector stores what the satellite actually measured rather than `0.0` for an unreported metric.
+90. **Runtime log-level control is exposed through `ComponentControl`** rather than as a thirteenth capability or as a root fact in every `Cx` — one consumer, same root provider, and W2a's own reason for root facts (every component needs it) runs the other way here.
+91. **`Provision` gains `ProvisionDetail::Routes(RouteManifest)`**, because the alternatives are failing the one component everything else's reachability depends on, *after* its siblings have started, or not detecting a duplicate route at all.
+92. **The gRPC service keeps its own socket** — verified, not conceded: `grpc_port` is a config column defaulting to 50051 and the management API validates that it differs from the HTTP and HTTPS ports, so a separate socket is the shipped, validated behaviour and folding it onto 443 would be a fleet-wide flag day.
+93. **Metrics are Prometheus text on `/metrics`** rather than counters on a status endpoint, because a status endpoint has to invent a format and then somebody writes an exporter for it anyway.
+94. **A full spool drops the newest at the edge, counted and alarmed** — stalling `admit` loses the same Davis packets *and* hangs shutdown, and dropping the oldest spooled envelopes would discard exactly what durability exists to protect.
+95. **`Host` matching is case-insensitive**, because the current case-sensitive map silently serves one website's data under another's hostname and preserving that preserves a bug rather than a contract.
+96. **Directory listings return 404** on the four asset trees, per W1's own recommendation.
+97. **Every decision taken on the owner's behalf carries a stated reversal trigger**, because a call made for somebody else without one is a call nobody can revisit safely.
+
 ---
 
 # Open questions
 
-Stated as decisions for the owner, with options and a recommendation.
+**None are left for the owner.** The ten questions this document originally raised have all been
+decided; the owner asked for the calls to be made rather than referred, and the two that turned on a
+fact rather than a judgement were settled by reading the code instead of by choosing.
 
-**OQ-W3-1. Does an added `ETag` header on a frozen endpoint break conformance?**
+The format below is deliberate: each entry records the **call**, the **reason in one line**, and —
+the part that matters for a decision taken on someone else's behalf — **what would reverse it**. A
+decision with no stated reversal trigger is a decision nobody can revisit safely.
 
-§2a.5 adds `ETag` to `/latest` (and `/snow`, and the asset routes). W1 Decision 3 says conformance
-asserts "status, headers, key set, value types, numeric formatting, key order … and trailing-newline
-presence". If "headers" means an exact set comparison, every additive header fails the suite; if it
-means "the recorded headers are present and correct", additive headers pass.
+| | Call | Why | What would reverse it |
+|---|---|---|---|
+| **1** | **`ETag` is emitted on `/latest`, `/snow` and the assets.** | **Settled by fact, not judgement.** The conformance runner asserts a per-fixture *allowlist* of header names (`contract/conformance/src/lib.rs:320`) and never enumerates the response's headers, so an additive header is invisible to it — which is also why `Date` and `Server` have never been a problem. | Nothing. This was a question about what the runner does, and the runner does not care. |
+| **2** | **W2's generator emits proto3 `optional` on every metric field.** | Wire-compatible (same field numbers, same tags, same encoding), and the only option under which a satellite and its collector hold the same data rather than the collector silently storing `0.0` for a metric that was never reported. | Evidence that a deployed non-Rust consumer of the proto breaks on explicit presence. None is known; the only consumers are this daemon and its own peers. |
+| **3** | **Log-level control is exposed through `ComponentControl`.** | Operator control of a running process, same root provider, one consumer. A thirteenth capability for one consumer is noise in a graph whose only jobs are start ordering and `Waiting`. | W2a deciding that `ComponentControl` is strictly about component lifecycle, in which case it becomes a thirteenth capability — a rename, not a redesign. |
+| **4** | **`Provision` gains `ProvisionDetail::Routes(RouteManifest)`.** | It is what makes a duplicate route a `PlanError` naming both owners instead of a silent last-registration-wins. The alternative fails the one component everything else's reachability depends on, and fails it *after* its siblings have started. | W2a declining the extension; detection then moves into `http:listener::build` and the listener becomes the thing that fails when two other components disagree. |
+| **5** | **Assets get `ETag` and `Last-Modified`. They do not get `max-age`.** | `ETag` already saves the bytes — the browser revalidates and gets a 304 with no body. `max-age` only saves the revalidation *request*, worth microseconds on a LAN, and costs a browser running the previous release's `weather-app.js` against the new server until the TTL expires. | Content-hashed asset filenames. With those, a year-long `max-age` is correct and safe — but that is a website change, which D-38 puts out of scope. |
+| **6** | **The gRPC port keeps its own socket.** | **Settled by fact.** `grpc_port` is a configuration column defaulting to 50051 (`pkg/config/provider_sqlite.go:231`) and the management API *validates that it differs from the HTTP and HTTPS ports* (`handlers_controllers.go:501`, `:506`). A separate socket is the shipped, validated behaviour; folding it onto 443 would invalidate a config column and make the rewrite's first operational event a fleet-wide flag day. | A W9 migration report showing no peer still uses the legacy port, at which point it can be retired as an ordinary deprecation rather than as an upgrade break. |
+| **7** | **Prometheus text on an additive `/metrics` route**, with the same numbers as JSON for the UI. | A status endpoint has to invent a format and then somebody writes an exporter for it anyway. The recorder is in-process and costs nothing when nobody scrapes. | Nothing in sight. OpenTelemetry would be the upgrade path if tracing ever needs to leave the process, and `metrics` does not block it. |
+| **8** | **A full spool drops at the edge, counted and alarmed.** | Stalling `admit` back-pressures the Davis serial loop, which drops packets anyway — so stalling loses the same data *and* hangs shutdown. Dropping the *oldest* spooled envelopes instead would discard exactly what durability exists to protect, so the newest is the right thing to refuse. | Nothing. The real protection is upstream: `spool_depth_bytes` rises for days first, and at 2 GiB the ceiling is ~12 days of worst-case density. |
+| **9** | **`Host` matching is case-insensitive.** | Hostnames are case-insensitive, and today a request for `EXAMPLE.COM` falls through a case-sensitive map and silently serves *someone else's* website. Preserving that is preserving a bug, not a contract. | A fixture showing a client depends on the fall-through. None exists; no fixture covers mixed case. |
+| **10** | **Directory listings return 404.** | W1's own recommendation. No client requests `/js/`, `/css/`, `/images/` or `/fonts/` as directories, and an HTML index of the asset tree is a small information disclosure that nothing here benefits from. | A client discovered to enumerate the asset tree. There is none in either shipped client. |
 
-*Options.* (a) W1's runner asserts required headers present-and-correct, additive headers permitted.
-(b) Gate `ETag` behind the request carrying `If-None-Match`, so a client that does not ask never sees
-it. (c) Drop conditional GET.
+**Three of these change bytes a client could in principle observe** — entries 5 (an added `ETag`), 9
+(case-insensitive `Host`) and 10 (404 instead of a directory index) — so they are deviations from
+D-37 however small, and they are listed again in the assumptions for W6's ledger. Each is additive
+or closes a defect; none removes a response any shipped client reads.
 
-*Recommendation:* **(a)**, and it is almost certainly already the intent — the alternative would also
-forbid `Server`, `Date` and any future header. The conformance runner should state it explicitly, and
-if the owner prefers belt and braces, (b) costs two lines and is strictly compatible. **W1 confirms.**
-
-**OQ-W3-2. The committed protobuf cannot express "the sensor did not report".**
-
-`generated/proto/reading.proto` declares metric fields as bare proto3 scalars, which have no field
-presence, so absent and `0.0` are identical on the wire. This document's writer stores `NULL` for an
-unreported metric (§2.5), so a reading crossing a collector hop arrives as `0.0` and the collector
-stores a zero. That is silent corruption whose only symptom is a wrong average months later, and it
-also interacts with W1-BUG-1 in the opposite direction from the local writer.
-
-*Options.* (a) Mark every metric field `optional` in W2's generator — proto3 explicit presence, which
-is **wire-compatible**: same field numbers, same encoding, presence tracked in the generated code.
-(b) Add a parallel presence bitmap field. (c) Accept the loss and document that a collector's copy is
-zero-filled.
-
-*Recommendation:* **(a).** It is one line per field in a generator that already emits the file, it
-changes no field number, and it is the only option that makes a satellite and its collector hold the
-same data. **W2 owns the generator change; W7 owns confirming the uplink carries presence; W4 should
-know that a collector-written row can now be NULL.**
-
-**OQ-W3-3. Where does runtime log-level control live in the capability graph?**
-
-§5.5 needs `api:management` to reach the `tracing_subscriber::reload` handle. W2a's capability set is
-closed at twelve and this document must not silently redesign it.
-
-*Options.* (a) Expose it through **`ComponentControl`**, which is already supervisor-provided and
-already means "observe state; start/stop/run-now". (b) Add a thirteenth capability, `LogControl`.
-(c) Make it a root fact in every `Cx`, like the config watch.
-
-*Recommendation:* **(a).** It is operator control of a running process, provided by the same root,
-consumed by the same single component. (c) is wrong because W2a's reason for making the config watch
-a root fact is that *every* component needs it, and exactly one needs this. **W2a confirms, or W6
-records (b).**
-
-**OQ-W3-4. `ComponentSpec` needs a `RouteManifest` for plan-time conflict detection.**
-
-§6.2 detects duplicate routes in `plan()`, which requires the declared paths to be available from the
-spec rather than from a built component. That is an extension to W2a's `Provision`:
-`ProvisionDetail::Routes(RouteManifest)`.
-
-*Options.* (a) Extend `Provision` as above. (b) Detect conflicts at mount time, in `http:listener`'s
-`build`, failing the listener. (c) Do not detect; last writer wins, as `gorilla/mux` effectively does
-today.
-
-*Recommendation:* **(a).** (b) means the one component whose availability everything else depends on
-is the component that fails, and it fails *after* other components have started. (c) is the current
-behaviour and it is how two components can silently claim `/latest`. The extension is one enum with
-one variant. **W2a confirms.**
-
-**OQ-W3-5. Do the static assets get real cache headers?**
-
-Today only `/fonts/` carries `Cache-Control`; `/js`, `/css` and `/images` are served with none, on
-payloads that change only when the binary does. §7.2 reproduces that exactly and adds `ETag`, which
-is strictly additive.
-
-*Options.* (a) Reproduce exactly, `ETag` only — what this document ships. (b) Add
-`public, max-age=31536000, immutable` to the content-hashed asset paths as well, which would require
-hashed filenames to be safe. (c) Add a modest `max-age=3600` with no filename change.
-
-*Recommendation:* **(a) now, (c) with the owner's signature.** It changes bytes no shipped client
-parses, so the risk is near zero — but it is a deviation from D-37 and W1 Decision 14, and this
-document's rule is that deviations are the owner's.
-
-**OQ-W3-6. Does the legacy gRPC port stay bound?**
-
-§6.1 folds gRPC onto the main router but keeps an optional second socket, because moving the service
-from its current dedicated port to 443 would break every machine-to-machine peer on upgrade.
-
-*Options.* (a) Keep the legacy port bindable, defaulting to **on** when the configuration names one.
-(b) Default to off and require an explicit opt-in. (c) One socket only; peers are reconfigured at
-upgrade time.
-
-*Recommendation:* **(a).** The cost is one `TcpListener` serving the same `Router`; the cost of (c)
-is a flag day across the fleet. W9's migration can report which peers are still on the legacy port,
-and the port can be retired once the report is empty. **Owner decides; W7 should know the answer.**
-
-**OQ-W3-7. Prometheus, or counters on a status endpoint?**
-
-§5.10 chooses Prometheus text exposition, which is an *addition* to D-32's crate list rather than a
-substitution.
-
-*Options.* (a) `metrics` + `metrics-exporter-prometheus` on an additive `/metrics` route, with the
-same numbers as JSON for the UI. (b) Hand-rolled counters rendered as JSON only. (c) OpenTelemetry.
-
-*Recommendation:* **(a).** (b) has to invent a format and then somebody writes an exporter for it
-anyway. (c) is a much larger dependency for a single-process homelab daemon. Recorded as proposed
-amendment A-W3-1 so D-32 stays the single list.
-
-**OQ-W3-8. What happens when the spool reaches its ceiling?**
-
-§2.7 decides *drop at the edge and alarm*, over *stall ingest*. The reasoning is that a stalled
-`admit` back-pressures the Davis serial loop, which drops packets anyway, and additionally hangs
-shutdown — so stalling loses the same data and costs more.
-
-*Options.* (a) Drop at the edge, counted and alarmed. (b) Stall ingest. (c) Drop the *oldest* spooled
-envelopes instead of refusing new ones.
-
-*Recommendation:* **(a).** (c) is tempting and wrong: the oldest envelopes are the ones a durable
-sink has not yet stored, so dropping them is exactly the loss durability exists to prevent, while
-dropping the newest at least leaves the historical record contiguous. The real protection is that
-`spool_depth_bytes` rises for weeks first.
-
-**OQ-W3-9. Case-insensitive `Host` matching is a behaviour change. Confirm it?**
-
-The Go lookup is a case-sensitive map, so `EXAMPLE.COM` falls through to the default website today
-and would match under §6.3. No fixture covers it.
-
-*Recommendation:* **make it case-insensitive**, because hostnames are case-insensitive and the
-current behaviour serves one site's data under another's name. Recorded as a deliberate deviation so
-W6's ledger carries it rather than a reader discovering a diff.
-
-**OQ-W3-10. Do `/js/`, `/css/`, `/images/` and `/fonts/` keep their directory listings?**
-
-W1's OQ-W1-4 recommends 404 and this document follows it, but the decision is the owner's because it
-is a deviation from D-37, however small.
-
-*Recommendation:* **404**, as W1 recommends. No client requests them, and a directory index is a
-minor information disclosure that nothing here benefits from.
+**One of these is work for another work item rather than this one**: entry 2 needs a line per field
+in W2's generator, W7 must carry presence on the wire, and W4 should expect a collector-written row
+to contain NULL. It is recorded against all three rather than being quietly assumed, because it is
+the one finding here that no single document would have produced on its own.
 
 ---
 
@@ -2593,13 +2552,15 @@ detector**: if one of these is wrong, it is findable with a grep rather than dur
 
 1. `ComponentSpec`, `Trigger`, `Capability`, `Need`/`Provision`, `Strength`, `Access`, `Arity`,
    `Tick`/`OnReading`/`Serve` and the lifecycle states are **implemented as written**; this document
-   adds mechanics, not variants — with the two exceptions in assumptions 2 and 3, both raised as open
-   questions rather than assumed.
+   adds mechanics, not variants — with the two exceptions in assumptions 2 and 3, both decided here
+   and both reversible by a rename rather than a redesign.
 2. `Provision` gains `ProvisionDetail::Routes(RouteManifest)` so that route conflicts are a
-   `PlanError` (OQ-W3-4). If W2a declines, §6.2's detection moves to `http:listener::build` and the
-   listener becomes the component that fails when two others disagree.
-3. `ComponentControl` also carries runtime log-level control (OQ-W3-3). If W2a declines, the
-   capability set grows to thirteen.
+   `PlanError` (Decision 91). **Taken**, not asked: if W2a declines, §6.2's detection moves into
+   `http:listener::build` and the listener becomes the component that fails when two others disagree
+   — which is why it was taken.
+3. `ComponentControl` also carries runtime log-level control (Decision 90). **Taken**, not asked: if
+   W2a reads `ComponentControl` as strictly lifecycle, the capability set grows to thirteen and
+   nothing else about §5.5 changes.
 4. **`Durable` is satisfied by a local durable spool at the fan-out point, not a bounded channel**
    (W2a Decision 62), and W7's spool is that mechanism rather than a collector-only facility. §2 is
    written against that; if the spool were a channel, W2a Decision 61 or 62 is violated.
@@ -2628,7 +2589,7 @@ detector**: if one of these is wrong, it is findable with a grep rather than dur
 13. The query layer reads `generated/rust/aggregates.rs` for which columns a level holds rather than
     re-deriving them (W2 assumption 15), and knows that a mean requires `mw_mean(c_sum, c_count)` and
     a direction requires `mw_circular_mean(c_sin_sum, c_cos_sum, c_dir_count)` (assumption 16).
-14. **The generator can be made to emit proto3 `optional` on metric fields** (OQ-W3-2). Without it,
+14. **The generator emits proto3 `optional` on metric fields** (Decision 89). Without it,
     the uplink cannot distinguish an unreported metric from zero, and §2.5's NULL-storing writer
     produces zeros on the far side of a hop.
 15. The registry's per-metric `agg` is the same field that generates aggregate SQL and that resolves
@@ -2663,8 +2624,11 @@ detector**: if one of these is wrong, it is findable with a grep rather than dur
 
 **About W1 (frozen contract)**
 
-25. **Conformance asserts that the recorded headers are present and correct, not that no other header
-    exists** (OQ-W3-1). Additive `ETag`, `X-MW-Snapshot-Age` and `X-MW-Degraded` depend on it.
+25. Conformance asserts a per-fixture **allowlist** of header names and never enumerates the
+    response's headers — **verified at `contract/conformance/src/lib.rs:320`**, so this is a
+    confirmed property rather than an assumption, and the additive `ETag`, `X-MW-Snapshot-Age` and
+    `X-MW-Degraded` headers cannot fail the suite. If a future runner adds a full header-set
+    comparison, it must exempt additive headers or it will also fail on `Date` and `Server`.
 26. The recorded HTML bodies in `contract/fixtures/` are usable as **byte goldens** for §7.1's
     template port, not merely as substring references. If they were captured with any normalisation,
     §7.1's acceptance test weakens to substring level and the `GoHtmlEscaper` decision loses its
@@ -2718,10 +2682,11 @@ detector**: if one of these is wrong, it is findable with a grep rather than dur
     defaults over W7's format.
 44. The uplink is a `Trigger::OnReading { NotFrom(self), Durable, 10 s }` component wrapped in
     `SpooledSink`, with no bespoke lifecycle (W2a Decision 25).
-45. W7 needs OQ-W3-2's answer before the wire protocol is frozen: without proto3 presence, a
-    forwarded reading cannot carry "not reported".
-46. W7 should know whether the legacy gRPC port stays bound (OQ-W3-6), because it decides whether a
-    satellite's endpoint changes at upgrade.
+45. W7 must carry proto3 field presence on the wire (Decision 89); without it a forwarded reading
+    cannot say "not reported" and the collector stores `0.0`. This is the one decision here that
+    another work item has to execute.
+46. **A satellite's endpoint does not change at upgrade** (Decision 92): the configured `grpc_port`
+    stays bound, serving the same router.
 47. `station:grpcrx` authenticates with mTLS at the TLS layer, before any frame is decoded (W2a
     Decision 46), which means the SNI resolver and the client-certificate verifier are configured
     together in `mw-http` and the peer identity reaches `Ingress::admit` through `FrameMeta`.
@@ -2752,17 +2717,22 @@ detector**: if one of these is wrong, it is findable with a grep rather than dur
 **About W6 (reconciliation)**
 
 57. W6 reads the four closing sections and treats the prose as background.
-58. W6 carries the deliberate deviations from D-37 forward as a ledger: **case-insensitive `Host`
-    matching** (OQ-W3-9), **404 instead of directory listings** (OQ-W3-10), and **additive response
-    headers** (OQ-W3-1) — three bytes-visible changes, each with the owner's decision attached.
+58. W6 carries the three deliberate deviations from D-37 forward as a ledger: **case-insensitive
+    `Host` matching** (Decision 95), **404 instead of directory listings** (Decision 96), and
+    **additive response headers** (Decision 88). All three were decided here at the owner's request;
+    each is additive or closes a defect, none removes a response a shipped client reads, and each
+    carries a reversal trigger in the Open questions section.
 59. W6 records the two corrected measurements in this document's header (`/latest` is 12 round trips,
     `/snow` is 4 or 8) against `docs/rewrite/README.md`'s "Measured facts" table, which currently
     states 7 for both.
 60. W6 records the **v2 API** as a named future work item (D-39); every additive route this document
     introduces (`/metrics`, `/config.json`, `/api/logs`, the `X-MW-*` headers) is deliberately
     outside the frozen surface and is the v2 item's starting inventory.
-61. W6 reconciles OQ-W3-2 across W2, W4 and W7, since it is the one finding here that no single
-    document would have produced.
+61. W6 reconciles Decision 89 (proto3 field presence) across W2, W4 and W7 — the one finding here
+    that no single document would have produced, and the only decision this document makes that
+    another work item has to implement.
+62. **W6 should expect no open questions from W3.** All ten were decided at the owner's request; the
+    Open questions section records each call with its reversal trigger instead of deferring it.
 
 ---
 
@@ -2878,6 +2848,12 @@ document.
 | `AboutStationHTML` is passed and never consumed | `rg -n 'AboutStationHTML' internal/controllers/restserver/assets/` returns nothing |
 | `weather-app.js.tmpl` interpolates exactly nine values | `rg -n '{{' internal/controllers/restserver/assets/js/weather-app.js.tmpl` |
 | the two hot-path handlers' extent | `handlers.go:205-403` (`/latest`) and `:406-613` (`/snow`) |
+| `grpc_port` is a validated config column defaulting to 50051 | `pkg/config/provider_sqlite.go:231`, and the port-collision checks at `internal/controllers/management/handlers_controllers.go:501` and `:506` |
+
+One claim is about this repository rather than the Go tree, and it is what settles the `ETag`
+question in the Open questions section: the conformance runner asserts a **per-fixture allowlist** of
+header names and never enumerates the response's headers. See `contract/conformance/src/lib.rs:320`
+and the four-entry `assert.headers` array in `contract/fixtures/latest-default-station.json`.
 
 The PostgreSQL bind-parameter ceiling (65,535) that fixes the 256-envelope batch is a protocol
 constant, not a measurement; the derived row ceiling of 303 is `65535 / 216` against the registry's
