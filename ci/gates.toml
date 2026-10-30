@@ -28,6 +28,23 @@ write into the working tree, because a check that fixes the problem it is checki
 always passes."""
 
 [[gate]]
+id = "legacy-import-drift"
+description = "The Go-to-Rust migration SQL matches the registry and the Go view inventory"
+owner = "W9 (data migration)"
+arms_when = "ci/db/migrate-from-go/go-aggregate-views.toml"
+cmd = ["cargo", "xtask", "legacy-import", "--check"]
+note = """
+The migration SQL in ci/db/migrate-from-go/generated/ is emitted from metrics/registry.toml
+and from the Go view inventory, and it is committed so that a 629-column transform can be
+reviewed rather than trusted. That only means anything while the committed copy matches its
+inputs: a registry change between review and cutover would otherwise leave an INSERT naming
+columns the destination no longer has, and the failure would arrive mid-import.
+
+Separate from codegen-drift on purpose. `codegen --check` says "generated/ matches
+metrics/registry.toml" and should keep saying exactly that; this emitter has a second input
+describing a frozen tree at a named commit."""
+
+[[gate]]
 id = "conformance"
 description = "Frozen legacy REST contract replayed against the built binary"
 owner = "W1 (frozen contract)"

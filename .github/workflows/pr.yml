@@ -161,7 +161,16 @@ jobs:
         run: |
           "$(go env GOPATH)/bin/actionlint" -color
       - name: Lint the standalone scripts
-        run: shellcheck -S warning ci/spike/armv6-cross-spike.sh ci/db/migrate-twice.sh
+        run: |
+          shellcheck -S warning \
+            ci/spike/armv6-cross-spike.sh \
+            ci/db/migrate-twice.sh \
+            ci/db/rebuild-aggregates.sh \
+            ci/db/migrate-from-go/migrate-from-go.sh \
+            ci/db/migrate-from-go/extract-go-views.sh \
+            ci/db/migrate-from-go/lab/run-in-pod.sh \
+            ci/db/migrate-from-go/lab/emit-old-schema.sh \
+            ci/db/migrate-from-go/lab/10-seed.sh
 
   gates:
     name: deferred gates
@@ -200,6 +209,26 @@ jobs:
         run: |
           if [ -n "$(git status --porcelain)" ]; then
             echo "::error::the drift check modified the working tree; it must only diff"
+            git status --porcelain
+            exit 1
+          fi
+
+  legacy-import-drift:
+    name: migration SQL drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask gate legacy-import-drift
+      # Same R-2 assertion as codegen-drift, for the same reason: a check that writes its
+      # own fix into the tree always passes.
+      - name: Assert the check left the tree clean
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::the migration-SQL drift check modified the working tree"
             git status --porcelain
             exit 1
           fi
@@ -341,6 +370,7 @@ jobs:
       - loom
       - gates
       - codegen-drift
+      - legacy-import-drift
       - conformance
       - driver-emulators
       - database
