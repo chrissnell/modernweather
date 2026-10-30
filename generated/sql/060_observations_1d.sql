@@ -7,7 +7,7 @@
 -- Generator: xtask (ModernWeather). Registry: metrics/registry.toml.
 -- Snapshot:  metrics/snapshot.toml — the record of allocated identifiers.
 
--- observations_1h: 1 hour buckets, read from observations_1m.
+-- observations_1d: 1 day buckets, read from observations_1h.
 --
 -- Three properties of this file are not negotiable, are easy to get wrong, and are
 -- silent when wrong. They are properties of the generator's template, not of
@@ -27,169 +27,169 @@
 -- Refresh policy, compression and retention for this view are W4's (OQ-4) and are
 -- deliberately not generated here.
 
-CREATE MATERIALIZED VIEW observations_1h
+CREATE MATERIALIZED VIEW observations_1d
 WITH (timescaledb.continuous, timescaledb.materialized_only = true) AS
 SELECT
-    time_bucket(INTERVAL '1 hour', bucket) AS bucket,
+    time_bucket(INTERVAL '1 day', bucket) AS bucket,
     station_id,
     -- Pressure [barometer]
     sum(barometer_sum) AS barometer_sum,
-    nullif(sum(barometer_count), 0) AS barometer_count,
+    nullif(sum(barometer_count), 0)::bigint AS barometer_count,
     min(barometer_min) AS barometer_min,
     max(barometer_max) AS barometer_max,
     -- Indoor temperature [in_temp]
     sum(intemp_sum) AS intemp_sum,
-    nullif(sum(intemp_count), 0) AS intemp_count,
+    nullif(sum(intemp_count), 0)::bigint AS intemp_count,
     min(intemp_min) AS intemp_min,
     max(intemp_max) AS intemp_max,
     -- Indoor humidity [in_humidity]
     sum(inhumidity_sum) AS inhumidity_sum,
-    nullif(sum(inhumidity_count), 0) AS inhumidity_count,
+    nullif(sum(inhumidity_count), 0)::bigint AS inhumidity_count,
     min(inhumidity_min) AS inhumidity_min,
     max(inhumidity_max) AS inhumidity_max,
     -- Temperature [out_temp]
     sum(outtemp_sum) AS outtemp_sum,
-    nullif(sum(outtemp_count), 0) AS outtemp_count,
+    nullif(sum(outtemp_count), 0)::bigint AS outtemp_count,
     min(outtemp_min) AS outtemp_min,
     max(outtemp_max) AS outtemp_max,
     -- Humidity [out_humidity]
     sum(outhumidity_sum) AS outhumidity_sum,
-    nullif(sum(outhumidity_count), 0) AS outhumidity_count,
+    nullif(sum(outhumidity_count), 0)::bigint AS outhumidity_count,
     min(outhumidity_min) AS outhumidity_min,
     max(outhumidity_max) AS outhumidity_max,
     -- Wind speed [wind_speed]
     sum(windspeed_sum) AS windspeed_sum,
-    nullif(sum(windspeed_count), 0) AS windspeed_count,
+    nullif(sum(windspeed_count), 0)::bigint AS windspeed_count,
     max(windspeed_max) AS windspeed_max,
     -- Wind speed (10-minute average) [wind_speed10]
     sum(windspeed10_sum) AS windspeed10_sum,
-    nullif(sum(windspeed10_count), 0) AS windspeed10_count,
+    nullif(sum(windspeed10_count), 0)::bigint AS windspeed10_count,
     max(windspeed10_max) AS windspeed10_max,
     -- Wind direction [wind_dir]
     sum(winddir_sin_sum) AS winddir_sin_sum,
     sum(winddir_cos_sum) AS winddir_cos_sum,
-    nullif(sum(winddir_dir_count), 0) AS winddir_dir_count,
+    nullif(sum(winddir_dir_count), 0)::bigint AS winddir_dir_count,
     -- Wind chill [wind_chill]
     sum(windchill_sum) AS windchill_sum,
-    nullif(sum(windchill_count), 0) AS windchill_count,
+    nullif(sum(windchill_count), 0)::bigint AS windchill_count,
     min(windchill_min) AS windchill_min,
     -- Heat index [heat_index]
     sum(heatindex_sum) AS heatindex_sum,
-    nullif(sum(heatindex_count), 0) AS heatindex_count,
+    nullif(sum(heatindex_count), 0)::bigint AS heatindex_count,
     max(heatindex_max) AS heatindex_max,
     -- Extra temperature 1 [extra_temp1]
     sum(extratemp1_sum) AS extratemp1_sum,
-    nullif(sum(extratemp1_count), 0) AS extratemp1_count,
+    nullif(sum(extratemp1_count), 0)::bigint AS extratemp1_count,
     min(extratemp1_min) AS extratemp1_min,
     max(extratemp1_max) AS extratemp1_max,
     -- Extra temperature 2 [extra_temp2]
     sum(extratemp2_sum) AS extratemp2_sum,
-    nullif(sum(extratemp2_count), 0) AS extratemp2_count,
+    nullif(sum(extratemp2_count), 0)::bigint AS extratemp2_count,
     min(extratemp2_min) AS extratemp2_min,
     max(extratemp2_max) AS extratemp2_max,
     -- Extra temperature 3 [extra_temp3]
     sum(extratemp3_sum) AS extratemp3_sum,
-    nullif(sum(extratemp3_count), 0) AS extratemp3_count,
+    nullif(sum(extratemp3_count), 0)::bigint AS extratemp3_count,
     min(extratemp3_min) AS extratemp3_min,
     max(extratemp3_max) AS extratemp3_max,
     -- Extra temperature 4 [extra_temp4]
     sum(extratemp4_sum) AS extratemp4_sum,
-    nullif(sum(extratemp4_count), 0) AS extratemp4_count,
+    nullif(sum(extratemp4_count), 0)::bigint AS extratemp4_count,
     min(extratemp4_min) AS extratemp4_min,
     max(extratemp4_max) AS extratemp4_max,
     -- Extra temperature 5 [extra_temp5]
     sum(extratemp5_sum) AS extratemp5_sum,
-    nullif(sum(extratemp5_count), 0) AS extratemp5_count,
+    nullif(sum(extratemp5_count), 0)::bigint AS extratemp5_count,
     min(extratemp5_min) AS extratemp5_min,
     max(extratemp5_max) AS extratemp5_max,
     -- Extra temperature 6 [extra_temp6]
     sum(extratemp6_sum) AS extratemp6_sum,
-    nullif(sum(extratemp6_count), 0) AS extratemp6_count,
+    nullif(sum(extratemp6_count), 0)::bigint AS extratemp6_count,
     min(extratemp6_min) AS extratemp6_min,
     max(extratemp6_max) AS extratemp6_max,
     -- Extra temperature 7 [extra_temp7]
     sum(extratemp7_sum) AS extratemp7_sum,
-    nullif(sum(extratemp7_count), 0) AS extratemp7_count,
+    nullif(sum(extratemp7_count), 0)::bigint AS extratemp7_count,
     min(extratemp7_min) AS extratemp7_min,
     max(extratemp7_max) AS extratemp7_max,
     -- Soil temperature 1 [soil_temp1]
     sum(soiltemp1_sum) AS soiltemp1_sum,
-    nullif(sum(soiltemp1_count), 0) AS soiltemp1_count,
+    nullif(sum(soiltemp1_count), 0)::bigint AS soiltemp1_count,
     min(soiltemp1_min) AS soiltemp1_min,
     max(soiltemp1_max) AS soiltemp1_max,
     -- Soil temperature 2 [soil_temp2]
     sum(soiltemp2_sum) AS soiltemp2_sum,
-    nullif(sum(soiltemp2_count), 0) AS soiltemp2_count,
+    nullif(sum(soiltemp2_count), 0)::bigint AS soiltemp2_count,
     min(soiltemp2_min) AS soiltemp2_min,
     max(soiltemp2_max) AS soiltemp2_max,
     -- Soil temperature 3 [soil_temp3]
     sum(soiltemp3_sum) AS soiltemp3_sum,
-    nullif(sum(soiltemp3_count), 0) AS soiltemp3_count,
+    nullif(sum(soiltemp3_count), 0)::bigint AS soiltemp3_count,
     min(soiltemp3_min) AS soiltemp3_min,
     max(soiltemp3_max) AS soiltemp3_max,
     -- Soil temperature 4 [soil_temp4]
     sum(soiltemp4_sum) AS soiltemp4_sum,
-    nullif(sum(soiltemp4_count), 0) AS soiltemp4_count,
+    nullif(sum(soiltemp4_count), 0)::bigint AS soiltemp4_count,
     min(soiltemp4_min) AS soiltemp4_min,
     max(soiltemp4_max) AS soiltemp4_max,
     -- Leaf temperature 1 [leaf_temp1]
     sum(leaftemp1_sum) AS leaftemp1_sum,
-    nullif(sum(leaftemp1_count), 0) AS leaftemp1_count,
+    nullif(sum(leaftemp1_count), 0)::bigint AS leaftemp1_count,
     min(leaftemp1_min) AS leaftemp1_min,
     max(leaftemp1_max) AS leaftemp1_max,
     -- Leaf temperature 2 [leaf_temp2]
     sum(leaftemp2_sum) AS leaftemp2_sum,
-    nullif(sum(leaftemp2_count), 0) AS leaftemp2_count,
+    nullif(sum(leaftemp2_count), 0)::bigint AS leaftemp2_count,
     min(leaftemp2_min) AS leaftemp2_min,
     max(leaftemp2_max) AS leaftemp2_max,
     -- Leaf temperature 3 [leaf_temp3]
     sum(leaftemp3_sum) AS leaftemp3_sum,
-    nullif(sum(leaftemp3_count), 0) AS leaftemp3_count,
+    nullif(sum(leaftemp3_count), 0)::bigint AS leaftemp3_count,
     min(leaftemp3_min) AS leaftemp3_min,
     max(leaftemp3_max) AS leaftemp3_max,
     -- Leaf temperature 4 [leaf_temp4]
     sum(leaftemp4_sum) AS leaftemp4_sum,
-    nullif(sum(leaftemp4_count), 0) AS leaftemp4_count,
+    nullif(sum(leaftemp4_count), 0)::bigint AS leaftemp4_count,
     min(leaftemp4_min) AS leaftemp4_min,
     max(leaftemp4_max) AS leaftemp4_max,
     -- Extra humidity 1 [extra_humidity1]
     sum(extrahumidity1_sum) AS extrahumidity1_sum,
-    nullif(sum(extrahumidity1_count), 0) AS extrahumidity1_count,
+    nullif(sum(extrahumidity1_count), 0)::bigint AS extrahumidity1_count,
     min(extrahumidity1_min) AS extrahumidity1_min,
     max(extrahumidity1_max) AS extrahumidity1_max,
     -- Extra humidity 2 [extra_humidity2]
     sum(extrahumidity2_sum) AS extrahumidity2_sum,
-    nullif(sum(extrahumidity2_count), 0) AS extrahumidity2_count,
+    nullif(sum(extrahumidity2_count), 0)::bigint AS extrahumidity2_count,
     min(extrahumidity2_min) AS extrahumidity2_min,
     max(extrahumidity2_max) AS extrahumidity2_max,
     -- Extra humidity 3 [extra_humidity3]
     sum(extrahumidity3_sum) AS extrahumidity3_sum,
-    nullif(sum(extrahumidity3_count), 0) AS extrahumidity3_count,
+    nullif(sum(extrahumidity3_count), 0)::bigint AS extrahumidity3_count,
     min(extrahumidity3_min) AS extrahumidity3_min,
     max(extrahumidity3_max) AS extrahumidity3_max,
     -- Extra humidity 4 [extra_humidity4]
     sum(extrahumidity4_sum) AS extrahumidity4_sum,
-    nullif(sum(extrahumidity4_count), 0) AS extrahumidity4_count,
+    nullif(sum(extrahumidity4_count), 0)::bigint AS extrahumidity4_count,
     min(extrahumidity4_min) AS extrahumidity4_min,
     max(extrahumidity4_max) AS extrahumidity4_max,
     -- Extra humidity 5 [extra_humidity5]
     sum(extrahumidity5_sum) AS extrahumidity5_sum,
-    nullif(sum(extrahumidity5_count), 0) AS extrahumidity5_count,
+    nullif(sum(extrahumidity5_count), 0)::bigint AS extrahumidity5_count,
     min(extrahumidity5_min) AS extrahumidity5_min,
     max(extrahumidity5_max) AS extrahumidity5_max,
     -- Extra humidity 6 [extra_humidity6]
     sum(extrahumidity6_sum) AS extrahumidity6_sum,
-    nullif(sum(extrahumidity6_count), 0) AS extrahumidity6_count,
+    nullif(sum(extrahumidity6_count), 0)::bigint AS extrahumidity6_count,
     min(extrahumidity6_min) AS extrahumidity6_min,
     max(extrahumidity6_max) AS extrahumidity6_max,
     -- Extra humidity 7 [extra_humidity7]
     sum(extrahumidity7_sum) AS extrahumidity7_sum,
-    nullif(sum(extrahumidity7_count), 0) AS extrahumidity7_count,
+    nullif(sum(extrahumidity7_count), 0)::bigint AS extrahumidity7_count,
     min(extrahumidity7_min) AS extrahumidity7_min,
     max(extrahumidity7_max) AS extrahumidity7_max,
     -- Rain rate [rain_rate]
     sum(rainrate_sum) AS rainrate_sum,
-    nullif(sum(rainrate_count), 0) AS rainrate_count,
+    nullif(sum(rainrate_count), 0)::bigint AS rainrate_count,
     max(rainrate_max) AS rainrate_max,
     -- Rainfall since last reading [rain_incremental]
     sum(rainincremental_total) AS rainincremental_total,
@@ -203,27 +203,27 @@ SELECT
     max(yearrain_max) AS yearrain_max,
     -- Solar radiation [solar_watts]
     sum(solarwatts_sum) AS solarwatts_sum,
-    nullif(sum(solarwatts_count), 0) AS solarwatts_count,
+    nullif(sum(solarwatts_count), 0)::bigint AS solarwatts_count,
     min(solarwatts_min) AS solarwatts_min,
     max(solarwatts_max) AS solarwatts_max,
     -- Clear-sky solar radiation [potential_solar_watts]
     sum(potentialsolarwatts_sum) AS potentialsolarwatts_sum,
-    nullif(sum(potentialsolarwatts_count), 0) AS potentialsolarwatts_count,
+    nullif(sum(potentialsolarwatts_count), 0)::bigint AS potentialsolarwatts_count,
     min(potentialsolarwatts_min) AS potentialsolarwatts_min,
     max(potentialsolarwatts_max) AS potentialsolarwatts_max,
     -- Solar energy [solar_joules]
     sum(solarjoules_sum) AS solarjoules_sum,
-    nullif(sum(solarjoules_count), 0) AS solarjoules_count,
+    nullif(sum(solarjoules_count), 0)::bigint AS solarjoules_count,
     min(solarjoules_min) AS solarjoules_min,
     max(solarjoules_max) AS solarjoules_max,
     -- UV index [uv]
     sum(uv_sum) AS uv_sum,
-    nullif(sum(uv_count), 0) AS uv_count,
+    nullif(sum(uv_count), 0)::bigint AS uv_count,
     min(uv_min) AS uv_min,
     max(uv_max) AS uv_max,
     -- Solar radiation (sensor) [radiation]
     sum(radiation_sum) AS radiation_sum,
-    nullif(sum(radiation_count), 0) AS radiation_count,
+    nullif(sum(radiation_count), 0)::bigint AS radiation_count,
     min(radiation_min) AS radiation_min,
     max(radiation_max) AS radiation_max,
     -- Evapotranspiration today [day_et]
@@ -234,42 +234,42 @@ SELECT
     max(yearet_max) AS yearet_max,
     -- Soil moisture 1 [soil_moisture1]
     sum(soilmoisture1_sum) AS soilmoisture1_sum,
-    nullif(sum(soilmoisture1_count), 0) AS soilmoisture1_count,
+    nullif(sum(soilmoisture1_count), 0)::bigint AS soilmoisture1_count,
     min(soilmoisture1_min) AS soilmoisture1_min,
     max(soilmoisture1_max) AS soilmoisture1_max,
     -- Soil moisture 2 [soil_moisture2]
     sum(soilmoisture2_sum) AS soilmoisture2_sum,
-    nullif(sum(soilmoisture2_count), 0) AS soilmoisture2_count,
+    nullif(sum(soilmoisture2_count), 0)::bigint AS soilmoisture2_count,
     min(soilmoisture2_min) AS soilmoisture2_min,
     max(soilmoisture2_max) AS soilmoisture2_max,
     -- Soil moisture 3 [soil_moisture3]
     sum(soilmoisture3_sum) AS soilmoisture3_sum,
-    nullif(sum(soilmoisture3_count), 0) AS soilmoisture3_count,
+    nullif(sum(soilmoisture3_count), 0)::bigint AS soilmoisture3_count,
     min(soilmoisture3_min) AS soilmoisture3_min,
     max(soilmoisture3_max) AS soilmoisture3_max,
     -- Soil moisture 4 [soil_moisture4]
     sum(soilmoisture4_sum) AS soilmoisture4_sum,
-    nullif(sum(soilmoisture4_count), 0) AS soilmoisture4_count,
+    nullif(sum(soilmoisture4_count), 0)::bigint AS soilmoisture4_count,
     min(soilmoisture4_min) AS soilmoisture4_min,
     max(soilmoisture4_max) AS soilmoisture4_max,
     -- Leaf wetness 1 [leaf_wetness1]
     sum(leafwetness1_sum) AS leafwetness1_sum,
-    nullif(sum(leafwetness1_count), 0) AS leafwetness1_count,
+    nullif(sum(leafwetness1_count), 0)::bigint AS leafwetness1_count,
     min(leafwetness1_min) AS leafwetness1_min,
     max(leafwetness1_max) AS leafwetness1_max,
     -- Leaf wetness 2 [leaf_wetness2]
     sum(leafwetness2_sum) AS leafwetness2_sum,
-    nullif(sum(leafwetness2_count), 0) AS leafwetness2_count,
+    nullif(sum(leafwetness2_count), 0)::bigint AS leafwetness2_count,
     min(leafwetness2_min) AS leafwetness2_min,
     max(leafwetness2_max) AS leafwetness2_max,
     -- Leaf wetness 3 [leaf_wetness3]
     sum(leafwetness3_sum) AS leafwetness3_sum,
-    nullif(sum(leafwetness3_count), 0) AS leafwetness3_count,
+    nullif(sum(leafwetness3_count), 0)::bigint AS leafwetness3_count,
     min(leafwetness3_min) AS leafwetness3_min,
     max(leafwetness3_max) AS leafwetness3_max,
     -- Leaf wetness 4 [leaf_wetness4]
     sum(leafwetness4_sum) AS leafwetness4_sum,
-    nullif(sum(leafwetness4_count), 0) AS leafwetness4_count,
+    nullif(sum(leafwetness4_count), 0)::bigint AS leafwetness4_count,
     min(leafwetness4_min) AS leafwetness4_min,
     max(leafwetness4_max) AS leafwetness4_max,
     -- Indoor alarm [inside_alarm]
@@ -325,304 +325,304 @@ SELECT
     max(txbatterystatus_max) AS txbatterystatus_max,
     -- Console battery voltage [cons_battery_voltage]
     sum(consbatteryvoltage_sum) AS consbatteryvoltage_sum,
-    nullif(sum(consbatteryvoltage_count), 0) AS consbatteryvoltage_count,
+    nullif(sum(consbatteryvoltage_count), 0)::bigint AS consbatteryvoltage_count,
     min(consbatteryvoltage_min) AS consbatteryvoltage_min,
     max(consbatteryvoltage_max) AS consbatteryvoltage_max,
     -- Station battery voltage [station_battery_voltage]
     sum(stationbatteryvoltage_sum) AS stationbatteryvoltage_sum,
-    nullif(sum(stationbatteryvoltage_count), 0) AS stationbatteryvoltage_count,
+    nullif(sum(stationbatteryvoltage_count), 0)::bigint AS stationbatteryvoltage_count,
     min(stationbatteryvoltage_min) AS stationbatteryvoltage_min,
     max(stationbatteryvoltage_max) AS stationbatteryvoltage_max,
     -- Snow sensor distance [snow_distance]
     sum(snowdistance_sum) AS snowdistance_sum,
-    nullif(sum(snowdistance_count), 0) AS snowdistance_count,
+    nullif(sum(snowdistance_count), 0)::bigint AS snowdistance_count,
     min(snowdistance_min) AS snowdistance_min,
     max(snowdistance_max) AS snowdistance_max,
     -- Snow depth [snow_depth]
     sum(snowdepth_sum) AS snowdepth_sum,
-    nullif(sum(snowdepth_count), 0) AS snowdepth_count,
+    nullif(sum(snowdepth_count), 0)::bigint AS snowdepth_count,
     min(snowdepth_min) AS snowdepth_min,
     max(snowdepth_max) AS snowdepth_max,
     -- Extra value 1 [extra_float1]
     sum(extrafloat1_sum) AS extrafloat1_sum,
-    nullif(sum(extrafloat1_count), 0) AS extrafloat1_count,
+    nullif(sum(extrafloat1_count), 0)::bigint AS extrafloat1_count,
     min(extrafloat1_min) AS extrafloat1_min,
     max(extrafloat1_max) AS extrafloat1_max,
     -- Extra value 2 [extra_float2]
     sum(extrafloat2_sum) AS extrafloat2_sum,
-    nullif(sum(extrafloat2_count), 0) AS extrafloat2_count,
+    nullif(sum(extrafloat2_count), 0)::bigint AS extrafloat2_count,
     min(extrafloat2_min) AS extrafloat2_min,
     max(extrafloat2_max) AS extrafloat2_max,
     -- Extra value 3 [extra_float3]
     sum(extrafloat3_sum) AS extrafloat3_sum,
-    nullif(sum(extrafloat3_count), 0) AS extrafloat3_count,
+    nullif(sum(extrafloat3_count), 0)::bigint AS extrafloat3_count,
     min(extrafloat3_min) AS extrafloat3_min,
     max(extrafloat3_max) AS extrafloat3_max,
     -- Extra value 4 [extra_float4]
     sum(extrafloat4_sum) AS extrafloat4_sum,
-    nullif(sum(extrafloat4_count), 0) AS extrafloat4_count,
+    nullif(sum(extrafloat4_count), 0)::bigint AS extrafloat4_count,
     min(extrafloat4_min) AS extrafloat4_min,
     max(extrafloat4_max) AS extrafloat4_max,
     -- Extra value 5 [extra_float5]
     sum(extrafloat5_sum) AS extrafloat5_sum,
-    nullif(sum(extrafloat5_count), 0) AS extrafloat5_count,
+    nullif(sum(extrafloat5_count), 0)::bigint AS extrafloat5_count,
     min(extrafloat5_min) AS extrafloat5_min,
     max(extrafloat5_max) AS extrafloat5_max,
     -- Extra value 6 [extra_float6]
     sum(extrafloat6_sum) AS extrafloat6_sum,
-    nullif(sum(extrafloat6_count), 0) AS extrafloat6_count,
+    nullif(sum(extrafloat6_count), 0)::bigint AS extrafloat6_count,
     min(extrafloat6_min) AS extrafloat6_min,
     max(extrafloat6_max) AS extrafloat6_max,
     -- Extra value 7 [extra_float7]
     sum(extrafloat7_sum) AS extrafloat7_sum,
-    nullif(sum(extrafloat7_count), 0) AS extrafloat7_count,
+    nullif(sum(extrafloat7_count), 0)::bigint AS extrafloat7_count,
     min(extrafloat7_min) AS extrafloat7_min,
     max(extrafloat7_max) AS extrafloat7_max,
     -- Extra value 8 [extra_float8]
     sum(extrafloat8_sum) AS extrafloat8_sum,
-    nullif(sum(extrafloat8_count), 0) AS extrafloat8_count,
+    nullif(sum(extrafloat8_count), 0)::bigint AS extrafloat8_count,
     min(extrafloat8_min) AS extrafloat8_min,
     max(extrafloat8_max) AS extrafloat8_max,
     -- Extra value 9 [extra_float9]
     sum(extrafloat9_sum) AS extrafloat9_sum,
-    nullif(sum(extrafloat9_count), 0) AS extrafloat9_count,
+    nullif(sum(extrafloat9_count), 0)::bigint AS extrafloat9_count,
     min(extrafloat9_min) AS extrafloat9_min,
     max(extrafloat9_max) AS extrafloat9_max,
     -- Extra value 10 [extra_float10]
     sum(extrafloat10_sum) AS extrafloat10_sum,
-    nullif(sum(extrafloat10_count), 0) AS extrafloat10_count,
+    nullif(sum(extrafloat10_count), 0)::bigint AS extrafloat10_count,
     min(extrafloat10_min) AS extrafloat10_min,
     max(extrafloat10_max) AS extrafloat10_max,
     -- Temperature sensor 1 [temp1]
     sum(temp1_sum) AS temp1_sum,
-    nullif(sum(temp1_count), 0) AS temp1_count,
+    nullif(sum(temp1_count), 0)::bigint AS temp1_count,
     min(temp1_min) AS temp1_min,
     max(temp1_max) AS temp1_max,
     -- Temperature sensor 2 [temp2]
     sum(temp2_sum) AS temp2_sum,
-    nullif(sum(temp2_count), 0) AS temp2_count,
+    nullif(sum(temp2_count), 0)::bigint AS temp2_count,
     min(temp2_min) AS temp2_min,
     max(temp2_max) AS temp2_max,
     -- Temperature sensor 3 [temp3]
     sum(temp3_sum) AS temp3_sum,
-    nullif(sum(temp3_count), 0) AS temp3_count,
+    nullif(sum(temp3_count), 0)::bigint AS temp3_count,
     min(temp3_min) AS temp3_min,
     max(temp3_max) AS temp3_max,
     -- Temperature sensor 4 [temp4]
     sum(temp4_sum) AS temp4_sum,
-    nullif(sum(temp4_count), 0) AS temp4_count,
+    nullif(sum(temp4_count), 0)::bigint AS temp4_count,
     min(temp4_min) AS temp4_min,
     max(temp4_max) AS temp4_max,
     -- Temperature sensor 5 [temp5]
     sum(temp5_sum) AS temp5_sum,
-    nullif(sum(temp5_count), 0) AS temp5_count,
+    nullif(sum(temp5_count), 0)::bigint AS temp5_count,
     min(temp5_min) AS temp5_min,
     max(temp5_max) AS temp5_max,
     -- Temperature sensor 6 [temp6]
     sum(temp6_sum) AS temp6_sum,
-    nullif(sum(temp6_count), 0) AS temp6_count,
+    nullif(sum(temp6_count), 0)::bigint AS temp6_count,
     min(temp6_min) AS temp6_min,
     max(temp6_max) AS temp6_max,
     -- Temperature sensor 7 [temp7]
     sum(temp7_sum) AS temp7_sum,
-    nullif(sum(temp7_count), 0) AS temp7_count,
+    nullif(sum(temp7_count), 0)::bigint AS temp7_count,
     min(temp7_min) AS temp7_min,
     max(temp7_max) AS temp7_max,
     -- Temperature sensor 8 [temp8]
     sum(temp8_sum) AS temp8_sum,
-    nullif(sum(temp8_count), 0) AS temp8_count,
+    nullif(sum(temp8_count), 0)::bigint AS temp8_count,
     min(temp8_min) AS temp8_min,
     max(temp8_max) AS temp8_max,
     -- Temperature sensor 9 [temp9]
     sum(temp9_sum) AS temp9_sum,
-    nullif(sum(temp9_count), 0) AS temp9_count,
+    nullif(sum(temp9_count), 0)::bigint AS temp9_count,
     min(temp9_min) AS temp9_min,
     max(temp9_max) AS temp9_max,
     -- Temperature sensor 10 [temp10]
     sum(temp10_sum) AS temp10_sum,
-    nullif(sum(temp10_count), 0) AS temp10_count,
+    nullif(sum(temp10_count), 0)::bigint AS temp10_count,
     min(temp10_min) AS temp10_min,
     max(temp10_max) AS temp10_max,
     -- Soil temperature 5 [soil_temp5]
     sum(soiltemp5_sum) AS soiltemp5_sum,
-    nullif(sum(soiltemp5_count), 0) AS soiltemp5_count,
+    nullif(sum(soiltemp5_count), 0)::bigint AS soiltemp5_count,
     min(soiltemp5_min) AS soiltemp5_min,
     max(soiltemp5_max) AS soiltemp5_max,
     -- Soil temperature 6 [soil_temp6]
     sum(soiltemp6_sum) AS soiltemp6_sum,
-    nullif(sum(soiltemp6_count), 0) AS soiltemp6_count,
+    nullif(sum(soiltemp6_count), 0)::bigint AS soiltemp6_count,
     min(soiltemp6_min) AS soiltemp6_min,
     max(soiltemp6_max) AS soiltemp6_max,
     -- Soil temperature 7 [soil_temp7]
     sum(soiltemp7_sum) AS soiltemp7_sum,
-    nullif(sum(soiltemp7_count), 0) AS soiltemp7_count,
+    nullif(sum(soiltemp7_count), 0)::bigint AS soiltemp7_count,
     min(soiltemp7_min) AS soiltemp7_min,
     max(soiltemp7_max) AS soiltemp7_max,
     -- Soil temperature 8 [soil_temp8]
     sum(soiltemp8_sum) AS soiltemp8_sum,
-    nullif(sum(soiltemp8_count), 0) AS soiltemp8_count,
+    nullif(sum(soiltemp8_count), 0)::bigint AS soiltemp8_count,
     min(soiltemp8_min) AS soiltemp8_min,
     max(soiltemp8_max) AS soiltemp8_max,
     -- Soil temperature 9 [soil_temp9]
     sum(soiltemp9_sum) AS soiltemp9_sum,
-    nullif(sum(soiltemp9_count), 0) AS soiltemp9_count,
+    nullif(sum(soiltemp9_count), 0)::bigint AS soiltemp9_count,
     min(soiltemp9_min) AS soiltemp9_min,
     max(soiltemp9_max) AS soiltemp9_max,
     -- Soil temperature 10 [soil_temp10]
     sum(soiltemp10_sum) AS soiltemp10_sum,
-    nullif(sum(soiltemp10_count), 0) AS soiltemp10_count,
+    nullif(sum(soiltemp10_count), 0)::bigint AS soiltemp10_count,
     min(soiltemp10_min) AS soiltemp10_min,
     max(soiltemp10_max) AS soiltemp10_max,
     -- Humidity sensor 1 [humidity1]
     sum(humidity1_sum) AS humidity1_sum,
-    nullif(sum(humidity1_count), 0) AS humidity1_count,
+    nullif(sum(humidity1_count), 0)::bigint AS humidity1_count,
     min(humidity1_min) AS humidity1_min,
     max(humidity1_max) AS humidity1_max,
     -- Humidity sensor 2 [humidity2]
     sum(humidity2_sum) AS humidity2_sum,
-    nullif(sum(humidity2_count), 0) AS humidity2_count,
+    nullif(sum(humidity2_count), 0)::bigint AS humidity2_count,
     min(humidity2_min) AS humidity2_min,
     max(humidity2_max) AS humidity2_max,
     -- Humidity sensor 3 [humidity3]
     sum(humidity3_sum) AS humidity3_sum,
-    nullif(sum(humidity3_count), 0) AS humidity3_count,
+    nullif(sum(humidity3_count), 0)::bigint AS humidity3_count,
     min(humidity3_min) AS humidity3_min,
     max(humidity3_max) AS humidity3_max,
     -- Humidity sensor 4 [humidity4]
     sum(humidity4_sum) AS humidity4_sum,
-    nullif(sum(humidity4_count), 0) AS humidity4_count,
+    nullif(sum(humidity4_count), 0)::bigint AS humidity4_count,
     min(humidity4_min) AS humidity4_min,
     max(humidity4_max) AS humidity4_max,
     -- Humidity sensor 5 [humidity5]
     sum(humidity5_sum) AS humidity5_sum,
-    nullif(sum(humidity5_count), 0) AS humidity5_count,
+    nullif(sum(humidity5_count), 0)::bigint AS humidity5_count,
     min(humidity5_min) AS humidity5_min,
     max(humidity5_max) AS humidity5_max,
     -- Humidity sensor 6 [humidity6]
     sum(humidity6_sum) AS humidity6_sum,
-    nullif(sum(humidity6_count), 0) AS humidity6_count,
+    nullif(sum(humidity6_count), 0)::bigint AS humidity6_count,
     min(humidity6_min) AS humidity6_min,
     max(humidity6_max) AS humidity6_max,
     -- Humidity sensor 7 [humidity7]
     sum(humidity7_sum) AS humidity7_sum,
-    nullif(sum(humidity7_count), 0) AS humidity7_count,
+    nullif(sum(humidity7_count), 0)::bigint AS humidity7_count,
     min(humidity7_min) AS humidity7_min,
     max(humidity7_max) AS humidity7_max,
     -- Humidity sensor 8 [humidity8]
     sum(humidity8_sum) AS humidity8_sum,
-    nullif(sum(humidity8_count), 0) AS humidity8_count,
+    nullif(sum(humidity8_count), 0)::bigint AS humidity8_count,
     min(humidity8_min) AS humidity8_min,
     max(humidity8_max) AS humidity8_max,
     -- Humidity sensor 9 [humidity9]
     sum(humidity9_sum) AS humidity9_sum,
-    nullif(sum(humidity9_count), 0) AS humidity9_count,
+    nullif(sum(humidity9_count), 0)::bigint AS humidity9_count,
     min(humidity9_min) AS humidity9_min,
     max(humidity9_max) AS humidity9_max,
     -- Humidity sensor 10 [humidity10]
     sum(humidity10_sum) AS humidity10_sum,
-    nullif(sum(humidity10_count), 0) AS humidity10_count,
+    nullif(sum(humidity10_count), 0)::bigint AS humidity10_count,
     min(humidity10_min) AS humidity10_min,
     max(humidity10_max) AS humidity10_max,
     -- Soil humidity 1 [soil_hum1]
     sum(soilhum1_sum) AS soilhum1_sum,
-    nullif(sum(soilhum1_count), 0) AS soilhum1_count,
+    nullif(sum(soilhum1_count), 0)::bigint AS soilhum1_count,
     min(soilhum1_min) AS soilhum1_min,
     max(soilhum1_max) AS soilhum1_max,
     -- Soil humidity 2 [soil_hum2]
     sum(soilhum2_sum) AS soilhum2_sum,
-    nullif(sum(soilhum2_count), 0) AS soilhum2_count,
+    nullif(sum(soilhum2_count), 0)::bigint AS soilhum2_count,
     min(soilhum2_min) AS soilhum2_min,
     max(soilhum2_max) AS soilhum2_max,
     -- Soil humidity 3 [soil_hum3]
     sum(soilhum3_sum) AS soilhum3_sum,
-    nullif(sum(soilhum3_count), 0) AS soilhum3_count,
+    nullif(sum(soilhum3_count), 0)::bigint AS soilhum3_count,
     min(soilhum3_min) AS soilhum3_min,
     max(soilhum3_max) AS soilhum3_max,
     -- Soil humidity 4 [soil_hum4]
     sum(soilhum4_sum) AS soilhum4_sum,
-    nullif(sum(soilhum4_count), 0) AS soilhum4_count,
+    nullif(sum(soilhum4_count), 0)::bigint AS soilhum4_count,
     min(soilhum4_min) AS soilhum4_min,
     max(soilhum4_max) AS soilhum4_max,
     -- Soil humidity 5 [soil_hum5]
     sum(soilhum5_sum) AS soilhum5_sum,
-    nullif(sum(soilhum5_count), 0) AS soilhum5_count,
+    nullif(sum(soilhum5_count), 0)::bigint AS soilhum5_count,
     min(soilhum5_min) AS soilhum5_min,
     max(soilhum5_max) AS soilhum5_max,
     -- Soil humidity 6 [soil_hum6]
     sum(soilhum6_sum) AS soilhum6_sum,
-    nullif(sum(soilhum6_count), 0) AS soilhum6_count,
+    nullif(sum(soilhum6_count), 0)::bigint AS soilhum6_count,
     min(soilhum6_min) AS soilhum6_min,
     max(soilhum6_max) AS soilhum6_max,
     -- Soil humidity 7 [soil_hum7]
     sum(soilhum7_sum) AS soilhum7_sum,
-    nullif(sum(soilhum7_count), 0) AS soilhum7_count,
+    nullif(sum(soilhum7_count), 0)::bigint AS soilhum7_count,
     min(soilhum7_min) AS soilhum7_min,
     max(soilhum7_max) AS soilhum7_max,
     -- Soil humidity 8 [soil_hum8]
     sum(soilhum8_sum) AS soilhum8_sum,
-    nullif(sum(soilhum8_count), 0) AS soilhum8_count,
+    nullif(sum(soilhum8_count), 0)::bigint AS soilhum8_count,
     min(soilhum8_min) AS soilhum8_min,
     max(soilhum8_max) AS soilhum8_max,
     -- Soil humidity 9 [soil_hum9]
     sum(soilhum9_sum) AS soilhum9_sum,
-    nullif(sum(soilhum9_count), 0) AS soilhum9_count,
+    nullif(sum(soilhum9_count), 0)::bigint AS soilhum9_count,
     min(soilhum9_min) AS soilhum9_min,
     max(soilhum9_max) AS soilhum9_max,
     -- Soil humidity 10 [soil_hum10]
     sum(soilhum10_sum) AS soilhum10_sum,
-    nullif(sum(soilhum10_count), 0) AS soilhum10_count,
+    nullif(sum(soilhum10_count), 0)::bigint AS soilhum10_count,
     min(soilhum10_min) AS soilhum10_min,
     max(soilhum10_max) AS soilhum10_max,
     -- Leaf wetness 5 [leaf_wetness5]
     sum(leafwetness5_sum) AS leafwetness5_sum,
-    nullif(sum(leafwetness5_count), 0) AS leafwetness5_count,
+    nullif(sum(leafwetness5_count), 0)::bigint AS leafwetness5_count,
     min(leafwetness5_min) AS leafwetness5_min,
     max(leafwetness5_max) AS leafwetness5_max,
     -- Leaf wetness 6 [leaf_wetness6]
     sum(leafwetness6_sum) AS leafwetness6_sum,
-    nullif(sum(leafwetness6_count), 0) AS leafwetness6_count,
+    nullif(sum(leafwetness6_count), 0)::bigint AS leafwetness6_count,
     min(leafwetness6_min) AS leafwetness6_min,
     max(leafwetness6_max) AS leafwetness6_max,
     -- Leaf wetness 7 [leaf_wetness7]
     sum(leafwetness7_sum) AS leafwetness7_sum,
-    nullif(sum(leafwetness7_count), 0) AS leafwetness7_count,
+    nullif(sum(leafwetness7_count), 0)::bigint AS leafwetness7_count,
     min(leafwetness7_min) AS leafwetness7_min,
     max(leafwetness7_max) AS leafwetness7_max,
     -- Leaf wetness 8 [leaf_wetness8]
     sum(leafwetness8_sum) AS leafwetness8_sum,
-    nullif(sum(leafwetness8_count), 0) AS leafwetness8_count,
+    nullif(sum(leafwetness8_count), 0)::bigint AS leafwetness8_count,
     min(leafwetness8_min) AS leafwetness8_min,
     max(leafwetness8_max) AS leafwetness8_max,
     -- Soil tension 1 [soil_tens1]
     sum(soiltens1_sum) AS soiltens1_sum,
-    nullif(sum(soiltens1_count), 0) AS soiltens1_count,
+    nullif(sum(soiltens1_count), 0)::bigint AS soiltens1_count,
     min(soiltens1_min) AS soiltens1_min,
     max(soiltens1_max) AS soiltens1_max,
     -- Soil tension 2 [soil_tens2]
     sum(soiltens2_sum) AS soiltens2_sum,
-    nullif(sum(soiltens2_count), 0) AS soiltens2_count,
+    nullif(sum(soiltens2_count), 0)::bigint AS soiltens2_count,
     min(soiltens2_min) AS soiltens2_min,
     max(soiltens2_max) AS soiltens2_max,
     -- Soil tension 3 [soil_tens3]
     sum(soiltens3_sum) AS soiltens3_sum,
-    nullif(sum(soiltens3_count), 0) AS soiltens3_count,
+    nullif(sum(soiltens3_count), 0)::bigint AS soiltens3_count,
     min(soiltens3_min) AS soiltens3_min,
     max(soiltens3_max) AS soiltens3_max,
     -- Soil tension 4 [soil_tens4]
     sum(soiltens4_sum) AS soiltens4_sum,
-    nullif(sum(soiltens4_count), 0) AS soiltens4_count,
+    nullif(sum(soiltens4_count), 0)::bigint AS soiltens4_count,
     min(soiltens4_min) AS soiltens4_min,
     max(soiltens4_max) AS soiltens4_max,
     -- Growing degree days [gdd]
     max(gdd_max) AS gdd_max,
     -- Reference evapotranspiration (short crop) [etos]
     sum(etos_sum) AS etos_sum,
-    nullif(sum(etos_count), 0) AS etos_count,
+    nullif(sum(etos_count), 0)::bigint AS etos_count,
     min(etos_min) AS etos_min,
     max(etos_max) AS etos_max,
     -- Reference evapotranspiration (tall crop) [etrs]
     sum(etrs_sum) AS etrs_sum,
-    nullif(sum(etrs_count), 0) AS etrs_count,
+    nullif(sum(etrs_count), 0)::bigint AS etrs_count,
     min(etrs_min) AS etrs_min,
     max(etrs_max) AS etrs_max,
     -- Leak detector 1 [leak1]
@@ -711,12 +711,12 @@ SELECT
     max(batt_cellgateway_max) AS batt_cellgateway_max,
     -- Pressure (relative) [barom_rel_in]
     sum(baromrelin_sum) AS baromrelin_sum,
-    nullif(sum(baromrelin_count), 0) AS baromrelin_count,
+    nullif(sum(baromrelin_count), 0)::bigint AS baromrelin_count,
     min(baromrelin_min) AS baromrelin_min,
     max(baromrelin_max) AS baromrelin_max,
     -- Pressure (absolute) [barom_abs_in]
     sum(baromabsin_sum) AS baromabsin_sum,
-    nullif(sum(baromabsin_count), 0) AS baromabsin_count,
+    nullif(sum(baromabsin_count), 0)::bigint AS baromabsin_count,
     min(baromabsin_min) AS baromabsin_min,
     max(baromabsin_max) AS baromabsin_max,
     -- Relay 1 [relay1]
@@ -751,97 +751,97 @@ SELECT
     max(relay10_max) AS relay10_max,
     -- PM2.5 [pm25]
     sum(pm25_sum) AS pm25_sum,
-    nullif(sum(pm25_count), 0) AS pm25_count,
+    nullif(sum(pm25_count), 0)::bigint AS pm25_count,
     min(pm25_min) AS pm25_min,
     max(pm25_max) AS pm25_max,
     -- PM2.5 (24-hour average) [pm25_24h]
     sum(pm25_24h_sum) AS pm25_24h_sum,
-    nullif(sum(pm25_24h_count), 0) AS pm25_24h_count,
+    nullif(sum(pm25_24h_count), 0)::bigint AS pm25_24h_count,
     min(pm25_24h_min) AS pm25_24h_min,
     max(pm25_24h_max) AS pm25_24h_max,
     -- PM2.5 indoors [pm25_in]
     sum(pm25_in_sum) AS pm25_in_sum,
-    nullif(sum(pm25_in_count), 0) AS pm25_in_count,
+    nullif(sum(pm25_in_count), 0)::bigint AS pm25_in_count,
     min(pm25_in_min) AS pm25_in_min,
     max(pm25_in_max) AS pm25_in_max,
     -- PM2.5 indoors (24-hour average) [pm25_in_24h]
     sum(pm25_in_24h_sum) AS pm25_in_24h_sum,
-    nullif(sum(pm25_in_24h_count), 0) AS pm25_in_24h_count,
+    nullif(sum(pm25_in_24h_count), 0)::bigint AS pm25_in_24h_count,
     min(pm25_in_24h_min) AS pm25_in_24h_min,
     max(pm25_in_24h_max) AS pm25_in_24h_max,
     -- PM2.5 indoors (AQIN sensor) [pm25_in_aqin]
     sum(pm25_in_aqin_sum) AS pm25_in_aqin_sum,
-    nullif(sum(pm25_in_aqin_count), 0) AS pm25_in_aqin_count,
+    nullif(sum(pm25_in_aqin_count), 0)::bigint AS pm25_in_aqin_count,
     min(pm25_in_aqin_min) AS pm25_in_aqin_min,
     max(pm25_in_aqin_max) AS pm25_in_aqin_max,
     -- PM2.5 indoors, 24-hour average (AQIN sensor) [pm25_in_24h_aqin]
     sum(pm25_in_24h_aqin_sum) AS pm25_in_24h_aqin_sum,
-    nullif(sum(pm25_in_24h_aqin_count), 0) AS pm25_in_24h_aqin_count,
+    nullif(sum(pm25_in_24h_aqin_count), 0)::bigint AS pm25_in_24h_aqin_count,
     min(pm25_in_24h_aqin_min) AS pm25_in_24h_aqin_min,
     max(pm25_in_24h_aqin_max) AS pm25_in_24h_aqin_max,
     -- PM10 indoors (AQIN sensor) [pm10_in_aqin]
     sum(pm10_in_aqin_sum) AS pm10_in_aqin_sum,
-    nullif(sum(pm10_in_aqin_count), 0) AS pm10_in_aqin_count,
+    nullif(sum(pm10_in_aqin_count), 0)::bigint AS pm10_in_aqin_count,
     min(pm10_in_aqin_min) AS pm10_in_aqin_min,
     max(pm10_in_aqin_max) AS pm10_in_aqin_max,
     -- PM10 indoors, 24-hour average (AQIN sensor) [pm10_in_24h_aqin]
     sum(pm10_in_24h_aqin_sum) AS pm10_in_24h_aqin_sum,
-    nullif(sum(pm10_in_24h_aqin_count), 0) AS pm10_in_24h_aqin_count,
+    nullif(sum(pm10_in_24h_aqin_count), 0)::bigint AS pm10_in_24h_aqin_count,
     min(pm10_in_24h_aqin_min) AS pm10_in_24h_aqin_min,
     max(pm10_in_24h_aqin_max) AS pm10_in_24h_aqin_max,
     -- CO2 [co2]
     sum(co2_sum) AS co2_sum,
-    nullif(sum(co2_count), 0) AS co2_count,
+    nullif(sum(co2_count), 0)::bigint AS co2_count,
     min(co2_min) AS co2_min,
     max(co2_max) AS co2_max,
     -- CO2 indoors (AQIN sensor) [co2_in_aqin]
     sum(co2_in_aqin_sum) AS co2_in_aqin_sum,
-    nullif(sum(co2_in_aqin_count), 0) AS co2_in_aqin_count,
+    nullif(sum(co2_in_aqin_count), 0)::bigint AS co2_in_aqin_count,
     min(co2_in_aqin_min) AS co2_in_aqin_min,
     max(co2_in_aqin_max) AS co2_in_aqin_max,
     -- CO2 indoors, 24-hour average (AQIN sensor) [co2_in_24h_aqin]
     sum(co2_in_24h_aqin_sum) AS co2_in_24h_aqin_sum,
-    nullif(sum(co2_in_24h_aqin_count), 0) AS co2_in_24h_aqin_count,
+    nullif(sum(co2_in_24h_aqin_count), 0)::bigint AS co2_in_24h_aqin_count,
     min(co2_in_24h_aqin_min) AS co2_in_24h_aqin_min,
     max(co2_in_24h_aqin_max) AS co2_in_24h_aqin_max,
     -- Indoor temperature (AQIN sensor) [pm_in_temp_aqin]
     sum(pm_in_temp_aqin_sum) AS pm_in_temp_aqin_sum,
-    nullif(sum(pm_in_temp_aqin_count), 0) AS pm_in_temp_aqin_count,
+    nullif(sum(pm_in_temp_aqin_count), 0)::bigint AS pm_in_temp_aqin_count,
     min(pm_in_temp_aqin_min) AS pm_in_temp_aqin_min,
     max(pm_in_temp_aqin_max) AS pm_in_temp_aqin_max,
     -- Indoor humidity (AQIN sensor) [pm_in_humidity_aqin]
     sum(pm_in_humidity_aqin_sum) AS pm_in_humidity_aqin_sum,
-    nullif(sum(pm_in_humidity_aqin_count), 0) AS pm_in_humidity_aqin_count,
+    nullif(sum(pm_in_humidity_aqin_count), 0)::bigint AS pm_in_humidity_aqin_count,
     min(pm_in_humidity_aqin_min) AS pm_in_humidity_aqin_min,
     max(pm_in_humidity_aqin_max) AS pm_in_humidity_aqin_max,
     -- Air quality index, PM2.5 (AQIN sensor) [aqi_pm25_aqin]
     sum(aqi_pm25_aqin_sum) AS aqi_pm25_aqin_sum,
-    nullif(sum(aqi_pm25_aqin_count), 0) AS aqi_pm25_aqin_count,
+    nullif(sum(aqi_pm25_aqin_count), 0)::bigint AS aqi_pm25_aqin_count,
     min(aqi_pm25_aqin_min) AS aqi_pm25_aqin_min,
     max(aqi_pm25_aqin_max) AS aqi_pm25_aqin_max,
     -- Air quality index, PM2.5 24-hour (AQIN sensor) [aqi_pm25_24h_aqin]
     sum(aqi_pm25_24h_aqin_sum) AS aqi_pm25_24h_aqin_sum,
-    nullif(sum(aqi_pm25_24h_aqin_count), 0) AS aqi_pm25_24h_aqin_count,
+    nullif(sum(aqi_pm25_24h_aqin_count), 0)::bigint AS aqi_pm25_24h_aqin_count,
     min(aqi_pm25_24h_aqin_min) AS aqi_pm25_24h_aqin_min,
     max(aqi_pm25_24h_aqin_max) AS aqi_pm25_24h_aqin_max,
     -- Air quality index, PM10 (AQIN sensor) [aqi_pm10_aqin]
     sum(aqi_pm10_aqin_sum) AS aqi_pm10_aqin_sum,
-    nullif(sum(aqi_pm10_aqin_count), 0) AS aqi_pm10_aqin_count,
+    nullif(sum(aqi_pm10_aqin_count), 0)::bigint AS aqi_pm10_aqin_count,
     min(aqi_pm10_aqin_min) AS aqi_pm10_aqin_min,
     max(aqi_pm10_aqin_max) AS aqi_pm10_aqin_max,
     -- Air quality index, PM10 24-hour (AQIN sensor) [aqi_pm10_24h_aqin]
     sum(aqi_pm10_24h_aqin_sum) AS aqi_pm10_24h_aqin_sum,
-    nullif(sum(aqi_pm10_24h_aqin_count), 0) AS aqi_pm10_24h_aqin_count,
+    nullif(sum(aqi_pm10_24h_aqin_count), 0)::bigint AS aqi_pm10_24h_aqin_count,
     min(aqi_pm10_24h_aqin_min) AS aqi_pm10_24h_aqin_min,
     max(aqi_pm10_24h_aqin_max) AS aqi_pm10_24h_aqin_max,
     -- Air quality index, PM2.5 indoors [aqi_pm25_in]
     sum(aqi_pm25_in_sum) AS aqi_pm25_in_sum,
-    nullif(sum(aqi_pm25_in_count), 0) AS aqi_pm25_in_count,
+    nullif(sum(aqi_pm25_in_count), 0)::bigint AS aqi_pm25_in_count,
     min(aqi_pm25_in_min) AS aqi_pm25_in_min,
     max(aqi_pm25_in_max) AS aqi_pm25_in_max,
     -- Air quality index, PM2.5 indoors 24-hour [aqi_pm25_in_24h]
     sum(aqi_pm25_in_24h_sum) AS aqi_pm25_in_24h_sum,
-    nullif(sum(aqi_pm25_in_24h_count), 0) AS aqi_pm25_in_24h_count,
+    nullif(sum(aqi_pm25_in_24h_count), 0)::bigint AS aqi_pm25_in_24h_count,
     min(aqi_pm25_in_24h_min) AS aqi_pm25_in_24h_min,
     max(aqi_pm25_in_24h_max) AS aqi_pm25_in_24h_max,
     -- Lightning strikes today [lightning_day]
@@ -850,10 +850,10 @@ SELECT
     max(lightning_hour_max) AS lightning_hour_max,
     -- Distance to last lightning strike [lightning_distance]
     sum(lightning_distance_sum) AS lightning_distance_sum,
-    nullif(sum(lightning_distance_count), 0) AS lightning_distance_count,
+    nullif(sum(lightning_distance_count), 0)::bigint AS lightning_distance_count,
     min(lightning_distance_min) AS lightning_distance_min,
     max(lightning_distance_max) AS lightning_distance_max
-FROM observations_1m
+FROM observations_1h
 GROUP BY 1, 2
 WITH NO DATA;
 

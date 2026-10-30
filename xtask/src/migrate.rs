@@ -91,6 +91,16 @@ pub fn render(
         );
     }
 
+    // The finalisers, in every migration. They are the one piece of generated SQL whose
+    // *body* can change without any identifier changing — W4 made mw_circular_mean return
+    // 0 rather than NULL for an empty bucket (OQ-W1-2 option (c)) — and before this they
+    // were emitted only by the bootstrap migration, so such a change reached generated/
+    // and never reached a deployed database. They are CREATE OR REPLACE and no continuous
+    // aggregate inlines them, so re-asserting them is idempotent and cheap.
+    s.push_str("-- Finalisers, re-asserted. See generated/sql/010_functions.sql.\n\n");
+    s.push_str(strip_header(&gen::finalisers()));
+    s.push('\n');
+
     let adds: Vec<&Change> = changes
         .iter()
         .filter(|c| c.class == Class::AddColumn)
@@ -204,10 +214,9 @@ pub fn render(
 
     if adds.is_empty() && levels.is_empty() && breaking.is_empty() {
         s.push_str(
-            "-- Nothing to do: the registry changed only in metadata the database does not\n\
-             -- hold (labels, units, tiers, legacy key mappings). Regenerate and commit\n\
-             -- generated/ instead.\n\
-             SELECT 1;\n",
+            "-- Beyond the finalisers above there is nothing to do: the registry changed only\n\
+             -- in metadata the database does not hold (labels, units, tiers, legacy key\n\
+             -- mappings). Regenerate and commit generated/ instead.\n",
         );
     }
 

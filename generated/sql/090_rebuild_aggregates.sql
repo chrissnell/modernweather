@@ -24,6 +24,7 @@
 SET synchronous_commit = off;
 
 CALL refresh_continuous_aggregate('observations_1m', NULL, NULL);
+CALL refresh_continuous_aggregate('observations_5m', NULL, NULL);
 CALL refresh_continuous_aggregate('observations_1h', NULL, NULL);
 CALL refresh_continuous_aggregate('observations_1d', NULL, NULL);
 

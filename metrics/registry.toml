@@ -24,10 +24,11 @@ schema_version = 1
 # here and both are emittable by the generator. Overridable per metric.
 mean_representation = "sum_count"
 # Default per-level inclusion for a metric that does not name its own `levels`.
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 
-# The aggregate hierarchy (D-11). Each level reads the level named in `source`,
-# never raw except for the first. The Go 5-minute level is deliberately absent.
+# The aggregate hierarchy (D-11, extended by W4). Each level reads the level named in
+# `source`, never raw except for the first. The Go 5-minute level is carried forward
+# (W4 decision 1) because /span serves its default 24-hour band from it.
 #
 # `levels` on a metric must be contiguous from "1m": a level reads the level below
 # it, so a metric cannot appear at "1h" unless "1m" carries it. See
@@ -40,10 +41,21 @@ bucket = "1 minute"
 source = "raw"
 materialized_only = true
 
+# W4: the 5-minute level. D-11 as merged lists three levels; W1 measured four bands on
+# /span and both shipped clients read the 5-minute band for the default 24-hour view, so
+# serving /span/24h from any other level changes every client's chart resolution. D-11's
+# own assumption 16 licenses this on the condition it derives from the 1-minute level,
+# which it does. See docs/database-schema.md §1 and amendment A-W4-1.
+[[level]]
+name = "5m"
+bucket = "5 minutes"
+source = "1m"
+materialized_only = true
+
 [[level]]
 name = "1h"
 bucket = "1 hour"
-source = "1m"
+source = "5m"
 materialized_only = true
 
 [[level]]
@@ -125,7 +137,7 @@ label = "Pressure"
 unit = "inHg"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["bar"]
 introduced_in = "0.1.0"
 
@@ -140,7 +152,7 @@ label = "Indoor temperature"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["itemp"]
 introduced_in = "0.1.0"
 
@@ -155,7 +167,7 @@ label = "Indoor humidity"
 unit = "percent"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["ihum"]
 introduced_in = "0.1.0"
 
@@ -170,7 +182,7 @@ label = "Temperature"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["otemp"]
 introduced_in = "0.1.0"
 
@@ -185,7 +197,7 @@ label = "Humidity"
 unit = "percent"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["ohum", "outhumidity"]
 introduced_in = "0.1.0"
 
@@ -200,7 +212,7 @@ label = "Wind speed"
 unit = "mph"
 tier = "core"
 aggregates = ["mean", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["winds"]
 introduced_in = "0.1.0"
 
@@ -215,7 +227,7 @@ label = "Wind speed (10-minute average)"
 unit = "mph"
 tier = "core"
 aggregates = ["mean", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -229,7 +241,7 @@ label = "Wind direction"
 unit = "deg"
 tier = "core"
 aggregates = ["circular_mean"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["windd"]
 introduced_in = "0.1.0"
 
@@ -244,7 +256,7 @@ label = "Wind chill"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["windch"]
 legacy_read_time_computed = true
 introduced_in = "0.1.0"
@@ -260,7 +272,7 @@ label = "Heat index"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["heatidx"]
 legacy_read_time_computed = true
 introduced_in = "0.1.0"
@@ -276,7 +288,7 @@ label = "Extra temperature 1"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extratemp1"]
 introduced_in = "0.1.0"
 
@@ -291,7 +303,7 @@ label = "Extra temperature 2"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extratemp2"]
 introduced_in = "0.1.0"
 
@@ -306,7 +318,7 @@ label = "Extra temperature 3"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extratemp3"]
 introduced_in = "0.1.0"
 
@@ -321,7 +333,7 @@ label = "Extra temperature 4"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extratemp4"]
 introduced_in = "0.1.0"
 
@@ -336,7 +348,7 @@ label = "Extra temperature 5"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extratemp5"]
 introduced_in = "0.1.0"
 
@@ -351,7 +363,7 @@ label = "Extra temperature 6"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extratemp6"]
 introduced_in = "0.1.0"
 
@@ -366,7 +378,7 @@ label = "Extra temperature 7"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extratemp7"]
 introduced_in = "0.1.0"
 
@@ -381,7 +393,7 @@ label = "Soil temperature 1"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["soiltemp1"]
 introduced_in = "0.1.0"
 
@@ -396,7 +408,7 @@ label = "Soil temperature 2"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["soiltemp2"]
 introduced_in = "0.1.0"
 
@@ -411,7 +423,7 @@ label = "Soil temperature 3"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["soiltemp3"]
 introduced_in = "0.1.0"
 
@@ -426,7 +438,7 @@ label = "Soil temperature 4"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["soiltemp4"]
 introduced_in = "0.1.0"
 
@@ -441,7 +453,7 @@ label = "Leaf temperature 1"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["leaftemp1"]
 introduced_in = "0.1.0"
 
@@ -456,7 +468,7 @@ label = "Leaf temperature 2"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["leaftemp2"]
 introduced_in = "0.1.0"
 
@@ -471,7 +483,7 @@ label = "Leaf temperature 3"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["leaftemp3"]
 introduced_in = "0.1.0"
 
@@ -486,7 +498,7 @@ label = "Leaf temperature 4"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["leaftemp4"]
 introduced_in = "0.1.0"
 
@@ -501,7 +513,7 @@ label = "Extra humidity 1"
 unit = "percent"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrahumidity1"]
 introduced_in = "0.1.0"
 
@@ -516,7 +528,7 @@ label = "Extra humidity 2"
 unit = "percent"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrahumidity2"]
 introduced_in = "0.1.0"
 
@@ -531,7 +543,7 @@ label = "Extra humidity 3"
 unit = "percent"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrahumidity3"]
 introduced_in = "0.1.0"
 
@@ -546,7 +558,7 @@ label = "Extra humidity 4"
 unit = "percent"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrahumidity4"]
 introduced_in = "0.1.0"
 
@@ -561,7 +573,7 @@ label = "Extra humidity 5"
 unit = "percent"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrahumidity5"]
 introduced_in = "0.1.0"
 
@@ -576,7 +588,7 @@ label = "Extra humidity 6"
 unit = "percent"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrahumidity6"]
 introduced_in = "0.1.0"
 
@@ -591,7 +603,7 @@ label = "Extra humidity 7"
 unit = "percent"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrahumidity7"]
 introduced_in = "0.1.0"
 
@@ -606,7 +618,7 @@ label = "Rain rate"
 unit = "in_per_hour"
 tier = "core"
 aggregates = ["mean", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["rainrate"]
 introduced_in = "0.1.0"
 
@@ -621,7 +633,7 @@ label = "Rainfall since last reading"
 unit = "in"
 tier = "core"
 aggregates = ["total"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["rainincremental"]
 introduced_in = "0.1.0"
 # The frozen /span surface calls the bucketed total "period_rain", not
@@ -641,7 +653,7 @@ label = "Storm rainfall"
 unit = "in"
 tier = "core"
 aggregates = ["max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["stormrain"]
 introduced_in = "0.1.0"
 
@@ -670,7 +682,7 @@ label = "Rainfall today"
 unit = "in"
 tier = "core"
 aggregates = ["max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["dayrain", "rainday"]
 introduced_in = "0.1.0"
 
@@ -685,7 +697,7 @@ label = "Rainfall this month"
 unit = "in"
 tier = "core"
 aggregates = ["max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["monthrain"]
 introduced_in = "0.1.0"
 
@@ -700,7 +712,7 @@ label = "Rainfall this year"
 unit = "in"
 tier = "core"
 aggregates = ["max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["yearrain"]
 introduced_in = "0.1.0"
 
@@ -715,7 +727,7 @@ label = "Solar radiation"
 unit = "W_per_m2"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["solarwatts"]
 introduced_in = "0.1.0"
 
@@ -730,7 +742,7 @@ label = "Clear-sky solar radiation"
 unit = "W_per_m2"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["potentialsolarwatts"]
 introduced_in = "0.1.0"
 
@@ -745,7 +757,7 @@ label = "Solar energy"
 unit = "J_per_m2"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["solarjoules"]
 introduced_in = "0.1.0"
 
@@ -760,7 +772,7 @@ label = "UV index"
 unit = "index"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["uv"]
 introduced_in = "0.1.0"
 
@@ -775,7 +787,7 @@ label = "Solar radiation (sensor)"
 unit = "W_per_m2"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["radiation"]
 introduced_in = "0.1.0"
 
@@ -790,7 +802,7 @@ label = "Evapotranspiration today"
 unit = "in"
 tier = "extended"
 aggregates = ["max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -804,7 +816,7 @@ label = "Evapotranspiration this month"
 unit = "in"
 tier = "extended"
 aggregates = ["max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -818,7 +830,7 @@ label = "Evapotranspiration this year"
 unit = "in"
 tier = "extended"
 aggregates = ["max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -832,7 +844,7 @@ label = "Soil moisture 1"
 unit = "cbar"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -846,7 +858,7 @@ label = "Soil moisture 2"
 unit = "cbar"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -860,7 +872,7 @@ label = "Soil moisture 3"
 unit = "cbar"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -874,7 +886,7 @@ label = "Soil moisture 4"
 unit = "cbar"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -888,7 +900,7 @@ label = "Leaf wetness 1"
 unit = "index"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -902,7 +914,7 @@ label = "Leaf wetness 2"
 unit = "index"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -916,7 +928,7 @@ label = "Leaf wetness 3"
 unit = "index"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -930,7 +942,7 @@ label = "Leaf wetness 4"
 unit = "index"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -944,7 +956,7 @@ label = "Indoor alarm"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -958,7 +970,7 @@ label = "Rain alarm"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -972,7 +984,7 @@ label = "Outside alarm 1"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -986,7 +998,7 @@ label = "Outside alarm 2"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1000,7 +1012,7 @@ label = "Extra alarm 1"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1014,7 +1026,7 @@ label = "Extra alarm 2"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1028,7 +1040,7 @@ label = "Extra alarm 3"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1042,7 +1054,7 @@ label = "Extra alarm 4"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1056,7 +1068,7 @@ label = "Extra alarm 5"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1070,7 +1082,7 @@ label = "Extra alarm 6"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1084,7 +1096,7 @@ label = "Extra alarm 7"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1098,7 +1110,7 @@ label = "Extra alarm 8"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1112,7 +1124,7 @@ label = "Soil/leaf alarm 1"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1126,7 +1138,7 @@ label = "Soil/leaf alarm 2"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1140,7 +1152,7 @@ label = "Soil/leaf alarm 3"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1154,7 +1166,7 @@ label = "Soil/leaf alarm 4"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1168,7 +1180,7 @@ label = "Transmitter battery"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1182,7 +1194,7 @@ label = "Console battery voltage"
 unit = "V"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["consbatteryvoltage"]
 introduced_in = "0.1.0"
 
@@ -1197,7 +1209,7 @@ label = "Station battery voltage"
 unit = "V"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["stationbatteryvoltage"]
 introduced_in = "0.1.0"
 
@@ -1268,7 +1280,7 @@ label = "Snow sensor distance"
 unit = "mm"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["snowdistance"]
 introduced_in = "0.1.0"
 
@@ -1283,7 +1295,7 @@ label = "Snow depth"
 unit = "mm"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["snowdepth"]
 introduced_in = "0.1.0"
 
@@ -1298,7 +1310,7 @@ label = "Extra value 1"
 unit = "unitless"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrafloat1"]
 introduced_in = "0.1.0"
 
@@ -1313,7 +1325,7 @@ label = "Extra value 2"
 unit = "unitless"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrafloat2"]
 introduced_in = "0.1.0"
 
@@ -1328,7 +1340,7 @@ label = "Extra value 3"
 unit = "unitless"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrafloat3"]
 introduced_in = "0.1.0"
 
@@ -1343,7 +1355,7 @@ label = "Extra value 4"
 unit = "unitless"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrafloat4"]
 introduced_in = "0.1.0"
 
@@ -1358,7 +1370,7 @@ label = "Extra value 5"
 unit = "unitless"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrafloat5"]
 introduced_in = "0.1.0"
 
@@ -1373,7 +1385,7 @@ label = "Extra value 6"
 unit = "unitless"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrafloat6"]
 introduced_in = "0.1.0"
 
@@ -1388,7 +1400,7 @@ label = "Extra value 7"
 unit = "unitless"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrafloat7"]
 introduced_in = "0.1.0"
 
@@ -1403,7 +1415,7 @@ label = "Extra value 8"
 unit = "unitless"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrafloat8"]
 introduced_in = "0.1.0"
 
@@ -1418,7 +1430,7 @@ label = "Extra value 9"
 unit = "unitless"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrafloat9"]
 introduced_in = "0.1.0"
 
@@ -1433,7 +1445,7 @@ label = "Extra value 10"
 unit = "unitless"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["extrafloat10"]
 introduced_in = "0.1.0"
 
@@ -1598,7 +1610,7 @@ label = "Temperature sensor 1"
 unit = "degF"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1612,7 +1624,7 @@ label = "Temperature sensor 2"
 unit = "degF"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1626,7 +1638,7 @@ label = "Temperature sensor 3"
 unit = "degF"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1640,7 +1652,7 @@ label = "Temperature sensor 4"
 unit = "degF"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1654,7 +1666,7 @@ label = "Temperature sensor 5"
 unit = "degF"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1668,7 +1680,7 @@ label = "Temperature sensor 6"
 unit = "degF"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1682,7 +1694,7 @@ label = "Temperature sensor 7"
 unit = "degF"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1696,7 +1708,7 @@ label = "Temperature sensor 8"
 unit = "degF"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1710,7 +1722,7 @@ label = "Temperature sensor 9"
 unit = "degF"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1724,7 +1736,7 @@ label = "Temperature sensor 10"
 unit = "degF"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1738,7 +1750,7 @@ label = "Soil temperature 5"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1752,7 +1764,7 @@ label = "Soil temperature 6"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1766,7 +1778,7 @@ label = "Soil temperature 7"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1780,7 +1792,7 @@ label = "Soil temperature 8"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1794,7 +1806,7 @@ label = "Soil temperature 9"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1808,7 +1820,7 @@ label = "Soil temperature 10"
 unit = "degF"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1822,7 +1834,7 @@ label = "Humidity sensor 1"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1836,7 +1848,7 @@ label = "Humidity sensor 2"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1850,7 +1862,7 @@ label = "Humidity sensor 3"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1864,7 +1876,7 @@ label = "Humidity sensor 4"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1878,7 +1890,7 @@ label = "Humidity sensor 5"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1892,7 +1904,7 @@ label = "Humidity sensor 6"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1906,7 +1918,7 @@ label = "Humidity sensor 7"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1920,7 +1932,7 @@ label = "Humidity sensor 8"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1934,7 +1946,7 @@ label = "Humidity sensor 9"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1948,7 +1960,7 @@ label = "Humidity sensor 10"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1962,7 +1974,7 @@ label = "Soil humidity 1"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1976,7 +1988,7 @@ label = "Soil humidity 2"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -1990,7 +2002,7 @@ label = "Soil humidity 3"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2004,7 +2016,7 @@ label = "Soil humidity 4"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2018,7 +2030,7 @@ label = "Soil humidity 5"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2032,7 +2044,7 @@ label = "Soil humidity 6"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2046,7 +2058,7 @@ label = "Soil humidity 7"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2060,7 +2072,7 @@ label = "Soil humidity 8"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2074,7 +2086,7 @@ label = "Soil humidity 9"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2088,7 +2100,7 @@ label = "Soil humidity 10"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2102,7 +2114,7 @@ label = "Leaf wetness 5"
 unit = "index"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2116,7 +2128,7 @@ label = "Leaf wetness 6"
 unit = "index"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2130,7 +2142,7 @@ label = "Leaf wetness 7"
 unit = "index"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2144,7 +2156,7 @@ label = "Leaf wetness 8"
 unit = "index"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2158,7 +2170,7 @@ label = "Soil tension 1"
 unit = "cbar"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2172,7 +2184,7 @@ label = "Soil tension 2"
 unit = "cbar"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2186,7 +2198,7 @@ label = "Soil tension 3"
 unit = "cbar"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2200,7 +2212,7 @@ label = "Soil tension 4"
 unit = "cbar"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2214,7 +2226,7 @@ label = "Growing degree days"
 unit = "degree_days"
 tier = "extended"
 aggregates = ["max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2228,7 +2240,7 @@ label = "Reference evapotranspiration (short crop)"
 unit = "in"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2242,7 +2254,7 @@ label = "Reference evapotranspiration (tall crop)"
 unit = "in"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2256,7 +2268,7 @@ label = "Leak detector 1"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2270,7 +2282,7 @@ label = "Leak detector 2"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2284,7 +2296,7 @@ label = "Leak detector 3"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2298,7 +2310,7 @@ label = "Leak detector 4"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2312,7 +2324,7 @@ label = "Outdoor sensor battery"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2326,7 +2338,7 @@ label = "Indoor sensor battery"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2340,7 +2352,7 @@ label = "Battery 1"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2354,7 +2366,7 @@ label = "Battery 2"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2368,7 +2380,7 @@ label = "Battery 3"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2382,7 +2394,7 @@ label = "Battery 4"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2396,7 +2408,7 @@ label = "Battery 5"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2410,7 +2422,7 @@ label = "Battery 6"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2424,7 +2436,7 @@ label = "Battery 7"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2438,7 +2450,7 @@ label = "Battery 8"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2452,7 +2464,7 @@ label = "Battery 9"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2466,7 +2478,7 @@ label = "Battery 10"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2480,7 +2492,7 @@ label = "Particulate sensor battery"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2494,7 +2506,7 @@ label = "Lightning sensor battery"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2508,7 +2520,7 @@ label = "Leak detector 1 battery"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2522,7 +2534,7 @@ label = "Leak detector 2 battery"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2536,7 +2548,7 @@ label = "Leak detector 3 battery"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2550,7 +2562,7 @@ label = "Leak detector 4 battery"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2564,7 +2576,7 @@ label = "Soil moisture sensor 1 battery"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2578,7 +2590,7 @@ label = "Soil moisture sensor 2 battery"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2592,7 +2604,7 @@ label = "Soil moisture sensor 3 battery"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2606,7 +2618,7 @@ label = "Soil moisture sensor 4 battery"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2620,7 +2632,7 @@ label = "CO2 sensor battery"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2634,7 +2646,7 @@ label = "Cellular gateway battery"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2648,7 +2660,7 @@ label = "Pressure (relative)"
 unit = "inHg"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2662,7 +2674,7 @@ label = "Pressure (absolute)"
 unit = "inHg"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2676,7 +2688,7 @@ label = "Relay 1"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2690,7 +2702,7 @@ label = "Relay 2"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2704,7 +2716,7 @@ label = "Relay 3"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2718,7 +2730,7 @@ label = "Relay 4"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2732,7 +2744,7 @@ label = "Relay 5"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2746,7 +2758,7 @@ label = "Relay 6"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2760,7 +2772,7 @@ label = "Relay 7"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2774,7 +2786,7 @@ label = "Relay 8"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2788,7 +2800,7 @@ label = "Relay 9"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2802,7 +2814,7 @@ label = "Relay 10"
 unit = "state"
 tier = "extended"
 aggregates = ["min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2816,7 +2828,7 @@ label = "PM2.5"
 unit = "ug_per_m3"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["pm25"]
 introduced_in = "0.1.0"
 
@@ -2831,7 +2843,7 @@ label = "PM2.5 (24-hour average)"
 unit = "ug_per_m3"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2845,7 +2857,7 @@ label = "PM2.5 indoors"
 unit = "ug_per_m3"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2859,7 +2871,7 @@ label = "PM2.5 indoors (24-hour average)"
 unit = "ug_per_m3"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2873,7 +2885,7 @@ label = "PM2.5 indoors (AQIN sensor)"
 unit = "ug_per_m3"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2887,7 +2899,7 @@ label = "PM2.5 indoors, 24-hour average (AQIN sensor)"
 unit = "ug_per_m3"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2901,7 +2913,7 @@ label = "PM10 indoors (AQIN sensor)"
 unit = "ug_per_m3"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2915,7 +2927,7 @@ label = "PM10 indoors, 24-hour average (AQIN sensor)"
 unit = "ug_per_m3"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2929,7 +2941,7 @@ label = "CO2"
 unit = "ppm"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["co2"]
 introduced_in = "0.1.0"
 
@@ -2944,7 +2956,7 @@ label = "CO2 indoors (AQIN sensor)"
 unit = "ppm"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2958,7 +2970,7 @@ label = "CO2 indoors, 24-hour average (AQIN sensor)"
 unit = "ppm"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2972,7 +2984,7 @@ label = "Indoor temperature (AQIN sensor)"
 unit = "degF"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -2986,7 +2998,7 @@ label = "Indoor humidity (AQIN sensor)"
 unit = "percent"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -3000,7 +3012,7 @@ label = "Air quality index, PM2.5 (AQIN sensor)"
 unit = "aqi"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["aqi_pm25_aqin"]
 legacy_read_time_computed = true
 introduced_in = "0.1.0"
@@ -3016,7 +3028,7 @@ label = "Air quality index, PM2.5 24-hour (AQIN sensor)"
 unit = "aqi"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -3030,7 +3042,7 @@ label = "Air quality index, PM10 (AQIN sensor)"
 unit = "aqi"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["aqi_pm10_aqin"]
 legacy_read_time_computed = true
 introduced_in = "0.1.0"
@@ -3046,7 +3058,7 @@ label = "Air quality index, PM10 24-hour (AQIN sensor)"
 unit = "aqi"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -3060,7 +3072,7 @@ label = "Air quality index, PM2.5 indoors"
 unit = "aqi"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -3074,7 +3086,7 @@ label = "Air quality index, PM2.5 indoors 24-hour"
 unit = "aqi"
 tier = "extended"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -3088,7 +3100,7 @@ label = "Lightning strikes today"
 unit = "count"
 tier = "core"
 aggregates = ["max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -3102,7 +3114,7 @@ label = "Lightning strikes this hour"
 unit = "count"
 tier = "core"
 aggregates = ["max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]
@@ -3130,7 +3142,7 @@ label = "Distance to last lightning strike"
 unit = "mi"
 tier = "core"
 aggregates = ["mean", "min", "max"]
-levels = ["1m", "1h", "1d"]
+levels = ["1m", "5m", "1h", "1d"]
 introduced_in = "0.1.0"
 
 [[metric]]

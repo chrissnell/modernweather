@@ -144,8 +144,8 @@ if [ -n "$(find "$PREV_DIR" -name '*.sql' 2>/dev/null)" ]; then
     on "$DB_B" -f ci/db/seed.sql
     seeded=1
   else
-    echo "    note: ci/db/seed.sql does not exist; W4 owns the seed fixture. The upgrade" >&2
-    echo "          path runs against an empty table until it does." >&2
+    echo "    note: ci/db/seed.sql does not exist. The upgrade path runs against an" >&2
+    echo "          empty table, which is weaker than it should be." >&2
   fi
 else
   echo "    note: no previous migrations, so path B is currently a second path A." >&2
@@ -202,11 +202,39 @@ if ! diff -u "$WORK/a.caggs" "$WORK/b.caggs"; then
   status=1
 fi
 
+# The schema assertions, on BOTH paths. These are the properties that a dump comparison
+# cannot see because both paths are equally wrong about them: a count column that became
+# numeric, a finaliser that returns NULL where the frozen contract needs 0, a level that
+# started reading raw, a retention policy on the raw table. W4 owns them and
+# ci/db/schema-assertions.sql explains each one. Three of the nine are there because they
+# were violated.
+echo "=== schema assertions, path A"
+on "$DB_A" -f ci/db/schema-assertions.sql || status=1
+echo "=== schema assertions, path B"
+on "$DB_B" -f ci/db/schema-assertions.sql || status=1
+
 # And that the seeded rows are still there and still readable through the aggregates. A
-# migration that silently drops data passes a schema comparison.
+# migration that silently drops data passes a schema comparison. This is also where D-12,
+# D-13 and D-14 stop being spike results and become assertions the build runs.
 if [ "$seeded" -eq 1 ] && [ -f ci/db/verify-seed.sql ]; then
   echo "=== verifying seeded data survived"
   on "$DB_B" -f ci/db/verify-seed.sql || status=1
+fi
+
+# How strong was this run? Path B is only a real upgrade test if it applied a *delta*: a
+# previous migration set that is a strict prefix of HEAD's. Saying so out loud is the
+# difference between a gate that is green and a gate that is known to have tested
+# something — the state this check was in before W4 landed, with one migration in the
+# tree, was "green because both paths were the same path".
+prev_n=$(find "$PREV_DIR" -name '*.sql' 2>/dev/null | wc -l | tr -d ' ')
+head_n=$(find "$MIGRATIONS_DIR" -name '*.sql' | wc -l | tr -d ' ')
+echo "=== path B applied $prev_n migration(s), then $((head_n - prev_n)) more to reach HEAD"
+if [ "$prev_n" -eq 0 ]; then
+  echo "    WEAK: no previous migrations, so path B was a second path A." >&2
+elif [ "$prev_n" -eq "$head_n" ]; then
+  echo "    WEAK: HEAD adds no migration, so both paths ran the same set." >&2
+else
+  echo "    path B exercised a real upgrade over $( [ "$seeded" -eq 1 ] && echo seeded || echo empty ) tables."
 fi
 
 if [ "$status" -eq 0 ]; then
