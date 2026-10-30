@@ -20,6 +20,7 @@ mod coverage;
 mod dist;
 mod gates;
 mod gen;
+mod legacy;
 mod migrate;
 mod registry;
 mod snapshot;
@@ -46,6 +47,7 @@ fn main() -> ExitCode {
     let result = match cmd {
         "codegen" => codegen(&root, flags.contains(&"--check")),
         "migrate" => migrate_cmd(&root, &flags),
+        "legacy-import" => legacy_import(&root, &flags),
         "budget" => budget(&root),
         "validate" => validate_cmd(&root),
         "gates" => gates::list(&owned).map(|()| ExitCode::SUCCESS),
@@ -103,6 +105,12 @@ fn usage() {
          \x20                        changes. Loud on purpose; read the migration.\n\
          \x20     --dry-run          print what would be written, write nothing\n\
          \x20 validate           check every invariant and exit\n\
+         \n\
+         the Go-to-Rust data migration (W9)\n\
+         \x20 legacy-import      emit the migration SQL into ci/db/migrate-from-go/generated/\n\
+         \x20                    from metrics/registry.toml and\n\
+         \x20                    ci/db/migrate-from-go/go-aggregate-views.toml\n\
+         \x20     --check            regenerate into a temporary directory and diff\n\
          \x20 budget             print the column budget against the ceiling\n\
          \n\
          the gate and the release pipeline (W8)\n\
@@ -454,6 +462,74 @@ fn budget(root: &Path) -> Result<ExitCode, String> {
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// W9: the Go-to-Rust data migration emitter.
+// ---------------------------------------------------------------------------
+
+/// Emits `ci/db/migrate-from-go/generated/`. Deliberately a separate subcommand from
+/// `codegen` rather than another entry in `gen::all`, because its second input is not the
+/// registry: `go-aggregate-views.toml` describes a *frozen* tree at a named commit, and
+/// `codegen --check` is the gate that says "generated/ matches metrics/registry.toml". It
+/// should keep saying exactly that.
+fn legacy_import(root: &Path, flags: &[&str]) -> Result<ExitCode, String> {
+    let reg = load(root)?;
+    let go = legacy::GoViews::load(&root.join(legacy::GO_VIEWS))?;
+    let files = legacy::all(&reg, &go);
+
+    if !flags.contains(&"--check") {
+        for (path, body) in &files {
+            let full = root.join(path);
+            std::fs::create_dir_all(full.parent().unwrap())
+                .map_err(|e| format!("{}: {e}", full.display()))?;
+            std::fs::write(&full, body).map_err(|e| format!("{}: {e}", full.display()))?;
+        }
+        println!(
+            "legacy-import: wrote {} files to {} (registry {} metrics, {} at {})",
+            files.len(),
+            legacy::OUT_DIR,
+            reg.live_metrics().len(),
+            go.source_file,
+            &go.source_commit[..12],
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Same discipline as `codegen --check`: never write into the working tree, because a
+    // check that fixes the problem it checks for always passes (R-2).
+    let on_disk = read_tree(&root.join("ci/db/migrate-from-go/generated"), root);
+    let mut drift: Vec<String> = Vec::new();
+    for (path, want) in &files {
+        match on_disk.get(path) {
+            None => drift.push(format!("  missing from the tree: {path}")),
+            Some(have) if have != want => {
+                drift.push(format!("  differs: {path}{}", first_difference(have, want)));
+            }
+            Some(_) => {}
+        }
+    }
+    for path in on_disk.keys() {
+        if !files.contains_key(path) {
+            drift.push(format!("  in the tree but not generated: {path}"));
+        }
+    }
+    if drift.is_empty() {
+        println!(
+            "legacy-import --check: {} files match the registry and the Go view inventory",
+            files.len()
+        );
+        Ok(ExitCode::SUCCESS)
+    } else {
+        eprintln!(
+            "legacy-import --check: emitted output does not match its inputs\n{}\n\n\
+             Edit metrics/registry.toml, or re-run\n\
+             `ci/db/migrate-from-go/extract-go-views.sh <remoteweather>`, then run\n\
+             `cargo xtask legacy-import` and commit both.",
+            drift.join("\n")
+        );
+        Ok(ExitCode::from(1))
+    }
 }
 
 /// The generated Rust is compiled here rather than merely written out. `metrics.rs`

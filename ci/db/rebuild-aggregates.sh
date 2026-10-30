@@ -43,9 +43,18 @@
 # DATABASE_URL must point at the weather database.
 
 set -euo pipefail
-: "${DATABASE_URL:?set DATABASE_URL to the weather database}"
 
-psql_() { psql --set ON_ERROR_STOP=1 -X -q "$DATABASE_URL" "$@"; }
+# W9 edit, flagged in docs/data-migration.md's closing section: PSQL overrides the whole
+# invocation, so this script also works where `psql` cannot reach the database directly —
+# a container, a bastion, or the W9 migration lab, which talks to a pod through
+# `kubectl exec`. DATABASE_URL remains required unless PSQL is given, because without one
+# of the two there is nothing to connect to.
+if [ -n "${PSQL:-}" ]; then
+  psql_() { $PSQL --set ON_ERROR_STOP=1 -X -q "$@"; }
+else
+  : "${DATABASE_URL:?set DATABASE_URL to the weather database, or PSQL to a psql invocation}"
+  psql_() { psql --set ON_ERROR_STOP=1 -X -q "$DATABASE_URL" "$@"; }
+fi
 
 # Level, and the window /span can ever read it over (docs/legacy-api-contract.md §2.3).
 # `/span` takes no time anchor, so every span is [now - span, now] and these are exhaustive.
