@@ -8,6 +8,67 @@
 W4 designs the new schema; nothing owns moving ten years of the owner's data into it. The owner's
 constraint: *"I don't want to lose the data from my existing database."*
 
+## 0. What has changed since this prompt was written — read this first
+
+Three things. The first changes how you work, the second gives you a target schema that did not
+exist, and the third is a number nobody has been able to check.
+
+**You cannot reach the production database, and neither could anyone before you.** W0's OQ-1 records
+it: production is not in the homelab Kubernetes cluster, and the spike could not reach it. So every
+instruction below that says *measure production*, *confirm whether retention was paused* or *run this
+query* is a deliverable **for the owner to run**, not something you execute. Write them as
+parameterised, runnable SQL with the expected output stated, so that a single paste produces an
+answer the document can absorb.
+
+What you *can* do, and should: stand up a throwaway TimescaleDB container matching CI's image
+(`timescale/timescaledb-ha:pg17`), build the **old** schema in it from `createTableSQL` and the four
+`create*ViewSQL` constants in `internal/storage/timescaledb/sql.go` of the read-only `remoteweather`
+tree, seed it, and verify your transform and your reconciliation queries actually run and actually
+agree. That is how W0 and W4 produced their numbers. A migration procedure that has never been
+executed against anything is not a procedure; one executed against a faithful copy of the old schema
+is worth having.
+
+**The target schema now exists, and it is not the one §2 imagines.** W4 is merged — read
+`docs/database-schema.md` before writing the transform. Four things bear on you directly:
+
+- **`stations` is a dimension table with a surrogate `station_id int`.** The old table carries
+  `stationname text` and `stationtype text` on every row. Your transform must resolve them to
+  `station_id`, which means populating `stations` first and mapping as you load — not a
+  column-for-column copy.
+- **There are four aggregate levels now, not three.** W4 added `observations_5m` to preserve
+  `/span`'s 6 h–48 h band. Your §3 step 4 creates four levels, and the explicit full
+  materialisation in step 5 applies to each.
+- **W4 put retention on the lower levels** — 7, 14 and 90 days on `observations_1m`, `_5m` and `_1h`
+  respectively. This directly constrains §1: W4's assumption 35 points out that importing the
+  ~294-day rollup remainder into `observations_1m` would be **deleted by retention within a week.**
+  It belongs in `observations_1d`, or in raw as reconstructed readings, or nowhere — and W4
+  deliberately did not decide which. You do.
+- **Create the raw unique index as part of the import, not after** (W4 assumption 34). It is 4.0 s
+  over 35.9 M rows, but doing it on a live table takes a lock, and `ON CONFLICT` is unavailable until
+  it exists — which your import probably wants.
+
+Also inherit three things W4 handed you by name: **OQ-1** (production's PostgreSQL and TimescaleDB
+version — W4 §5.2 lists which of its decisions move if it is PostgreSQL 14, and notes that a
+TimescaleDB older than 2.9 cannot build the hierarchy at all, which would make the upgrade part of
+*your* work item rather than an option), **OQ-2** (the compression hold-rate query, which brackets a
+capacity figure that has already propagated into planning documents), and **OQ-6** (the ~72-column
+gap between the Go source's 215-column definition and production's ~143-column table — the registry
+was bootstrapped from the source, and somebody has to report the difference).
+
+**The retention policy's status is unknown.** Pausing it has been a pre-flight action in the master
+issue since 2026-10-27 and is the owner's to perform; this prompt predates any answer, and nothing in
+this runtime can observe production to check. **Do not assume either way.** Open the document with the
+question, state the cost of the answer being "no" in days-of-raw-lost at the time you run, and give
+the one-line query that settles it:
+
+```sql
+SELECT job_id, application_name, schedule_interval, next_start
+FROM timescaledb_information.jobs
+WHERE proc_name = 'policy_retention';
+```
+
+---
+
 ## Measured starting state
 
 Source database is `weather_v2_0_0`.
