@@ -19,6 +19,91 @@ This work item is the integration pass. **Its job is to reconcile, not to redesi
 documents conflict, surface it and propose the minimal resolution; do not quietly rewrite one of
 them, and do not introduce a third approach.
 
+## 0. Five things this prompt could not know
+
+All ten documents are merged. `main` carries `docs/DESIGN.md`, `spike-findings.md`,
+`legacy-api-contract.md`, `metric-registry.md`, `component-model.md`, `service-architecture.md`,
+`database-schema.md`, `management-ui-design.md`, `collector.md`, `release.md` and
+`data-migration.md`, each with the four required closing sections, plus real code: `metrics/`,
+`generated/`, `migrations/`, `xtask/`, `contract/`, `ci/` and `.github/workflows/`. The PR gate is
+live and green.
+
+Five things happened during the programme that change your inputs. None is a redesign; they are
+findings you would otherwise spend your first hours rediscovering, or deliverables this prompt
+forgot to ask for.
+
+**1. You owe a deviation ledger, and §3 never asks for one.** Two documents reference "W6's deviation
+ledger" by name as though it were already a deliverable. W3 produced three entries — an added `ETag`
+on `/latest`, `/snow` and the assets; case-insensitive `Host` matching; `404` instead of a directory
+index — each a deviation from **D-37**'s frozen contract, however small, and W3 says explicitly that
+they are "listed again in the assumptions for W6's ledger." W4's assumption 39 states, equally
+explicitly, that it has **no** entry. W9's OQ-W9-4 asks whether `period_rain`'s accuracy improvement
+belongs in one. So: **add a deviation ledger to `docs/reconciliation.md`** — every place a design
+knowingly changes a byte a shipped client could observe, with who decided it, the reasoning, and
+whether it is additive or behavioural. This is the artefact that answers "did we break the iOS app,
+and if so where and on purpose."
+
+**2. One CI gate is green by deferral, not by running — and it guards a completed deliverable.**
+Work through this chain yourself, then decide who fixes it:
+
+- `ci/gates.toml` declares gate `conformance`, owned by W1, with `arms_when =
+  "tests/conformance/manifest.toml"` and `cmd = ["cargo", "xtask", "conformance",
+  "--target-binary", "target/debug/modernweather"]`.
+- `tests/conformance/manifest.toml` does not exist and nothing is going to create it: W1 shipped its
+  runner as a standalone crate at **`contract/conformance/`** with 70 golden fixtures, per W0's R-3.
+- There is no `conformance` subcommand in `xtask` and no `modernweather` binary.
+- The CI job named *"frozen contract conformance"* runs `cargo xtask gate conformance`, which reads
+  the manifest, finds it absent, prints `DEFERRED` and **exits 0**.
+
+So a job reports green on every PR while W1's suite — whose own "done when" required it to pass
+against the Go server — never runs in CI. This is precisely what your §2 means by "verify the PR gate
+actually exists and is green, not just designed." Note the contrast with `codegen-drift`, where the
+same mechanism worked exactly as intended: W2 landed `metrics/registry.toml`, the gate armed itself,
+and it has been running since. The mechanism is sound; this one gate's `arms_when` and `cmd` point at
+an interface nobody built. `driver-emulators` is also `DEFERRED`, but legitimately — no Rust drivers
+exist yet.
+
+**3. The workspace root on `main` is partly a merge resolution, not any document's decision.** W2 and
+W8 ran in the same stage and both created a root `Cargo.toml` and an `xtask` crate, because each was
+told to create one if none existed. At merge the resolution was: keep W8's root manifest (W2's was an
+explicit placeholder), fold both module sets into **one** `xtask` crate, and drop W8's placeholder
+`xtask/src/codegen.rs` — it shimmed out to a separate `mw-codegen` package, while `ci/gates.toml`
+already declared the drift gate as `cargo xtask codegen --check`, which is what W2 implemented. W2's
+assumption 13 then says W3 "will restructure the minimal root workspace this work item created," and
+W3 did decide the crate layout. **Nothing guarantees the tree and W3's decision agree.** Check
+`Cargo.toml`, `crates/` and `xtask/src/` against W3 §1 and record the result; `contract/conformance/`
+declares its own empty `[workspace]`, which W1 left to W3 as well.
+
+**4. Four named W2 follow-ups are unowned.** W4's open questions each end in a recommendation
+addressed to W2, and W2 is finished: OQ-W4-1 (`affected_levels` drops every level when one level's
+membership changed), OQ-W4-2 (dimensions have no deprecation path, so `stationname`/`stationtype`
+cannot leave the raw table), OQ-W4-3 (no `jsonb` SQL type, so `observations.extra` sits outside the
+registry), OQ-W4-4 (`cargo xtask codegen` writes stale files and never prunes them, so `codegen`
+leaves a tree `--check` rejects). Feed these into §2 as gaps with an owner, not into §4 as questions
+for the owner — they are small, decided, and need a work item rather than a decision.
+
+**5. Four things need the owner and cannot be resolved by anyone here.** Keep them in §4 as a
+separate group, because they are not design questions and they have been outstanding for the whole
+programme: **pre-flight 1** — whether the production 365-day raw retention policy has been paused,
+still unconfirmed, and every day it fires converts another day of raw into unrecoverable rollup-only
+history; **OQ-1** — production's PostgreSQL and TimescaleDB version, which W4 §5.2 says moves several
+of its decisions and which, below TimescaleDB 2.9, makes a major-version upgrade part of W9;
+**OQ-2** — the compression hold-rate query, which brackets a capacity figure that has already
+propagated into planning documents; **OQ-6** — the ~72-column gap between the Go source's 215-column
+definition the registry was bootstrapped from and production's ~143 columns. **Production is not
+reachable from an agent runtime** (W0 OQ-1), so all four are queries for the owner to run. Do not
+treat them as answerable here.
+
+**One piece of bookkeeping for §2.** W2's and W4's prompts were outlines when the programme started
+and were written mid-flight from merged output; W1, W3 and W9 each had a `§0` appended for the same
+reason. The consequence is that `remoteweather:docs/rewrite/` — the second "canonical copy" the
+master issue describes — is now stale across the board, while `modernweather:docs/rewrite/` is
+current. W0's **R-1** argues for referencing the Go repo by URL and nothing more, which argues for
+retiring those copies. Record it as a gap with a recommendation; it is the owner's call, and
+`remoteweather` is read-only reference for every other purpose.
+
+---
+
 ## Inputs
 
 Read all of these, and read them *together* rather than in sequence:
