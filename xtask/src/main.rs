@@ -517,7 +517,13 @@ mod generated_compiles {
         let reg = load(&repo_root()).expect("registry is valid");
         let files = super::gen::all(&reg);
         for (path, body) in &files {
-            if !path.contains("observations_1") {
+            // Every level file, matched on the generator's own naming rather than on a
+            // hard-coded list: the filter used to read `observations_1`, which silently
+            // stopped covering the 5-minute level the moment it was added.
+            if !path.starts_with("generated/sql/")
+                || !path.contains("_observations_")
+                || path.contains("090_")
+            {
                 continue;
             }
             for (i, line) in body.lines().enumerate() {
@@ -551,6 +557,96 @@ mod generated_compiles {
                 );
             }
         }
+    }
+
+    /// `sum(bigint)` returns `numeric`, so a roll-up without a cast gives every level
+    /// above the first a numeric count while this struct — and W3's query layer with it —
+    /// says bigint. `mw_mean` is `(double precision, bigint)` and numeric does not
+    /// implicitly narrow, so the symptom was three of `/span`'s four bands failing to
+    /// resolve the finaliser at all. Found by running the query; kept by this test and by
+    /// ci/db/schema-assertions.sql A-1.
+    #[test]
+    fn a_rolled_up_count_is_cast_back_to_bigint() {
+        let reg = load(&repo_root()).expect("registry is valid");
+        let mut checked = 0;
+        for level in &reg.levels {
+            if level.source == "raw" {
+                continue;
+            }
+            for (_, c) in reg.level_columns(&level.name) {
+                if !c.name.ends_with("_count") {
+                    continue;
+                }
+                assert_eq!(
+                    c.sql_type, "bigint",
+                    "{}.{} is declared {}",
+                    level.name, c.name, c.sql_type
+                );
+                assert!(
+                    c.from_level.ends_with("::bigint"),
+                    "{}.{} rolls up as `{}`, which is numeric — mw_mean cannot be called \
+                     on it and sqlx will decode it as the wrong type",
+                    level.name,
+                    c.name,
+                    c.from_level
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "no count columns found, so this test proved nothing"
+        );
+    }
+
+    /// OQ-W1-2 option (c), W3 assumption 18: a bucket with no non-NULL `winddir` must
+    /// finalise to `0`, not to `null`. `windd` is a non-optional Swift `Double` and a
+    /// missing key fails the decode of the entire `/span` response, so `null` here is a
+    /// contract change rather than a tidier answer. The asymmetry with `mw_mean`, which
+    /// stays NULL, is the decision — both halves are asserted.
+    #[test]
+    fn the_circular_mean_finaliser_returns_zero_for_an_empty_bucket() {
+        let sql = super::gen::finalisers();
+        let circular = sql
+            .split("CREATE OR REPLACE FUNCTION mw_circular_mean")
+            .nth(1)
+            .expect("mw_circular_mean is generated");
+        assert!(
+            circular.contains("THEN 0"),
+            "mw_circular_mean does not return 0 for an empty bucket (W1-BUG-1)"
+        );
+        assert!(
+            !circular.contains("THEN NULL"),
+            "mw_circular_mean returns NULL for an empty bucket, which is OQ-W1-2 option \
+             (b) — a contract change, not option (c)"
+        );
+
+        let mean = sql
+            .split("CREATE OR REPLACE FUNCTION mw_mean")
+            .nth(1)
+            .expect("mw_mean is generated");
+        let mean_body = mean.split("$$").nth(1).expect("mw_mean has a body");
+        assert!(
+            mean_body.contains("THEN NULL"),
+            "mw_mean must stay NULL for an empty bucket; only the direction is zero-filled"
+        );
+    }
+
+    /// The finalisers are the one piece of generated SQL whose *body* can change without
+    /// any identifier changing, so no snapshot diff is produced and nothing else would
+    /// carry the change into a deployed database. Before this, they were emitted only by
+    /// the bootstrap migration.
+    #[test]
+    fn every_migration_reasserts_the_finalisers() {
+        let reg = load(&repo_root()).expect("registry is valid");
+        let m = super::migrate::render(&reg, &[], false, "20260101000000", "no_op");
+        assert!(
+            m.body
+                .contains("CREATE OR REPLACE FUNCTION mw_circular_mean"),
+            "a migration that changes only a finaliser would reach generated/ and never \
+             reach a database"
+        );
+        assert!(m.body.contains("CREATE OR REPLACE FUNCTION mw_mean"));
     }
 
     #[test]

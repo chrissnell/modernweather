@@ -269,8 +269,20 @@ impl Metric {
                             name: format!("{c}_count"),
                             sql_type: "bigint",
                             // H-2: a zero count is stored as NULL, not as 0.
+                            //
+                            // The ::bigint on the roll-up is load-bearing, not cosmetic.
+                            // sum(bigint) returns numeric, so without it every level above
+                            // the first declares its count columns numeric while this
+                            // struct — and generated/rust/aggregates.rs with it — says
+                            // bigint. The consequences are not subtle: mw_mean is declared
+                            // (double precision, bigint) and numeric does not implicitly
+                            // narrow, so `mw_mean(c_sum, c_count)` fails outright on three
+                            // of /span's four bands, and sqlx decodes the column into the
+                            // wrong Rust type on all three. Found by running the query
+                            // (docs/database-schema.md §6, measurement 1), not by reading
+                            // the SQL. A count also has no business being variable-length.
                             from_raw: format!("nullif(count({c}), 0)"),
-                            from_level: format!("nullif(sum({c}_count), 0)"),
+                            from_level: format!("nullif(sum({c}_count), 0)::bigint"),
                             strategy: *s,
                         });
                     }
@@ -325,8 +337,9 @@ impl Metric {
                     out.push(AggColumn {
                         name: format!("{c}_dir_count"),
                         sql_type: "bigint",
+                        // ::bigint for the same reason as `_count` above.
                         from_raw: format!("nullif(count({c}), 0)"),
-                        from_level: format!("nullif(sum({c}_dir_count), 0)"),
+                        from_level: format!("nullif(sum({c}_dir_count), 0)::bigint"),
                         strategy: *s,
                     });
                 }

@@ -18,8 +18,20 @@ LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
 $$;
 
 -- Vector mean of an angle, finalised from the sine sum, cosine sum and count the
--- aggregates carry. Verified through all three levels against a direct computation
--- from raw: agreement to within 3e-12 degrees over 868 bucket pairs (D-13).
+-- aggregates carry. Verified through the level hierarchy against a direct
+-- computation from raw: agreement to within 3e-12 degrees over 868 bucket pairs
+-- (D-13).
+--
+-- The empty-bucket branch returns 0, not NULL, and that is a contract requirement
+-- rather than a convenience (OQ-W1-2 option (c), W3 assumption 18). W1-BUG-1:
+-- the Go finaliser divides sin_sum by a zero count and /span is a 500 with
+-- SQLSTATE 22012 for any station reporting no winddir. It is latent there only
+-- because the Go writer inserts its whole struct, zeros included, so windd
+-- serialises as 0. This design's writer stores NULL for an unreported metric
+-- (W3 §2.5), which makes the defect live. Returning NULL instead would be a
+-- contract change: `windd` is a non-optional Swift Double, and a missing key
+-- fails the decode of the entire /span response, not just that field. 0 is what
+-- ships today and 0 is what this returns.
 CREATE OR REPLACE FUNCTION mw_circular_mean(
     sin_sum double precision,
     cos_sum double precision,
@@ -27,7 +39,7 @@ CREATE OR REPLACE FUNCTION mw_circular_mean(
 ) RETURNS double precision
 LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
     SELECT CASE
-        WHEN n IS NULL OR n = 0 THEN NULL
+        WHEN n IS NULL OR n = 0 OR sin_sum IS NULL OR cos_sum IS NULL THEN 0
         ELSE (atan2d(sin_sum / n, cos_sum / n) + 360)::numeric % 360
     END::double precision
 $$;

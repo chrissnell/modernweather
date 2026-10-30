@@ -70,8 +70,20 @@ fn functions_sql() -> String {
          \x20   SELECT CASE WHEN n IS NULL OR n = 0 THEN NULL ELSE total / n END\n\
          $$;\n\n\
          -- Vector mean of an angle, finalised from the sine sum, cosine sum and count the\n\
-         -- aggregates carry. Verified through all three levels against a direct computation\n\
-         -- from raw: agreement to within 3e-12 degrees over 868 bucket pairs (D-13).\n\
+         -- aggregates carry. Verified through the level hierarchy against a direct\n\
+         -- computation from raw: agreement to within 3e-12 degrees over 868 bucket pairs\n\
+         -- (D-13).\n\
+         --\n\
+         -- The empty-bucket branch returns 0, not NULL, and that is a contract requirement\n\
+         -- rather than a convenience (OQ-W1-2 option (c), W3 assumption 18). W1-BUG-1:\n\
+         -- the Go finaliser divides sin_sum by a zero count and /span is a 500 with\n\
+         -- SQLSTATE 22012 for any station reporting no winddir. It is latent there only\n\
+         -- because the Go writer inserts its whole struct, zeros included, so windd\n\
+         -- serialises as 0. This design's writer stores NULL for an unreported metric\n\
+         -- (W3 §2.5), which makes the defect live. Returning NULL instead would be a\n\
+         -- contract change: `windd` is a non-optional Swift Double, and a missing key\n\
+         -- fails the decode of the entire /span response, not just that field. 0 is what\n\
+         -- ships today and 0 is what this returns.\n\
          CREATE OR REPLACE FUNCTION mw_circular_mean(\n\
          \x20   sin_sum double precision,\n\
          \x20   cos_sum double precision,\n\
@@ -79,7 +91,7 @@ fn functions_sql() -> String {
          ) RETURNS double precision\n\
          LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$\n\
          \x20   SELECT CASE\n\
-         \x20       WHEN n IS NULL OR n = 0 THEN NULL\n\
+         \x20       WHEN n IS NULL OR n = 0 OR sin_sum IS NULL OR cos_sum IS NULL THEN 0\n\
          \x20       ELSE (atan2d(sin_sum / n, cos_sum / n) + 360)::numeric % 360\n\
          \x20   END::double precision\n\
          $$;\n",
@@ -776,6 +788,10 @@ fn ts_metrics(reg: &Registry) -> String {
 
 /// Exposed so the migration generator reuses the exact aggregate definition rather
 /// than re-deriving it.
+pub fn finalisers() -> String {
+    functions_sql()
+}
+
 pub fn aggregate_definition(reg: &Registry, level: &str) -> String {
     aggregate_sql(reg, level)
 }
