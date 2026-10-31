@@ -56,27 +56,33 @@ disjoint crates. Everything else is serial.
 parallel with M1 and M2 because nothing in those touches a real database beyond CI's service
 container. `docs/reconciliation.md` §7 has the full reasoning and the measurements.
 
-### M0-1 — TimescaleDB as a StatefulSet *(N-17)*
-**Depends on:** nothing. **Blocks:** M5-1.
+### M0-1 — TimescaleDB as a StatefulSet on a dedicated node *(N-17)*
+**Depends on:** the owner adding the node. **Blocks:** M5-1.
 A single-replica StatefulSet on a `local` PersistentVolume, `timescale/timescaledb-ha:pg17` (the
-plain image lacks `timescaledb_toolkit`, which D-2 requires — W8 D-17's reason), pinned to
-`big-bulky-1` with a `nodeSelector` and a toleration for the `workload-class=heavy` taint, copying
-the shape of the `graywolf-publish-big-bulky-1` local PV that is already proven in this cluster.
-**Storage must not be NFS** — W4 D-26's refresh policy has 3.06–3.22 s of measured lag against a
-10-second deadline, and A-W4-3 showed a durable refresh is ~47% WAL fsync.
+plain image lacks `timescaledb_toolkit`, which D-2 requires — W8 D-17's reason), on **its own Talos
+worker**, tainted so nothing else schedules there, with a `local` PV copying the shape of
+`graywolf-publish-big-bulky-1` — the pattern transfers; only the node name changes.
+**Storage must not be NFS, and should be NVMe** — W4 D-26's refresh policy has 3.06–3.22 s of measured
+lag against a 10-second deadline, and A-W4-3 showed ~47% of a durable refresh is WAL fsync. This
+workload is fsync-latency-bound, so disk *latency* is the spec that matters; capacity is not (a decade
+is ~36 GB).
+**`big-bulky-1` is explicitly not the target** — rejected by the owner 2026-10-31 on operating
+experience: it is too busy with map builds. `docs/reconciliation.md` §7.3 records why the "measure it
+first" recommendation was withdrawn rather than deleted.
 **Done when:** `ci/sql/assert-timescaledb-version.sql` passes against it; the schema migrations apply
-from empty into a fresh `modernweather` database; `mw_aggregate_refresh_seconds` and the 1-minute
-refresh lag are being recorded so §7.4's "measure before buying" has data.
-**Explicitly not done here:** buying hardware. The recommendation is to run on the existing heavy node
-and let the refresh-lag measurement decide whether a dedicated node is needed. That is evidence rather
-than a guess, and it is the programme's own method applied to its infrastructure.
+from empty into a fresh `modernweather` database; the node is tainted and the PV is bound.
 
-### M0-2 — backup, and a restore rehearsal in CI *(N-19)*
-**Depends on:** M0-1. **Blocks:** cutover (M7-5).
-A `CronJob` that `pg_dump`s to storage **on a different machine** — `synology-nfs-csi` and
-`archlinux-nfs` both already exist — plus a restore rehearsal in CI against a fixture-sized database.
-**Done when:** a restore has been performed from a dump and reconciled, in CI, **not** documented.
-D-6's first half is the mechanism; this is its untested second half.
+### M0-2 — weekly off-site backup, and a restore rehearsal in CI *(N-19)*
+**Depends on:** M0-1. **Blocks:** cutover (M7-5). **This is the owner's stated condition for
+accepting a single replica**, so it is not optional and it is not after cutover.
+A weekly `CronJob` dumping **per year** to Cloudflare R2 — so the recurring upload is the current year
+(~4–5 GB) rather than the whole decade, since raw is append-only and a historical year cannot change.
+**Dump raw + `observations_1d_legacy`/`_1h_legacy` + `config.db`. Do not dump the aggregate levels**
+(D-15 makes them disposable, and they would be the largest thing in the file). The legacy archive is
+the one that gets forgotten and the only copy of the ~294 rollup-only days.
+**Done when:** a restore has been performed from an R2 object and reconciled, **in CI**, not
+documented. D-6's first half is the mechanism; this is its untested second half. Also: record the real
+dump size, which replaces §7.5's only extrapolated figure.
 **Must carry two measured W9 findings:** A-W9-2 — an aggregate *accepts* an `INSERT` and discards it
 on the next refresh, so pre-seeded aggregate rows are not a restore mechanism; and W4 D-23's
 phase-1-first ordering (0.87 s to make the charts right against 467 s to materialise everything), so
@@ -518,7 +524,7 @@ still in production.** This is the milestone that makes cutover a decision rathe
 Everything that is "another instance of a pattern M3 and M4 established". Parallelisable; none of it
 blocks M7.
 
-### M6-1 — the remaining six drivers
+### M6-1 — the remaining six drivers *(includes N-20)*
 **Depends on:** M3-1. Davis (serial and TCP), Campbell Scientific, Ambient, AirGradient, the snow
 gauge, and the gRPC receiver. **Davis and Campbell get a `socat` pty pair** (W3 D-83) because serial
 framing and read-timeout behaviour is where that class of defect lives.
@@ -527,6 +533,11 @@ framing and read-timeout behaviour is where that class of defect lives.
 `?PASSWORD=` compared constant-time (W2a D-43). A second Ambient station is a config row, not a second
 HTTP server.
 **Done when:** each driver passes all three test levels against its pinned Go emulator.
+**N-20 lands with Campbell:** the owner's station is on USB serial and the daemon is moving into
+Kubernetes, so Campbell must work over `TcpOut` against a `ser2net` bridge as well as over `Serial`.
+W2a §4a.5 already maps it as `Serial | TcpOut` and the Go version already dials TCP when
+`SerialDevice` is empty, so this is a test case rather than a new capability — but it is the one
+driver where the TCP path is load-bearing in production rather than a convenience.
 **Decision point that lands here, not before:** **OQ-W4-3** — whether the registry gains a `jsonb`
 type so `observations.extra` can be a registry entry. W4's note is explicit that this is "worth
 deciding before W7 writes its first driver that receives an unknown field", and this is that moment.
@@ -684,4 +695,4 @@ reader might expect are deliberately absent.
 | ~~M7-3~~ | ~~**O-11** which `chonky` gaps to upstream~~ | **Answered: all twelve are fair game.** Upstream G2/G4/G9/G10 now; the rest as their shape settles in use |
 | ~~before first release~~ | ~~**O-9** is a Pi Zero in use?~~ | **Answered: retain the broadest hardware support.** All four targets stay; with no ARM1176 to test on, W8 D-25's qemu run under `-cpu arm1176` **is** the validation — no new hardware needed |
 | ~~N-1~~ | ~~**O-6** which legacy surface is dead~~ | **Answered structurally** — only the iOS endpoints are frozen, so `legacy-v1.json` settles it and the access-log query is unnecessary |
-| — | **O-3** the compression hold rate, **O-4** the column gap | No. O-4 falls out of M5-1 as a side effect |
+| — | **O-3** the compression hold rate, **O-4** the column gap | No. **All four production questions are answered by one run of `migrate-from-go.sh preflight`** — P-1 is O-1, P-2/P-2b/P-3b are O-2's policy state, P-6 is O-3, P-7 is O-4 |

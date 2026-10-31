@@ -1242,7 +1242,7 @@ still owes (**O-5**).
 
 ## 4. Work items raised by this document
 
-Nineteen — sixteen from the audit, and **three added 2026-10-31** from the owner's answers (§6, §7).
+Twenty — sixteen from the audit, and **four added 2026-10-31** from the owner's answers (§6, §7).
 Each is a named item with an owner-facing one-liner; each appears in
 `docs/implementation-plan.md` with dependencies, done-criteria and a test strategy. **None is a
 redesign** — every one closes a gap §2, §6 or §7 found.
@@ -1267,7 +1267,8 @@ redesign** — every one closes a gap §2, §6 or §7 found.
 | **N-16** | `rebuild-aggregates.sh` phase 1 uses the widest band above | **G-5** / OQ-W9-3. `--recent-only` currently caches a hole in `observations_1d` beyond 14 days. | small |
 | **N-17** | **Run TimescaleDB in Kubernetes** | **§7.** No design document owns where the database runs. Single-replica StatefulSet on a `local` PV, which is also the migration's target — so the platform move and W9's migration are one operation. | medium |
 | **N-18** | Classify each fixture frozen / coupled / retired | **§6.4.** Only five endpoints are frozen; the rest are coupled, not unconstrained. The suite keeps its breadth and the runner reports the two classes differently. | small |
-| **N-19** | **Scheduled `pg_dump` off-node, and a CI restore rehearsal** | **§7.5.** D-6 names the mechanism and nothing owns running it. On a single-replica local-PV StatefulSet the local volume *is* the single point of failure. | small |
+| **N-19** | **Weekly off-site `pg_dump` to R2, and a CI restore rehearsal** | **§7.5.** D-6 names the mechanism and nothing owns running it; the owner has made it the condition of accepting a single replica. Raw + the legacy archive + `config.db`; **not** the aggregates (D-15). Per-year dumps, so the weekly job re-uploads ~4–5 GB rather than 40. | small |
+| **N-20** | **Serial over TCP for the USB-attached Campbell station** | **§7.6.** The station is on USB serial and the database is moving into Kubernetes. Already supported on both sides — Go dials TCP when `SerialDevice` is empty, and W2a §4a.5 maps Campbell as `Serial \| TcpOut` — so this is `ser2net` plus a config change, and it does **not** block the database move. | small |
 
 ### N-1 — the v2 API, with its starting inventory
 
@@ -1653,8 +1654,13 @@ statefulset there, but open to ideas."*
 
 No design document covers where the database runs — W4 designed the schema, W9 designed the
 migration, and D-2 pins the versions, but the platform was never anybody's. It is a real gap and it
-is raised as **N-17**. What follows is a recommendation with the measurements it rests on, not a
-decision taken on the owner's behalf.
+is raised as **N-17**.
+
+**Settled 2026-10-31**, in two rounds: this document first recommended running on the existing heavy
+node and measuring the contention, and the owner rejected that from operating experience (§7.3). The
+shape is now **a dedicated Talos worker, single-replica StatefulSet, local NVMe** (§7.4), with weekly
+off-site backups as the stated condition (§7.5). The USB-serial station turned out to be a separate
+problem with a separate answer (§7.6).
 
 ### 7.1 A fresh `modernweather` database was already the plan
 
@@ -1687,91 +1693,190 @@ does `pg_dump` need and does the archive extraction work", which is a detail rat
 It also means *"pitcairn is very hard to migrate"* stops being a problem to solve. Nothing is migrated
 in place. The box is read from once and then switched off.
 
-### 7.3 The hardware may already be in the cluster
+### 7.3 `big-bulky-1` was considered and rejected
 
-Measured against the live cluster rather than assumed:
+**Superseded 2026-10-31 by the owner, on operating experience:** *"Big Bulky is not the answer. It's
+too busy with maps."*
 
-| | Finding |
-|---|---|
-| **`big-bulky-1`** | 24 CPU, 64 GiB RAM, **~1.86 TiB local storage**, already a dedicated worker — labelled `workload-class=heavy` with a matching `NoSchedule` taint, so nothing lands there unless it asks to |
-| **Local-PV pattern** | Already in production in this cluster: `graywolf-publish-big-bulky-1` is a 500 GiB `local` volume (a real `local` volume with `nodeAffinity`, not a `hostPath`) at `/var/mnt/graywolf-publish`, `Retain`, `WaitForFirstConsumer`, via the `graywolf-tiles-local` no-provisioner storage class |
-| **Postgres-on-K8s pattern** | Also already present: `multica/multica-postgres` is a running StatefulSet |
-| **The OS is Talos** | v1.13.4, immutable and API-driven. `/var/mnt/...` is the Talos user-volume convention, so adding a disk is a machine-config patch rather than a shell session |
+This section previously recommended running on `big-bulky-1` and measuring whether contention with
+the graywolf batch jobs mattered. That recommendation is withdrawn, and the reasoning for withdrawing
+it is worth recording rather than just deleting: **the measurement was proposed because this document
+had no operating history, and the owner does.** §7.4's original caveat named the risk correctly —
+bursty radar-contour and planet-overview tile builds sharing a disk with a latency-sensitive database
+— and the person running that node already knew the answer. Measuring to rediscover it would have
+been ceremony.
 
-**How big is this database, really?** Small. W4 measured raw compression at **5.3×** at a 76.87% hold
-rate, and the Go table is ~19 GB/year uncompressed; W4 D-5's retention puts all four aggregate levels
-together at **337 MB**. So a decade of history is roughly **40 GB**, against 1.86 TiB of local disk
-already present. Hardware is not the constraint here, and the recommendation is explicitly **not** to
-buy for capacity.
+The findings that survive, because they are about the workload rather than the node:
 
-**The Talos point is the structural answer to the owner's actual complaint.** pitcairn is hard to
-migrate *because* it is a hand-maintained Arch box whose state lives in years of accumulated local
-changes. A Talos node has no shell and no accumulated state — its entire configuration is a
-declarative machine config. Moving onto Talos does not just relocate the problem; it removes the
-class of problem.
+| | Finding | Still true |
+|---|---|---|
+| **The database is small** | W4 measured 5.3× raw compression at a 76.87% hold rate, and production's `weather` is **19 GB/year** uncompressed at ~143 columns. All four aggregate levels together are **337 MB** under W4 D-5's retention | **Yes.** A decade is roughly **36 GB** compressed. Capacity is not a reason to buy anything |
+| **Storage must not be NFS** | W4 D-26 phase-locks the 1-minute refresh 3 s past each boundary with 3.06–3.22 s measured lag against a **10-second** deadline; A-W4-3 decomposed a durable refresh as **~357 s of 758 s being WAL fsync** | **Yes, and it is the one hard constraint.** This workload is fsync-latency-bound. `multica-postgres` on `synology-nfs-csi` is the contrast — right for a 20 GiB config database, wrong for this one |
+| **The local-PV pattern is proven here** | `graywolf-publish-big-bulky-1` is a real `local` volume with `nodeAffinity` at `/var/mnt/…`, `Retain`, `WaitForFirstConsumer`, via a `no-provisioner` storage class | **Yes** — the pattern transfers to any node; only the node name changes |
+| **Talos removes the class of problem** | pitcairn is hard to migrate *because* it is a hand-maintained Arch box carrying years of accumulated local state. A Talos node has no shell and no accumulated state | **Yes, and this is the strongest argument for the move** |
 
-### 7.4 Recommendation
+### 7.4 Recommendation — a dedicated Talos worker
 
-**A plain single-replica StatefulSet on a `local` PersistentVolume — the owner's own instinct — and
-start on `big-bulky-1` rather than buying a server.**
+**Owner decision, 2026-10-31:** a dedicated machine, in the cluster, hardware already available. *"I'm
+fine with a single standalone node as a Timescale server, so long as we figure out how to get backups
+working."*
 
-1. **Image: `timescale/timescaledb-ha:pg17`.** Not the plain image: D-2 requires
-   `timescaledb_toolkit` and the plain image lacks it, which is exactly why W8 D-17 chose this one for
-   CI. Using the same image family in CI and production is worth having.
-2. **Storage must be local, not NFS.** This is the one non-negotiable. W4 D-26 phase-locks the
-   1-minute refresh policy 3 seconds past each boundary and measured **3.06–3.22 s** of lag against
-   `window:rollup`'s **10-second** deadline — real headroom, but not an order of magnitude. And
-   A-W4-3 decomposed a durable aggregate refresh as **~357 s of 758 s being WAL fsync**, so this
-   workload is fsync-latency-bound more than throughput-bound. The existing `multica-postgres` on
-   `synology-nfs-csi` is the contrast: correct for a 20 GiB configuration database, wrong for this.
-3. **Pin it with `nodeSelector` + a toleration for `workload-class=heavy`**, and a `local` PV with
-   `nodeAffinity` — copying `graywolf-publish-big-bulky-1`'s shape exactly, since that pattern is
-   already proven here.
-4. **Measure before buying.** `big-bulky-1`'s current tenants are bursty graywolf batch jobs — radar
-   contours every ~5 minutes, surface-fronts and planet-overview tile builds. Co-locating a
-   latency-sensitive database with tile builders **on the same disk** is a genuine contention risk,
-   and the thing it would eat is item 2's refresh headroom. So: deploy there, give it resource
-   requests and a separate physical disk if one is free, and **watch `mw_aggregate_refresh_seconds`
-   and the refresh lag against the 10-second deadline** — both of which W3 §5.10 and W4 §6.2 already
-   make observable. If the lag approaches the deadline, *that* is the evidence for a dedicated node,
-   and it will be evidence rather than a guess. This is the programme's own method applied to its
-   infrastructure.
+A single-replica StatefulSet on a `local` PersistentVolume, on **its own Talos worker**, tainted so
+nothing else lands there.
 
-**On the alternatives, since the owner asked for ideas:**
+**What the workload actually needs**, so the hardware can be matched rather than guessed:
 
-| Option | Verdict |
-|---|---|
-| **Plain StatefulSet** (recommended) | Simplest thing that satisfies the constraints, and both halves of the pattern already exist in this cluster. Costs: backup is hand-rolled (see §7.5) and there is no automated failover |
-| **CloudNativePG** | A genuinely good operator — barman-based backup and PITR, rolling minor upgrades, automated failover. But TimescaleDB needs a custom image, and CNPG's HA story wants ≥2 replicas on replicated storage, which fights the local-disk requirement that item 2 makes non-negotiable. More machinery than this problem has |
-| **Timescale's own K8s operator** | No. Effectively unmaintained |
-| **Leave it on bare metal, new box** | Works, and reintroduces the hand-maintained-host problem the owner is trying to escape |
+| | Need | Why |
+|---|---|---|
+| **Disk** | **NVMe or SSD. Not spinning.** Capacity is almost irrelevant — 256 GB is ~7× a decade of history | The workload is **fsync-latency-bound**, not throughput-bound: ~47% of a durable aggregate refresh is WAL fsync (A-W4-3), and the 1-minute refresh has 6.8 s of slack against its deadline (W4 D-26). Latency is what consumes that slack |
+| **RAM** | 16–32 GB is generous | The hot working set is the uncompressed recent chunks plus `shared_buffers`. The whole compressed database is ~36 GB for a decade |
+| **CPU** | 4–8 cores; single-thread speed matters more than count | The heaviest operation is an aggregate refresh, and it is **one session** — W4 measured 401 s at 627 expressions over 35.9 M rows with `synchronous_commit = off`. More cores do not shorten it |
+| **Network** | 1 GbE is ample | Ingest is 4 stations at 2 s. The only bulk transfer is the one-time migration |
 
-**The honest summary of the trade:** a single replica on a local PV cannot reschedule — if
-`big-bulky-1` is down, the pod is `Pending` until it returns, because that is what `local` volumes
-mean. That is acceptable *only* because §7.5 is done, and it is proportionate: the Go daemon has been
-a single process on a single box for years, and D-35 describes a system with one administrator and no
-RBAC. It is proportionate, not ideal, and the thing that makes it safe is a restore that has been
-tested rather than assumed.
+**Not** a second replica. A single replica on a `local` volume **cannot reschedule** — if the node is
+down the pod is `Pending`, because that is what `local` volumes mean. The owner has accepted that
+explicitly, and §7.5 is the condition that makes it safe. CloudNativePG was considered and declined:
+TimescaleDB needs a custom image, and CNPG's HA story wants ≥2 replicas on replicated storage, which
+fights the non-negotiable in §7.3.
 
-### 7.5 A gap this question surfaces: D-6's backup has no owner and no schedule
+**Image: `timescale/timescaledb-ha:pg17`** — not the plain image, which lacks `timescaledb_toolkit`
+that D-2 requires. It is also what CI already uses (W8 D-17), so CI and production share an image
+family.
+
+**On Talos specifically:** adding the node is a machine config, the data disk becomes a user volume
+mounted under `/var/mnt/`, and the `local` PV is then pinned to it with `nodeAffinity` — the same
+shape as `graywolf-publish-big-bulky-1`. No shell, no udev rules, no accumulated state. This is the
+part that answers *"pitcairn is very hard to migrate"* structurally rather than by relocating it.
+
+### 7.5 Backups — the condition that makes a single replica safe
 
 D-6 says backup and restore is `pg_dump` of the raw hypertable plus an aggregate refresh, and that no
-bespoke tool is built. That is the right mechanism and **nothing in the programme owns running it.**
-On pitcairn that was a latent gap. On a single-replica local-PV StatefulSet it is load-bearing,
-because the local volume *is* the single point of failure.
+bespoke tool is built. That is the right mechanism and **nothing in the programme owned running it.**
+On pitcairn that was a latent gap. On a single-replica local-PV StatefulSet the local volume *is* the
+single point of failure, so it becomes load-bearing — and the owner has made it the condition of
+accepting a single replica.
 
-Raised as **N-19**: a `CronJob` that `pg_dump`s to storage **on a different machine** — the cluster
-already has `synology-nfs-csi` and `archlinux-nfs` for exactly this — plus a **restore rehearsal that
-runs in CI** against a fixture-sized database, so D-6's second half is proved rather than documented.
-W9 D-1 is the reason this needs real care rather than a one-liner: `drop_chunks` logs an invalidation
-that a later refresh acts on, so "restore raw and rebuild the aggregates" has an ordering that has
-already bitten once in measurement.
+**Owner constraint, 2026-10-31:** weekly, stored off-site, Cloudflare R2 a candidate *"depending on
+cost"*. Raised as **N-19**.
 
-**Two things N-19 should carry forward from W9's findings**, because they are counter-intuitive and
-already measured: A-W9-2 — a continuous aggregate **accepts** an `INSERT` and discards it on the next
-refresh, so pre-seeded aggregate rows are not a restore mechanism; and A-W4-3 — a full rebuild at ten
-years is an hour-scale operation, so a restore runbook needs W4 D-23's phase-1-first ordering (0.87 s
-to make the charts right, 467 s to materialise everything) rather than a single blocking refresh.
+#### What to back up, which is less than the database
+
+D-15 makes the aggregate levels **disposable derived data**, so they are not backed up at all — they
+are rebuilt. What is irreplaceable is smaller than it looks, and one item is easy to miss:
+
+| | Back up? | Size | Why |
+|---|---|---|---|
+| `observations` (raw) | **Yes** | ~3.6 GB/year compressed (19 GB/year raw at 5.3×) | Derived from nothing. D-4 retains it indefinitely |
+| `observations_1d_legacy`, `observations_1h_legacy` | **Yes — and this is the one that gets forgotten** | ~2.5 MB + ~58 MB | The **only** copy of the ~294 days of rollup with no raw behind it. Not derived, not regenerable, and deliberately outside the aggregate hierarchy (W9 D-4) |
+| `config.db` (SQLite) | **Yes** | a few hundred kB | Station calibration, certificates, website configuration. Tiny, irreplaceable, and the thing a human cannot re-derive — see D-66's reasoning for why it is not re-typable |
+| `stations`, `station_metrics`, `almanac_cache`, `snow_totals_cache` | Yes, incidentally | small | Projections and caches. Cheap enough that excluding them is not worth the thought |
+| `observations_1m` / `_5m` / `_1h` / `_1d` | **No** | would be the largest thing in the dump | Disposable (D-15), retention-bounded (W4 D-5), and rebuilt by `ci/db/rebuild-aggregates.sh` |
+
+#### Why weekly full dumps are cheap here
+
+**Raw is append-only and immutable per time range.** No reading is ever updated, so a historical year
+cannot change. That makes the obvious schedule wasteful and a per-range one nearly free:
+
+- Dump **per year** rather than as one file. Old years are written once and never rewritten.
+- The weekly job then re-dumps only the **current** year — roughly 4–5 GB, not 40.
+- Restores become granular: a single year can be pulled without the other nine.
+
+#### Cost, since it was asked conditionally
+
+Estimated from the measured 19 GB/year and 5.3×, with `pg_dump -Fc`'s zlib on data with a 76.87% hold
+rate landing in a similar range — **to be replaced with the real number from the first dump**, since
+this is the one figure here that is extrapolated rather than measured:
+
+| | |
+|---|---|
+| A decade at rest | ~40–50 GB |
+| R2 storage | ~$0.015/GB-month → **$0.60–0.75/month**, less the 10 GB-month free tier |
+| Weekly upload | ~4–5 GB (current year only). Class A operations stay inside the free tier |
+| **Egress** | **Free, and this is the reason to pick R2 specifically** |
+
+**Under a dollar a month, and the zero-egress property is the one that matters.** The same 40 GB on
+S3 would cost roughly $3.60 *per restore* in egress — and a backup you hesitate to restore from is
+not a backup. That is also why §7.5's deliverable is a **rehearsed** restore rather than a dump.
+
+#### Two measured findings the restore path must carry
+
+Both are counter-intuitive and already paid for:
+
+- **A-W9-2 — a continuous aggregate *accepts* an `INSERT` and discards it on the next refresh.**
+  Pre-seeded aggregate rows are not a restore mechanism. The restore path is: load raw, then rebuild.
+  Measured — the insert succeeds, duplicates succeed, the rows read back correctly, and then a refresh
+  over the range leaves zero rows. The failure is entirely later than the mistake.
+- **W4 D-23's phase-1-first ordering.** A full rebuild at ten years is an hour-scale operation
+  (A-W4-3). `ci/db/rebuild-aggregates.sh` refreshes the `/span` bands first, bottom-up —
+  **0.87 s against 467 s**, the difference between "the charts are right" and "everything is
+  materialised". A restore runbook that blocks on a full refresh is an outage that did not need to be
+  one.
+
+### 7.6 The USB-serial station, which is a separate problem from the database
+
+**Owner constraint, 2026-10-31:** *"my home weather station (CSI driver) uses USB serial, so we need a
+way to connect that to the node we'll be using (or a way to forward over the network from another
+Linux box)."*
+
+**This is two problems, not one, and separating them is most of the answer.** The USB serial device is
+read by a **station driver** — a component of the daemon (W2a §4a). It has nothing to do with where
+**TimescaleDB** runs. D-44 makes this explicit: a node's position in a topology is the set of
+components its configuration produces, not a mode it is in. So the database node does not need the
+USB device, and the machine holding the USB device does not need to be a database node.
+
+Three ways to close it, in recommendation order.
+
+**(a) Serial over TCP — works today, on the shipping Go version, with no code change.**
+
+A small Linux box physically attached to the station runs `ser2net` (or `socat`) exposing the USB
+serial port as a TCP socket; the Campbell driver connects over TCP instead of serial.
+
+This needs no new capability on either side, **verified in both trees**:
+
+- The **Go** implementation already does it. `internal/weatherstations/campbell/station.go:254` takes
+  the serial path only `if s.config.SerialDevice != ""`; otherwise `:303` builds
+  `net.JoinHostPort(s.config.Hostname, s.config.Port)` and `:320` dials TCP. The configuration table
+  already carries `hostname`, `port` and `baud` (`pkg/config/provider_sqlite.go:105-108`).
+- The **Rust** design already specifies it. W2a §4a.5 maps Campbell's transport as
+  **`Serial | TcpOut`**, the same cell as Davis.
+
+So this is a configuration change on the current system, available before the rewrite exists, and it
+survives the rewrite untouched. *Honest costs:* one more box in the path, and serial-over-TCP gives up
+hardware flow control and DTR manipulation — irrelevant for Campbell's command/response ASCII
+protocol, but worth knowing before assuming it generalises to every serial device.
+
+**(b) A satellite node — the better long-term answer, and what W7 was designed for.**
+
+Run `modernweather` *itself* on the box attached to the station, configured as a **satellite**: station
+components plus an uplink, no local database. It spools locally and forwards to the collector in
+Kubernetes (W7 §8.2 is exactly this configuration).
+
+This is strictly better than (a) on two axes: the driver talks to the real device rather than to a
+serial-over-TCP bridge, and **a network outage stops losing readings** — W7's spool holds ~100 days at
+the measured rate against a 2 GiB ceiling, and the uplink resumes with a cumulative ack (W7 D-22).
+It also gives the ARMv6/ARMv7 targets a purpose: this is the use case that justifies keeping them, and
+it connects **O-9**'s "retain the broadest hardware support" to something concrete.
+
+Not available immediately — it needs M6-4. But the Go version already has `grpcreceiver` and remote
+stations, so a **Go satellite against a Rust collector** is a supported path from day one: W7 D-42
+designs the compat shim for exactly that, with three stated limitations (no resume or cross-reconnect
+dedup, no relay, no field presence).
+
+**(c) USB passthrough into the pod — possible, and not recommended.**
+
+A privileged pod with a `hostPath` of `/dev/serial/by-id/…` (never `/dev/ttyUSB0`, whose numbering is
+not stable across a replug), plus `nodeAffinity` pinning it to the node the cable is plugged into.
+
+Privileged pods are routine in this cluster — twelve namespaces enforce `privileged` — but **no pod
+currently mounts any `/dev` hostPath and there is no device plugin**, so unlike the local-PV pattern
+there is nothing here to copy. The deeper objection is not the mechanics: it is that **it pins the
+daemon's scheduling to a physical cable**, and then wants that node to also be the database node,
+which recreates in Kubernetes exactly the single-box coupling that makes pitcairn hard to move.
+
+**Recommendation: (a) now, (b) when M6-4 lands, (c) not at all.** Raised as **N-20**. The important
+consequence is that **the USB-serial question does not block the database move** — it is answerable
+with a $35 box and a config change, independently and in either order.
+
 
 ---
 
