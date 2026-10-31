@@ -10,6 +10,14 @@ interface, you are in the wrong document.
 
 Decisions are **never edited in place**. See `## Amendments` at the end for the protocol.
 
+**Where to start, as of W6 (2026-10-30).** The design programme is complete and all ten documents are
+merged. `# Decisions — the ledger` below is **one numbered ledger of all sixty-seven decisions, each
+carrying its source**, and it is what an implementation agent should read instead of ten design
+documents — the documents are the rationale, the ledger is the specification. `## Amendments` carries
+the twenty-three amendments the programme produced, applied under the protocol. The integration pass
+that produced both — the contradiction audit, the gap audit and the deviation ledger — is
+`docs/reconciliation.md`; the build order is `docs/implementation-plan.md`.
+
 ---
 
 ## Read this first — what the spike changed
@@ -523,10 +531,8 @@ that nobody settles it here by accident.
 
 ## Amendments
 
-**Empty, deliberately. The protocol matters more than the content.**
-
-This document is the shared context every later work item reads, and it will be wrong about
-something. When that happens:
+**The protocol, unchanged.** This document is the shared context every later work item reads, and it
+will be wrong about something. When that happens:
 
 - **A decision is never edited in place.** Not corrected, not softened, not quietly deleted.
 - The work item that found the problem appends an entry here recording **the date**, **which
@@ -536,67 +542,565 @@ something. When that happens:
   current answer teaches nobody anything and invites the same mistake twice.
 - An agent that disagrees with a decision **surfaces the disagreement and does not resolve it.** Write
   the proposed amendment, flag it at the top of your own document, and then carry on under the
-  existing decision so that your document stays internally consistent. A single agent silently
-  overriding a shared decision is the specific failure that produces six documents which each make
-  sense alone and do not cohere.
+  existing decision so that your document stays internally consistent.
 
 Entry format:
 
 > **YYYY-MM-DD — D-nn superseded by W<item>.** What was found. What replaces it. Why the original was
 > wrong rather than merely inconvenient.
 
+**Applied by W6, 2026-10-30.** Every document in the programme deliberately left its amendments
+*proposed* — W9 said so explicitly ("W6 consumes these four sections from every document and is the
+right place for the amendments to be applied together"), and W4 set the precedent. Fourteen
+amendment sets from eight documents are applied below, in decision order rather than discovery
+order, because a reader arrives here from a decision. Each `Status` cell in the ledger points at its
+entry. The derivation of every one is in `docs/reconciliation.md`.
+
+**Nothing here was decided by W6 except where an entry says so.** W6's own additions are *decisions*
+(D-47 – D-67), not amendments: they fill holes between documents rather than contradicting anything.
+The two exceptions are A-W6-1 and A-W6-2, both of which extend a decision's scope rather than
+changing its content.
+
+**Four proposals were additions, not amendments, and became decisions instead.** W7 and W8 each
+filed proposals against a decision that *did not exist* — they found a gap in the ledger rather than
+an error in an entry — so the amendment protocol does not apply and there is nothing to mark
+superseded. They are listed here so a reader following a `Source` cell is not left looking for a
+missing `### A-` heading:
+
+| Proposal | Source document | Became |
+|---|---|---|
+| **A-W8-2** — Linux artefacts are statically linked against musl | `docs/release.md` | **D-43.** §9 covered CI and tooling and said nothing about linkage, and linkage is the measured precondition for the ARMv6 target existing at all |
+| **A-W7-1** — a node's position in a topology is a set of components, not a mode | `docs/collector.md` | **D-44.** D-31's rationale names the collector role and stops short of saying what it is, which left W7 to supply it |
+| **A-W7-2** — registration carries identity only | `docs/collector.md` | **D-45.** D-33 covers how a secret is *held*, not whether it should be *transmitted* — and the Go implementation transmits four of them in cleartext to a table that nothing reads |
+| **A-W7-3** — admission precedes the pipeline | `docs/collector.md` | **D-46.** D-29 specifies the data flow and not where authorisation sits in it; the Go receiver pushes into the distributor at `grpcreceiver/station.go:175` and consults the registry at `:182` |
+
+**A-W7-4** is the one W7 proposal that *is* an amendment — it extends D-30 — and it is folded into
+A-W2a-1 below, because D-30 was being split in the same breath and two amendments to a decision that
+no longer exists would be worse than one.
+
+W7's own note on A-W7-3 deserves recording, because it was right to raise it: the decision is close
+enough to W2a's Decision 46 that W6 could reasonably have recorded it only there. It is kept as
+D-46 because D-29 is the decision about the *flow*, and W2a's Decision 46 is about identity
+resolution — stating it at the flow level is what makes it apply to a direction nobody has invented
+yet.
+
 ---
 
-# Decisions
+### A-1 — 2026-10-28 — D-3 and D-9 gain a caveat. *Source: W1.*
 
-1. The implementation language is Rust, on the tokio runtime; the Go version stays deployable throughout.
-2. The deployment target is PostgreSQL 17 with TimescaleDB 2.31 and `timescaledb_toolkit`, pinned rather than floating.
-3. Storage is a wide table, one column per metric — not narrow/EAV; measured 7–9× better density with no crossover.
-4. Raw readings are retained indefinitely, with compression enabled from day one, segmented by station and ordered by descending time.
-5. The versioned-aggregate and union-view scheme is rejected as unnecessary once retention is removed.
-6. Backup and restore is `pg_dump` of the raw hypertable plus an aggregate refresh; no bespoke tool is built.
-7. Compression is configured when the hypertable is created, not retrofitted later.
-8. Schema changes happen solely through migrations; there is no DDL at startup and no `IF NOT EXISTS` idiom.
-9. Adding a metric is a nullable `ADD COLUMN` — 11.6 ms against ~1 GB of compressed chunks — and the migration takes a short lock timeout and retries.
-10. The 10–12× compression figure is an estimate pending one hold-rate measurement on production; no capacity decision depends on it.
-11. Aggregates are hierarchical: 1-minute from raw, 1-hour from 1-minute, 1-day from 1-hour.
-12. Nothing in the aggregate hierarchy stores a finished average; `avg(avg(x))` was measured wrong in 658 of 868 cases.
-13. Aggregates store composable state — `min`/`max`/`sum` natively, a mean as sum-and-count or as a two-step aggregate state.
-14. Sums are accumulated in a type wider than the column being summed; `sum(real)` is not order-independent.
-15. Aggregates are disposable derived data — the supported way to change one is drop, regenerate, refresh.
-16. Generated aggregates emit nullable counts, because `count()` returns 0 and would otherwise fill a third of the view with zeroes.
-17. Aggregate rebuilds run with relaxed commit durability; a full refresh is fsync-bound and 12× faster without it.
-18. The 1-minute aggregate is sized and retained deliberately — at production width it is larger than the compressed raw table it derives from.
-19. The generator enforces the 1600-column ceiling, counting allocated rather than live identifiers.
-20. One registry, authored in TOML, is the single source of truth for every metric; generated output is committed and CI-checked for drift.
-21. Column names and protobuf field numbers are allocated once and never reused; removal deprecates rather than frees.
-22. The registry format and generator shape are W2's decisions, not this document's.
-23. The word "controller" is retired in favour of a single component abstraction.
-24. A component is a cancellable task owning its resources, supervised as a set; stopping is cancellation plus ownership, not a method.
-25. A component declares a trigger and does not own a timer; the supervisor owns all scheduling.
-26. Dependencies between components are declared as required and provided capabilities; the supervisor resolves startup order.
-27. A missing dependency means waiting, not refusing to construct.
-28. Configuration reaches components by watch or broadcast, never through shared mutable state.
-29. Data flows sources → fan-in → transform/enrich → fan-out → sinks, with an explicit overflow policy per sink.
-30. Sinks are composable and carry per-sink delivery policy: durable sinks never lose data, rate-limited upload sinks coalesce to the newest reading.
-31. Transport is orthogonal to role; gRPC and REST are codecs, not kinds of component.
-32. The crate list in §6 is the default choice for each named idiom; substitutions are allowed but must be recorded as amendments.
-33. Secrets use a redacting wrapper type and credentials are compared in constant time.
-34. Errors are typed per module and preserve their cause chain.
-35. Administrative authentication is a username and password — one administrator, no roles, Argon2id, sessions distinct from credentials, no default password; W5 §3 owns the design.
-36. Internal vocabulary is not user-facing vocabulary; an internal term on screen is a bug, and W5 §0 owns the translation table.
-37. The legacy external contract is frozen and new endpoints are additive only; W1 captures the surface.
-38. The public weather website is carried forward as-is, except that template-generated JavaScript becomes static JavaScript plus a JSON config endpoint.
-39. A new v2 API is out of scope for this design program; W6 records it as a named future work item.
-40. The ancillary Go tools are not ported — the provisioner stays in Go and is updated, the emulators stay in Go deliberately as independent test implementations, the rest retire.
-41. A PR gate running build, test, format, lint and concurrency-checked tests exists from the first commit.
-42. The required database version is asserted both in CI and at startup.
+**What was found.** The density argument for the wide table is that PostgreSQL stores a NULL as one
+bit, and D-9 adds a metric as a nullable `ADD COLUMN`. Both are correct and both encourage a writer
+to store NULL for a metric a station does not report. Against the `circular_avg` aggregate as the Go
+server defines it, a window in which `winddir` is entirely NULL makes `/span` return **500** — the
+finaliser divides by a zero accumulator. The shipping Go daemon is only safe because it writes its
+whole reading struct, zeros included, so no column it writes is ever NULL. The rewrite is expected
+to be more parsimonious and would therefore hit this.
+
+**What replaces it.** Nothing. D-3 and D-9 stand; they gain the caveat that **a NULL-tolerant writer
+requires NULL-tolerant aggregate finalisers**, and that D-37 constrains the fix to one that still
+emits `0` rather than `null`. **Discharged:** W4 D-8 makes `mw_circular_mean` return `0` for a bucket
+with no non-NULL `winddir` (OQ-W1-2 option (c)), and `ci/db/schema-assertions.sql` A-3 asserts it.
+
+**Why this is more than inconvenient.** It is the only place found where two merged decisions combine
+into a user-visible 500 that neither decision's own document would predict.
+
+### A-2 — 2026-10-28 — D-37 names its artefacts. *Source: W1.*
+
+**What was found.** D-37 says the legacy contract is frozen and that W1 captures the surface, which
+leaves "frozen to what?" answerable only by reading prose.
+
+**What replaces it.** D-37 gains: *the frozen surface is defined by `contract/legacy-v1.json` plus the
+70 fixtures in `contract/fixtures/`, and a green conformance run against the Rust daemon is the
+acceptance test for any PR that touches a legacy endpoint.*
+
+**Why this is more than inconvenient.** A freeze with no executable definition is a freeze that
+nobody can be found to have broken. **W6 note:** the acceptance test does not yet run in CI — see
+`docs/reconciliation.md` G-1 and work item N-3.
+
+### A-3 — 2026-10-28 — D-38 records the nine values. *Source: W1.*
+
+**What was found.** D-38 decides that template-generated JavaScript becomes static JavaScript plus a
+JSON configuration endpoint, but does not say what that endpoint carries. `weather-app.js.tmpl`
+consumes exactly nine of the eleven values the Go handler passes it.
+
+**What replaces it.** D-38 gains a pointer to `docs/legacy-api-contract.md` §9's list. W3 and W5 both
+read D-38 and would otherwise each re-derive it from the Go template. **Discharged:** W3 D-80 fixes
+the payload as exactly that set with JSON keys equal to the JavaScript property names.
+
+**Why this is more than inconvenient.** It is the one decision in this document that deliberately
+changes the website's bytes, so the exact replacement payload is load-bearing rather than detail.
+
+### A-4 — 2026-10-28 — D-32 states its scope. *Source: W1.*
+
+**What was found.** D-32 names `axum`/`tonic` for HTTP and lists no HTTP *client*. The conformance
+runner needs a blocking client and uses `ureq`, which is neither a substitution for a listed crate
+nor covered by the list.
+
+**What replaces it.** D-32 gains a scope sentence: *it governs the daemon's dependencies; test
+harnesses may choose their own, recorded where they are used.*
+
+**Why this is more than inconvenient.** Without it, every piece of test infrastructure either drags
+in the daemon's async stack or files an amendment, and W6 reconciles noise.
+
+### A-W2-2 — 2026-10-29 — D-9's cheapness claim is true of the column and false of the aggregates. *Source: W2.*
+
+**What was found.** The `ADD COLUMN` is 11.6 ms as measured. But under D-15 the only supported way to
+change an aggregate is drop, regenerate and refresh, and a new metric that any level carries forces a
+rebuild of that level and every level above it. At ten years of history D-17 puts that in the hour
+range. The migration generator demonstrates it: one added column produces a drop-and-recreate of
+every level.
+
+**What replaces it.** A qualification on D-9 — *adding a metric is a millisecond DDL operation plus
+an aggregate rebuild whose cost is D-17's and D-18's.* **Discharged in part:** W4 D-23's rebuild
+procedure refreshes the `/span` bands first, bottom-up, before backfilling history, measured at
+**0.87 s against 467 s** — a 537× difference between "the charts are right" and "everything is
+materialised" — so a new metric is queryable at recent resolution in under a second.
+
+**Why this is more than inconvenient.** "Adding a metric is cheap" is cited as the justification for
+D-3 and D-4. Both survive the correction — the alternative layouts are worse on this axis too — but
+a capacity plan written from the 11.6 ms figure alone schedules a metric addition as a no-op and
+discovers an hour-long rebuild in production.
+
+*(W2's A-W2-1 — that OQ-5's recommendation is not constructible under D-11 — is not an amendment to a
+decision; it corrected an open question, and W4 D-3 closed it by taking OQ-W2-1 option (a). Recorded
+here only so a reader looking for it is not left wondering.)*
+
+### A-W4-1 — 2026-10-29 — **D-11 is superseded: the hierarchy has four levels, not three.** *Source: W4.*
+
+**What was found.** `/span` reads four tables, not three, and the missing one is the 5-minute level
+that serves every span between 6 and 48 hours — including `/span/24h`, the public website's default
+view. This is not inferred from the Go source: `contract/fixtures/span-24h-five-minute-buckets.json`
+puts the bucket spacing at exactly **300,000 ms**. W1 assumption 10 and W3 assumption 19 both already
+state four bands, so D-11 was the only document saying three.
+
+**What replaces it.** The hierarchy is 1-minute from raw, **5-minute from 1-minute**, 1-hour from
+5-minute, 1-day from 1-hour. D-11's mechanism is untouched — each level still reads the level below
+it — and D-11's own assumption 16 already licensed this on the condition that a 5-minute level derive
+from the 1-minute level, which it does, exactly five buckets to one.
+
+**Why the original was wrong rather than merely incomplete.** Assumption 16 reads as a hypothetical
+("the Go version's 5-minute level is **not** assumed to carry forward"), and under D-37 it is not a
+hypothetical — it is a frozen band. A reader implementing D-11 as written ships three levels and then
+has to choose which wrong thing `/span/24h` does: quarter the points in the dominant chart, or
+quintuple the response size. Neither is reachable without breaking the contract.
+
+### A-W4-2 — 2026-10-29 — **OQ-4's recommendation is unavailable; D-18's figure and D-19's claim are corrected.** *Source: W4.*
+
+**What was found.** Two things, and the second explains the first.
+
+- `compress_chunk` on `observations_1m` fails: `row is too big: size 11720, maximum size 8160`.
+  Bisected, **the widest compressible continuous aggregate is 439 columns**; the generated levels are
+  629. D-19 located this failure "near the ceiling", citing a 1600-column view rejected at an
+  estimated 28,852 bytes. The real threshold is a quarter of the way to the ceiling, which is why
+  production's 397-column views compress and these do not. Narrowing is unavailable (membership can
+  only shrink away from raw) and `stats_agg` reaches only 502.
+- At the generated width the minute level is 4,175 bytes per bucket row — 8.8 GB/year and **87.8 GB
+  for a decade** at four stations, **2.1× D-18's figure**, almost exactly the 629/398 column ratio.
+  D-18's number was right for its width.
+
+**What replaces it.** OQ-4's other arm: **7-day retention on `observations_1m`, 14-day on `_5m`,
+90-day on `_1h`, `_1d` unbounded — 337 MB in place of 107 GB.** And a sharper reason than
+"aggregates are disposable": `/span` takes no time anchor, so each level is read over exactly one
+trailing window and never over history. D-4's hole is in *raw*, and raw is permanent, so an evicted
+minute bucket is an evicted cache entry rather than lost information. D-18's qualitative claim stands
+and is strengthened: the minute level is not free, it is *less* free than D-18 says, and the escape
+D-18 offered does not exist.
+
+**Why the original was wrong rather than merely inconvenient.** OQ-4's recommendation is conditional
+on a measurement ("confirm that compressed-aggregate query latency is acceptable"), which reads as a
+performance question with a probable answer. It is not — the configuration cannot be created. An
+implementer following OQ-4 would write `ALTER MATERIALIZED VIEW … SET (timescaledb.compress = true)`,
+which **succeeds**, and then watch a compression policy job fail silently every day while the minute
+level grew unbounded. D-19 is wrong in the direction that hides this: it says the problem is near the
+ceiling, so nobody at 629 columns thinks to check.
+
+### A-W4-3 — 2026-10-29 — **D-17's 12× is corrected to 1.89×, and the refresh is not purely fsync-bound.** *Source: W4.*
+
+**What was found.** At 627 expressions over 35,942,400 rows, the same comparison gives **758.5 s with
+`synchronous_commit = on` and 401.4 s with it off — 1.89×, not 12×** — while the identical
+aggregation as a plain query is 10.0 s single-threaded. Decomposed: ~10 s of arithmetic, +96 s to
+materialise 1.2 M 629-column rows into a plain table, +295 s of continuous-aggregate refresh
+machinery, +357 s of WAL fsync.
+
+**What replaces it.** A qualification. Relaxing commit durability for a rebuild is still correct and
+still worth doing — it halves the longest operation in the system — but **fsync is roughly half the
+cost of a durable refresh rather than nearly all of it**, and the residue after relaxing it is 32×
+the plain query, not ~10×. "It is WAL fsync, not CPU" should read "it is not CPU: roughly half is WAL
+fsync and most of the rest is the refresh's own write path, both of which scale with the
+materialisation's width."
+
+**Why the original was wrong rather than merely dated.** The 12× is quoted in
+`generated/sql/090_rebuild_aggregates.sql`'s own header, so it is the number an operator reads at the
+moment they are deciding whether a rebuild will finish inside a maintenance window. Planning a
+15-minute operation from a figure that promises 2 is how a deploy overruns. The decision survives;
+the capacity figure does not — and the thing that actually makes a rebuild bearable is not durability
+but A-W2-2's ordering, which is 537×.
+
+### A-W2a-1 — 2026-10-28 — **D-30 is superseded by D-30a and D-30b.** *Sources: W2a, extended by W3 (A-W3-2) and W7 (A-W7-4).*
+
+**What was found.** Measured against the code, the rate-limited outputs are not sinks on the reading
+stream and cannot be made into correct ones. APRS/CWOP, Weather Underground and PWS Weather are
+driven by `time.NewTicker` and poll the database; none subscribes to readings. More importantly they
+**must not** send the newest reading: CWOP requires wind direction and speed *averaged* over ~5
+minutes with gust as a *peak over ~10 minutes*, and Weather Underground's field names encode the
+windows explicitly (`windspdmph_avg2m`, `windgustmph_10m`). Coalescing to the newest reading yields
+an instantaneous sample where an average is required — which is exactly the defect the current APRS
+packet builder has, taking gust from a 10-minute SQL function but wind direction and speed straight
+off the reading. The "latest reading" those uploaders start from is itself
+`weather_1m … WHERE bucket > NOW() - INTERVAL '2 minutes' LIMIT 1` with **no `ORDER BY`**
+(`internal/database/client.go:121`), so it is an arbitrary bucket up to two minutes stale.
+
+**What replaces it.** **D-30a** and **D-30b** in the ledger, splitting the asymmetry D-30 correctly
+identified. W3's A-W3-2 reached the same conclusion from the sink's side and is folded in; W7's
+A-W7-4 adds the bounded-spool exception and the `max_lag` invariant that makes it right.
+
+**Why the original was wrong rather than merely inconvenient.** D-30's *intent* — never backfill a
+rate-limited service with an hour of history — is correct and is preserved. Its mechanism encodes the
+assumption that an output's correct value is a *reading*, and for every rate-limited output in this
+system it is a *window*. An implementation built on D-30 as written would transmit instantaneous wind
+values to CWOP, which is a protocol violation **that looks like working software**: the packets are
+accepted, the numbers are wrong, and nothing reports it. That is the current behaviour, and D-30 as
+written would carry it forward.
+
+### A-W3-2 — 2026-10-28 — D-29 names the fan-out point. *Source: W3.*
+
+**What was found.** The shape is right, but "fan-out" is underspecified in exactly the place where
+the design is decided. W2a's Decision 61 forbids a source being blocked by a sink and Decision 62
+concludes that `Durable` therefore requires a local durable spool. Those two together leave no
+freedom: the fan-out point **is** the spool, every durable sink reads it through its own cursor, and
+`Latest` and `Lossy` subscribers are notified from the same append. A reader of D-29 alone would
+reasonably build a `broadcast` channel and satisfy neither decision.
+
+**What replaces it.** D-29 gains: *the fan-out point is a local durable spool; durable sinks consume
+it through independent cursors and acknowledge a prefix, while coalescing and lossy subscribers are
+notified after the append commits.*
+
+**Why this is more than inconvenient.** It is the one structural commitment in the pipeline, and it is
+currently derivable only by reading two documents and noticing that their conjunction has a unique
+solution.
+
+### A-W3-4 — 2026-10-28 — D-31's singular unit is the router and the route table. *Source: W3.*
+
+**What was found.** D-31 makes transport orthogonal to role and the W2a/W3 prompts both phrase the
+consequence as "one listener, not seven". Read literally, that moves `WeatherV1` and `WeatherAppsV1`
+from their dedicated port onto the website's port, which breaks every machine-to-machine peer at
+upgrade. And it is not merely a reading: `grpc_port` is a configuration column defaulting to 50051
+(`pkg/config/provider_sqlite.go:231`) and the management API **validates that it differs from the
+HTTP and HTTPS ports** (`handlers_controllers.go:501`, `:506`), so a separate socket is the shipped,
+validated behaviour.
+
+**What replaces it.** D-31 gains: *the singular unit is the router and the route table. One
+`http:listener` component binds the sockets configuration names — the main port, an optional
+redirecting plaintext port, an optional legacy gRPC port for existing peers — and serves one router
+on all of them.*
+
+**Why this is more than inconvenient.** Seven listener-owning sites, each with its own TLS setup and
+shutdown path, is the defect. One component binding two sockets is not that defect, and conflating
+the two would force an unnecessary compatibility break on W7 and make the rewrite's first operational
+event a fleet-wide flag day.
+
+### A-W3-1 and A-W8-3 — 2026-10-28 — D-32's crate table gains seven rows. *Sources: W3, W8, W5.*
+
+**What was found.** D-32 lists the default crate for each named idiom and says a *substitution* must
+be recorded as an amendment. Seven idioms the design requires are not named at all, so seven agents
+would each pick one. That is precisely the divergence D-32 exists to prevent, in the one form the
+decision does not cover. W8's A-3 independently filed the TLS row, noting it is load-bearing on
+ARMv6 and affects `sqlx`'s own feature flags, which name the provider explicitly.
+
+**What replaces it.** Nothing is replaced; the table gains rows:
+
+| Concern | Crate | Why this one |
+|---|---|---|
+| TLS, and the SNI resolver | `rustls` + **`ring`**, `rustls-pemfile` | answers W8's OQ-1; smaller than `aws-lc-rs`, no `cmake` build dependency, and already on the ARMv6 allowlist |
+| HTML templating | `askama` | compile-time checked, so a missing field is a build error rather than a request-time one |
+| Static asset embedding | `rust-embed` | one static binary per target, matching what the Go version does with `embed.FS` |
+| Protobuf parsing at build time | **`protox`** + `prost-build` | no `protoc` binary on any of four cross targets or on a Pi |
+| Logging and metrics | `tracing`, `tracing-subscriber`, `metrics`, `metrics-exporter-prometheus` | one logging path, and a metrics surface that is not logs |
+| systemd readiness | `sd-notify` | `Type=notify` without linking `libsystemd`, which a static musl build cannot |
+| Management OpenAPI derivation | `utoipa` | the schema is derived from the Rust handlers rather than hand-maintained (W5 D-37) |
+
+**Why this is more than inconvenient.** W1's A-4 already asked D-32 to state that it governs the
+daemon rather than test infrastructure. The same decision needs the converse: it should be complete
+for the daemon, or it is a list that answers some questions and silently delegates others.
+
+### A-W3-3 — 2026-10-28 — D-38 records *how* the config payload is delivered. *Source: W3.*
+
+**What was found.** W1's A-3 already asked D-38 to name the nine values. Implementing it surfaces a
+second gap: "a JSON configuration endpoint" read literally means the module does a `fetch` at
+initialisation, which introduces an extra round trip and an asynchronous boundary into a module that
+is synchronous today — in a page that is supposed to be visually unchanged. The page already contains
+the right pattern: `radar-config` is delivered as an inline `<script type="application/json">` block.
+
+**What replaces it.** D-38 gains: *the configuration is delivered inline as a
+`<script id="mw-config" type="application/json">` block, following the existing `radar-config`
+precedent; `GET /config.json` exists as an additive endpoint for other consumers. The payload is the
+nine values listed in `docs/legacy-api-contract.md` §9, with JSON keys equal to the JavaScript
+object's property names.*
+
+**Why this is more than inconvenient.** The difference between an inline block and a `fetch` is the
+difference between "visually unchanged" and "a flash of unstyled content and an ordering bug".
+
+### A-W5-1 — 2026-10-29 — D-35 says what "one administrator" means about sessions. *Source: W5.*
+
+**What was found.** D-35 says "one administrator, no roles, no multiple accounts", which settles
+*identities*. It is silent on *sessions*, and the two readings diverge materially: "one identity,
+many revocable sessions" (a laptop and a phone both signed in, each revocable, with "sign out
+everywhere") versus "one session at a time". The second would make the session table pointless and
+remove the revocation feature D-35's own rationale asks for — but it is a reading the words permit,
+and a later reader economising on the session table would not be obviously wrong.
+
+**What replaces it.** D-35 gains: *"One administrator" constrains identities, not sessions. The single
+administrator may hold several concurrent sessions — a laptop and a phone — each independently
+revocable, with a "sign out everywhere" action. This is required by the decision's own rationale: a
+session that cannot be revoked independently of the credential is the defect being removed.*
+
+### A-W5-2 — 2026-10-29 — D-36 names its enforcement mechanism. *Source: W5.*
+
+**What was found.** D-36 says an internal term on screen "is treated as a bug, not a documentation
+gap", which is the right standard with no mechanism behind it. Every team that has written that
+sentence has also shipped the term.
+
+**What replaces it.** D-36 gains: *Enforcement is mechanical: user-facing strings live in a single
+copy module, and a CI gate fails the build on a banned internal term. Deliberate exceptions are
+marked explicitly and the gate prints the current exception list on every run.* **W5 §6.6 owns the
+mechanism** — about thirty lines of `xtask`. **W6 note:** that gate (`ui-copy`) is now declared in
+`ci/gates.toml`, deferred; without the declaration the decision degrades into a code-review
+preference, which is the failure this amendment exists to prevent.
+
+### A-W5-3 — 2026-10-29 — D-33 names the management API's transport defaults. *Source: W5.*
+
+**What was found.** D-33 covers secret *handling* — a redacting wrapper type and constant-time
+comparison — and cites the current token's logging and cookie defects. It does not mention two
+adjacent defects on the same surface that are equally measured and equally one-line fixes:
+`Access-Control-Allow-Origin: *` on the admin API
+(`internal/controllers/management/controller.go:306`) and a default bind of `0.0.0.0`.
+
+**What replaces it.** D-33 gains: *The management API's transport defaults are part of this decision:
+CORS is an exact-match allowlist defaulting to empty (never `*`, never a reflected `Origin`), and the
+default bind address is `127.0.0.1`. **W5 §3.5 owns both.** The public website's bind address is
+unaffected.*
+
+### A-W8-1 — 2026-10-28 — the W8 prompt asks for union-view assertions that D-5 rejected. *Source: W8.*
+
+**What was found.** The canonical W8 prompt asks §2 for "the union-view assertions W4 defines", which
+contradicts D-5. No union views exist to assert on.
+
+**What replaces it.** No decision changes. The migration gate compares schema dumps,
+continuous-aggregate catalog entries including view definitions, and surviving data between the two
+paths. The prompt line is corrected so W4 is not sent looking for a scheme the design rejected.
+**W6 note:** W9 does generate `observations_1d_with_legacy`, but W9 D-6 keeps it out of the read path
+and W9 assumption 11 keeps it out of the hierarchy, so D-5 stands.
+
+### A-W8-4 — 2026-10-28 — D-40's "the emulators stay in Go" means *at a pinned commit*. *Source: W8.*
+
+**What was found.** D-40 and the capability inventory both treat the emulators as fixed external test
+infrastructure, which is right, but "fixed" is doing load-bearing work: the reference repository is
+read-only to this programme and is **not frozen**, so an unrelated upstream commit can turn this
+repository's CI red.
+
+**What replaces it.** D-40's rationale gains: *the emulators are consumed at a pinned commit of the
+reference repository, recorded in this repository, and bumping it is a reviewed change.* No decision
+is reversed. **Discharged:** W8 D-23.
+
+### A-W9-1 — 2026-10-30 — D-4 and D-6 gain the mechanism by which the *existing* data can still be lost. *Source: W9.*
+
+**What was found.** Retention dropping a raw chunk invalidates the continuous aggregates above it, so
+on TimescaleDB 2.31 the next refresh of any level over that range — **including the level's own
+scheduled policy** — deletes the buckets whose raw has gone. Measured: a manual refresh removed 21 of
+29 daily buckets and one policy run with `start_offset = 10 years` removed 41 of 83, the destroyed
+range matching the dropped-chunk range to the day, with `drop_chunks` logging the invalidation that
+caused it.
+
+**What replaces it.** Nothing about the new design changes — D-4 and D-6 both rest on aggregates
+being disposable derived data, which they are *because raw is permanent*. The old database is the
+case where they are not. The amendment is the mechanism, recorded, because it is **the one way the
+owner's existing data can still be lost** and because "the aggregates are disposable" is the sentence
+that makes it sound safe.
+
+**Consequence for the pre-flight list:** **archive first, then pause.** Pausing retention is not what
+protects the aggregate buckets; the archive copy is correct under every answer to OQ-W9-2.
+`docs/rewrite/README.md` pre-flight item 1 is corrected accordingly.
+
+### A-W9-2 — 2026-10-30 — D-6 gains its converse. *Source: W9.*
+
+**What was found.** A continuous aggregate **accepts** an `INSERT` on TimescaleDB 2.31 and discards it
+on the next refresh, on the next policy run, or when the level is dropped and recreated. Measured:
+the insert succeeds, duplicates succeed (a materialisation hypertable has no unique constraint on
+`(bucket, station_id)`), the rows read back correctly through `mw_mean`, and then a refresh over the
+range leaves zero rows.
+
+**What replaces it.** D-6 makes "restore raw, then rebuild the aggregates" the supported path, which
+is right. It gains the converse: *there is no supported path that puts rows **into** an aggregate.
+Pre-seeded aggregate rows are not a restore mechanism.*
+
+**Why this is more than a comment.** The failure is entirely at a later time than the mistake.
+**Discharged:** W9 D-4 puts the rollup archive into plain tables (`observations_1d_legacy`,
+`observations_1h_legacy`) and never into a level.
+
+### A-W9-3 — 2026-10-30 — D-14 has a visible consequence on two frozen-contract keys. *Source: W9.*
+
+**What was found.** D-14 widened the new accumulator because `sum(real)` is not associative. The old
+schema does worse than add in a different order: it accumulates in `float4`. `sum(rainincremental)`
+returns `real`, and `circular_avg_state` declares `sin_sum real, cos_sum real, accum real` with a
+finaliser that divides and takes `atan2d` in `real`. Measured at 2,160 readings per daily bucket:
+`period_rain` differs by up to 3.13 × 10⁻⁶ relative and `winddir` by 1.73 × 10⁻⁷, and **both round to
+a different float32 in 100% of buckets.** At production's 2-second cadence the Go side's error is
+roughly 20× larger.
+
+**What replaces it.** D-14's decision is correct and is strengthened by this. The amendment records
+that it has a *visible* consequence on two frozen-contract keys (`/span`'s `period_rain` and `windd`),
+which D-14 does not mention, and that **the new numbers are the accurate ones**. Carried in
+`docs/reconciliation.md` §3 as **DEV-4**, which is what W9's OQ-W9-4 asked W6 to decide: it belongs in
+the deviation ledger, because during the side-by-side validation period an unrecorded value diff on
+two frozen keys looks exactly like a migration defect.
+
+### A-W6-1 — 2026-10-30 — D-25's "no component-owned timer" does not reach inside a `Service`'s loop. *Source: W6.*
+
+**What was found.** D-25 says a component declares a trigger and does not own a timer. W2a's Decision
+7 states that a `Service` component owns time *inside* its loop — read deadlines, reconnect backoff —
+and that this is not a D-25 violation; W3 assumption 5 relies on it to keep `Service` out of the
+timer heap entirely. Three documents agree, and D-25 as written does not say so.
+
+**What replaces it.** D-25 gains: *this governs **scheduling**. A long-running `Service` component owns
+time inside its own loop — read deadlines, reconnect backoff, keepalives — which is not a schedule
+and not a second clock. The supervisor owns when a component runs, not what it waits on while
+running.*
+
+**Why this is worth recording.** It is the one place where a decision stated as an absolute has a
+universally-agreed exception, and an implementer reading D-25 alone would either put `Service` in the
+timer heap or file this amendment themselves.
+
+### A-W6-2 — 2026-10-30 — D-8 governs the configuration store too. *Source: W6.*
+
+**What was found.** D-8 says schema changes happen solely through migrations, with no DDL at startup
+and no `IF NOT EXISTS` idiom, and its rationale is the Go schema frozen at first-run shape by exactly
+that idiom. Every document read it as being about the weather database. W5 assumption 39 is the only
+place that applies it to the configuration store — "the 'migrations only' rule applied to the
+configuration store" — and assigns the work to W4, which scopes itself to PostgreSQL throughout. The
+result is nine-plus SQLite tables assumed into existence by four documents with no DDL and no
+migration mechanism.
+
+**What replaces it.** D-8 gains: *this governs **every** schema this system owns, including the SQLite
+configuration store. Configuration migrations live in `migrations/config/` and are applied by name,
+exactly as the weather migrations are.*
+
+**Why this is more than inconvenient.** The Go configuration database is the actual instance of the
+defect D-8 was written about: `CREATE TABLE IF NOT EXISTS` at startup, frozen at first-run shape. A
+rewrite that applied D-8 to the weather schema and reinvented startup DDL for the configuration would
+reproduce the original defect in the only place it ever happened. See `docs/reconciliation.md` G-2 and
+work items N-4 and N-5.
+
+---
+
+# Decisions — the ledger
+
+**One numbered ledger, every entry carrying its source.** This is the single place to answer *"why is
+it like this"*, and it is **the thing an implementation agent reads instead of ten design
+documents**. The documents remain the rationale; this is the specification.
+
+Read the `Status` column. A decision is **never edited in place** (see `## Amendments`):
+
+- *(blank)* — stands as written.
+- **extended** — the decision stands and an amendment adds to it. Read the amendment too.
+- **corrected** — the decision stands and an amendment fixes a figure or a claim inside it. **The
+  number in the decision's own text is the wrong one.**
+- **superseded** — do not implement this as written. Read the amendment.
+
+| # | Decision | Source | Status |
+|---|---|---|---|
+| **D-1** | The implementation language is Rust, on the tokio runtime; the Go version stays deployable throughout. | W0 | |
+| **D-2** | The deployment target is PostgreSQL 17 with TimescaleDB 2.31 and `timescaledb_toolkit`, pinned rather than floating. | W0 | |
+| **D-3** | Storage is a wide table, one column per metric — not narrow/EAV; measured 7–9× better density with no crossover. | W0 §2 | **extended** → A-1 |
+| **D-4** | Raw readings are retained indefinitely, with compression enabled from day one, segmented by station and ordered by descending time. | W0 §2 | **extended** → A-W9-1 |
+| **D-5** | The versioned-aggregate and union-view scheme is rejected as unnecessary once retention is removed. | W0 §3 | |
+| **D-6** | Backup and restore is `pg_dump` of the raw hypertable plus an aggregate refresh; no bespoke tool is built. | W0 §2 | **extended** → A-W9-1, A-W9-2 |
+| **D-7** | Compression is configured when the hypertable is created, not retrofitted later. | W0 §2 | |
+| **D-8** | Schema changes happen solely through migrations; there is no DDL at startup and no `IF NOT EXISTS` idiom. | W0 §2 | **extended** → A-W6-2 (it governs the configuration store too) |
+| **D-9** | Adding a metric is a nullable `ADD COLUMN` — 11.6 ms against ~1 GB of compressed chunks — and the migration takes a short lock timeout and retries. | W0 §2 | **extended** → A-1; **corrected** → A-W2-2 |
+| **D-10** | The 10–12× compression figure is an estimate pending one hold-rate measurement on production; no capacity decision depends on it. | W0 §2 | |
+| **D-11** | Aggregates are hierarchical: 1-minute from raw, 1-hour from 1-minute, 1-day from 1-hour. | W0 §3 | **superseded** → A-W4-1 (**four** levels) |
+| **D-12** | Nothing in the aggregate hierarchy stores a finished average; `avg(avg(x))` was measured wrong in 658 of 868 cases. | W0 §3 | |
+| **D-13** | Aggregates store composable state — `min`/`max`/`sum` natively, a mean as sum-and-count or as a two-step aggregate state. | W0 §3 | |
+| **D-14** | Sums are accumulated in a type wider than the column being summed; `sum(real)` is not order-independent. | W0 §3 | **extended** → A-W9-3 |
+| **D-15** | Aggregates are disposable derived data — the supported way to change one is drop, regenerate, refresh. | W0 §3 | |
+| **D-16** | Generated aggregates emit nullable counts, because `count()` returns 0 and would otherwise fill a third of the view with zeroes. | W0 §3 | |
+| **D-17** | Aggregate rebuilds run with relaxed commit durability; a full refresh is fsync-bound and 12× faster without it. | W0 §3 | **corrected** → A-W4-3 (**1.89×**, not 12×) |
+| **D-18** | The 1-minute aggregate is sized and retained deliberately — at production width it is larger than the compressed raw table it derives from. | W0 §3 | **corrected** → A-W4-2 (2.1× larger than stated, and it **cannot** be compressed) |
+| **D-19** | The generator enforces the 1600-column ceiling, counting allocated rather than live identifiers. | W0 §3 | **corrected** → A-W4-2 (the *compression* ceiling is **439**, not "near 1600") |
+| **D-20** | One registry, authored in TOML, is the single source of truth for every metric; generated output is committed and CI-checked for drift. | W0 §4 | |
+| **D-21** | Column names and protobuf field numbers are allocated once and never reused; removal deprecates rather than frees. | W0 §4 | |
+| **D-22** | The registry format and generator shape are W2's decisions, not this document's. | W0 §4 | discharged — W2 D-1 |
+| **D-23** | The word "controller" is retired in favour of a single component abstraction. | W0 §5 | |
+| **D-24** | A component is a cancellable task owning its resources, supervised as a set; stopping is cancellation plus ownership, not a method. | W0 §5 | |
+| **D-25** | A component declares a trigger and does not own a timer; the supervisor owns all scheduling. | W0 §5 | **extended** → A-W6-1 (a `Service` owns time *inside* its loop) |
+| **D-26** | Dependencies between components are declared as required and provided capabilities; the supervisor resolves startup order. | W0 §5 | |
+| **D-27** | A missing dependency means waiting, not refusing to construct. | W0 §5 | |
+| **D-28** | Configuration reaches components by watch or broadcast, never through shared mutable state. | W0 §5 | |
+| **D-29** | Data flows sources → fan-in → transform/enrich → fan-out → sinks, with an explicit overflow policy per sink. | W0 §5 | **extended** → A-W3-2 (the fan-out point **is** the spool) |
+| **D-30** | Sinks are composable and carry per-sink delivery policy: durable sinks never lose data, rate-limited upload sinks coalesce to the newest reading. | W0 §5 | **superseded** → A-W2a-1 (split into **D-30a** and **D-30b**) |
+| **D-30a** | A durable sink must not lose data. Because a source is never blocked by a sink, a durable sink is served by a **local durable spool** at the fan-out point rather than an in-memory channel; a slow sink falls behind on disk, never upstream. **A durable sink must not lose data *while the spool has room*** — the spool is bounded, and at the bound the policy is to refuse at the edge, counted, logged and visible as a component failure. `max_lag` must be reachable before the ceiling at the node's observed rate; a configuration where it is not is a startup warning. | W2a (A-W2a-1), extended by W7 (A-W7-4) | |
+| **D-30b** | Rate-limited outputs are **not stream sinks.** They are scheduled producers with a declared period, and each declares the **windowed values** it needs as `(Metric, Window, Agg)`, resolved by rolling up aggregate buckets. Rate limiting is therefore structural — a component that does not wake more often than allowed needs no queue, no buffer and no coalescing. | W2a (A-W2a-1) | |
+| **D-31** | Transport is orthogonal to role; gRPC and REST are codecs, not kinds of component. | W0 §5 | **extended** → A-W3-4 (the singular unit is the **router and route table**, not the socket) |
+| **D-32** | The crate list in §6 is the default choice for each named idiom; substitutions are allowed but must be recorded as amendments. | W0 §6 | **extended** → A-4 (it governs the daemon, not test infrastructure), A-W3-1 (seven additions) |
+| **D-33** | Secrets use a redacting wrapper type and credentials are compared in constant time. | W0 §7 | **extended** → A-W5-3 (the management API's transport defaults) |
+| **D-34** | Errors are typed per module and preserve their cause chain. | W0 §7 | |
+| **D-35** | Administrative authentication is a username and password — one administrator, no roles, Argon2id, sessions distinct from credentials, no default password; W5 §3 owns the design. | W0 §7 | **extended** → A-W5-1 (one *identity*, several revocable sessions) |
+| **D-36** | Internal vocabulary is not user-facing vocabulary; an internal term on screen is a bug, and W5 §0 owns the translation table. | W0 §8 | **extended** → A-W5-2 (enforcement is a CI gate, not review) |
+| **D-37** | The legacy external contract is frozen and new endpoints are additive only; W1 captures the surface. | W0 §8 | **extended** → A-2 (named artefacts), and see `docs/reconciliation.md` §3 for the six recorded deviations |
+| **D-38** | The public weather website is carried forward as-is, except that template-generated JavaScript becomes static JavaScript plus a JSON config endpoint. | W0 §8 | **extended** → A-3 (the nine values), A-W3-3 (how the payload is delivered) |
+| **D-39** | A new v2 API is out of scope for this design program; W6 records it as a named future work item. | W0 §8 | discharged — `docs/reconciliation.md` §4, **N-1** |
+| **D-40** | The ancillary Go tools are not ported — the provisioner stays in Go and is updated, the emulators stay in Go deliberately as independent test implementations, the rest retire. | W0 §9 | **extended** → A-W8-4 (**at a pinned commit**); the provisioner update is **N-2** |
+| **D-41** | A PR gate running build, test, format, lint and concurrency-checked tests exists from the first commit. | W0 §9 | |
+| **D-42** | The required database version is asserted both in CI and at startup. | W0 §9 | **extended** → D-62 (the startup half had no owner) |
+| **D-43** | **Linux release artefacts are statically linked against musl, for every architecture.** A glibc ARMv6 cross build from Debian's toolchain produces an ARMv7-tagged binary that faults on a Raspberry Pi 1/Zero; one linkage for all four architectures also means one packaging rule and no runtime library skew. Consequence: musl's allocator and resolver differ from glibc's. | W8 (A-W8-2) | |
+| **D-44** | **A node's position in a topology is the set of components its configuration produces, not a mode it is in.** A collector is a node whose components include an ingest endpoint; a satellite is one whose components include an uplink; a node with both is the default case. There is no `role`, `mode` or `is_collector` field in the configuration. | W7 (A-W7-1) | |
+| **D-45** | **Registration between nodes carries identity and station metadata only. A node never transmits a third-party credential to another node.** A collector that uploads on behalf of the fleet selects which origins it covers and uses its own credentials. | W7 (A-W7-2) | |
+| **D-46** | **Admission control for an inbound reading happens before the reading reaches the stream, and an unauthorised sender is a counted rejection.** There is no path by which a reading is stored and then found to be unauthorised. | W7 (A-W7-3) | |
+| **D-47** | **The uplink's reading filter is `NotFrom(peer)`, not `NotFrom(self)`.** `admit` sets `path = [self]`, so every envelope in a node's own spool carries `self`; `NotFrom(self)` matches everything and the uplink would send nothing. | W6 (C-W2a-25) | |
+| **D-48** | **A `503` from an unmounted route can never be observed on a frozen path, and that is a tested invariant.** `api:legacy` declares only `LatestSnapshot` as a hard requirement, and `snapshot:latest` starts successfully with `ReadingStore` unavailable, so the legacy route table mounts unconditionally. With the database down, every frozen route returns its contract response — never `503`. | W6 (C-W2a-28) | |
+| **D-49** | **Every management API route is `/api/v1/*`.** W5 versions the management surface; W3's `/api/logs` spelling is superseded by `/api/v1/logs`. | W6 (C-W3-40) | |
+| **D-50** | **`WindowedView` resolves `Mean`, `Min`, `Max`, `Sum` and `CircularMean` from the registry's declared strategies, mapping `Sum` onto the registry's `total`. There is no `Agg::Last`** — an output needing a metric's current value reads `LatestSnapshot`, not a window. | W6 (C-W2a-10) | |
+| **D-51** | **`Provision` carries `ProvisionDetail::Routes(RouteManifest)`**, so a duplicate route is a `PlanError` naming both owners rather than silent last-registration-wins. | W3 D-91, accepted by W6 (C-W3-2) | |
+| **D-52** | **`ComponentControl` also carries the runtime `tracing` reload handle** — one consumer, same root provider, and a thirteenth capability for one consumer is noise in a graph whose only jobs are ordering and `Waiting`. | W3 D-90, accepted by W6 (C-W3-2) | |
+| **D-53** | **`ComponentControl` also exposes `applied_generation` per component and the newest committed `generation`.** It is supervisor state by construction, so computing it elsewhere means a second source of truth for "is this change live". W5 §2.2 is unimplementable without it. | W5 assumption 4, accepted by W6 (C-W3-2) | |
+| **D-54** | **`/span`'s response cache holds the closed-bucket prefix only; the trailing partial bucket is appended per request.** W3 D-40's 60-second TTL is lossless of the materialised prefix and *not* of W4 D-13's tail, which changes at the raw cadence. The tail costs a measured 0.44–6.89 ms. | W6 (C-W3/W4-1) | |
+| **D-55** | **The trailing-bucket tail query lives in `mw-store`**, so `ReadingStore::span` returns materialised buckets plus the tail and no caller can forget it. `/span/24h` means "24 hours of 5-minute buckets", and the last one is still filling. | W6 (OQ-W4-6, with D-54 as a second reason) | |
+| **D-56** | **`Ingress::admit` upserts `stations` on identity resolution; `writer:timescale` maintains `stations.last_seen` and `station_metrics`.** They are read-side projections and nothing else populates them at run time. | W6 (C-W4-20) | |
+| **D-57** | **The management OpenAPI schema and its TypeScript client get their own drift gate (`mgmt-schema-drift`), not `codegen-drift`.** `cargo xtask codegen --check` must keep meaning exactly "`generated/` matches `metrics/registry.toml`"; a second emitter with a different input gets a second gate, following `legacy-import-drift`'s precedent. | W6 (C-W5-36, after W9 D-20) | |
+| **D-58** | **Node and pnpm are build-time requirements of a release machine, not runtime requirements of the artefact.** `cargo xtask dist` builds the UI bundle once, natively, **before** the cross matrix, and fails if the bundle is missing or stale. The shipped artefact is still one static binary. | W6 (C-W5-45) | |
+| **D-59** | **An envelope's `path` is an ordered `SmallVec<[OriginId; 8]>`, not a bitset.** Three of the six receive-check clauses are positional, and a set cannot distinguish "added by my sender's `forward`" from "here two hops ago". At `MAX_PATH = 8` a bitset is an optimisation with no benefit and an overflow case to guard. | W7 assumption 12, accepted by W6 (C-W7-12) | |
+| **D-60** | **`Ingress` has a second entry point, `accept()`, which never reassigns provenance.** `admit` assigns `seq`; running it on a forwarded envelope renumbers it in the receiver's coordinate space and destroys the `(origin, seq)` identity the cumulative ack and the dedup gate both depend on. | W7 assumption 13, accepted by W6 (C-W7-13) | |
+| **D-61** | **Provenance is not a column on the raw hypertable.** Nothing reads it — idempotency lives at the spool gate and the natural key — and `origin` would be a `[[dimension]]`, which has no deprecation path, making the column a one-way door. If it is wanted later, **N-14**'s `metadata` role is a prerequisite. | W6 (C-W7-26) | |
+| **D-62** | **The database version is asserted at startup as well as in CI**, in the binary's boot sequence after the pool opens and before `plan()` runs, failing with a message naming the required and found versions — the same comparison `ci/sql/assert-timescaledb-version.sql` makes. | W6 (C-W8-6), discharging the other half of D-42 | |
+| **D-63** | **The codegen interface is `cargo xtask codegen [--check]`, implemented in `xtask/src/gen.rs`.** There is no `mw-codegen` package and no `xtask/src/codegen.rs`; `docs/release.md`'s five references to them describe an interface that was dropped at merge. `ci/gates.toml` has always declared the correct command. | W6 (C-W8-7) | |
+| **D-64** | **A gate's `arms_when` must name a path that some work item's done-criteria require it to create.** A gate armed on a path nobody owns reports green forever; a gate armed on a path that already exists fails immediately. G-1 is the first failure mode, observed. | W6 (G-1) | |
+| **D-65** | **The configuration store's station table is `config.stations`; the PostgreSQL read-side projection is the `observations`-side `stations`.** One is authoritative and the other is a cache, and no document or comment may write "the stations table" unqualified. | W6 (G-2) | |
+| **D-66** | **Per-station third-party service settings normalise into a `station_service` table** rather than sitting on the device row beside the hardware configuration. W5's OQ-W5-4 deferred this to W4 on the grounds that normalising costs a migration; since the configuration schema is now written from scratch (**N-4**), there is no in-place migration to avoid. | W6 (OQ-W5-4) | |
+| **D-67** | **The four plaintext third-party credentials are not migrated.** `remote_stations`' `aprs_password`, `wu_api_key`, `aeris_client_secret` and `pws_password` crossed the wire in cleartext and sat in a second database where nothing read them. **N-5** drops the columns; the owner re-enters the rotated secrets once. Everything else in the configuration is migrated, not re-typed. | W6 (G-2, after A-W7-2) | |
+
+**Sixty-seven decisions, plus D-30a/D-30b replacing D-30.** Twenty-one are this work item's, and every
+one of those is a *resolution* of something two documents left between them rather than new design —
+see `docs/reconciliation.md` §1 and §2 for each one's derivation. One further decision (**D-68**,
+retiring `remoteweather:docs/rewrite/`) is **proposed and not applied**, because applying it means
+writing to the read-only reference repository: see `docs/reconciliation.md`'s *Proposed amendments*.
 
 ---
 
 # Open questions
 
 Stated as decisions for the owner, with a recommendation each.
+
+> **W6, 2026-10-30 — status of this section.** Three of the six are closed by a later document and are
+> kept here, marked, rather than deleted, so the reasoning stays findable: **OQ-3** (sum-and-count
+> versus `stats_agg`) → W4 D-2, sum-and-count everywhere; **OQ-4** (compress or bound the minute
+> level) → W4 D-4/D-5, compression proved *impossible* at 629 columns and retention taken instead
+> (A-W4-2); **OQ-5** (per-level membership) → W4 D-3, every level carries every aggregatable metric,
+> after W2's A-W2-1 showed OQ-5's recommendation was not constructible under D-11.
+>
+> **OQ-1, OQ-2 and OQ-6 are still open and all three need a query against production**, which is not
+> reachable from an agent runtime. They are carried as **O-1**, **O-3** and **O-4** in
+> `docs/reconciliation.md` §5, alongside nine other questions the programme surfaced. **That
+> consolidated list is the one to read**; this section is kept for its rationale.
 
 **OQ-1. What TimescaleDB version does production actually run?**
 
