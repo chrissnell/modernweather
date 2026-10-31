@@ -17,9 +17,17 @@
 #
 #   preflight   report. Versions, retention-policy state, extents, the column gap. Changes
 #               nothing anywhere. Run it first, read it, then decide.
-#   archive     the only step that writes to the source: CREATE TABLE weather_1d_archive /
-#               weather_1h_archive AS SELECT * FROM the view. Cheap, reversible, and the
-#               thing that makes the history decision reversible too.
+#   archive     the only step that CREATES anything in the source: CREATE TABLE
+#               weather_1d_archive / weather_1h_archive AS SELECT * FROM the view. Cheap,
+#               reversible, and the thing that makes the history decision reversible too.
+#   pause-source-retention
+#               disable the raw retention policy on the source, so it stops converting a
+#               further day of raw into rollup-only history every day. The second of the
+#               two statements that touch the source, and it REFUSES TO RUN until
+#               `archive` has succeeded — pausing protects the future, the archive
+#               protects what is already at risk, and doing them in the wrong order
+#               leaves a window in which neither has happened. Reversible:
+#               alter_job(..., scheduled => true).
 #   stage       create the w9 schema on the target and load both inventories.
 #   stations    populate `stations` from w9.station_map. Nothing can be imported before it.
 #   raw         stream the raw hypertable, slice by slice, resumably.
@@ -97,6 +105,95 @@ step_archive() {
       echo "  weather_${lvl}_archive verified: $a rows, equal to the view"
     fi
   done
+}
+
+# The second statement that touches the source, and the only one that changes behaviour
+# rather than adding a table. DESIGN.md A-W9-1 is why the ordering is enforced rather than
+# documented: `drop_chunks` logs an invalidation, and a later refresh over that range
+# deletes the buckets whose raw has gone — measured at 41 of 83 daily buckets in one policy
+# run, with no error. So pausing retention stops the *future* loss and the archive is what
+# protects the history that is already exposed. A run that paused first and then failed to
+# archive would look like success and be the dangerous half.
+step_pause_source_retention() {
+  say "pause-source-retention — THE ONE STEP THAT CHANGES THE SOURCE'S BEHAVIOUR"
+
+  # --- interlock: the archive must already exist and be non-empty.
+  local missing=0
+  for lvl in 1d 1h; do
+    local n
+    n="$(srcq "SELECT coalesce((SELECT count(*) FROM pg_class
+                                 WHERE relname = 'weather_${lvl}_archive'
+                                   AND relkind = 'r'), 0)")"
+    if [ "$n" = "0" ]; then
+      echo "  MISSING: weather_${lvl}_archive" >&2; missing=1; continue
+    fi
+    n="$(srcq "SELECT count(*) FROM weather_${lvl}_archive")"
+    if [ "$n" = "0" ]; then
+      echo "  EMPTY: weather_${lvl}_archive exists but has 0 rows" >&2; missing=1; continue
+    fi
+    echo "  ok: weather_${lvl}_archive present, $n rows"
+  done
+  if [ "$missing" != "0" ]; then
+    cat >&2 <<'EOM'
+
+  REFUSING TO PAUSE. Run `archive` first and let it verify.
+
+  Pausing retention protects the days you have not lost yet. The archive protects the
+  ~294 days that are already rollup-only and therefore already exposed to the mechanism
+  in DESIGN.md A-W9-1. In the wrong order there is a window where neither is true, and
+  it looks like progress.
+EOM
+    return 1
+  fi
+
+  # --- report every policy job before touching one. The refresh policies in particular:
+  #     an ACTIVE refresh policy on weather_1d is the thing that destroys rollup history,
+  #     but disabling it would also stop the live site's aggregates from advancing. That
+  #     is the owner's call, not this script's, so it is reported and left alone.
+  say "every policy job on the source, before any change"
+  src -c "SELECT j.job_id, j.proc_name, j.hypertable_name, j.scheduled,
+                 j.config ->> 'drop_after' AS drop_after, j.next_start,
+                 s.last_run_status
+            FROM timescaledb_information.jobs j
+            LEFT JOIN timescaledb_information.job_stats s USING (job_id)
+           WHERE j.proc_name LIKE 'policy_%'
+           ORDER BY j.proc_name, j.job_id"
+
+  # --- disable retention on the RAW hypertable only.
+  local jobs
+  jobs="$(srcq "SELECT job_id FROM timescaledb_information.jobs
+                 WHERE proc_name = 'policy_retention'
+                   AND hypertable_name = 'weather'
+                   AND scheduled
+                 ORDER BY job_id")"
+  if [ -z "$jobs" ]; then
+    echo "  no ENABLED retention policy on \`weather\` — nothing to pause (already done, or never existed)"
+  else
+    for id in $jobs; do
+      src -c "SELECT alter_job($id, scheduled => false)"
+      echo "  paused retention job $id on \`weather\`"
+    done
+  fi
+
+  # --- verify, and say plainly what was NOT touched.
+  say "after"
+  src -c "SELECT job_id, proc_name, hypertable_name, scheduled,
+                 config ->> 'drop_after' AS drop_after, next_start
+            FROM timescaledb_information.jobs
+           WHERE proc_name = 'policy_retention' ORDER BY job_id"
+  cat <<'EOM'
+  Retention on `weather` is paused. Reverse with: SELECT alter_job(<id>, scheduled => true);
+
+  NOT touched, deliberately:
+    - retention on any aggregate (weather_1m / weather_5m). Those are derived from raw,
+      and raw is now being kept.
+    - every refresh policy. An active refresh over the rollup-only window is what
+      DESIGN.md A-W9-1 describes, but disabling it would stop the live site's aggregates
+      from advancing. Read the `scheduled` column above and decide; the archive is
+      already taken either way.
+    - nothing was dropped, updated or deleted. This step issues one alter_job per
+      enabled retention job on `weather`, and nothing else.
+EOM
 }
 
 step_stage() {
@@ -251,6 +348,7 @@ step_policies() {
 case "${1:-help}" in
   preflight)  step_preflight ;;
   archive)    step_archive ;;
+  pause-source-retention) step_pause_source_retention ;;
   stage)      step_stage ;;
   gap)        step_gap ;;
   stations)   step_stations ;;
