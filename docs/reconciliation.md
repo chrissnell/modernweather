@@ -1908,9 +1908,10 @@ with a $35 box and a config change, independently and in either order.
 ## 8. The rollup-only history was already gone
 
 **Measured 2026-10-31, against production.** This is the most consequential thing this programme
-found, and it is a finding rather than a recommendation: **the ~294 days of daily and hourly rollup
-that `docs/data-migration.md` §3 was written to protect do not exist.** They were destroyed before
-anyone looked.
+found, and it is a finding rather than a recommendation: **the daily and hourly rollup that
+`docs/data-migration.md` §3 was written to protect does not exist outside the raw window.** It was
+destroyed before anyone looked — and because no endpoint can request a span older than one year
+(§8.1b), there was no symptom.
 
 ### 8.1 The evidence
 
@@ -1934,13 +1935,67 @@ _hyper_5_44_chunk   2025-07-30..2025-10-08         0
 _hyper_5_58_chunk   2025-10-08..2025-12-17       124   <- only the part from 2025-10-29
 ```
 
-**301 days of empty chunks**, from `2025-01-01` to `2025-10-29`. The chunks were created when the
-buckets existed. The rows are gone and the containers were left behind.
+**301 days of empty chunks**, from `2025-01-01` to `2025-10-29` — the rows are gone and the
+containers were left behind. **See §8.1b: "301 days of empty chunks" is not the same as "301 days of
+readings deleted", and the stronger reading is not supportable.** The deletion itself is evidenced
+directly; its extent in days of real data is not recoverable from this database.
 
 This is the signature of A-W9-1's mechanism, and it distinguishes it from ordinary retention:
 `drop_chunks` on **raw** *removes* chunks — the raw hypertable's oldest chunk is simply `2025-10-29`,
 with no empty predecessors. A continuous-aggregate refresh over an invalidated range *deletes rows
 inside retained chunks*. The empty chunks are only explicable as refresh, not retention.
+
+### 8.1b Why the live site looks completely fine — and the correction this forces
+
+**The owner challenged this finding**, reasonably: *"I'm able to view historical weather on
+suncrestweather.com with no issues."* Both observations are true, and reconciling them is what
+establishes the finding's real scope.
+
+**The site cannot ask for more than a year.** Measured against the live server:
+
+| Request | Result |
+|---|---|
+| `/span/8760h` (365 d) | **HTTP 200**, 364 points, oldest `2025-11-01` |
+| `/span/8784h` (366 d) | **HTTP 400** — `time span exceeds maximum allowed duration of 1 year` |
+| `/span/17520h` (2 y) | **HTTP 400**, same |
+
+So every byte the website can request is inside the intact window, and the server **refuses** to ask
+for anything older. W9 D-6 predicted exactly this — *"`/span` takes no time anchor and rejects a span
+over one year … so the furthest band it can ask for always has real data behind it"* — which is
+precisely **why the loss was invisible**: no endpoint exposes the range that is gone.
+
+**Two corrections to §8.1, in the direction of less certainty.**
+
+*First, the size of the loss is not 301 days of data.* 301 days is the span of **chunk ranges** that
+are now empty, which is not the same as 301 days of readings. `pg_stat_all_tables` is more precise
+and partly disagrees with the stronger reading:
+
+```
+chunk               range                  live  ins   del   autovacuumed
+_hyper_5_35_chunk   2025-01-01..2025-03-12    0     0     0   no
+_hyper_5_36_chunk   2025-03-12..2025-05-21    0     0     0   no
+_hyper_5_37_chunk   2025-05-21..2025-07-30    0     0     0   no
+_hyper_5_44_chunk   2025-07-30..2025-10-08    0    14   121   yes
+_hyper_5_58_chunk   2025-10-08..2025-12-17  124     8    50   yes
+```
+
+**`n_tup_del` of 121 and 50 is direct evidence of deletion** on the two chunks nearest the boundary.
+The three older chunks show no activity at all — consistent with having been emptied before the last
+statistics reset, but **not proof of it**, because these counters do not survive a restart or
+`pg_stat_reset()`. The honest statement is therefore: *rows were demonstrably deleted from the
+boundary chunks, and the older chunks exist with zero rows.*
+
+*Second, that data did exist is established independently* — by `almanac_cache`, which survived
+because it is a precomputed table rather than a continuous aggregate. It holds 34 records dated from
+**2025-01-22**, including `low_barometer = 24.899` on 2025-01-24, under station names
+**`DavisVantagePro2`** and **`backyard-snow`** that no longer appear in the current data at all. So
+there were readings back to at least January 2025, under earlier station names — which is also a live
+instance of the station-rename bucket split W2 D-5 fixes.
+
+**Revised scope.** Daily and hourly rollup covering roughly 2025-01 to 2025-10-29 is gone from the
+aggregates; the exact number of days that held readings cannot be established from the surviving
+database. The all-time records survive in `almanac_cache`. **Nothing a client can request is
+affected**, which is why there was no symptom.
 
 ### 8.2 Why it happened, and why it was certain to
 
@@ -1966,7 +2021,9 @@ nothing.**
 ### 8.3 What this changes
 
 - **O-7 is moot.** The history question (W9 OQ-W9-1: delete ~294 days of rollup, or carry it for
-  ~60 MB) has no subject. There is nothing to carry. The owner's answer — Option B, import the
+  ~60 MB) has no subject. There is nothing to carry. **And it never had a consumer either** — §8.1b
+  shows `/span` refuses any span over one year, so even had the rollup survived, no endpoint could
+  have served it without the time-anchored v2 endpoint (**N-1**) that does not exist yet. The owner's answer — Option B, import the
   archive — stands as the right call on the facts as they were known, and the archive it refers to is
   empty of anything unique.
 - **The archive copy was still taken** (`weather_1d_archive`, 967 rows; `weather_1h_archive`, 20,041
