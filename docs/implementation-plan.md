@@ -467,16 +467,22 @@ has always specified. W9 built this; this item *runs* it and records the result.
 one named archive step), so the platform move and the data migration are **one** operation and the
 old box stays as the rollback. This is also what reduces **O-1** from a fork in the plan to a detail:
 there is no in-place major-version upgrade, because the transform is a logical export and import.
-**Prerequisites that are not this item's to satisfy:** **O-2** (archive first, then pause — and the
-archive is correct under every answer, so it waits on nothing) and **O-1** (now only `pg_dump`
-flags and archive extraction, per above). **O-7 is answered: Option B, import the archive.**
+**Prerequisites — all discharged 2026-10-31.** **O-2** done: archive taken and verified, raw
+retention paused (`alter_job(1004, scheduled => false)`). **O-1** answered: source is PostgreSQL
+**16.6** / TimescaleDB **2.17.2**, so the hierarchy is constructible and there is no in-place
+upgrade. **O-7** is **moot** — the rollup history it referred to was already destroyed
+(`docs/reconciliation.md` §8), so the rollup import step has no input. **Run `rollup` anyway**: it is
+idempotent, it costs seconds, and it is the step that would carry the data if an older `pg_dump` of
+pitcairn ever surfaces.
 **Done when:** `w9` reconciliation passes with zero tolerance on every metric per year; the two
 bounded statistics are inside their derived bound; `w9.assert_no_unknown_source_columns()` raises
 nothing.
 **Test strategy:** W9's negative controls — the reconciliation was proved able to fail, and a
 reconciliation that ran against zero rows raises rather than passes.
-**Also produces O-4's answer as a side effect:** the import computes
-`w9.expected_column INTERSECT w9.source_column`, so the ~72-column gap is enumerated by running it.
+**O-4 is already answered and the gap is zero:** production's `weather` has **215 columns**, exactly
+the Go source definition, so `w9.expected_column INTERSECT w9.source_column` will match everything.
+`w9.assert_no_unknown_source_columns()` should raise nothing — and if it does, something has changed
+since 2026-10-31 and that is worth stopping for.
 
 ### M5-2 — the diff harness
 **Depends on:** M5-1, M3-1. Build (b) and (c) above as a runnable harness in `ci/diff/`, with its
@@ -686,7 +692,7 @@ reader might expect are deliberately absent.
 
 | Milestone | Needs | Blocking? |
 |---|---|---|
-| — | **O-2** archive-then-pause the raw retention policy | **Not blocking, and losing data now.** Every day it stays open converts another day of raw into rollup-only history |
+| ~~—~~ | ~~**O-2** archive-then-pause the raw retention policy~~ | **Done 2026-10-31.** Archive taken and verified; job 1004 paused. The loss it was racing had **already completed** — see §8 |
 | M5-1 | **O-1** the production version | **Yes.** Below TimescaleDB 2.9 the hierarchy cannot be built and M5-1 becomes a major-version upgrade |
 | M5-1 | **O-7** the history option | Yes for M5-1's scope; the archive copy is correct either way |
 | ~~M4-2~~ | ~~**O-5** the `/stationinfo` hazard~~ | **Answered: option (b).** Ships as a signed deviation with a new fixture |
@@ -695,4 +701,4 @@ reader might expect are deliberately absent.
 | ~~M7-3~~ | ~~**O-11** which `chonky` gaps to upstream~~ | **Answered: all twelve are fair game.** Upstream G2/G4/G9/G10 now; the rest as their shape settles in use |
 | ~~before first release~~ | ~~**O-9** is a Pi Zero in use?~~ | **Answered: retain the broadest hardware support.** All four targets stay; with no ARM1176 to test on, W8 D-25's qemu run under `-cpu arm1176` **is** the validation — no new hardware needed |
 | ~~N-1~~ | ~~**O-6** which legacy surface is dead~~ | **Answered structurally** — only the iOS endpoints are frozen, so `legacy-v1.json` settles it and the access-log query is unnecessary |
-| — | **O-3** the compression hold rate, **O-4** the column gap | No. **All four production questions are answered by one run of `migrate-from-go.sh preflight`** — P-1 is O-1, P-2/P-2b/P-3b are O-2's policy state, P-6 is O-3, P-7 is O-4 |
+| ~~—~~ | ~~**O-1**–**O-4**, the four production queries~~ | **All four answered 2026-10-31** against production. See `docs/reconciliation.md` §5 Group A for the measured values and §8 for the data-loss finding. Two premises were wrong: there is no column gap, and the rollup history was already destroyed |

@@ -1340,7 +1340,32 @@ tools — are all settled and are **not** reopened here.
 lines of design left twelve things for a human, four of which are database queries. That is the
 system working.
 
-### Group A — four production queries. Nobody with access to this repository can answer these.
+### Group A — ANSWERED 2026-10-31. All four, measured against production.
+
+> **The owner fixed `pg_hba.conf` and the queries ran.** Every figure below is measured, not
+> extrapolated. **Two of the four premises these questions rested on turned out to be wrong**, and one
+> of those is a data loss that had already happened. See §8.
+
+| | Question | Measured answer |
+|---|---|---|
+| **O-1** | Production's PostgreSQL / TimescaleDB version | **PostgreSQL 16.6, TimescaleDB 2.17.2.** Not PostgreSQL 14 — the `docker-compose` guess was wrong in the harmless direction. 2.17.2 is **above 2.9**, so the four-level hierarchy is constructible and W4 §5.2's contingency does not fire. The new instance is PG 17 + 2.31 (D-2), reached by W9's logical export/import, so there is no in-place upgrade |
+| **O-2** | Is raw retention firing? | **Yes — and it was 4 h 55 m from the next run.** Job **1004**, `drop_after = 365 days`, daily. **Now paused** (`scheduled = f`). There were **five** retention policies, not one: 1004 on raw plus 1005–1008 on the four aggregates (1 month / 6 months / 2 years / 10 years). Only 1004 was touched |
+| **O-3** | The compression hold rate | **59.6%** over 322,346 sampled pairs — **well below** the ~87% the planning documents assumed and below the 76.87% W4 measured in its own rig. Production also has **zero compressed chunks**: compression was never enabled there, so its 19 GB is uncompressed |
+| **O-4** | The ~72-column gap | **There is no gap.** Production's `weather` has **215 columns** — exactly the Go source definition the registry was bootstrapped from. The "~143 columns" in `docs/database-schema.md` §0 was an assumption, never a measurement. 215 + `station_id` = the registry's 216 allocated identifiers, which is a perfect match, so W9 D-8's run-time `expected ∩ source` intersection will match everything |
+
+**Consequences for figures already in these documents:**
+
+- **W4 D-7's 5.3× compression is optimistic for this data.** It was measured at a 76.87% hold rate;
+  production is 59.6%, and W0's spike established that the ratio is driven almost entirely by that
+  rate (1.89× to 13.74× on the same schema). Expect the lower part of that range. D-10 already says
+  no decision depends on the ratio — that still holds — but **every capacity figure derived from
+  5.3× should be treated as a floor on size rather than an estimate**.
+- **§7.3's “~36 GB for a decade” is revised upward to roughly 50–60 GB.** Same reasoning. It changes
+  nothing about the hardware recommendation: it is still trivial against any NVMe.
+- **The new system will still be smaller than production for the same data**, because production has
+  no compression at all.
+
+### Group A — the original four questions, kept for their reasoning
 
 These four have been outstanding for the whole programme, and the first one is losing data every day
 it stays open.
@@ -1880,6 +1905,102 @@ with a $35 box and a config change, independently and in either order.
 
 ---
 
+## 8. The rollup-only history was already gone
+
+**Measured 2026-10-31, against production.** This is the most consequential thing this programme
+found, and it is a finding rather than a recommendation: **the ~294 days of daily and hourly rollup
+that `docs/data-migration.md` §3 was written to protect do not exist.** They were destroyed before
+anyone looked.
+
+### 8.1 The evidence
+
+Four queries, each independently sufficient:
+
+| | Result |
+|---|---|
+| Raw window | `2025-10-29` → `2026-10-30`, exactly **366 days** — the 365-day policy trimming daily |
+| `weather_1d` extent | `2025-10-29` → `2026-10-30`. **Same start as raw** |
+| Day buckets older than the raw window | **0** |
+| `_materialized_hypertable_5` queried **directly**, bypassing the real-time view union | `min(bucket) = 2025-10-29` |
+
+And the forensic one — **the chunks are still there and they are empty:**
+
+```
+chunk               range                  live rows
+_hyper_5_35_chunk   2025-01-01..2025-03-12         0
+_hyper_5_36_chunk   2025-03-12..2025-05-21         0
+_hyper_5_37_chunk   2025-05-21..2025-07-30         0
+_hyper_5_44_chunk   2025-07-30..2025-10-08         0
+_hyper_5_58_chunk   2025-10-08..2025-12-17       124   <- only the part from 2025-10-29
+```
+
+**301 days of empty chunks**, from `2025-01-01` to `2025-10-29`. The chunks were created when the
+buckets existed. The rows are gone and the containers were left behind.
+
+This is the signature of A-W9-1's mechanism, and it distinguishes it from ordinary retention:
+`drop_chunks` on **raw** *removes* chunks — the raw hypertable's oldest chunk is simply `2025-10-29`,
+with no empty predecessors. A continuous-aggregate refresh over an invalidated range *deletes rows
+inside retained chunks*. The empty chunks are only explicable as refresh, not retention.
+
+### 8.2 Why it happened, and why it was certain to
+
+Three settings in combination, all of them individually reasonable:
+
+| | |
+|---|---|
+| Job **1004** | retention on raw, `drop_after = 365 days`, **daily** |
+| Job **1003** | refresh `weather_1d` with **`start_offset = 10 years`** |
+| Job **1002** | refresh `weather_1h` with **`start_offset = 2 years`** |
+
+Every day: retention drops a day of raw at the 365-day boundary, and then a refresh policy whose
+window reaches back *ten years* re-materialises over that range, finds no raw, and deletes the
+buckets. The invalidation log confirms the mechanism was live — every level carried an unbounded-low
+invalidation entry, and all four showed invalidations reaching below the raw window.
+
+**So the loss was not an event. It was a daily process**, and it had already consumed everything
+outside the raw window before this programme started. `docs/data-migration.md`'s framing — that each
+day "converts one more day of raw readings into rollup-only history" — describes the first half of a
+mechanism whose second half ran the same night. **A day of raw did not become rollup-only. It became
+nothing.**
+
+### 8.3 What this changes
+
+- **O-7 is moot.** The history question (W9 OQ-W9-1: delete ~294 days of rollup, or carry it for
+  ~60 MB) has no subject. There is nothing to carry. The owner's answer — Option B, import the
+  archive — stands as the right call on the facts as they were known, and the archive it refers to is
+  empty of anything unique.
+- **The archive copy was still taken** (`weather_1d_archive`, 967 rows; `weather_1h_archive`, 20,041
+  rows; 2025-10-29 → 2026-10-30, 42 MB total) **and is now redundant rather than irreplaceable** —
+  every row in it is reconstructible from raw, which is the opposite of the premise. It is kept as a
+  point-in-time snapshot taken before the policy change, and it can be dropped whenever the owner
+  likes.
+- **W9's legacy-archive apparatus has no input.** `observations_1d_legacy`, `observations_1h_legacy`,
+  `w9.legacy_boundary`, `w9.assert_legacy_disjoint()` and `observations_1d_with_legacy` were all built
+  for data that is not there. **Recommendation: keep them, do not rip them out.** They are built,
+  tested and harmless, and they become useful the moment an older `pg_dump` of pitcairn surfaces from
+  anywhere — which is now the only route by which that history could return. Recorded as **D-71**.
+- **§7.5's backup argument is strengthened, not weakened.** The legacy archive was listed there as the
+  irreplaceable item that gets forgotten. It is now empty — but the reasoning was right, and the thing
+  it was protecting against is precisely what happened here: a derived-data mechanism quietly eating
+  the only copy of something.
+
+### 8.4 Why nobody caught it, which is the part worth keeping
+
+W0's spike measured the destructive refresh behaviour **on TimescaleDB 2.31** and W9 reproduced it in
+a lab. Both were right about the mechanism. What neither could do was look at production — W0 OQ-1
+recorded it as unreachable, and that premise went unchallenged for the whole programme until
+`docs/reconciliation.md` §5 found the network was fine and only `pg_hba` was in the way.
+
+**The measurement was available the entire time and the question was framed as unanswerable.** W9
+even wrote the query that proves it — P-4b, *"the ~294-day number, measured rather than remembered"* —
+and shipped it unrun. Every document that cites ~294 days cites an inference.
+
+The lesson is narrow and worth stating: **"production is unreachable" was a conclusion drawn from a
+`Do not` instruction, not from a test.** W0 was told not to touch production, correctly, and recorded
+the consequence as a property of the environment. Nobody retested it, because it was written down.
+
+---
+
 ## Decisions
 
 1. **This pass reconciles; it does not redesign.** Every resolution in §1 is either a clerical fix, a correction forced by measurement, or an acceptance of a recommendation its own author made. Where a resolution was a genuine design choice it went to §5.
@@ -1911,7 +2032,7 @@ items and about the owner, not about documents yet to be written.
 1. **The implementation plan's ordering constraints are binding, not advisory.** In particular: the frozen-contract conformance suite must be green **before** any legacy endpoint is reimplemented, not after. N-3 is what makes that possible at all, which is why it sits in milestone 1.
 2. **N-12 (proto3 `optional`) is done inside the registry work item**, before anything reads `generated/proto/`. Retrofitting presence after a collector exists is a fleet-wide flag day for a change that is free today.
 3. **N-14 (dimension `role = "metadata"`) lands with the registry work**, because it is the prerequisite for both OQ-W4-2's column drop and C-W7-26's eventual provenance column, and because a `[[dimension]]` with no deprecation path is a one-way door.
-4. **The sixty-nine decisions in `DESIGN.md`'s ledger are the implementation's specification**, and the ten design documents are its rationale. An implementation agent that reads only the ledger should never be wrong; it will sometimes not know *why*.
+4. **The seventy-one decisions in `DESIGN.md`'s ledger are the implementation's specification**, and the ten design documents are its rationale. An implementation agent that reads only the ledger should never be wrong; it will sometimes not know *why*.
 5. **D-47 through D-67 (this document's additions) are resolutions, not new design.** D-68 and D-69 are the owner's, taken 2026-10-31. Each one's reasoning is the reasoning its originating document gave; where this document chose between two options it says which argument it chose on.
 6. **The owner answers O-2 before the next raw chunk is dropped.** Nothing in the plan is sequenced against it, because it is not a dependency — it is a loss that is already occurring.
 7. **`remoteweather` stays readable at `c3ec9f7`** for the emulators (D-40, W8 D-23), the Go view inventory (W9 D-11) and N-9's reading of `pkg/solar`.
@@ -1952,7 +2073,7 @@ should not depend on the old one carrying a copy of its own planning documents.
 
 Proposed as a new decision rather than an edit:
 
-> **D-70. `modernweather:docs/rewrite/` is the single canonical copy of the programme's prompt set.
+> **D-72. `modernweather:docs/rewrite/` is the single canonical copy of the programme's prompt set.
 > `remoteweather` is read-only reference for the Go implementation's *behaviour* and carries no
 > planning documents.** The copy under `remoteweather:docs/rewrite/` is deleted, and anything that
 > referenced it references the `modernweather` path.

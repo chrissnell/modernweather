@@ -11,7 +11,7 @@ interface, you are in the wrong document.
 Decisions are **never edited in place**. See `## Amendments` at the end for the protocol.
 
 **Where to start, as of W6 (2026-10-30).** The design programme is complete and all ten documents are
-merged. `# Decisions — the ledger` below is **one numbered ledger of all sixty-nine decisions, each
+merged. `# Decisions — the ledger` below is **one numbered ledger of all seventy-one decisions, each
 carrying its source**, and it is what an implementation agent should read instead of ten design
 documents — the documents are the rationale, the ledger is the specification. `## Amendments` carries
 the twenty-three amendments the programme produced, applied under the protocol. The integration pass
@@ -1078,12 +1078,14 @@ Read the `Status` column. A decision is **never edited in place** (see `## Amend
 | **D-66** | **Per-station third-party service settings normalise into a `station_service` table** rather than sitting on the device row beside the hardware configuration. W5's OQ-W5-4 deferred this to W4 on the grounds that normalising costs a migration; since the configuration schema is now written from scratch (**N-4**), there is no in-place migration to avoid. | W6 (OQ-W5-4) | |
 | **D-68** | **The frozen surface is the five endpoints the iOS client calls** — `/latest`, `/span/{hours}h`, `/snow`, `/stationinfo`, `/forecast/{hours}`. Everything else the server exposes is **coupled, not frozen**: the public website's JavaScript ships *inside the server binary* (`rust-embed`, D-76), so server and website are one artefact and one release, and a response change there is a refactor that must touch both halves in one PR rather than a contract break. **The test is "can the client be updated atomically with the server?"**, which has an answer for any future client. Supersedes D-37's scope; D-37's mechanism — an executable definition in `contract/` — is unchanged. | Owner, 2026-10-31 (W6 §6) | |
 | **D-69** | **`/alerts`, `/api/remote-stations` and `format=msgpack` are not carried forward.** None is called by either shipped client; `legacy-v1.json` records that no client sends `msgpack`, and `/api/remote-stations`' table is retired by D-45 anyway. This also disposes of W1-BUG-2 by deleting its subject. They become the v2 deprecation list's first closed entries rather than open candidates. | Owner, 2026-10-31 (W6 §6.3) | |
+| **D-70** | **Production's rollup-only history was already destroyed before the programme measured it**, so W9's legacy-archive apparatus has no input. `observations_1d_legacy`, `observations_1h_legacy`, `w9.legacy_boundary`, `w9.assert_legacy_disjoint()` and `observations_1d_with_legacy` are **kept, not removed**: they are built, tested and harmless, and they are the only route by which that history could return if an older `pg_dump` of pitcairn surfaces. Measured 2026-10-31 — 301 days of empty chunks on `_materialized_hypertable_5`, `2025-01-01` to `2025-10-29`. | W6 §8, measured | |
+| **D-71** | **Raw retention on the source is paused, not removed** (`alter_job(1004, scheduled => false)`), and `archive` must succeed before `pause-source-retention` will run. The two protect different things and the order is enforced by the script rather than documented. | Owner-authorised, executed 2026-10-31 (W6 §8) | |
 | **D-67** | **The four plaintext third-party credentials are not migrated.** `remote_stations`' `aprs_password`, `wu_api_key`, `aeris_client_secret` and `pws_password` crossed the wire in cleartext and sat in a second database where nothing read them. **N-5** drops the columns; the owner re-enters the rotated secrets once. Everything else in the configuration is migrated, not re-typed. | W6 (G-2, after A-W7-2) | |
 
-**Sixty-nine decisions, plus D-30a/D-30b replacing D-30.** D-68 and D-69 are the owner's, taken
+**Seventy-one decisions, plus D-30a/D-30b replacing D-30.** D-68 and D-69 are the owner's, taken
 2026-10-31 and recorded in `docs/reconciliation.md` §6. Twenty-one are this work item's, and every
 one of those is a *resolution* of something two documents left between them rather than new design —
-see `docs/reconciliation.md` §1 and §2 for each one's derivation. One further decision (**D-70**,
+see `docs/reconciliation.md` §1 and §2 for each one's derivation. One further decision (**D-72**,
 retiring `remoteweather:docs/rewrite/`) is **proposed and not applied**, because applying it means
 writing to the read-only reference repository: see `docs/reconciliation.md`'s *Proposed amendments*.
 
