@@ -6,7 +6,7 @@ sixty-seven decisions in `docs/DESIGN.md`'s ledger and the sixteen work items
 where a milestone needs something undecided, it says so and names the open question rather than
 inventing an answer.
 
-**Shape.** Seven milestones, thirty-two work items. Each item is sized to be **reviewable in one
+**Shape.** Eight milestones (M0–M7), thirty-four work items. Each item is sized to be **reviewable in one
 sitting** — roughly one PR a reviewer can hold in their head — and carries its own dependencies,
 done-criteria and test strategy.
 
@@ -47,6 +47,40 @@ M2  the skeleton: crates, supervisor, config store
 
 **M3 and M4 are parallelisable** after M2 — they share `mw-types` and the supervisor and touch
 disjoint crates. Everything else is serial.
+
+---
+
+## Milestone 0 — the database platform *(added 2026-10-31)*
+
+**Independent of every other milestone and on the critical path for M5-1 only.** It can run in
+parallel with M1 and M2 because nothing in those touches a real database beyond CI's service
+container. `docs/reconciliation.md` §7 has the full reasoning and the measurements.
+
+### M0-1 — TimescaleDB as a StatefulSet *(N-17)*
+**Depends on:** nothing. **Blocks:** M5-1.
+A single-replica StatefulSet on a `local` PersistentVolume, `timescale/timescaledb-ha:pg17` (the
+plain image lacks `timescaledb_toolkit`, which D-2 requires — W8 D-17's reason), pinned to
+`big-bulky-1` with a `nodeSelector` and a toleration for the `workload-class=heavy` taint, copying
+the shape of the `graywolf-publish-big-bulky-1` local PV that is already proven in this cluster.
+**Storage must not be NFS** — W4 D-26's refresh policy has 3.06–3.22 s of measured lag against a
+10-second deadline, and A-W4-3 showed a durable refresh is ~47% WAL fsync.
+**Done when:** `ci/sql/assert-timescaledb-version.sql` passes against it; the schema migrations apply
+from empty into a fresh `modernweather` database; `mw_aggregate_refresh_seconds` and the 1-minute
+refresh lag are being recorded so §7.4's "measure before buying" has data.
+**Explicitly not done here:** buying hardware. The recommendation is to run on the existing heavy node
+and let the refresh-lag measurement decide whether a dedicated node is needed. That is evidence rather
+than a guess, and it is the programme's own method applied to its infrastructure.
+
+### M0-2 — backup, and a restore rehearsal in CI *(N-19)*
+**Depends on:** M0-1. **Blocks:** cutover (M7-5).
+A `CronJob` that `pg_dump`s to storage **on a different machine** — `synology-nfs-csi` and
+`archlinux-nfs` both already exist — plus a restore rehearsal in CI against a fixture-sized database.
+**Done when:** a restore has been performed from a dump and reconciled, in CI, **not** documented.
+D-6's first half is the mechanism; this is its untested second half.
+**Must carry two measured W9 findings:** A-W9-2 — an aggregate *accepts* an `INSERT` and discards it
+on the next refresh, so pre-seeded aggregate rows are not a restore mechanism; and W4 D-23's
+phase-1-first ordering (0.87 s to make the charts right against 467 s to materialise everything), so
+a restore runbook does not block on a full rebuild.
 
 ---
 
@@ -330,8 +364,16 @@ trailing bucket aggregated from raw, and the 60-second cache holds the **prefix 
 `/forecast` caches the stored `jsonb` text byte for byte and splices it between a prefix and a suffix
 (D-39) — nothing parses or re-emits it, which is how Postgres's whitespace and the missing trailing
 newline survive.
-**Done when:** `cargo xtask gate conformance` is **green: 70/70 against the Rust binary**, and the
-negative control still fails. This is the milestone's headline.
+**Scope narrowed 2026-10-31** (`docs/reconciliation.md` §6): only the **five** endpoints iOS calls are
+frozen — `/latest`, `/span/{hours}h`, `/snow`, `/stationinfo`, `/forecast/{hours}`. `/alerts`,
+`/api/remote-stations` and `format=msgpack` are **not implemented** (§6.3), which also disposes of
+W1-BUG-2 by deleting its subject. The website's endpoints are **coupled, not frozen** — they may
+change, but only in lockstep with the embedded JavaScript in the same PR, because server and website
+ship as one binary (D-69). O-5's `/stationinfo` fix lands here as a signed deviation with a new
+fixture.
+**Done when:** `cargo xtask gate conformance` is **green against the Rust binary** for every
+frozen-class and coupled-class fixture, and the negative control still fails. This is the milestone's
+headline.
 **Test strategy:** the conformance suite is the specification. Plus a regression test for W1-BUG-1 —
 `/span` for a station with no non-NULL `winddir` must return 200 with `windd: 0`, which W4 D-8's
 finaliser makes true and which was a 500 in Go.
@@ -411,12 +453,17 @@ throughout apart from one named archive step (W9 D-2, D-3) — means the stronge
 runs weeks before anything is decommissioned.
 
 ### M5-1 — run the migration into a parallel database
-**Depends on:** M3-3, M4-2. **Blocks:** M5-2, M7-4.
-Execute `ci/db/migrate-from-go/migrate-from-go.sh` against production as source and a new instance as
-target. W9 built this; this item *runs* it and records the result.
+**Depends on:** M3-3, M4-2, **M0-1**. **Blocks:** M5-2, M7-4.
+Execute `ci/db/migrate-from-go/migrate-from-go.sh` with pitcairn as source and **M0-1's Kubernetes
+instance** as target — a fresh `modernweather` database, which is what the script's own usage header
+has always specified. W9 built this; this item *runs* it and records the result.
+**pitcairn is never upgraded and never modified** (W9 D-2, D-3 keep the source read-only apart from
+one named archive step), so the platform move and the data migration are **one** operation and the
+old box stays as the rollback. This is also what reduces **O-1** from a fork in the plan to a detail:
+there is no in-place major-version upgrade, because the transform is a logical export and import.
 **Prerequisites that are not this item's to satisfy:** **O-2** (archive first, then pause — and the
-archive is correct under every answer, so it does not wait on anything), **O-1** (the version, which
-decides whether this is also a major-version PostgreSQL upgrade), **O-7** (the history option).
+archive is correct under every answer, so it waits on nothing) and **O-1** (now only `pg_dump`
+flags and archive extraction, per above). **O-7 is answered: Option B, import the archive.**
 **Done when:** `w9` reconciliation passes with zero tolerance on every metric per year; the two
 bounded statistics are inside their derived bound; `w9.assert_no_unknown_source_columns()` raises
 nothing.
@@ -631,10 +678,10 @@ reader might expect are deliberately absent.
 | — | **O-2** archive-then-pause the raw retention policy | **Not blocking, and losing data now.** Every day it stays open converts another day of raw into rollup-only history |
 | M5-1 | **O-1** the production version | **Yes.** Below TimescaleDB 2.9 the hierarchy cannot be built and M5-1 becomes a major-version upgrade |
 | M5-1 | **O-7** the history option | Yes for M5-1's scope; the archive copy is correct either way |
-| M4-2 | **O-5** the `/stationinfo` hazard | No — M4-2 ships W1's faithful reproduction unless the owner chooses (b) |
-| M6-2, M7-4 | **O-8** the RF beacon floor | Yes for M7-4's migration behaviour; one constant for M6-2 |
-| M7-2 | **O-10** the four admin-surface calls | Yes, and all four have recommendations |
-| M7-3 | **O-11** which `chonky` gaps to upstream | No — the local components work either way |
-| before first release | **O-9** is a Pi Zero in use? | No, but it decides whether ARMv6 needs real-hardware validation before publishing |
-| N-1 | **O-6** which legacy surface is dead | No — one access-log query, and it only shapes the deprecation list |
+| ~~M4-2~~ | ~~**O-5** the `/stationinfo` hazard~~ | **Answered: option (b).** Ships as a signed deviation with a new fixture |
+| ~~M6-2, M7-4~~ | ~~**O-8** the RF beacon floor~~ | **Answered: 600 s.** M7-4's migration raises a sub-600 s KISS device with a one-line report |
+| ~~M7-2~~ | ~~**O-10** the four admin-surface calls~~ | **Answered: all four accepted** |
+| ~~M7-3~~ | ~~**O-11** which `chonky` gaps to upstream~~ | **Answered: all twelve are fair game.** Upstream G2/G4/G9/G10 now; the rest as their shape settles in use |
+| ~~before first release~~ | ~~**O-9** is a Pi Zero in use?~~ | **Answered: retain the broadest hardware support.** All four targets stay; with no ARM1176 to test on, W8 D-25's qemu run under `-cpu arm1176` **is** the validation — no new hardware needed |
+| ~~N-1~~ | ~~**O-6** which legacy surface is dead~~ | **Answered structurally** — only the iOS endpoints are frozen, so `legacy-v1.json` settles it and the access-log query is unnecessary |
 | — | **O-3** the compression hold rate, **O-4** the column gap | No. O-4 falls out of M5-1 as a side effect |

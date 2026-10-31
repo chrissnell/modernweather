@@ -1242,9 +1242,10 @@ still owes (**O-5**).
 
 ## 4. Work items raised by this document
 
-Sixteen. Each is a named item with an owner-facing one-liner; each appears in
+Nineteen — sixteen from the audit, and **three added 2026-10-31** from the owner's answers (§6, §7).
+Each is a named item with an owner-facing one-liner; each appears in
 `docs/implementation-plan.md` with dependencies, done-criteria and a test strategy. **None is a
-redesign** — every one closes a gap §2 found, and twelve of the sixteen are small.
+redesign** — every one closes a gap §2, §6 or §7 found.
 
 | | Item | Why it exists | Size |
 |---|---|---|---|
@@ -1264,6 +1265,9 @@ redesign** — every one closes a gap §2 found, and twelve of the sixteen are s
 | **N-14** | Dimension `role = "metadata"` | **G-5** / OQ-W4-2 / OQ-W2-6. `[[dimension]]` has no deprecation path, so `stationname`/`stationtype` cannot leave the raw table at all. Prerequisite for C-W7-26. | small |
 | **N-15** | `codegen` prunes files it did not write | **G-5** / OQ-W4-4. Today `codegen` leaves a tree `--check` rejects. | small |
 | **N-16** | `rebuild-aggregates.sh` phase 1 uses the widest band above | **G-5** / OQ-W9-3. `--recent-only` currently caches a hole in `observations_1d` beyond 14 days. | small |
+| **N-17** | **Run TimescaleDB in Kubernetes** | **§7.** No design document owns where the database runs. Single-replica StatefulSet on a `local` PV, which is also the migration's target — so the platform move and W9's migration are one operation. | medium |
+| **N-18** | Classify each fixture frozen / coupled / retired | **§6.4.** Only five endpoints are frozen; the rest are coupled, not unconstrained. The suite keeps its breadth and the runner reports the two classes differently. | small |
+| **N-19** | **Scheduled `pg_dump` off-node, and a CI restore rehearsal** | **§7.5.** D-6 names the mechanism and nothing owns running it. On a single-replica local-PV StatefulSet the local volume *is* the single point of failure. | small |
 
 ### N-1 — the v2 API, with its starting inventory
 
@@ -1301,6 +1305,28 @@ endpoint the archive is carried and unreadable, which is the recorded trade.
 
 ## 5. Open questions for the owner
 
+> ### Owner answers — 2026-10-31
+>
+> **chris answered eight of the twelve** in one pass. Recorded here rather than only in the issue
+> thread, because this file is what a later work item reads.
+>
+> | | Question | Answer |
+> |---|---|---|
+> | **O-5** | The `/stationinfo` iOS decode hazard | **Option (b)** — drop `omitempty` from `about_text`, emit `0` for an unset `weather_device`. Concurred. Higher stakes than this document recorded: `/stationinfo` is one of the **five** endpoints iOS actually calls |
+> | **O-6** | Which legacy surface is dead | **Answered structurally; the access-log query is no longer needed.** Only the endpoints iOS calls are frozen — see §6. `/alerts` and `/api/remote-stations` have no iOS *or* website consumer, and no shipped client sends `format=msgpack` |
+> | **O-7** | The history question | **Option B** — import the archive. Concurred |
+> | **O-8** | RF beacon floor | **600 s.** Concurred. N-5's config migration raises a sub-600 s KISS device with a one-line report rather than failing the parse |
+> | **O-9** | Is a Pi Zero in use? | **Retain the broadest hardware support available.** All four Linux targets stay. Consequence, stated plainly: with no ARM1176 hardware to test on, the qemu run under `-cpu arm1176` **is** the validation — which is what W8 D-25 already decided ("the ARMv6 verdict is the qemu run, not the build and not the ELF attribute"), so this needs no new hardware |
+> | **O-10** | Four admin-surface calls | **All four accepted** as recommended |
+> | **O-11** | Which `chonky` gaps to upstream | **All twelve are fair game.** The four-now/two-later split below was about *sequencing* — proving `AppShell` and `CopyField`'s shape in use before fixing their API — not about permission |
+> | **O-12** | Process finding | Noted |
+>
+> **Still open: O-1, O-2, O-3, O-4** — the four production queries, and see the correction under
+> Group A: **pitcairn is reachable from an agent runtime after all**, so three of the four are a
+> credential handoff rather than an owner chore.
+
+
+
 **Twelve, consolidated and deduplicated from sixty-two open questions across ten documents.** Fifty
 are closed: forty-one were answered by a later document (W4 alone closed OQ-3, OQ-4, OQ-5, OQ-W1-2,
 OQ-W2-1 and OQ-W2-6; W3 closed its own ten plus OQ-D and W8's OQ-1 and OQ-2), four were resolved in
@@ -1315,9 +1341,23 @@ system working.
 
 ### Group A — four production queries. Nobody with access to this repository can answer these.
 
-**Production is not reachable from an agent runtime** (W0 OQ-1: it is not in the homelab Kubernetes
-cluster). These four have been outstanding for the whole programme, and the first one is losing data
-every day it stays open.
+These four have been outstanding for the whole programme, and the first one is losing data every day
+it stays open.
+
+> **Corrected 2026-10-31 — the blocker is credentials, not reachability.** The programme has recorded
+> since W0 OQ-1 that "production is not reachable from an agent runtime", and that premise is wrong at
+> the network layer. `pitcairn` (10.50.0.35) is on the same /24 as the Kubernetes cluster
+> (10.50.0.51–56) and **port 5432 accepts a TCP connection from an agent runtime** — verified by
+> connecting to the port and doing nothing else. No authentication was attempted, and none should be
+> without being asked for.
+>
+> So **O-1, O-3 and O-4 are one read-only credential away from being agent work** rather than three
+> separate owner chores. **O-2 is not, and should not be:** it writes to production and then disables
+> a policy, which belongs on the owner's hand.
+>
+> W0's conclusion was reasonable when written — the spike's `Do not` list forbade touching production
+> at all, so nobody tested the premise. It is recorded as a correction rather than quietly fixed,
+> because three open questions sat on it for the whole programme.
 
 **O-1. What PostgreSQL and TimescaleDB version does production run?** *(W0 OQ-1; W9 OQ-W9-2's
 version half)*
@@ -1505,6 +1545,236 @@ by reading two documents, and the author of the model would have resolved them b
 
 ---
 
+## 6. The frozen surface, re-scoped to the iOS client
+
+**Owner decision, 2026-10-31.** *"The only endpoints that matter are the ones used by the iOS app.
+Everything else can be changed to whatever you want to do with it. You have freedom to restructure
+the API, but we need to retain the legacy endpoints so people's iOS don't break."*
+
+This narrows D-37 considerably, and it replaces the thing D-37 was reaching for with a sharper
+version of it.
+
+### 6.1 What iOS actually calls — five endpoints
+
+From `contract/legacy-v1.json`'s `clients` block, which W1 built from `RemoteWeather.app` @
+`77967ab`:
+
+| | iOS | website |
+|---|---|---|
+| `/latest` | ✓ | ✓ |
+| `/span/{hours}h` | ✓ | ✓ |
+| `/snow` | ✓ | ✓ |
+| `/stationinfo` | ✓ | ✓ |
+| `/forecast/{hours}` | ✓ | ✓ |
+| `/almanac`, `/api/stations` | — | ✓ |
+| `/`, `/portal`, `/privacy`, `/support` | — | ✓ |
+| `/js/`, `/css/`, `/images/`, `/fonts/` | — | ✓ |
+| `/alerts`, `/api/remote-stations` | — | — |
+
+**`iOS \ website` is empty.** Every endpoint iOS calls is also called by the website, so the five are
+a strict subset — which means re-scoping the freeze to iOS costs the website nothing it was not
+already going to get.
+
+### 6.2 The better reason for a freeze: independent deployment, not legacy
+
+D-37 froze "the legacy external contract", which lumps two unlike things together. The owner's rule
+separates them, and the distinction is **who deploys the client**:
+
+- **iOS is deployed independently of the server.** A shipped build is on people's phones and cannot
+  be changed in step with a server release — App Store review is in the loop. A response change is a
+  **contract break**, and the blast radius is every phone until users update.
+- **The website's JavaScript ships *inside the server binary*** — `rust-embed`, W3 D-76. Server and
+  client are one artefact and one release. A response change there is not a contract break, it is a
+  **refactor that must touch both halves in the same PR**.
+
+So: **five endpoints are frozen because their client is independently deployed. The rest is coupled,
+not frozen.** Recorded as **D-69**. This is what D-37 was approximating, and it is falsifiable in a
+way "legacy" is not — the test is "can the client be updated atomically with the server?", which has
+an answer for any future client too.
+
+### 6.3 What this drops
+
+| Drop | Evidence | Saving |
+|---|---|---|
+| **`/alerts`** | No working in-repo client; not in either client's endpoint list. W1 D-13 kept it only because D-37 said *frozen* | A handler, a store capability, a fixture set |
+| **`/api/remote-stations`** | Same. Its only reference is a management-UI fetch against a server with no such route — and W7 A-W7-2 retires the table behind it anyway. **This also disposes of W1-BUG-2** (a 500 for any row with a NULL text column) by deleting its subject | A handler, and the last consumer of a table already being retired |
+| **`format=msgpack`** | `legacy-v1.json`: *"No shipped client sends it."* Implemented on `/latest`, `/snow`, `/forecast`, silently ignored on `/span`, and it loses number types on `/forecast` by decoding the `jsonb` into `interface{}` first | One encoder path and its content negotiation out of `mw-api-legacy`, which is the crate whose entire job is carrying quirks |
+
+**O-6 is closed without the access-log query.** The query was only needed to decide whether an
+unknown third-party client might exist. Under the owner's rule the question is no longer "does
+anything call this" but "does **iOS** call this", and `legacy-v1.json` already answers that
+definitively for all sixteen endpoints.
+
+### 6.4 What does *not* change, and why that is deliberate
+
+**The 70 fixtures and the conformance suite stay at full breadth.** It would be easy to read this
+re-scoping as licence to shrink the suite to five endpoints. That would be a mistake, and the reason
+is the distinction in §6.2: *coupled* is not *unconstrained*. The website's endpoints still have to
+keep working — they are merely allowed to change in lockstep. The fixtures are the cheapest available
+regression test for "did I change the website's data without noticing", they already exist, and they
+already pass. **Deleting passing coverage to match a narrower contract is paying for the same work
+twice.**
+
+So the fixtures are **re-classified, not removed**:
+
+| Class | Endpoints | What a diff means |
+|---|---|---|
+| **frozen** | the five in §6.1 | A **contract break.** CI must fail; a change needs the owner's signature and a new fixture |
+| **coupled** | `/almanac`, `/api/stations`, the HTML pages, the four asset trees | A **lockstep change.** CI fails until the fixture is updated in the same PR as the server and the JavaScript — which is the point: it forces both halves to move together |
+| **retired** | `/alerts`, `/api/remote-stations`, `format=msgpack` | Fixtures deleted with the handler |
+
+Carried as work item **N-18**: add a `class` field to each fixture, and make the runner report the
+two classes separately so a frozen-class failure is visibly different from a coupled-class one.
+`contract/legacy-v1.json`'s `frozen` key becomes the five rather than the sixteen.
+
+### 6.5 Two consequences worth stating
+
+**O-5 gets more important, not less.** `/stationinfo` is one of the five. The hazard — a website with
+no about text or no bound device returns a body iOS cannot decode **at all**, losing the station list,
+the snow device, the air-quality device and the radar token — is now squarely inside the frozen set
+rather than at its edge. The owner has concurred with option (b), so it ships as a deliberate,
+signed deviation with a new fixture.
+
+**N-1 (the v2 API) gets both larger and cheaper.** "You have freedom to restructure the API" plus
+*"we can redesign future iOS versions as well, later on"* means v2 is no longer constrained to being
+additive around a frozen sixteen-endpoint surface — it is a clean design over five frozen endpoints
+and a website that moves with it. The fifth ordering constraint still keeps it after cutover: a new
+API surface is the first thing that cannot be verified against the Go version. But its scope is now
+worth more than when D-39 deferred it.
+
+---
+
+## 7. Where the database runs
+
+**Owner concern, 2026-10-31.** *"Currently it's on an Arch Linux server (pitcairn, 10.50.0.35) that
+is quite out of date and it's very hard to migrate. I want to get it moved into K8S. I think a good
+way would be to spin up a new physical server with local disk and RAM and have you run it as a
+statefulset there, but open to ideas."*
+
+No design document covers where the database runs — W4 designed the schema, W9 designed the
+migration, and D-2 pins the versions, but the platform was never anybody's. It is a real gap and it
+is raised as **N-17**. What follows is a recommendation with the measurements it rests on, not a
+decision taken on the owner's behalf.
+
+### 7.1 A fresh `modernweather` database was already the plan
+
+Answering the first question directly: **yes, and it is already in the tree.**
+`ci/db/migrate-from-go/migrate-from-go.sh`'s own usage header reads
+
+```
+SOURCE=postgresql://.../weather_v2_0_0  TARGET=postgresql://.../modernweather
+```
+
+The source is read-only for the entire migration apart from one explicitly named archive step
+(W9 D-2, D-3), and the target is a new, empty database that the schema migrations create from
+scratch. **The weather half was designed this way.** The *configuration* half was not, and that is
+**G-2** in this document — the largest genuine absence this pass found, now **N-4** (the schema) and
+**N-5** (the migration).
+
+### 7.2 The move and the migration are one operation, not two
+
+The most useful thing to say about sequencing: **do not upgrade pitcairn and then move it.** Stand the
+new TimescaleDB up in Kubernetes, point W9's migration at pitcairn as source and the new instance as
+target, reconcile, cut over. pitcairn is never upgraded, never modified, and stays as the rollback.
+
+This matters because it **dissolves most of O-1**. O-1 asks production's PostgreSQL version because
+W4 §5.2 and W9 OQ-W9-2 both note that below TimescaleDB 2.9 the migration becomes a major-version
+upgrade as well as a schema change. With a fresh target there **is** no in-place upgrade: W9's
+transform is a logical export and import (`COPY ... TO STDOUT` → `COPY ... FROM`), which crosses
+versions by construction. O-1 narrows from "does this change the shape of a work item" to "what flags
+does `pg_dump` need and does the archive extraction work", which is a detail rather than a fork.
+
+It also means *"pitcairn is very hard to migrate"* stops being a problem to solve. Nothing is migrated
+in place. The box is read from once and then switched off.
+
+### 7.3 The hardware may already be in the cluster
+
+Measured against the live cluster rather than assumed:
+
+| | Finding |
+|---|---|
+| **`big-bulky-1`** | 24 CPU, 64 GiB RAM, **~1.86 TiB local storage**, already a dedicated worker — labelled `workload-class=heavy` with a matching `NoSchedule` taint, so nothing lands there unless it asks to |
+| **Local-PV pattern** | Already in production in this cluster: `graywolf-publish-big-bulky-1` is a 500 GiB `local` volume (a real `local` volume with `nodeAffinity`, not a `hostPath`) at `/var/mnt/graywolf-publish`, `Retain`, `WaitForFirstConsumer`, via the `graywolf-tiles-local` no-provisioner storage class |
+| **Postgres-on-K8s pattern** | Also already present: `multica/multica-postgres` is a running StatefulSet |
+| **The OS is Talos** | v1.13.4, immutable and API-driven. `/var/mnt/...` is the Talos user-volume convention, so adding a disk is a machine-config patch rather than a shell session |
+
+**How big is this database, really?** Small. W4 measured raw compression at **5.3×** at a 76.87% hold
+rate, and the Go table is ~19 GB/year uncompressed; W4 D-5's retention puts all four aggregate levels
+together at **337 MB**. So a decade of history is roughly **40 GB**, against 1.86 TiB of local disk
+already present. Hardware is not the constraint here, and the recommendation is explicitly **not** to
+buy for capacity.
+
+**The Talos point is the structural answer to the owner's actual complaint.** pitcairn is hard to
+migrate *because* it is a hand-maintained Arch box whose state lives in years of accumulated local
+changes. A Talos node has no shell and no accumulated state — its entire configuration is a
+declarative machine config. Moving onto Talos does not just relocate the problem; it removes the
+class of problem.
+
+### 7.4 Recommendation
+
+**A plain single-replica StatefulSet on a `local` PersistentVolume — the owner's own instinct — and
+start on `big-bulky-1` rather than buying a server.**
+
+1. **Image: `timescale/timescaledb-ha:pg17`.** Not the plain image: D-2 requires
+   `timescaledb_toolkit` and the plain image lacks it, which is exactly why W8 D-17 chose this one for
+   CI. Using the same image family in CI and production is worth having.
+2. **Storage must be local, not NFS.** This is the one non-negotiable. W4 D-26 phase-locks the
+   1-minute refresh policy 3 seconds past each boundary and measured **3.06–3.22 s** of lag against
+   `window:rollup`'s **10-second** deadline — real headroom, but not an order of magnitude. And
+   A-W4-3 decomposed a durable aggregate refresh as **~357 s of 758 s being WAL fsync**, so this
+   workload is fsync-latency-bound more than throughput-bound. The existing `multica-postgres` on
+   `synology-nfs-csi` is the contrast: correct for a 20 GiB configuration database, wrong for this.
+3. **Pin it with `nodeSelector` + a toleration for `workload-class=heavy`**, and a `local` PV with
+   `nodeAffinity` — copying `graywolf-publish-big-bulky-1`'s shape exactly, since that pattern is
+   already proven here.
+4. **Measure before buying.** `big-bulky-1`'s current tenants are bursty graywolf batch jobs — radar
+   contours every ~5 minutes, surface-fronts and planet-overview tile builds. Co-locating a
+   latency-sensitive database with tile builders **on the same disk** is a genuine contention risk,
+   and the thing it would eat is item 2's refresh headroom. So: deploy there, give it resource
+   requests and a separate physical disk if one is free, and **watch `mw_aggregate_refresh_seconds`
+   and the refresh lag against the 10-second deadline** — both of which W3 §5.10 and W4 §6.2 already
+   make observable. If the lag approaches the deadline, *that* is the evidence for a dedicated node,
+   and it will be evidence rather than a guess. This is the programme's own method applied to its
+   infrastructure.
+
+**On the alternatives, since the owner asked for ideas:**
+
+| Option | Verdict |
+|---|---|
+| **Plain StatefulSet** (recommended) | Simplest thing that satisfies the constraints, and both halves of the pattern already exist in this cluster. Costs: backup is hand-rolled (see §7.5) and there is no automated failover |
+| **CloudNativePG** | A genuinely good operator — barman-based backup and PITR, rolling minor upgrades, automated failover. But TimescaleDB needs a custom image, and CNPG's HA story wants ≥2 replicas on replicated storage, which fights the local-disk requirement that item 2 makes non-negotiable. More machinery than this problem has |
+| **Timescale's own K8s operator** | No. Effectively unmaintained |
+| **Leave it on bare metal, new box** | Works, and reintroduces the hand-maintained-host problem the owner is trying to escape |
+
+**The honest summary of the trade:** a single replica on a local PV cannot reschedule — if
+`big-bulky-1` is down, the pod is `Pending` until it returns, because that is what `local` volumes
+mean. That is acceptable *only* because §7.5 is done, and it is proportionate: the Go daemon has been
+a single process on a single box for years, and D-35 describes a system with one administrator and no
+RBAC. It is proportionate, not ideal, and the thing that makes it safe is a restore that has been
+tested rather than assumed.
+
+### 7.5 A gap this question surfaces: D-6's backup has no owner and no schedule
+
+D-6 says backup and restore is `pg_dump` of the raw hypertable plus an aggregate refresh, and that no
+bespoke tool is built. That is the right mechanism and **nothing in the programme owns running it.**
+On pitcairn that was a latent gap. On a single-replica local-PV StatefulSet it is load-bearing,
+because the local volume *is* the single point of failure.
+
+Raised as **N-19**: a `CronJob` that `pg_dump`s to storage **on a different machine** — the cluster
+already has `synology-nfs-csi` and `archlinux-nfs` for exactly this — plus a **restore rehearsal that
+runs in CI** against a fixture-sized database, so D-6's second half is proved rather than documented.
+W9 D-1 is the reason this needs real care rather than a one-liner: `drop_chunks` logs an invalidation
+that a later refresh acts on, so "restore raw and rebuild the aggregates" has an ordering that has
+already bitten once in measurement.
+
+**Two things N-19 should carry forward from W9's findings**, because they are counter-intuitive and
+already measured: A-W9-2 — a continuous aggregate **accepts** an `INSERT` and discards it on the next
+refresh, so pre-seeded aggregate rows are not a restore mechanism; and A-W4-3 — a full rebuild at ten
+years is an hour-scale operation, so a restore runbook needs W4 D-23's phase-1-first ordering (0.87 s
+to make the charts right, 467 s to materialise everything) rather than a single blocking refresh.
+
+---
+
 ## Decisions
 
 1. **This pass reconciles; it does not redesign.** Every resolution in §1 is either a clerical fix, a correction forced by measurement, or an acceptance of a recommendation its own author made. Where a resolution was a genuine design choice it went to §5.
@@ -1536,8 +1806,8 @@ items and about the owner, not about documents yet to be written.
 1. **The implementation plan's ordering constraints are binding, not advisory.** In particular: the frozen-contract conformance suite must be green **before** any legacy endpoint is reimplemented, not after. N-3 is what makes that possible at all, which is why it sits in milestone 1.
 2. **N-12 (proto3 `optional`) is done inside the registry work item**, before anything reads `generated/proto/`. Retrofitting presence after a collector exists is a fleet-wide flag day for a change that is free today.
 3. **N-14 (dimension `role = "metadata"`) lands with the registry work**, because it is the prerequisite for both OQ-W4-2's column drop and C-W7-26's eventual provenance column, and because a `[[dimension]]` with no deprecation path is a one-way door.
-4. **The sixty-seven decisions in `DESIGN.md`'s ledger are the implementation's specification**, and the ten design documents are its rationale. An implementation agent that reads only the ledger should never be wrong; it will sometimes not know *why*.
-5. **D-47 through D-67 (this document's additions) are resolutions, not new design.** Each one's reasoning is the reasoning its originating document gave; where this document chose between two options it says which argument it chose on.
+4. **The sixty-nine decisions in `DESIGN.md`'s ledger are the implementation's specification**, and the ten design documents are its rationale. An implementation agent that reads only the ledger should never be wrong; it will sometimes not know *why*.
+5. **D-47 through D-67 (this document's additions) are resolutions, not new design.** D-68 and D-69 are the owner's, taken 2026-10-31. Each one's reasoning is the reasoning its originating document gave; where this document chose between two options it says which argument it chose on.
 6. **The owner answers O-2 before the next raw chunk is dropped.** Nothing in the plan is sequenced against it, because it is not a dependency — it is a loss that is already occurring.
 7. **`remoteweather` stays readable at `c3ec9f7`** for the emulators (D-40, W8 D-23), the Go view inventory (W9 D-11) and N-9's reading of `pkg/solar`.
 8. **The implementation plan assumes the Go version stays in production through every milestone.** Every milestone's done-criteria are written so that is true; a milestone that cannot be verified without cutting over has been split.
@@ -1577,7 +1847,7 @@ should not depend on the old one carrying a copy of its own planning documents.
 
 Proposed as a new decision rather than an edit:
 
-> **D-68. `modernweather:docs/rewrite/` is the single canonical copy of the programme's prompt set.
+> **D-70. `modernweather:docs/rewrite/` is the single canonical copy of the programme's prompt set.
 > `remoteweather` is read-only reference for the Go implementation's *behaviour* and carries no
 > planning documents.** The copy under `remoteweather:docs/rewrite/` is deleted, and anything that
 > referenced it references the `modernweather` path.
