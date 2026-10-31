@@ -11,7 +11,7 @@ interface, you are in the wrong document.
 Decisions are **never edited in place**. See `## Amendments` at the end for the protocol.
 
 **Where to start, as of W6 (2026-10-30).** The design programme is complete and all ten documents are
-merged. `# Decisions — the ledger` below is **one numbered ledger of all sixty-seven decisions, each
+merged. `# Decisions — the ledger` below is **one numbered ledger of all sixty-nine decisions, each
 carrying its source**, and it is what an implementation agent should read instead of ten design
 documents — the documents are the rationale, the ledger is the specification. `## Amendments` carries
 the twenty-three amendments the programme produced, applied under the protocol. The integration pass
@@ -1013,7 +1013,7 @@ Read the `Status` column. A decision is **never edited in place** (see `## Amend
 | **D-3** | Storage is a wide table, one column per metric — not narrow/EAV; measured 7–9× better density with no crossover. | W0 §2 | **extended** → A-1 |
 | **D-4** | Raw readings are retained indefinitely, with compression enabled from day one, segmented by station and ordered by descending time. | W0 §2 | **extended** → A-W9-1 |
 | **D-5** | The versioned-aggregate and union-view scheme is rejected as unnecessary once retention is removed. | W0 §3 | |
-| **D-6** | Backup and restore is `pg_dump` of the raw hypertable plus an aggregate refresh; no bespoke tool is built. | W0 §2 | **extended** → A-W9-1, A-W9-2 |
+| **D-6** | Backup and restore is `pg_dump` of the raw hypertable plus an aggregate refresh; no bespoke tool is built. | W0 §2 | **extended** → A-W9-1, A-W9-2. **The mechanism had no owner and no schedule** — now N-19, and load-bearing once the database is a single-replica local-PV StatefulSet (W6 §7.5) |
 | **D-7** | Compression is configured when the hypertable is created, not retrofitted later. | W0 §2 | |
 | **D-8** | Schema changes happen solely through migrations; there is no DDL at startup and no `IF NOT EXISTS` idiom. | W0 §2 | **extended** → A-W6-2 (it governs the configuration store too) |
 | **D-9** | Adding a metric is a nullable `ADD COLUMN` — 11.6 ms against ~1 GB of compressed chunks — and the migration takes a short lock timeout and retries. | W0 §2 | **extended** → A-1; **corrected** → A-W2-2 |
@@ -1046,7 +1046,7 @@ Read the `Status` column. A decision is **never edited in place** (see `## Amend
 | **D-34** | Errors are typed per module and preserve their cause chain. | W0 §7 | |
 | **D-35** | Administrative authentication is a username and password — one administrator, no roles, Argon2id, sessions distinct from credentials, no default password; W5 §3 owns the design. | W0 §7 | **extended** → A-W5-1 (one *identity*, several revocable sessions) |
 | **D-36** | Internal vocabulary is not user-facing vocabulary; an internal term on screen is a bug, and W5 §0 owns the translation table. | W0 §8 | **extended** → A-W5-2 (enforcement is a CI gate, not review) |
-| **D-37** | The legacy external contract is frozen and new endpoints are additive only; W1 captures the surface. | W0 §8 | **extended** → A-2 (named artefacts), and see `docs/reconciliation.md` §3 for the six recorded deviations |
+| **D-37** | The legacy external contract is frozen and new endpoints are additive only; W1 captures the surface. | W0 §8 | **superseded in scope** → **D-68** (five iOS endpoints are frozen; the rest is coupled). **extended** → A-2 (named artefacts), and see `docs/reconciliation.md` §3 for the six recorded deviations |
 | **D-38** | The public weather website is carried forward as-is, except that template-generated JavaScript becomes static JavaScript plus a JSON config endpoint. | W0 §8 | **extended** → A-3 (the nine values), A-W3-3 (how the payload is delivered) |
 | **D-39** | A new v2 API is out of scope for this design program; W6 records it as a named future work item. | W0 §8 | discharged — `docs/reconciliation.md` §4, **N-1** |
 | **D-40** | The ancillary Go tools are not ported — the provisioner stays in Go and is updated, the emulators stay in Go deliberately as independent test implementations, the rest retire. | W0 §9 | **extended** → A-W8-4 (**at a pinned commit**); the provisioner update is **N-2** |
@@ -1076,11 +1076,14 @@ Read the `Status` column. A decision is **never edited in place** (see `## Amend
 | **D-64** | **A gate's `arms_when` must name a path that some work item's done-criteria require it to create.** A gate armed on a path nobody owns reports green forever; a gate armed on a path that already exists fails immediately. G-1 is the first failure mode, observed. | W6 (G-1) | |
 | **D-65** | **The configuration store's station table is `config.stations`; the PostgreSQL read-side projection is the `observations`-side `stations`.** One is authoritative and the other is a cache, and no document or comment may write "the stations table" unqualified. | W6 (G-2) | |
 | **D-66** | **Per-station third-party service settings normalise into a `station_service` table** rather than sitting on the device row beside the hardware configuration. W5's OQ-W5-4 deferred this to W4 on the grounds that normalising costs a migration; since the configuration schema is now written from scratch (**N-4**), there is no in-place migration to avoid. | W6 (OQ-W5-4) | |
+| **D-68** | **The frozen surface is the five endpoints the iOS client calls** — `/latest`, `/span/{hours}h`, `/snow`, `/stationinfo`, `/forecast/{hours}`. Everything else the server exposes is **coupled, not frozen**: the public website's JavaScript ships *inside the server binary* (`rust-embed`, D-76), so server and website are one artefact and one release, and a response change there is a refactor that must touch both halves in one PR rather than a contract break. **The test is "can the client be updated atomically with the server?"**, which has an answer for any future client. Supersedes D-37's scope; D-37's mechanism — an executable definition in `contract/` — is unchanged. | Owner, 2026-10-31 (W6 §6) | |
+| **D-69** | **`/alerts`, `/api/remote-stations` and `format=msgpack` are not carried forward.** None is called by either shipped client; `legacy-v1.json` records that no client sends `msgpack`, and `/api/remote-stations`' table is retired by D-45 anyway. This also disposes of W1-BUG-2 by deleting its subject. They become the v2 deprecation list's first closed entries rather than open candidates. | Owner, 2026-10-31 (W6 §6.3) | |
 | **D-67** | **The four plaintext third-party credentials are not migrated.** `remote_stations`' `aprs_password`, `wu_api_key`, `aeris_client_secret` and `pws_password` crossed the wire in cleartext and sat in a second database where nothing read them. **N-5** drops the columns; the owner re-enters the rotated secrets once. Everything else in the configuration is migrated, not re-typed. | W6 (G-2, after A-W7-2) | |
 
-**Sixty-seven decisions, plus D-30a/D-30b replacing D-30.** Twenty-one are this work item's, and every
+**Sixty-nine decisions, plus D-30a/D-30b replacing D-30.** D-68 and D-69 are the owner's, taken
+2026-10-31 and recorded in `docs/reconciliation.md` §6. Twenty-one are this work item's, and every
 one of those is a *resolution* of something two documents left between them rather than new design —
-see `docs/reconciliation.md` §1 and §2 for each one's derivation. One further decision (**D-68**,
+see `docs/reconciliation.md` §1 and §2 for each one's derivation. One further decision (**D-70**,
 retiring `remoteweather:docs/rewrite/`) is **proposed and not applied**, because applying it means
 writing to the read-only reference repository: see `docs/reconciliation.md`'s *Proposed amendments*.
 
