@@ -33,6 +33,7 @@
 #   RW_COMMIT      the pinned Go commit (default: the one the fixtures were captured from)
 #   WORKDIR        scratch directory (default: target/conformance-go)
 #   CONFORMANCE_BIN  prebuilt legacy-conformance binary; built with cargo if unset
+#   MIN_MANGLED_FAILURES  how many fixtures the negative control must break (default 26)
 #   KEEP_RUNNING=1 leave the daemon and emulators up after a successful run, for poking at
 #   CONFORMANCE_FORCE_MANGLE=1  see above
 
@@ -60,7 +61,9 @@ PGHOST=${PGHOST:-127.0.0.1}
 PGPORT=${PGPORT:-5432}
 PGUSER=${PGUSER:-postgres}
 PGPASSWORD=${PGPASSWORD:-}
-PGDATABASE=${PGDATABASE:-remoteweather}
+# Deliberately not `remoteweather`: the database is dropped below, and a repo whose sibling
+# checkout is named remoteweather is exactly where someone keeps a local database by that name.
+PGDATABASE=${PGDATABASE:-conformance}
 PGSSLMODE=${PGSSLMODE:-disable}
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -91,17 +94,34 @@ cleanup() {
         [ -n "$pid" ] || continue
         kill "$pid" 2>/dev/null || true
     done
-    wait 2>/dev/null || true
+    # SIGTERM, then SIGKILL. An unbounded `wait` here would hang the whole run on one process
+    # that declines to exit, and a leaked emulator owns port 22222 for the next run.
+    local waited=0
+    while [ "$waited" -lt 10 ]; do
+        local alive=0
+        for pid in "${pids[@]:-}"; do
+            [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && alive=1
+        done
+        [ "$alive" -eq 0 ] && break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    for pid in "${pids[@]:-}"; do
+        [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+    done
     return 0
 }
 trap cleanup EXIT
 
+# Publishes the new pid as $LAST_BG_PID. Callers that need it read that rather than $!, which
+# any intervening command in this function could otherwise invalidate.
+LAST_BG_PID=
 start_bg() {
     local name=$1; shift
     "$@" >"$log_dir/$name.log" 2>&1 &
-    local pid=$!
-    pids+=("$pid")
-    printf '    started %s (pid %s), log %s\n' "$name" "$pid" "$log_dir/$name.log"
+    LAST_BG_PID=$!
+    pids+=("$LAST_BG_PID")
+    printf '    started %s (pid %s), log %s\n' "$name" "$LAST_BG_PID" "$log_dir/$name.log"
 }
 
 # Poll until `cmd` succeeds. Used instead of a fixed sleep so a slow runner is slow rather
@@ -132,6 +152,17 @@ for tool in "${required[@]}"; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 [ "${#missing[@]}" -eq 0 ] || die "missing required tool(s): ${missing[*]}"
+
+# Every port this run binds, checked before anything is started. A process leaked from an
+# earlier run satisfies the readiness probes below while the freshly started one dies on
+# "bind: address already in use" -- so the replay would silently measure the stale process.
+for port in "$REST_PORT" "$MANGLE_PORT" 22222 8123; do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+        die "port $port is already in use. A daemon, emulator or proxy leaked from an earlier
+    run would be measured instead of the one this script starts. Find it with
+    \`ss -ltnp | grep $port\` and kill it."
+    fi
+done
 
 # ---------------------------------------------------------------------------------------
 # Database
@@ -216,16 +247,27 @@ config_db=$WORKDIR/config.db
 rm -f "$config_db"
 # `rw` creates the configuration schema when the file does not exist and then goes on to run the
 # application, so there is no bootstrap-only mode to invoke. Start it, wait for the schema, stop
-# it. The schema is written before the application starts, so this is ordered, not raced.
+# it.
+#
+# What it waits for matters. pkg/config/provider_sqlite.go passes the whole schema to one Exec
+# with no enclosing transaction, so the statements auto-commit in order and the LAST ones are
+# `INSERT INTO configs` and the default `snowcache` row -- several statements after
+# weather_websites is created. Probing controller_configs therefore waits for the end of the
+# script rather than the middle of it. (And probing a table rather than sqlite_master because
+# `select ... from sqlite_master` returning no rows still exits 0, so it would have reported
+# ready against an empty file.)
 start_bg bootstrap "$bin/rw" -config "$config_db"
-bootstrap_pid=${pids[-1]}
-# Probing a table rather than sqlite_master: a `select ... from sqlite_master` returning no rows
-# still exits 0, so it would have reported ready against an empty file.
+bootstrap_pid=$LAST_BG_PID
 await "the configuration schema" 60 \
-    sqlite3 -bail "$config_db" "select count(*) from weather_websites"
+    sqlite3 -bail "$config_db" "select count(*) from controller_configs"
 kill "$bootstrap_pid" 2>/dev/null || true
-wait "$bootstrap_pid" 2>/dev/null || true
-unset 'pids[-1]'
+# Dropped from the cleanup list by value: negative array subscripts need bash 4.3, and this
+# script is meant to run on a developer's machine as well as on a runner.
+remaining=()
+for pid in "${pids[@]:-}"; do
+    [ -n "$pid" ] && [ "$pid" != "$bootstrap_pid" ] && remaining+=("$pid")
+done
+pids=("${remaining[@]:-}")
 
 say "Seeding the configuration database"
 # -bail throughout: without it the sqlite3 CLI prints "Parse error" and exits 0, so a seed that
@@ -260,8 +302,10 @@ sqlite3 -bail "$config_db" "select 'devices: ' || count(*) from devices
 # Nothing else is shifted. The daemon keeps the runner's clock, because every other time-derived
 # value on the frozen surface -- sunrise, sunset, moon phase, potentialsolarwatts -- is asserted
 # as a type and not as a value.
+# `10#` rather than GNU date's %-H: %H is zero-padded, so bare arithmetic would read 08 and 09
+# as invalid octal, and %-H is a GNU extension this script should not need.
 emulator_tz=$(
-    k=$(( 12 - $(date -u +%-H) ))
+    k=$(( 12 - 10#$(date -u +%H) ))
     if [ "$k" -ge 0 ]; then printf 'Etc/GMT-%d' "$k"; else printf 'Etc/GMT+%d' "$(( -k ))"; fi
 )
 say "Starting the station emulators (TZ=$emulator_tz, putting their solar curve at midday)"
@@ -272,8 +316,14 @@ await "the Campbell emulator" 30 grep -q "Listening on port 8123" "$log_dir/camp
 
 say "Starting the daemon (it provisions the whole TimescaleDB schema on first start)"
 start_bg remoteweather "$bin/rw" -config "$config_db"
-await "the REST server" 120 \
-    curl -fsS -o /dev/null -H 'Host: localhost' "http://127.0.0.1:$REST_PORT/stationinfo"
+daemon_pid=$LAST_BG_PID
+# `kill -0` as well as the HTTP probe: a socket answering on 18080 is not evidence that THIS
+# daemon is the one answering it. Together with the port preflight above that closes the gap.
+daemon_ready() {
+    kill -0 "$daemon_pid" 2>/dev/null \
+        && curl -fsS -o /dev/null -H 'Host: localhost' "http://127.0.0.1:$REST_PORT/stationinfo"
+}
+await "the REST server" 120 daemon_ready
 
 # The Davis driver stops polling after one successful 20-packet LOOP batch
 # (davis/station.go:200, recorded as a finding in docs/legacy-api-contract.md §10), so this is
@@ -386,11 +436,33 @@ if [ "$mangled_rc" -eq 0 ]; then
     suite that cannot be made to fail proves nothing (W1 Decision 10). Full output in
     $mangled_out"
 fi
+
+# "It failed" is not the assertion. The assertion is that it failed ON THE MANGLED FIELDS.
+#
+# contract/conformance/src/lib.rs reports a connection-level error as an ordinary `FAIL` line
+# reading "request failed: ...". So if the daemon had died between the two replays, or if a
+# proxy leaked from an earlier run owned 18081 and this one exited with "address in use", every
+# fixture would "fail", the floor below would be satisfied, and this script would print
+# NEGATIVE CONTROL HELD having proved nothing whatsoever. That is the exact shape of
+# docs/reconciliation.md G-1, aimed at the one assertion this work item exists to establish.
+#
+# Two cheap facts rule it out: the proxy only mangles JSON bodies, so the fixtures it does not
+# touch must still PASS, and no failure may be a transport failure.
+if grep -q 'request failed:' "$mangled_out"; then
+    grep -m 5 'request failed:' "$mangled_out"
+    die "the negative control saw transport failures rather than contract failures: the daemon
+    or the proxy was not answering, so this run proved nothing. Full output in $mangled_out"
+fi
+mangled_passed=${mangled_summary%% passed,*}
+if ! [ "$mangled_passed" -gt 0 ] 2>/dev/null; then
+    die "every fixture failed through the proxy, including the ones it does not mangle. That is
+    a broken forward path, not a working negative control. Full output in $mangled_out"
+fi
 if [ "$mangled_failures" -lt "$MIN_MANGLED_FAILURES" ]; then
     die "the negative control failed only $mangled_failures fixtures, expected at least
     $MIN_MANGLED_FAILURES (contract/README.md). Something stopped asserting. Full output in
     $mangled_out"
 fi
-say "NEGATIVE CONTROL HELD: $mangled_failures fixtures failed through the proxy"
+say "NEGATIVE CONTROL HELD: $mangled_failures fixtures failed through the proxy, $mangled_passed still passed"
 
 say "conformance-fixtures: green. $EXPECTED_FIXTURES/$EXPECTED_FIXTURES against the Go daemon, $mangled_failures failing through the negative control."

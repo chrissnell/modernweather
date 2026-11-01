@@ -909,6 +909,29 @@ default, so any row not written by the normal registration path breaks the endpo
   another batch. Reproduced against `cmd/davis-emulator`: readings stop after exactly 20 packets.
   This is a collector concern (W7), not an API concern, and it is a good example of the W0 finding
   that the Go emulators are a stronger oracle than an emulator written by the driver's author.
+* **The rig's solar readings follow the emulators' wall clock, so the capture procedure is not
+  reproducible at night.** Both `cmd/davis-emulator/main.go:177` and
+  `cmd/campbell-emulator/main.go:98` compute solar radiation from `time.Now()` in the process's
+  local zone and emit zero outside 06:00–18:00. Migration 030's
+  `refresh_almanac_cache_single` sources `high_solar` from the raw `weather` table filtered on
+  `solarwatts > 0`, and an `INSERT … SELECT` that selects nothing writes no row, so the metric is
+  absent and `/almanac` omits the key. Follow §11's steps in the evening and the fixture set you
+  capture has no `high_solar` — and a replay of `almanac-populated.json` against a rig stood up in
+  the evening fails on a missing key. `ci/conformance/go-target.sh` handles it by running only the
+  emulators in a fixed-offset zone that puts their clock at midday; neither emulator transmits a
+  timestamp, so nothing else moves. Recorded here because it is a property of the rig, not of the
+  harness that works around it.
+* **`refresh_almanac_cache` is scheduled hourly, and the almanac fixtures record a pre-seed
+  snapshot.** `migrations/weather/005_create_almanac_cache.up.sql:149` registers the job with
+  `'1 hour', initial_start => NOW()`. The first fire lands at migration time, before the rig seeds
+  the snow and air-quality stations, which is the state `almanac-populated.json` captured. A later
+  fire repopulates every station, and because `GetAlmanac` reads the extremes of the *website's*
+  air quality device, `/almanac?station=davis-full` then goes from 8 keys to 14 — gaining
+  `high_pm25`, `high_pm10_in`, `high_co2`, `high_tvoc`, and the derived `high_aqi_pm25` and
+  `high_aqi_pm10`. Both `almanac-populated.json` and `almanac-empty.json` fail at that point, the
+  second because those keys arrive from the website's device whichever station was asked about.
+  Any rig session that outlives the hour will see it. §11's step 5 now says to
+  unschedule the job after applying the migrations.
 * **The daemon's startup provisioning and `migrations/weather/` collide.** `migrate -command up`
   against a database the daemon has already provisioned fails at migration 001 with
   `function update_rainfall_summary() is not unique`, because the daemon creates
@@ -934,8 +957,18 @@ default, so any row not written by the normal registration path breaks the endpo
 | `endpoints.py` | the endpoint inventory, quirk list and the two response types no source scanner can see |
 | `genschema.py` | builds `legacy-v1.json` by parsing the Go and Swift sources; nothing in the schema is hand-transcribed |
 
-The six configured websites, five devices and two remote-station rows are described in
-`capture.py`'s fixture `Host` values and in `contract/legacy-v1.json`.
+The six configured websites, **seven** devices and two remote-station rows are described in
+`capture.py`'s fixture `Host` values and in `contract/legacy-v1.json`. They are also committed as
+runnable SQL in [`ci/conformance/config-seed.sql`](../ci/conformance/config-seed.sql), which is
+what `ci/conformance/go-target.sh` applies — that is the copy a replay checks, so prefer it over
+retyping this section's table.
+
+Two steps belong in the procedure above and are easy to miss, both for the reasons recorded in
+§10's observations: run the emulators with `TZ` set to a zone where their local clock reads
+midday, or `/almanac` loses `high_solar`; and after applying the five migrations, unschedule
+`refresh_almanac_cache` (`SELECT delete_job(job_id) FROM timescaledb_information.jobs WHERE
+proc_name = 'refresh_almanac_cache'`), or a session that outlives the hour grows six surplus
+`/almanac` keys.
 
 **The deliberate gap:** the snow gauge (a gRPC client), the AirGradient monitor (an HTTP poller) and
 the Aeris forecast and alert fetches were seeded directly rather than driven through their Go

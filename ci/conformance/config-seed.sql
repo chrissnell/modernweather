@@ -1,11 +1,19 @@
 -- The W1 capture rig's configuration database, as data rather than as prose.
 --
--- contract/tools/README.md "Configuration" describes five devices and six websites chosen so
--- that every branch of the frozen contract is reachable, but it describes them in a table a
--- human was expected to retype. The fixtures pin the parts that are not free: the station ids
--- (`/latest?station_id=1`, `/snow?station_id=3`, `/latest?station_id=4`), the hostnames each
--- fixture sends in its Host header, and the strings the HTML and weather-app.js fixtures
--- require. Everything here is checked by replaying the fixtures; nothing here is decorative.
+-- contract/tools/README.md "Configuration" describes the devices and websites W1 chose so that
+-- every branch of the frozen contract is reachable, but it describes them in a table a human was
+-- expected to retype. (Its prose says "five devices" above a table listing seven; seven is
+-- right, and the fixtures prove it.)
+--
+-- The fixtures pin the parts that are not free: the station ids three of them address by number
+-- (`/latest?station_id=1`, `/snow?station_id=3`, `/latest?station_id=4`), the id/name/type and
+-- location of every device /api/stations returns, each `enabled` flag, the six hostnames the
+-- Host headers send, and the strings the HTML and weather-app.js fixtures require as substrings.
+--
+-- What a green replay does NOT check, because contract/conformance compares JSON *shape* rather
+-- than values: the page titles, the exact coordinates, every string in remote_stations, the
+-- unused ports below, and the gRPC settings. Those are reconstructions of the rig, chosen to be
+-- consistent with it, and a change to one of them will not fail the suite.
 --
 -- Applied with sqlite3 to a database `remoteweather -config` has already bootstrapped, so the
 -- schema (pkg/config/provider_sqlite.go) and the default `configs` row already exist.
@@ -24,8 +32,13 @@ DELETE FROM weather_websites;
 DELETE FROM remote_stations;
 DELETE FROM controller_configs WHERE controller_type = 'rest';
 
--- Websites first: devices.website_id references them, and the REST server picks the FIRST
--- website as its fallback for an unmatched Host, so `localhost` has to be id 1.
+-- Websites first, because devices.website_id references them.
+--
+-- The ids themselves are not load-bearing. No fixture reads a website id, and the REST server's
+-- fallback for an unmatched Host is not "the first row" either: GetWeatherWebsites returns them
+-- ORDER BY name, so DefaultWebsite ends up being `Dead Snow Station`. That is unreachable here
+-- anyway -- websiteMiddleware matches Host exactly and all 70 fixtures send one of the six
+-- hostnames below -- but it is worth not believing the opposite.
 --
 -- apple_app_id is left at its schema default (6755874087), which html-weather-station asserts.
 INSERT INTO weather_websites
@@ -43,8 +56,20 @@ VALUES
    0, '', 0, '', 0, 0, ''),
   -- The weather_device hazard: a portal has no device_id, so /stationinfo omits BOTH
   -- weather_device and about_text. Also the only website /api/stations answers.
+  --
+  -- The page_title is cosmetic. html-portal and html-portal-root assert the substring
+  -- "Weather Management Portal", but that comes from restserver/assets/portal.html.tmpl, which
+  -- consumes no template variables at all; page_title reaches the wire only through
+  -- /api/stations, where only its type is asserted.
   (3, 1, 'Weather Portal', NULL, 'portal.test', 'Weather Management Portal', '',
    0, '', 0, '', 1, 0, ''),
+  -- The three websites below carry device_id 5 (`nolocation`). That is a reconstruction, not
+  -- something contract/tools/README.md recorded: its website table names no device for these
+  -- three. A non-portal website needs a resolvable primary device or `/` 500s, and pointing all
+  -- three at the device with no location keeps them invisible to /api/stations, which excludes
+  -- devices without coordinates. Three websites sharing one device is a state the management
+  -- API's own uniqueness check would refuse, so do not copy this into a real configuration.
+  --
   -- /snow 404 for a website with snow disabled.
   (4, 1, 'No Snow Station', 5, 'nosnow.test', 'No Snow Station', '',
    0, '', 0, '', 0, 0, ''),
@@ -67,9 +92,11 @@ INSERT INTO devices
   (id, config_id, name, type, enabled, hostname, port, base_snow_distance,
    website_id, latitude, longitude, altitude, aeris_enabled)
 VALUES
-  -- Full sensor complement; aeris_enabled is what registers /forecast and /alerts. The client
-  -- id and secret are deliberately empty: the Aeris controller only polls the upstream API when
-  -- both are set, so the routes exist and contract/tools/rig/aeris.sql stays the only source.
+  -- Full sensor complement; aeris_enabled is what registers /forecast and /alerts. No client id
+  -- or secret is written, so both are NULL: the Aeris controller only polls the upstream API
+  -- when both are non-empty, so the routes exist and contract/tools/rig/aeris.sql stays the only
+  -- source. (They are read through sql.NullString, so NULL is safe here -- unlike
+  -- remote_stations below.)
   (1, 1, 'davis-full',      'davis',              1, '127.0.0.1', '22222',    0, 1, 39.900, -105.500, 1800, 1),
   (2, 1, 'csi-minimal',     'campbellscientific', 1, '127.0.0.1', '8123',     0, 2, 39.800, -105.400, 1750, 0),
   (3, 1, 'snowgauge',       'snowgauge',          0, '127.0.0.1', '19001', 1500, NULL, 39.910, -105.510, 1800, 0),

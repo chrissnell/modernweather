@@ -90,9 +90,11 @@ mechanism used exactly as designed.
 W1 Decision 10 is the reason this is not just "replay and check green": a green conformance
 run is only accepted alongside a PASSING NEGATIVE CONTROL. The harness replays the fixtures
 twice -- once against the daemon, where all 70 must pass, and once through
-contract/tools/rig/mangle_proxy.py, where it must FAIL on at least 26 of them. A suite that
-cannot be made to fail proves nothing, so the second replay failing is a precondition for
-the gate being green rather than a diagnostic.
+contract/tools/rig/mangle_proxy.py, where at least 26 must FAIL, at least one must still
+pass, and none may fail at the transport layer. A suite that cannot be made to fail proves
+nothing, so the second replay failing is a precondition for the gate being green rather
+than a diagnostic -- and the last two conditions are what stop "every fixture failed
+because nothing was listening" from counting as a control that held.
 
 Run it locally with ci/conformance/README.md's one command; set CONFORMANCE_FORCE_MANGLE=1
 to watch the gate go red on demand."""

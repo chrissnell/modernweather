@@ -1,19 +1,37 @@
--- Freeze the one background job that would rewrite a seeded snapshot the fixtures depend on.
+-- Unschedule the one background job that could rewrite a seeded snapshot the fixtures depend on.
 --
--- Migrations 005/028/029/030 register `refresh_almanac_cache` on an hourly schedule and run it
--- once on the way past. That single run is what the almanac fixtures recorded: it happened while
--- only the two emulator-driven stations had data, which is why almanac-populated carries eight
--- metrics for davis-full and no air-quality metrics at all -- /almanac reads the extremes of the
--- website's air quality device, and aqmon had not been seeded yet.
+-- migrations/weather/005_create_almanac_cache.up.sql registers `refresh_almanac_cache` with
+-- `add_job('refresh_almanac_cache', '1 hour', initial_start => NOW())`, guarded by an IF NOT
+-- EXISTS on proc_name. It is the only one of the five migrations that registers it; 028, 029 and
+-- 030 replace the function and each call it once directly. The daemon's own provisioning
+-- registers only `update_rainfall_summary` and `refresh_snow_cache`.
 --
--- Leaving the job scheduled makes that a race. Fire it after contract/tools/rig/seed.sql and
--- aqmon gains high_pm25 / high_pm10_in / high_co2 / high_tvoc, so /almanac?station=davis-full
--- grows four keys the fixture does not have and the suite fails. Whether it fires depends on
--- where in the hour CI happened to start, which is the definition of a flaky gate.
+-- What the job would do is a key-set change, not a value change. The almanac fixtures recorded
+-- the cache as the migrations left it, while only the two emulator-driven stations had data --
+-- which is why almanac-populated carries eight metrics for davis-full and no air-quality metrics
+-- at all. /almanac reads the extremes of the WEBSITE's air quality device (handlers.go
+-- GetAlmanac), so a refresh that runs after contract/tools/rig/seed.sql gives aqmon a cache and
+-- every /almanac response on that website grows six keys: high_pm25, high_pm10_in, high_co2 and
+-- high_tvoc from the cache, plus high_aqi_pm25 and high_aqi_pm10, which GetAlmanac derives from
+-- the first two whenever they are non-nil.
+--
+-- This was watched rather than reasoned about. Firing `SELECT refresh_almanac_cache()` by hand
+-- against a seeded rig took /almanac?station=davis-full from 8 keys to 14 and broke TWO fixtures,
+-- not one: almanac-populated and also almanac-empty, which asks about `nolocation` and expects
+-- `{}` -- the air-quality keys arrive from the website's device regardless of which station was
+-- asked about.
+--
+-- To be precise about the risk this removes, because the honest version is narrower than it
+-- first looks: `initial_start => NOW()` means the first fire happens at migration time, which is
+-- always before the seeding and always harmless, and the next is an hour later. A CI run takes
+-- minutes, so CI was never going to race it. What this guards is the unbounded case -- a
+-- KEEP_RUNNING=1 session left up, a developer stepping through the rig by hand, a re-run against
+-- a database where the job was already an hour old. Those cross the boundary, and the symptom is
+-- six surplus keys in one fixture rather than anything that looks like a scheduling problem.
 --
 -- The other provisioned jobs are deliberately left alone: refresh_snow_cache and
--- update_rainfall_summary both feed values, never key sets, and /snow is written to fall back to
--- its SQL functions when the cache misses -- so the response shape is the same either way, and
+-- update_rainfall_summary both move values, never key sets, and /snow is written to fall back to
+-- its SQL functions when the cache misses -- so the response shape is identical either way, and
 -- stopping them would diverge from the server the fixtures were captured from.
 SELECT delete_job(job_id)
   FROM timescaledb_information.jobs

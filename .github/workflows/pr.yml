@@ -235,7 +235,7 @@ jobs:
           fi
 
   conformance:
-    name: frozen contract conformance
+    name: frozen contract conformance (Rust target)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -243,11 +243,29 @@ jobs:
         with:
           toolchain: ${{ env.RUST_STABLE }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo xtask gate conformance
+      # This gate is still deferred: there is no Rust daemon to replay against. A green check
+      # named "frozen contract conformance" that ran nothing is the shape of
+      # docs/reconciliation.md G-1, which is what let the original defect survive five stages —
+      # so the job name says which target it covers and the DEFERRED line goes into the run
+      # summary rather than only into the log. The Go-target half is `conformance-fixtures`.
+      - run: cargo xtask gate conformance | tee /tmp/conformance.txt
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo "## Frozen contract conformance (Rust target)"
+            echo
+            echo '```'
+            cat /tmp/conformance.txt 2>/dev/null || echo "the gate did not run"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   conformance-fixtures:
     name: frozen contract fixtures vs the Go daemon
     runs-on: ubuntu-latest
+    # The only job that starts long-lived subprocesses and waits on them. A deadline turns a
+    # wedged daemon into a failed check rather than a check that pends until the job limit.
+    timeout-minutes: 25
     services:
       timescaledb:
         # The same -ha image as the `database` job, for the same reason (DESIGN.md D-2): the

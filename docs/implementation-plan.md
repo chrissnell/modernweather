@@ -10,8 +10,8 @@ inventing an answer.
 sitting** — roughly one PR a reviewer can hold in their head — and carries its own dependencies,
 done-criteria and test strategy.
 
-**One standing rule for gates.** `ci/gates.toml` now declares twelve gates; four are armed and
-eight are deferred, each on a path a milestone below creates (**D-64**). **The work item that arms a
+**One standing rule for gates.** `ci/gates.toml` now declares twelve gates; five are armed and
+seven are deferred, each on a path a milestone below creates (**D-64**). **The work item that arms a
 gate also adds its job to `.github/workflows/pr.yml` and wires it into the required `gate` job.** W6
 declared the manifest entries and deliberately did not add the jobs: a job that prints `DEFERRED` and
 exits 0 is exactly the shape of `docs/reconciliation.md` G-1, and adding six of them would have been
@@ -140,18 +140,6 @@ that is M5-5, after the migration has proved it reads them from `config.stations
 ### M1-4 — run the conformance suite against the Go daemon in CI *(N-3 / G-1)* — ✅ **DONE 2026-11-01**
 **Depends on:** nothing. **Blocks:** M2-5, and by the second ordering constraint every legacy
 endpoint in M4.
-**Landed:** `ci/conformance/go-target.sh` plus three SQL files and a README; a
-`conformance-fixtures` job in `pr.yml` wired into `gate`. 70/70 pass against the Go daemon, and
-the same harness fails 26 fixtures through `mangle_proxy.py`. Both failure directions were
-watched: `CONFORMANCE_FORCE_MANGLE=1` sends the accepted replay through the proxy and the gate
-goes red; `MIN_MANGLED_FAILURES=99` makes the negative-control floor reject a control that
-stopped biting. Two things had to be pinned for the run to be reproducible rather than
-green-by-luck, both documented in `ci/conformance/README.md`: the emulators derive their solar
-curve from their own wall clock, so they run in a fixed-offset zone at midday (otherwise
-`/almanac` loses `high_solar` on any runner whose clock reads after 18:00); and the hourly
-`refresh_almanac_cache` job is deleted after the migrations, because firing it post-seed adds
-four air-quality keys `almanac-populated` does not have. The `conformance` gate was confirmed
-deferred on `crates/modernweather/Cargo.toml`, a path M2-1 creates.
 The largest item in this milestone and the only one that is not small. Stand the Go daemon up in CI
 from `remoteweather` @ `c3ec9f7` against a `timescale/timescaledb-ha:pg17` service container, seed it
 with W1's rig (`contract/tools/rig/`), replay all 70 fixtures, and run
@@ -162,6 +150,21 @@ run through `mangle_proxy.py`; `ci/conformance/go-target.sh` exists, which is wh
 declared in this PR.
 **Test strategy:** the negative control *is* the test strategy — a conformance suite that cannot be
 made to fail proves nothing, which is why W1 refused to accept a green run without one.
+**Landed:** `ci/conformance/go-target.sh` plus three SQL files and a README; a
+`conformance-fixtures` job in `pr.yml` wired into `gate`. 70/70 pass against the Go daemon, and
+the same harness fails 26 fixtures through `mangle_proxy.py` while 44 still pass. Three failure
+directions were watched rather than argued: `CONFORMANCE_FORCE_MANGLE=1` sends the accepted
+replay through the proxy and the gate goes red; `MIN_MANGLED_FAILURES=99` makes the floor reject
+a control that stopped biting; and pointing the runner at a dead port produces 70 `FAIL` lines
+that are all `request failed:`, which the transport guard rejects and a bare floor would have
+accepted as a held control. Two rig properties had to be pinned for the run to be reproducible
+rather than green-by-luck, both now recorded in `legacy-api-contract.md` §10 because they are
+W1's rig rather than this harness: the emulators derive their solar curve from their own wall
+clock, so they run in a fixed-offset zone at midday (otherwise `/almanac` loses `high_solar`
+after 18:00 local); and `refresh_almanac_cache` is unscheduled after the migrations, because a
+post-seed fire was observed taking `/almanac` from 8 keys to 14 and breaking two fixtures. The `conformance`
+gate was confirmed deferred on `crates/modernweather/Cargo.toml`, a path M2-1 creates, and its
+job now reports that deferral into the PR summary instead of only into its log.
 **Also in this item:** repoint the `conformance` gate (the Rust-target one) at
 `crates/modernweather/Cargo.toml`, done in W6's PR, and verify `cargo xtask gates` shows it deferred
 with an honest reason rather than an unreachable path.

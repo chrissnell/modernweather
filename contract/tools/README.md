@@ -26,9 +26,12 @@ go build -mod=vendor -o rwmigrate ./cmd/migrate
 # 3. configuration: ./rw -config config.db bootstraps an empty SQLite config database.
 #    Then insert five devices and six websites (see "Configuration" below).
 
-# 4. stations
-./davis-emulator -port 22222 &
-./campbell-emulator -port 8123 -interval 2s &
+# 4. stations. TZ matters: both emulators compute solar radiation from their own wall clock and
+#    emit zero outside 06:00-18:00 local, and the almanac's high_solar is sourced from
+#    `solarwatts > 0`, so capturing in the evening silently drops a key from /almanac.
+#    Use any zone in which it is ~midday locally. See docs/legacy-api-contract.md §10.
+TZ=Etc/GMT+0 ./davis-emulator -port 22222 &
+TZ=Etc/GMT+0 ./campbell-emulator -port 8123 -interval 2s &
 ./rw -config config.db &          # provisions the whole TimescaleDB schema on start
 
 # 5. the tables the daemon does NOT create
@@ -37,6 +40,12 @@ psql ... -f <go-repo>/migrations/weather/028_complete_almanac_metrics.up.sql
 psql ... -f <go-repo>/migrations/weather/029_almanac_store_pm_only.up.sql
 psql ... -f <go-repo>/migrations/weather/030_almanac_airgradient_pm10.up.sql
 psql ... -f <go-repo>/migrations/weather/025_create_snow_depth_est.up.sql
+
+# 5b. migration 005 schedules refresh_almanac_cache hourly. The almanac fixtures record the cache
+#     as these migrations left it -- before step 6 seeds the air-quality station -- so a later
+#     fire grows /almanac by six keys. Freeze it.
+psql ... -c "SELECT delete_job(job_id) FROM timescaledb_information.jobs \
+             WHERE proc_name = 'refresh_almanac_cache'"
 
 # 6. data the local drivers cannot produce
 psql ... -f rig/seed.sql        # snow gauge + air-quality readings
@@ -65,7 +74,9 @@ That collision is itself a finding — see `docs/legacy-api-contract.md` §10.
 
 ## Configuration
 
-Five devices and six websites, chosen so that every branch of the contract is reachable:
+Seven devices and six websites, chosen so that every branch of the contract is reachable. The
+table below is the description; `ci/conformance/config-seed.sql` is the same configuration as
+runnable SQL, and it is the copy a conformance replay actually checks.
 
 | Device | Type | Driven by | Why |
 |---|---|---|---|

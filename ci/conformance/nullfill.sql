@@ -6,8 +6,9 @@
 -- docs/legacy-api-contract.md §10). Matching the daemon's shape is what makes the seeded
 -- stations answerable at all.
 --
--- The column list is derived rather than written out because `weather` carries several hundred
--- numeric columns and a hand-maintained list would rot on the next migration.
+-- The column list is derived rather than written out because `weather` carries 197 numeric
+-- columns (127 real, 69 integer, 1 bigint, and no numeric/decimal) and a hand-maintained list
+-- would rot on the next migration.
 DO $$
 DECLARE
     assignments text;
