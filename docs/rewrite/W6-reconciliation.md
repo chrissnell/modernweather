@@ -82,17 +82,27 @@ registry), OQ-W4-4 (`cargo xtask codegen` writes stale files and never prunes th
 leaves a tree `--check` rejects). Feed these into §2 as gaps with an owner, not into §4 as questions
 for the owner — they are small, decided, and need a work item rather than a decision.
 
-**5. Four things need the owner and cannot be resolved by anyone here.** Keep them in §4 as a
-separate group, because they are not design questions and they have been outstanding for the whole
-programme: **pre-flight 1** — whether the production 365-day raw retention policy has been paused,
-still unconfirmed, and every day it fires converts another day of raw into unrecoverable rollup-only
-history; **OQ-1** — production's PostgreSQL and TimescaleDB version, which W4 §5.2 says moves several
-of its decisions and which, below TimescaleDB 2.9, makes a major-version upgrade part of W9;
-**OQ-2** — the compression hold-rate query, which brackets a capacity figure that has already
+**5. Four things need the owner — and one premise behind that sentence turned out to be wrong.**
+Keep them in §4 as a separate group: **pre-flight 1** — whether the production 365-day raw retention
+policy has been paused; **OQ-1** — production's PostgreSQL and TimescaleDB version, which W4 §5.2
+says moves several of its decisions and which, below TimescaleDB 2.9, makes a major-version upgrade
+part of W9; **OQ-2** — the compression hold-rate query behind a capacity figure that has already
 propagated into planning documents; **OQ-6** — the ~72-column gap between the Go source's 215-column
-definition the registry was bootstrapped from and production's ~143 columns. **Production is not
-reachable from an agent runtime** (W0 OQ-1), so all four are queries for the owner to run. Do not
-treat them as answerable here.
+definition the registry was bootstrapped from and production's supposed ~143 columns.
+
+> **Resolved 2026-10-31, and recorded here because the reasoning is the lesson.** All four were
+> measured. **PostgreSQL 16.6 / TimescaleDB 2.17.2** — not 14, and above 2.9, so W4's contingency
+> does not fire. **Hold rate 59.6%**, well below the ~87% the planning documents assumed, so every
+> capacity figure derived from W4's 5.3× is a floor rather than an estimate. **215 columns — the
+> ~72-column gap does not exist**, and "~143" was an assumption that was written down once and never
+> retested. And the ~294 days of rollup-only history this programme had been racing to protect were
+> **already gone**, destroyed nightly by a continuous-aggregate refresh rather than by retention.
+>
+> The sentence this item used to open with — "cannot be resolved by anyone here" — rested on W0
+> OQ-1's "production is not reachable from an agent runtime". **That was wrong at the network
+> layer**, and it was repeated through five stages without being retested. The blocker was a
+> credential, not reachability. Treat an inherited negative capability claim as something to retest,
+> not something to propagate.
 
 **One piece of bookkeeping for §2.** W2's and W4's prompts were outlines when the programme started
 and were written mid-flight from merged output; W1, W3 and W9 each had a `§0` appended for the same
