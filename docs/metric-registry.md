@@ -126,11 +126,12 @@ field_number = 221
 
 `role` does real work:
 
-| `role` | In raw | In aggregates | Meaning |
-|---|---|---|---|
-| `time` | `NOT NULL` | becomes `time_bucket(...) AS bucket` | the hypertable's time dimension |
-| `partition` | `NOT NULL` | the `GROUP BY` key | `station_id` |
-| `attribute` | nullable | **absent** | `stationname`, `stationtype` |
+| `role` | In raw | In aggregates | Retirable | Meaning |
+|---|---|---|---|---|
+| `time` | `NOT NULL` | becomes `time_bucket(...) AS bucket` | no | the hypertable's time dimension |
+| `partition` | `NOT NULL` | the `GROUP BY` key | no | `station_id` |
+| `attribute` | nullable | **absent** | no | `stationname`, `stationtype` |
+| `metadata` | **absent** | **absent** | **yes** | on the wire and in the reading types only |
 
 Two notes on that table. `station_id` is new: the Go table keys readings by station *name*.
 Protobuf 221 was already allocated to `station_id` upstream and means the same thing, so it is
@@ -138,6 +139,20 @@ carried over rather than reallocated. And the attribute dimensions are deliberat
 of the aggregates — the Go views group by `stationname`, which means renaming a station splits
 its buckets. With `station_id` as the key, the name is a station-registry attribute joined at
 read time.
+
+**`metadata` is the one retirable role, and that is why it exists** (N-14, implemented by
+M1-2; it answers OQ-W4-2 / OQ-W2-6 below). It means: present in the protobuf and in the
+generated Rust, TypeScript and OpenAPI reading types; absent from the raw DDL and from every
+aggregate. Its only allocated identifier is a protobuf field number, because it never became a
+PostgreSQL column — so it is the only dimension that `deprecated = true` can retire, exactly as
+it retires a metric. The other three roles consume an attribute number the moment the table is
+created, an attribute number is never released, and there is therefore no sequence of statements
+that retires one; the generator refuses `deprecated = true` on them rather than offering a flag.
+
+A `metadata` dimension carries `deprecated` and `deprecated_in` with the same meaning they have
+on a metric: the entry stays in the registry, the field number is emitted as `reserved` in the
+protobuf, and the value leaves every generated type. Deleting the entry outright is still fatal —
+the entry *is* the record that the number is spoken for.
 
 ### 1.3 Levels
 
@@ -225,17 +240,21 @@ deployed protobuf or already consumed as a PostgreSQL attribute number.
 3. **A column budget over the ceiling**, counted against allocated identifiers rather than live
    ones (H-4).
 4. **An aggregate that would emit more expressions than the ceiling permits** — 1598.
+5. **`deprecated = true` on a dimension whose role is not `metadata`.** A `time`, `partition` or
+   `attribute` dimension holds a PostgreSQL attribute number, which is never released, so
+   retiring one is not an operation that can be expressed — and therefore has no flag either.
 
 Plus the structural checks that would otherwise produce broken SQL: a level chain that skips a
 level, a metric carried at `1h` but not at `1m` (§A-W2-1), an aggregate on a `text` column,
 `mean` and `total` on the same metric (both emit a sum), a protobuf number in the reserved
-19000–19999 range, a deprecated metric with no `deprecated_in`, and one legacy JSON key
-claimed by two metrics.
+19000–19999 range, a deprecated metric or dimension with no `deprecated_in`, a `deprecated_in`
+on an entry that is not deprecated, and one legacy JSON key claimed by two metrics.
 
 ### 2.2 Refused by default — one loud flag
 
 Column rename, SQL type change in either direction, protobuf type change, aggregation strategy
-change, mean-representation change, and un-deprecating a retired metric. Each of these is a
+change, mean-representation change, un-deprecating a retired entry, and **moving a dimension
+onto the `metadata` role**, which takes its column out of the generated DDL. Each of these is a
 real operation an operator may genuinely need, so each is refused rather than impossible.
 
 **The escape hatch is `cargo xtask migrate --allow-breaking`, and what it requires of the
@@ -248,6 +267,16 @@ decision to run it where it belongs. Concretely:
 - a **SQL type change** is emitted as `ALTER COLUMN ... TYPE`, with a comment saying that on a
   compressed hypertable this requires decompressing every chunk holding the column and
   recompressing afterwards, and that it should not be run against a live API.
+- a **move onto the `metadata` role** emits no `DROP COLUMN`, deliberately: a dropped column
+  keeps its attribute number forever and is charged twice against the ceiling once the
+  hypertable is compressed (H-4). The migration names the column, says it stays in place
+  unwritten, and warns that the writer must stop writing it first or readings lose the value
+  with no error. The identifier stays allocated in the snapshot either way.
+
+The snapshot records a dimension's stored-ness in its `kind` — `dimension` for a column,
+`metadata_dimension` for one that is not — which is what makes a role move visible to the
+diff at all. Nothing else about the entry changes when a role is edited, so without it the
+generator saw no change, reported `all check out`, and rewrote the DDL with the column gone.
 - a **protobuf type change** produces no SQL and a prominent comment, because the damage is
   entirely on the client side.
 - an **aggregation strategy change** produces a drop-and-recreate of every affected level.
@@ -904,6 +933,11 @@ two columns and two text values per row.
 join the station registry at read time. They are already excluded from the aggregates, so the
 change is contained. Left in for now because removing a column from the bootstrapped registry
 would mean deprecating something that has never existed.
+
+*Status.* W4 answered it as OQ-W4-2: they should go, by way of a new `metadata` role. That role
+now exists — §1.2, work item N-14, landed as M1-2 — so the question is no longer "can this be
+expressed". Moving `stationname`/`stationtype` onto it is **M5-5**, after the data migration has
+proved the read path takes a station's name from `config.stations` rather than from a reading.
 
 ---
 

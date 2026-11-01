@@ -117,9 +117,20 @@ encodes to an absent field and decodes back to `None` rather than `0.0`.
 **Why first:** without it a NULL becomes `0.0` across a hop *and* across a spool restart (W7 D-11),
 and retrofitting presence after a collector is deployed is a fleet-wide flag day.
 
-### M1-2 — dimension `role = "metadata"` *(N-14 / OQ-W4-2, OQ-W2-6)*
+### M1-2 — dimension `role = "metadata"` *(N-14 / OQ-W4-2, OQ-W2-6)* — ✅ **DONE 2026-11-01**
 **Depends on:** nothing. **Blocks:** M1-3's pruning test; the eventual `stationname`/`stationtype`
 drop; D-61's provenance column if it is ever wanted.
+**Landed:** `Role::Metadata`, and `deprecated`/`deprecated_in` on `[[dimension]]` gated to that one
+role. `snapshot::from_registry` now reads a dimension's `deprecated` instead of hard-coding `false`,
+which is the constant that made `[[dimension]]` removal a one-way door. `generated/` is
+byte-identical, because the capability adds nothing until a registry entry uses it.
+**The role transition is classified, which M5-5 depends on:** the snapshot records stored-ness in
+its `kind`, so `attribute` → `metadata` is BREAKING (the column leaves the DDL; no `DROP COLUMN` is
+emitted, because an attribute number is never released) and `metadata` → `attribute` is an added
+column. Before that, a role edit changed nothing the diff compared, so `validate` reported `all
+check out` while `codegen` removed the column. `migrate` also now resolves an added column from the
+dimensions as well as the metrics; it searched only `reg.metrics`, so a new `[[dimension]]` reached
+`generated/sql/` and never reached a deployed database.
 Add a third dimension role: present in the protobuf and the Rust type, absent from the raw DDL and
 the aggregates.
 **Done when:** `cargo xtask validate` accepts a `metadata` dimension; the generated DDL omits it; a

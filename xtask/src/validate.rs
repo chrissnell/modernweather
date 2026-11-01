@@ -114,6 +114,42 @@ pub fn registry_internal(reg: &Registry) -> Result<(), String> {
         }
     }
 
+    // Dimension deprecation, which exists for exactly one role (N-14). A time,
+    // partition or attribute dimension is a column of the raw hypertable, and a
+    // PostgreSQL attribute number is never released — there is no sequence of
+    // statements that retires one, so there is no flag either. A `metadata`
+    // dimension never became a column, so its only allocated identifier is a
+    // protobuf field number, and `deprecated = true` reserves that forever.
+    for d in &reg.dimensions {
+        if d.deprecated && !d.role.retirable() {
+            errs.push(format!(
+                "FATAL: dimension '{}' has role = \"{}\" and deprecated = true.\n\
+                 \x20      Only a \"metadata\" dimension can be retired: the other roles are \
+                 columns of\n\
+                 \x20      {} and a PostgreSQL attribute number is never released (D-21, \
+                 H-4). If the\n\
+                 \x20      column should stop being written, move it to role = \"metadata\" \
+                 first — that\n\
+                 \x20      is a breaking change against the snapshot and says so.",
+                d.key,
+                d.role.name(),
+                crate::gen::RAW_TABLE
+            ));
+        }
+        if d.deprecated && d.deprecated_in.is_none() {
+            errs.push(format!(
+                "FATAL: dimension '{}' is deprecated but has no deprecated_in version",
+                d.key
+            ));
+        }
+        if !d.deprecated && d.deprecated_in.is_some() {
+            errs.push(format!(
+                "FATAL: dimension '{}' names a deprecated_in version but is not deprecated",
+                d.key
+            ));
+        }
+    }
+
     // The level chain: first level reads raw, each later level reads the one before it.
     if reg.levels.is_empty() {
         errs.push("FATAL: no [[level]] declared".into());
@@ -224,6 +260,12 @@ pub fn registry_internal(reg: &Registry) -> Result<(), String> {
                 m.key
             ));
         }
+        if !m.deprecated && m.deprecated_in.is_some() {
+            errs.push(format!(
+                "FATAL: metric '{}' names a deprecated_in version but is not deprecated",
+                m.key
+            ));
+        }
         if m.levels(&reg.defaults).is_empty() != m.aggregates.is_empty() {
             errs.push(format!(
                 "FATAL: metric '{}' has aggregates [{}] and levels [{}]. A metric with \
@@ -320,14 +362,27 @@ pub fn against_snapshot(
         }
     }
 
-    // Disappearance without deprecation.
+    // Disappearance without deprecation. Deleting the entry is never the way to retire
+    // something, because the entry *is* the record that the identifiers are spoken for.
     for o in &snap.entries {
         if !new_keys.contains_key(o.key.as_str()) {
+            let how = if snapshot::is_dimension(&o.kind) {
+                "Removing a dimension does not delete its entry: set deprecated = true and \
+                 deprecated_in = \"<version>\"\n\
+                 \x20      so the identifiers stay allocated (D-21). Only a role = \"metadata\" \
+                 dimension can be\n\
+                 \x20      retired at all — the other roles hold a PostgreSQL attribute number, \
+                 which is never\n\
+                 \x20      released."
+            } else {
+                "Removing a metric does not delete its entry: set deprecated = true and \
+                 deprecated_in = \"<version>\"\n\
+                 \x20      so the identifiers stay allocated (D-21)."
+            };
             errs.push(format!(
                 "FATAL: '{}' (column '{}', protobuf field {}) is in the snapshot and gone \
                  from the registry.\n\
-                 \x20      Removing a metric does not delete its entry: set deprecated = true \
-                 and deprecated_in = \"<version>\" so the identifiers stay allocated (D-21).",
+                 \x20      {how}",
                 o.key, o.column, o.field_number
             ));
         }
@@ -411,7 +466,10 @@ pub fn budget(reg: &Registry, snap: Option<&Snapshot>) -> Budget {
     };
     Budget {
         allocated_columns: allocated,
-        live_columns: reg.dimensions.len() + reg.live_metrics().len(),
+        // Columns the generated DDL declares today. A `metadata` dimension is not one
+        // of them; `allocated_columns` above still counts it, which over-counts the
+        // raw budget by one per metadata dimension and can only ever refuse early.
+        live_columns: reg.stored_dimensions().len() + reg.live_metrics().len(),
         per_level: reg
             .levels
             .iter()
@@ -477,6 +535,17 @@ proto_type = "string"
 label = "Station"
 introduced_in = "0.1.0"
 "#;
+
+    /// A `metadata` dimension: on the wire, in the reading types, not a column (N-14).
+    /// `origin` is D-61's hypothetical provenance field, which is the reason this role
+    /// was asked for — a `[[dimension]]` with no deprecation path is a one-way door.
+    fn metadata_dimension(extra: &str) -> String {
+        format!(
+            "[[dimension]]\nkey = \"origin\"\ncolumn = \"origin\"\nsql_type = \"text\"\n\
+             role = \"metadata\"\nfield_number = 900\nproto_name = \"origin\"\n\
+             proto_type = \"string\"\nlabel = \"Origin\"\nintroduced_in = \"0.2.0\"\n{extra}\n"
+        )
+    }
 
     fn metric(key: &str, column: &str, num: u32, extra: &str) -> String {
         format!(
@@ -661,6 +730,463 @@ introduced_in = "0.1.0"
             "{e}"
         );
         eprintln!("{e}");
+    }
+
+    // -----------------------------------------------------------------------
+    // N-14 / OQ-W4-2: dimension role = "metadata"
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_accepts_a_metadata_dimension() {
+        let r = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("")
+        ));
+        registry_internal(&r).expect("a metadata dimension is a valid registry entry");
+        let empty = Snapshot {
+            schema_version: 1,
+            entries: vec![],
+        };
+        let changes = against_snapshot(&r, &empty, false).expect("and allocates cleanly");
+        let origin = changes
+            .iter()
+            .find(|c| c.key == "origin")
+            .expect("its allocation is recorded");
+        assert_eq!(origin.class, Class::AddColumn);
+        assert!(
+            origin.detail.contains("no column"),
+            "the change must not claim a column: {}",
+            origin.detail
+        );
+    }
+
+    /// Generator-output assertion 1 of 3: absent from the raw DDL. Scans the emitted
+    /// SQL rather than the model, for the reason the aggregate-SQL test gives — the
+    /// model being right and the template being right are two different claims.
+    #[test]
+    fn the_generated_ddl_omits_a_metadata_dimension() {
+        let r = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("")
+        ));
+        let files = crate::gen::all(&r);
+        let table = files
+            .get("generated/sql/020_observations.sql")
+            .expect("the raw table is generated");
+        assert!(
+            !table.contains("origin"),
+            "a metadata dimension is not a column of the raw hypertable:\n{table}"
+        );
+        // The dimensions that *are* columns are still there, so this is not passing
+        // because the loop emitted nothing.
+        assert!(table.contains("station_id"), "{table}");
+        assert!(table.contains("time "), "{table}");
+    }
+
+    /// Generator-output assertion 2 of 3: absent from every aggregate. True today by
+    /// construction — only the time and partition dimensions reach an aggregate — and
+    /// asserted because "by construction" is a property of the template, not a promise.
+    #[test]
+    fn the_generated_aggregates_omit_a_metadata_dimension() {
+        let r = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("")
+        ));
+        let files = crate::gen::all(&r);
+        let mut levels = 0;
+        for (path, body) in &files {
+            if !path.contains("_observations_") {
+                continue;
+            }
+            assert!(!body.contains("origin"), "{path} mentions it:\n{body}");
+            levels += 1;
+        }
+        assert!(
+            levels > 0,
+            "no aggregate files found, so this proved nothing"
+        );
+    }
+
+    /// Generator-output assertion 3 of 3: present in the protobuf and the Rust type.
+    /// This is the half the role exists for — the value stays on the wire, where
+    /// `Ingress::admit` can use it, and stops being storage.
+    #[test]
+    fn the_proto_and_the_rust_type_carry_a_metadata_dimension() {
+        let r = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("")
+        ));
+        let files = crate::gen::all(&r);
+
+        let proto = files
+            .get("generated/proto/reading.proto")
+            .expect("generated");
+        assert!(proto.contains("string origin = 900;"), "{proto}");
+        // Dimensions do not carry field presence (D-89); a metadata dimension is
+        // still a dimension.
+        assert!(!proto.contains("optional string origin"), "{proto}");
+
+        let reading = files.get("generated/rust/reading.rs").expect("generated");
+        assert!(
+            reading.contains("pub origin: Option<String>,"),
+            "an absent-able dimension is an Option:\n{reading}"
+        );
+
+        let ts = files.get("generated/ts/reading.ts").expect("generated");
+        assert!(ts.contains("origin: string | null;"), "{ts}");
+
+        let openapi = files
+            .get("generated/openapi/reading.json")
+            .expect("generated");
+        assert!(openapi.contains("\"origin\""), "{openapi}");
+        // Not required: the station may not report it.
+        let required = openapi
+            .split("\"required\": [")
+            .nth(1)
+            .and_then(|r| r.split(']').next())
+            .expect("Reading has a required list");
+        assert!(!required.contains("origin"), "required was [{required}]");
+    }
+
+    /// **The case that matters.** `snapshot::from_registry` hard-coded
+    /// `deprecated: false` for every dimension, and the only escape from the
+    /// disappearance FATAL is `deprecated = true` — so until that constant was read
+    /// from the registry, no `[[dimension]]` could ever be retired at all. Retiring
+    /// one is the whole reason N-14 exists: it is the prerequisite for M5-5's
+    /// `stationname`/`stationtype` drop and for D-61's provenance column.
+    #[test]
+    fn a_metadata_dimension_can_be_retired_without_the_disappearance_fatal() {
+        let before = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("")
+        ));
+        let s = snap(&before);
+        assert!(
+            s.entries.iter().any(|e| e.key == "origin" && !e.deprecated),
+            "the snapshot records it as live first"
+        );
+
+        let after = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("deprecated = true\ndeprecated_in = \"0.3.0\"")
+        ));
+        let changes = against_snapshot(&after, &s, false)
+            .expect("retiring a metadata dimension is not fatal and is not breaking");
+        let c = changes
+            .iter()
+            .find(|c| c.key == "origin")
+            .expect("the retirement is classified");
+        assert_eq!(c.class, Class::Deprecate);
+        assert!(
+            c.detail.contains("stays reserved"),
+            "the field number is what is retained: {}",
+            c.detail
+        );
+        assert!(
+            snapshot::from_registry(&after)
+                .iter()
+                .any(|e| e.key == "origin" && e.deprecated),
+            "and it is written back to the snapshot as deprecated, not dropped"
+        );
+    }
+
+    /// The other half of the retirement: the identifier does not come back. A retired
+    /// dimension leaves the generated types and its protobuf number is reserved, which
+    /// is what stops it being handed to something else later (D-21).
+    #[test]
+    fn a_retired_metadata_dimension_leaves_the_types_and_reserves_its_number() {
+        let r = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("deprecated = true\ndeprecated_in = \"0.3.0\"")
+        ));
+        registry_internal(&r).expect("valid");
+        let files = crate::gen::all(&r);
+
+        let proto = files
+            .get("generated/proto/reading.proto")
+            .expect("generated");
+        assert!(!proto.contains("string origin = 900;"), "{proto}");
+        assert!(proto.contains("reserved 900;"), "{proto}");
+
+        for path in [
+            "generated/rust/reading.rs",
+            "generated/ts/reading.ts",
+            "generated/openapi/reading.json",
+            "generated/sql/020_observations.sql",
+        ] {
+            let body = files.get(path).expect("generated");
+            assert!(!body.contains("origin"), "{path} still carries it:\n{body}");
+        }
+    }
+
+    /// The door opens for one role only. An `attribute` dimension is a column of
+    /// `observations`, and a PostgreSQL attribute number is never released — there is
+    /// no statement that retires one, so there is no flag either.
+    #[test]
+    fn deprecating_a_dimension_that_holds_a_column_is_fatal() {
+        let toml = format!(
+            "{PRELUDE}\n{}\n[[dimension]]\nkey = \"station_name\"\ncolumn = \"stationname\"\n\
+             sql_type = \"text\"\nrole = \"attribute\"\nfield_number = 2\n\
+             proto_name = \"stationName\"\nproto_type = \"string\"\nlabel = \"Station name\"\n\
+             introduced_in = \"0.1.0\"\ndeprecated = true\ndeprecated_in = \"0.3.0\"\n",
+            metric("a", "ca", 4, "")
+        );
+        let r: Registry = toml::from_str(&toml).expect("fixture parses");
+        let e = registry_internal(&r).unwrap_err();
+        assert!(
+            e.contains("Only a \"metadata\" dimension can be retired"),
+            "{e}"
+        );
+        assert!(e.contains("attribute number is never released"), "{e}");
+    }
+
+    /// Deleting the entry is still not the way out, for a metadata dimension either:
+    /// the entry *is* the record that the protobuf number is spoken for, and the
+    /// generator needs it to keep emitting `reserved`.
+    #[test]
+    fn deleting_a_metadata_dimension_outright_is_still_fatal() {
+        let before = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("")
+        ));
+        let s = snap(&before);
+        let after = reg(&metric("a", "ca", 4, ""));
+        let e = against_snapshot(&after, &s, true).unwrap_err();
+        assert!(
+            e.contains("is in the snapshot and gone from the registry"),
+            "{e}"
+        );
+        assert!(
+            e.contains("Removing a dimension does not delete its entry"),
+            "{e}"
+        );
+        assert!(e.contains("role = \"metadata\""), "{e}");
+    }
+
+    #[test]
+    fn a_deprecated_dimension_without_a_version_is_fatal() {
+        let r = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("deprecated = true")
+        ));
+        let e = registry_internal(&r).unwrap_err();
+        assert!(e.contains("deprecated but has no deprecated_in"), "{e}");
+    }
+
+    /// Un-retiring is the reverse of a one-way door and is already classified
+    /// breaking for metrics. Opening the door for dimensions must not have opened it
+    /// in both directions.
+    #[test]
+    fn reviving_a_retired_metadata_dimension_is_refused() {
+        let before = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("deprecated = true\ndeprecated_in = \"0.3.0\"")
+        ));
+        let s = snap(&before);
+        let after = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("")
+        ));
+        let e = against_snapshot(&after, &s, false).unwrap_err();
+        assert!(e.contains("REFUSED"), "{e}");
+        assert!(
+            e.contains("an identifier that was retired is being revived"),
+            "{e}"
+        );
+    }
+
+    /// A metadata dimension is classified `AddColumn` so that `migrate` writes its
+    /// protobuf number into the snapshot, and it adds no column. The emitted migration
+    /// has to agree: keying the ALTER block on the change count produced
+    /// `ALTER TABLE observations ;`, which is not valid SQL.
+    #[test]
+    fn a_new_metadata_dimension_emits_no_alter_table() {
+        let before = reg(&metric("a", "ca", 4, ""));
+        let s = snap(&before);
+        let after = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("")
+        ));
+        let changes = against_snapshot(&after, &s, false).expect("not fatal");
+        assert!(changes.iter().any(|c| c.class == Class::AddColumn));
+
+        let m = crate::migrate::render(&after, &changes, false, "20260101000000", "add_origin");
+        assert!(
+            !m.body.contains("ALTER TABLE"),
+            "a protobuf-only dimension changes no table:\n{}",
+            m.body
+        );
+        assert!(
+            m.body.contains("there is nothing to do"),
+            "and the migration says so:\n{}",
+            m.body
+        );
+    }
+
+    /// Moving a dimension across the stored/not-stored line removes a column from the
+    /// generated DDL. Before `kind` distinguished the two, `from_registry` produced an
+    /// identical entry — same column, type, protobuf type, same `deprecated` — so the
+    /// diff saw **no change at all**: `validate` said "all check out" and `codegen`
+    /// quietly rewrote `020_observations.sql` with the column gone. M5-5 performs this
+    /// move on `station_name`, and this is the check that makes it say so.
+    #[test]
+    fn moving_a_dimension_to_the_metadata_role_is_breaking() {
+        let stored = format!(
+            "{PRELUDE}\n{}\n[[dimension]]\nkey = \"origin\"\ncolumn = \"origin\"\n\
+             sql_type = \"text\"\nrole = \"attribute\"\nfield_number = 900\n\
+             proto_name = \"origin\"\nproto_type = \"string\"\nlabel = \"Origin\"\n\
+             introduced_in = \"0.2.0\"\n",
+            metric("a", "ca", 4, "")
+        );
+        let before: Registry = toml::from_str(&stored).expect("fixture parses");
+        assert!(
+            crate::gen::all(&before)["generated/sql/020_observations.sql"].contains("origin"),
+            "it starts life as a column"
+        );
+        let s = snap(&before);
+
+        let after = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("")
+        ));
+        let e = against_snapshot(&after, &s, false).unwrap_err();
+        assert!(e.contains("REFUSED"), "{e}");
+        assert!(e.contains("column origin leaves the generated DDL"), "{e}");
+
+        // With the flag it is permitted, and the migration says what it will not do.
+        let changes = against_snapshot(&after, &s, true).expect("the flag permits it");
+        let m = crate::migrate::render(&after, &changes, false, "20260101000000", "to_metadata");
+        assert!(
+            m.body.contains("origin is no longer a generated column"),
+            "{}",
+            m.body
+        );
+        assert!(
+            !m.body.contains("DROP COLUMN origin"),
+            "a dropped column keeps its attribute number forever:\n{}",
+            m.body
+        );
+    }
+
+    /// The reverse. Not breaking — it adds a nullable column — but it must still be
+    /// seen, because a column that reaches `generated/sql/` and not the database is
+    /// exactly the drift D-8 exists to prevent.
+    #[test]
+    fn moving_a_dimension_off_the_metadata_role_adds_a_column() {
+        let before = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("")
+        ));
+        let s = snap(&before);
+        let after: Registry = toml::from_str(&format!(
+            "{PRELUDE}\n{}\n[[dimension]]\nkey = \"origin\"\ncolumn = \"origin\"\n\
+             sql_type = \"text\"\nrole = \"attribute\"\nfield_number = 900\n\
+             proto_name = \"origin\"\nproto_type = \"string\"\nlabel = \"Origin\"\n\
+             introduced_in = \"0.2.0\"\n",
+            metric("a", "ca", 4, "")
+        ))
+        .expect("fixture parses");
+
+        let changes = against_snapshot(&after, &s, false).expect("adding a column is not breaking");
+        let c = changes
+            .iter()
+            .find(|c| c.key == "origin")
+            .expect("the transition is classified");
+        assert_eq!(c.class, Class::AddColumn);
+        assert!(c.detail.contains("becomes a column"), "{}", c.detail);
+
+        let m = crate::migrate::render(&after, &changes, false, "20260101000000", "from_metadata");
+        assert!(
+            m.body.contains("ADD COLUMN origin text NULL"),
+            "the migration has to actually add it:\n{}",
+            m.body
+        );
+    }
+
+    /// `migrate` resolved an added column out of `reg.metrics` only, so a new
+    /// `[[dimension]]` produced a migration that classified itself "add nullable column"
+    /// and then emitted no DDL — a fresh install got the column and an upgrade did not,
+    /// with nothing recording the divergence. Before the guard it emitted
+    /// `ALTER TABLE observations ;` instead, which at least failed loudly.
+    #[test]
+    fn a_new_stored_dimension_actually_gets_its_alter_table() {
+        let before = reg(&metric("a", "ca", 4, ""));
+        let s = snap(&before);
+        let after: Registry = toml::from_str(&format!(
+            "{PRELUDE}\n{}\n[[dimension]]\nkey = \"probe\"\ncolumn = \"probe\"\n\
+             sql_type = \"text\"\nrole = \"attribute\"\nfield_number = 900\n\
+             proto_name = \"probe\"\nproto_type = \"string\"\nlabel = \"Probe\"\n\
+             introduced_in = \"0.2.0\"\n",
+            metric("a", "ca", 4, "")
+        ))
+        .expect("fixture parses");
+
+        let changes = against_snapshot(&after, &s, false).expect("not fatal");
+        let m = crate::migrate::render(&after, &changes, false, "20260101000000", "add_probe");
+        assert!(
+            m.body.contains("ADD COLUMN probe text NULL"),
+            "the generated DDL gains this column, so the migration must too:\n{}",
+            m.body
+        );
+        // And what `codegen` writes agrees with what the migration applies.
+        assert!(crate::gen::all(&after)["generated/sql/020_observations.sql"].contains("probe"));
+    }
+
+    #[test]
+    fn a_deprecated_in_without_deprecation_is_fatal_for_both_kinds() {
+        let d = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("deprecated_in = \"0.3.0\"")
+        ));
+        let e = registry_internal(&d).unwrap_err();
+        assert!(
+            e.contains("dimension 'origin' names a deprecated_in version but is not deprecated"),
+            "{e}"
+        );
+
+        let m = reg(&metric("a", "ca", 4, "deprecated_in = \"0.3.0\""));
+        let e = registry_internal(&m).unwrap_err();
+        assert!(
+            e.contains("metric 'a' names a deprecated_in version but is not deprecated"),
+            "{e}"
+        );
+    }
+
+    /// A metadata dimension is not a live column, so it must not be counted as one —
+    /// `budget` reports what the generated DDL declares.
+    #[test]
+    fn a_metadata_dimension_is_not_a_live_column() {
+        let plain = reg(&metric("a", "ca", 4, ""));
+        let with_meta = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("")
+        ));
+        assert_eq!(
+            budget(&plain, None).live_columns,
+            budget(&with_meta, None).live_columns,
+            "adding a metadata dimension declares no column"
+        );
+        assert_eq!(
+            budget(&with_meta, None).allocated_columns,
+            budget(&plain, None).allocated_columns + 1,
+            "it does allocate an identifier, and the budget counts those (H-4)"
+        );
     }
 
     #[test]

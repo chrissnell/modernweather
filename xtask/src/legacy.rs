@@ -342,13 +342,13 @@ pub fn all(reg: &Registry, go: &GoViews) -> Files {
 fn expected_raw_columns(reg: &Registry) -> Vec<(String, &'static str, &'static str)> {
     let mut v: Vec<(String, &'static str, &'static str)> = Vec::new();
     for d in &reg.dimensions {
-        if d.role == Role::Partition {
-            continue;
-        }
         let kind = match d.role {
             Role::Time => "time",
             Role::Attribute => "attribute",
-            Role::Partition => unreachable!(),
+            // The old table has no station_id, and a `metadata` dimension is not a
+            // column on either side of the import (N-14). Both are skipped here
+            // rather than above so there is one list of what this function covers.
+            Role::Partition | Role::Metadata => continue,
         };
         v.push((d.column.clone(), d.sql_type.ddl(), kind));
     }
@@ -1294,6 +1294,64 @@ mod tests {
         )
     }
 
+    /// The real registry has no `metadata` dimension, so every other test in this module
+    /// exercises the metadata branch of `expected_raw_columns` vacuously. This one takes
+    /// the real registry and splices one in, which is the only way to see that branch
+    /// run at all.
+    ///
+    /// It matters here more than it looks: `expected_raw_columns` drives the staging
+    /// table's `expected_column` rows, and a column named there that the destination
+    /// does not have fails the import mid-run, against production data, after the
+    /// archive has been taken.
+    fn registry_with_a_metadata_dimension() -> Registry {
+        let root = crate::repo_root();
+        let mut text =
+            std::fs::read_to_string(root.join(crate::REGISTRY)).expect("registry is readable");
+        text.push_str(
+            "\n[[dimension]]\nkey = \"origin\"\ncolumn = \"origin\"\nsql_type = \"text\"\n\
+             role = \"metadata\"\nfield_number = 900\nproto_name = \"origin\"\n\
+             proto_type = \"string\"\nlabel = \"Origin\"\nintroduced_in = \"0.2.0\"\n",
+        );
+        let reg: Registry = toml::from_str(&text).expect("fixture parses");
+        crate::validate::registry_internal(&reg).expect("fixture is a valid registry");
+        reg
+    }
+
+    #[test]
+    fn the_import_does_not_expect_a_metadata_dimension_from_the_old_table() {
+        let reg = registry_with_a_metadata_dimension();
+        let baseline = expected_raw_columns(&inputs().0).len();
+        let cols = expected_raw_columns(&reg);
+        assert_eq!(
+            cols.len(),
+            baseline,
+            "a metadata dimension is not a column on either side of the import"
+        );
+        assert!(
+            !cols.iter().any(|(c, _, _)| c == "origin"),
+            "expected_raw_columns names it: {cols:?}"
+        );
+        // The stored dimensions it must still expect are there, so this is not passing
+        // because the loop emitted nothing.
+        assert!(cols.iter().any(|(c, _, k)| c == "time" && *k == "time"));
+        assert!(cols
+            .iter()
+            .any(|(c, _, k)| c == "stationname" && *k == "attribute"));
+    }
+
+    #[test]
+    fn no_emitted_migration_sql_names_a_metadata_dimension() {
+        let reg = registry_with_a_metadata_dimension();
+        let go = inputs().1;
+        for (path, body) in all(&reg, &go) {
+            assert!(
+                !body.contains("origin"),
+                "{path} names a column the old table does not have and the new one \
+                 never will"
+            );
+        }
+    }
+
     #[test]
     fn the_go_view_inventory_covers_every_column_of_the_old_views() {
         let (_, go) = inputs();
@@ -1507,7 +1565,7 @@ mod tests {
             "the old table has no station_id"
         );
         for d in &reg.dimensions {
-            if d.role == Role::Partition {
+            if d.role == Role::Partition || !d.role.stored() {
                 continue;
             }
             assert!(staging.contains(&format!("('{}', ", d.column)));

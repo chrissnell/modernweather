@@ -40,6 +40,18 @@ pub struct Allocated {
     pub introduced_in: String,
 }
 
+/// A dimension that is a column of the raw hypertable.
+pub const DIMENSION: &str = "dimension";
+/// A dimension that is not (N-14). A distinct `kind` rather than a new field, so that
+/// `metrics/snapshot.toml` needs no format change: every entry it already holds is a
+/// column, and this value can only appear on an entry written after M1-2.
+pub const METADATA_DIMENSION: &str = "metadata_dimension";
+
+/// Whether this entry is a dimension of either sort.
+pub fn is_dimension(kind: &str) -> bool {
+    kind == DIMENSION || kind == METADATA_DIMENSION
+}
+
 impl Snapshot {
     pub fn load(path: &Path) -> Result<Snapshot, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -56,7 +68,17 @@ pub fn from_registry(reg: &Registry) -> Vec<Allocated> {
     let mut out: Vec<Allocated> = Vec::new();
     for d in &reg.dimensions {
         out.push(Allocated {
-            kind: "dimension".into(),
+            // `kind` is what makes a role change visible to the diff. The snapshot does
+            // not record a role, and adding one would mean a format change and a
+            // regeneration of all 216 committed entries — but `kind` is already written
+            // for every one of them, and every existing dimension is a column. So a
+            // dimension that stops being a column changes kind, and the diff below
+            // classifies that rather than seeing no change at all.
+            kind: if d.role.stored() {
+                DIMENSION.into()
+            } else {
+                METADATA_DIMENSION.into()
+            },
             key: d.key.clone(),
             column: d.column.clone(),
             sql_type: d.sql_type.ddl().into(),
@@ -65,7 +87,11 @@ pub fn from_registry(reg: &Registry) -> Vec<Allocated> {
             aggregates: vec![],
             mean_representation: None,
             levels: vec![],
-            deprecated: false,
+            // Read from the registry rather than hard-coded false. That constant was
+            // the one-way door: with it, no `[[dimension]]` could ever be retired,
+            // because the only escape from the disappearance FATAL is
+            // `deprecated = true` (N-14). Validation gates which roles may use it.
+            deprecated: d.deprecated,
             introduced_in: d.introduced_in.clone(),
         });
     }
@@ -167,16 +193,52 @@ pub fn diff(snap: &Snapshot, reg: &Registry) -> Vec<Change> {
 
     for n in &new {
         let Some(o) = old.get(n.key.as_str()) else {
+            // A `metadata` dimension allocates a protobuf field number and nothing
+            // else, so saying "new column" of it would be false. The change is still
+            // recorded: it is what makes `migrate` write the number into the snapshot,
+            // which is what keeps it from ever being handed to anything else (D-21).
+            let detail = if n.kind == METADATA_DIMENSION {
+                format!(
+                    "new metadata dimension {}, protobuf field {} — no column (N-14)",
+                    n.key, n.field_number
+                )
+            } else {
+                format!(
+                    "new {} {} ({} {}), protobuf field {}",
+                    n.kind, n.column, n.column, n.sql_type, n.field_number
+                )
+            };
+            changes.push(Change {
+                class: Class::AddColumn,
+                key: n.key.clone(),
+                detail,
+            });
+            continue;
+        };
+        // A dimension changing role across the stored/not-stored line. Neither
+        // direction is a no-op and neither was visible before: `column`, `sql_type`,
+        // `proto_type` and `deprecated` are all unchanged by a role edit, so without
+        // this the diff produced nothing at all and `codegen` quietly rewrote the DDL.
+        if o.kind == DIMENSION && n.kind == METADATA_DIMENSION {
+            changes.push(Change {
+                class: Class::Breaking,
+                key: n.key.clone(),
+                detail: format!(
+                    "role changed to \"metadata\": column {} leaves the generated DDL",
+                    o.column
+                ),
+            });
+        }
+        if o.kind == METADATA_DIMENSION && n.kind == DIMENSION {
             changes.push(Change {
                 class: Class::AddColumn,
                 key: n.key.clone(),
                 detail: format!(
-                    "new {} {} ({} {}), protobuf field {}",
-                    n.kind, n.column, n.column, n.sql_type, n.field_number
+                    "role changed from \"metadata\": {} ({} {}) becomes a column",
+                    n.key, n.column, n.sql_type
                 ),
             });
-            continue;
-        };
+        }
         if o.column != n.column {
             changes.push(Change {
                 class: Class::Breaking,
@@ -220,10 +282,18 @@ pub fn diff(snap: &Snapshot, reg: &Registry) -> Vec<Change> {
             });
         }
         if !o.deprecated && n.deprecated {
+            let detail = if n.kind == METADATA_DIMENSION {
+                format!(
+                    "metadata dimension {} retired; protobuf field {} stays reserved",
+                    n.key, n.field_number
+                )
+            } else {
+                format!("{} deprecated; identifiers retained", n.column)
+            };
             changes.push(Change {
                 class: Class::Deprecate,
                 key: n.key.clone(),
-                detail: format!("{} deprecated; identifiers retained", n.column),
+                detail,
             });
         }
         if o.deprecated && !n.deprecated {
