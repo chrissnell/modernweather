@@ -13,8 +13,12 @@
 //!
 //! Exit codes:
 //!   0  success, or `--check` found no drift
-//!   1  `--check` found drift, or a gate failed
+//!   1  `--check` found drift
 //!   2  an invariant was violated, or usage was wrong
+//!
+//! `gate <id>` exits with its command's own code rather than a code of its own, so a
+//! gate that runs `codegen --check` keeps the 1-means-drift, 2-means-rejected
+//! distinction that code made (C-W2-20).
 
 mod coverage;
 mod dist;
@@ -51,7 +55,9 @@ fn main() -> ExitCode {
         "budget" => budget(&root),
         "validate" => validate_cmd(&root),
         "gates" => gates::list(&owned).map(|()| ExitCode::SUCCESS),
-        "gate" => gates::run(&owned).map(|()| ExitCode::SUCCESS),
+        // Not mapped to a code of its own: the gate's command has already decided what
+        // its failure means, and collapsing that was C-W2-20.
+        "gate" => gates::run(&owned),
         "coverage" => coverage::main(&owned).map(|()| ExitCode::SUCCESS),
         "dist" => dist::main(&owned).map(|()| ExitCode::SUCCESS),
         "targets" => dist::targets(&owned).map(|()| ExitCode::SUCCESS),
@@ -115,7 +121,9 @@ fn usage() {
          \n\
          the gate and the release pipeline (W8)\n\
          \x20 gates [--markdown] show every deferred gate and whether it is armed\n\
-         \x20 gate <id>          run one gate, or report it as deferred and succeed\n\
+         \x20 gate <id>          run one gate, or report it as deferred and succeed.\n\
+         \x20                    Exits with the command's own code, and reports the\n\
+         \x20                    meaning that code has in ci/gates.toml.\n\
          \x20 coverage --check   compare line coverage against ci/coverage-floor.txt\n\
          \x20          --bump    raise the floor to the measured value\n\
          \x20 dist --target <t>  build and package one release artefact\n\
@@ -123,7 +131,8 @@ fn usage() {
          \x20 targets            the release matrix from ci/release.toml, as JSON for a\n\
          \x20        [--linux-only]  GitHub Actions strategy.matrix\n\
          \n\
-         Exit codes: 0 ok \u{b7} 1 drift found by --check \u{b7} 2 invariant violated or bad usage"
+         Exit codes: 0 ok \u{b7} 1 drift found by --check \u{b7} 2 invariant violated or bad \
+         usage \u{b7} gate <id>: the gate command's own code"
     );
 }
 
