@@ -695,9 +695,10 @@ reader might expect are deliberately absent.
 
 | Milestone | Needs | Blocking? |
 |---|---|---|
+| **M0-1** | **O-12 — a dedicated Talos worker node for the database.** NVMe-backed, not NFS: W4 D-26's refresh policy has 3.06–3.22 s of measured lag against a 10-second deadline and ~47% of a durable refresh is WAL fsync, so disk *latency* is the spec and capacity is not (a decade is ~36 GB). `big-bulky-1` was rejected 2026-10-31 as too busy with map builds | **Yes for M0-1, which blocks M5-1 and — through M0-2 — cutover.** Nothing in M1 or M2 touches a real database, so this is not on the critical path yet |
 | ~~—~~ | ~~**O-2** archive-then-pause the raw retention policy~~ | **Done 2026-10-31.** Archive taken and verified; job 1004 paused. The loss it was racing had **already completed** — see §8 |
-| M5-1 | **O-1** the production version | **Yes.** Below TimescaleDB 2.9 the hierarchy cannot be built and M5-1 becomes a major-version upgrade |
-| M5-1 | **O-7** the history option | Yes for M5-1's scope; the archive copy is correct either way |
+| ~~M5-1~~ | ~~**O-1** the production version~~ | **Answered 2026-10-31: PostgreSQL 16.6 / TimescaleDB 2.17.2.** Above 2.9, so the hierarchy is constructible and M5-1 is **not** a major-version upgrade — the new instance is pg17/2.31 and W9's logical export/import bridges them. The source half of that procedure has since been re-verified on the 16.6/2.17.2 pair |
+| ~~M5-1~~ | ~~**O-7** the history option~~ | **Moot.** §8 established there is nothing to carry: the ~294 rollup-only days were already destroyed, and §8.1b shows `/span` refuses any span over a year, so no endpoint could have served them. The archive was still taken and is redundant rather than irreplaceable |
 | ~~M4-2~~ | ~~**O-5** the `/stationinfo` hazard~~ | **Answered: option (b).** Ships as a signed deviation with a new fixture |
 | ~~M6-2, M7-4~~ | ~~**O-8** the RF beacon floor~~ | **Answered: 600 s.** M7-4's migration raises a sub-600 s KISS device with a one-line report |
 | ~~M7-2~~ | ~~**O-10** the four admin-surface calls~~ | **Answered: all four accepted** |
