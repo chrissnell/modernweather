@@ -46,15 +46,56 @@ describing a frozen tree at a named commit."""
 
 [[gate]]
 id = "conformance"
-description = "Frozen legacy REST contract replayed against the built binary"
-owner = "W1 (frozen contract)"
-arms_when = "tests/conformance/manifest.toml"
+description = "Frozen legacy REST contract replayed against the built Rust binary"
+owner = "W1 (frozen contract); runner driven by W3 §1.8"
+arms_when = "crates/modernweather/Cargo.toml"
 cmd = ["cargo", "xtask", "conformance", "--target-binary", "target/debug/modernweather"]
 note = """
-DESIGN.md R-3: the runner takes a base URL, so the same fixtures run against the Go
-daemon (which proves the fixtures describe reality) and against the Rust daemon (which
-proves the rewrite matches). Only the Rust run belongs in the PR gate; the Go run is a
-fixture-validity check and lives in the scheduled workflow."""
+DESIGN.md R-3 splits into TWO checks, and this gate is only the second of them:
+
+  1. fixture validity  - replay against the GO daemon, proving the fixtures describe
+                         reality. Possible today. Gate `conformance-fixtures` below.
+  2. rewrite conformance - replay against the RUST daemon, proving the rewrite matches.
+                         Impossible until a daemon exists. This gate.
+
+W6 repointed `arms_when`. It previously named `tests/conformance/manifest.toml`, a path
+nothing was going to create: W1 shipped the runner as a standalone crate at
+contract/conformance/ with 70 fixtures in contract/fixtures/, per W1 Decision 7. So this
+gate reported DEFERRED and exited 0 on every PR while the suite it guards -- whose own
+"done when" required it to pass -- had never run in CI. See docs/reconciliation.md G-1.
+
+It now arms on the daemon's own manifest, which is what actually makes a Rust-target
+replay possible (and is the same path ci/release.toml uses as `crate_manifest`). Arming
+it on contract/fixtures/ instead -- W3 §1.8's recommendation -- would arm it immediately
+and then fail, because `cargo xtask conformance` does not exist yet and there is no
+daemon to target. That is the mirror of the original defect, not its cure.
+
+DESIGN.md D-64: a gate's arms_when must name a path that some work item's done-criteria
+require it to create. This one is created by implementation-plan.md M2-1; the xtask
+subcommand is M2-5; a green run is M4-2's headline done-criterion."""
+
+[[gate]]
+id = "conformance-fixtures"
+description = "Frozen legacy REST fixtures replayed against the Go daemon, with a negative control"
+owner = "implementation-plan.md M1-4 (work item N-3)"
+arms_when = "ci/conformance/go-target.sh"
+cmd = ["ci/conformance/go-target.sh"]
+note = """
+The half of DESIGN.md R-3 that is possible today and has never run: point the runner at
+the GO daemon, which proves the 70 fixtures describe reality rather than describing what
+the rewrite happens to do.
+
+W1 Decision 10 is the reason this is not just "replay and check green": a green
+conformance run is only accepted alongside a PASSING NEGATIVE CONTROL. The harness must
+run contract/tools/rig/mangle_proxy.py -- kept in-tree for exactly this purpose -- and
+assert the suite FAILS through it. A conformance suite that cannot be made to fail
+proves nothing.
+
+The harness needs a Go toolchain, a timescale/timescaledb-ha:pg17 service container and
+W1's seeding rig (contract/tools/rig/), so it is real work rather than a one-line fix --
+which is why it is a named work item and why this gate is declared deferred rather than
+armed. The work item that writes ci/conformance/go-target.sh turns the gate on, which is
+the deferred mechanism used as designed."""
 
 [[gate]]
 id = "db-migrate-twice"
@@ -88,3 +129,97 @@ note = """
 A ratchet, not a threshold. DESIGN.md's prompt for this item is explicit that a fixed
 target invites tests written to hit a number; a floor that can only rise cannot be
 gamed downward and needs no arbitrary target."""
+
+[[gate]]
+id = "layout"
+description = "Crate layer order, forbidden dependencies and template escaping"
+owner = "W3 §1.4 (implementation-plan.md M2-1)"
+arms_when = "crates/mw-types/Cargo.toml"
+cmd = ["cargo", "xtask", "gate-layout"]
+note = """
+W3 Decision 1's entire argument for eighteen crates rather than one is that "forbidden to
+depend on" is only enforceable as a Cargo.toml fact. That covers the dependency edges.
+It does NOT cover the rest of W3 Decision 11, which this gate is the only enforcement of:
+the layer order, each crate's forbidden list, "only mw-types mentions generated/", "only
+mw-http binds a socket", "only the binary depends on anyhow", and W3 Decision 81's rule
+that no template under crates/mw-web/templates/ may use `safe` or `escape("none")`.
+
+Declared here by W6 because W3 assumption 55 named it and, having written no code, could
+not declare it -- and an undeclared gate is how a decision becomes a code-review
+preference. See docs/reconciliation.md G-4.
+
+M2-1's done-criteria require this gate to be seen FAILING (add a forbidden dependency to
+a scratch manifest, assert rejection) before it is trusted. A boundary gate nobody has
+watched fail is docs/reconciliation.md G-1 again."""
+
+[[gate]]
+id = "db-tests"
+description = "Tests that need a real TimescaleDB, which fail rather than skip"
+owner = "W3 §8.2 (implementation-plan.md M3-3)"
+arms_when = "crates/mw-store/tests/db.rs"
+cmd = ["cargo", "xtask", "db-tests"]
+note = """
+W3 Decision 84: database tests FAIL CI if they skip, so "green because it did not run" is
+unreachable. That is the exact failure mode docs/reconciliation.md G-1 documents, named as
+a decision in one document and -- until now -- undeclared in the manifest that enforces it.
+
+Note the contrast with contract/conformance/tests/conformance.rs, which self-skips when
+CONFORMANCE_BASE_URL is unset. That is correct for a crate that must stay green in a
+checkout with no server, and it is why the conformance gates above drive the BINARY rather
+than relying on `cargo test` to notice.
+
+Declared by W6 per W3 assumption 55. See docs/reconciliation.md G-4."""
+
+[[gate]]
+id = "mgmt-schema-drift"
+description = "The management OpenAPI schema and its TypeScript client match the Rust handlers"
+owner = "W5 §4.3 (implementation-plan.md M7-1)"
+arms_when = "crates/mw-api-mgmt/Cargo.toml"
+cmd = ["cargo", "xtask", "mgmt-schema", "--check"]
+note = """
+Separate from codegen-drift on purpose, following legacy-import-drift's precedent exactly.
+
+W5 assumption 36 expected generated/openapi/management.json and the TypeScript client to
+ride the existing codegen-drift gate. W9 Decision 20 had already settled the opposite
+principle for the same situation and gave the reason: `cargo xtask codegen --check` should
+keep meaning precisely "generated/ matches metrics/registry.toml", because that is the
+sentence a reviewer relies on when a PR touches generated code. This emitter has a
+different input -- the Rust handler set, via utoipa -- so it gets its own gate.
+
+DESIGN.md D-57. See docs/reconciliation.md C-W5-36.
+
+Needs the same "assert the check left the tree clean" step in pr.yml that codegen-drift
+and legacy-import-drift both have (DESIGN.md R-2): a check that writes its own fix into
+the tree always passes."""
+
+[[gate]]
+id = "ui-bundle"
+description = "The management UI's bundle is inside its budget"
+owner = "W5 §6.5 (implementation-plan.md M7-3)"
+arms_when = "ui/budget.toml"
+cmd = ["cargo", "xtask", "gate-ui-bundle"]
+note = """
+W5 Decision 50: 150 KB gzipped initial route, 280 KB all routes, 60 KB largest lazy chunk,
+plus a separate 45 KB font line. W5 Decision 51 names the three things the current UI does
+that this budget exists to prevent: no date library, no CDN, no chart library.
+
+Declared by W6 per W5 assumption 43. See docs/reconciliation.md G-4."""
+
+[[gate]]
+id = "ui-copy"
+description = "No internal term reaches a user-facing string"
+owner = "W5 §6.6 (implementation-plan.md M7-3)"
+arms_when = "ui/src/lib/copy/index.ts"
+cmd = ["cargo", "xtask", "gate-ui-copy"]
+note = """
+DESIGN.md D-36 says an internal term on screen is a bug rather than a documentation gap,
+which is the right standard with no mechanism behind it. A-W5-2 exists to give it one:
+user-facing strings live in a single copy module and this gate fails the build on a banned
+internal term, printing the current exception list on every run so a deliberate exception
+is visible rather than silent.
+
+W5's own words on why the mechanism is the decision: every team that has written that
+sentence has also shipped the term. Without this gate D-36 degrades into a code-review
+preference within a release or two.
+
+Declared by W6 per W5 assumption 43. See docs/reconciliation.md G-4."""

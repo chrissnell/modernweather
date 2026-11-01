@@ -48,13 +48,33 @@ the pipeline (W3 → runtime spine) and the UI (W5 → UI build); it is not an o
 These cost minutes and gate correctness; none of them belongs to a work item, so they are listed
 here rather than assumed.
 
-1. **Stop the ongoing raw-data loss now.** The production database's 365-day raw retention policy is
-   active and fires daily, so every day of this multi-stage program permanently converts one more day
-   of raw readings into rollup-only history (the ~294-day problem, still growing — and the 1m/5m
-   aggregates on 1-month/6-month retention lose their tails faster). Pause it
-   (`SELECT remove_retention_policy('weather');` — roughly 1.6 GB/month of uncompressed growth) or
-   take a verified `pg_dump` snapshot, and take W9 §1's cheap `weather_1d`/`weather_1h` archive
-   copies at the same time. W9 formalises the migration later; this step just stops the bleeding.
+1. **Stop the ongoing raw-data loss now — and take the archive copy FIRST.** The production
+   database's 365-day raw retention policy is active and fires daily, so every day of this
+   multi-stage program permanently converts one more day of raw readings into rollup-only history
+   (the ~294-day problem, still growing — and the 1m/5m aggregates on 1-month/6-month retention lose
+   their tails faster).
+
+   **Corrected by W9, 2026-10-30 — the order matters and the original wording had it backwards.**
+   This item originally read "pause it … and take the archive copies at the same time", treating the
+   two as one action. They are not, and pausing is **not** what protects the aggregate buckets. W9
+   measured (`docs/data-migration.md` D-1) that `drop_chunks` on the raw hypertable **logs an
+   invalidation** over the dropped range, so the next refresh of any level over that range —
+   *including that level's own ordinary scheduled policy* — deletes the buckets whose raw has gone. A
+   manual refresh removed 21 of 29 daily buckets; one policy run removed 41 of 83. So the ~294 days
+   of rollup are at risk from a **refresh**, not only from retention.
+
+   Therefore, in this order:
+
+   1. **Take the archive copy** — `ci/db/migrate-from-go/migrate-from-go.sh archive`, roughly 3 MB
+      and 3 seconds. It is correct under **every** answer to the version question below, which is
+      what makes it safe to do before knowing anything else. This is the only step in the whole
+      migration that writes to the source database, which is why W9 made it a separately named step.
+   2. **Then** pause retention (`SELECT remove_retention_policy('weather');` — roughly 1.6 GB/month
+      of uncompressed growth) or take a verified `pg_dump` snapshot.
+   3. **Never** run `refresh_continuous_aggregate` over history on the old database, and never
+      re-enable a refresh policy there.
+
+   See `docs/DESIGN.md`'s amendment **A-W9-1** and `docs/reconciliation.md` **O-2**.
 2. ~~**Register the iOS repo as a project resource.**~~ **Done 2026-10-28.**
    `git@github.com:chrissnell/RemoteWeather.app.git` is attached to the `modernweather` project as a
    `github_repo` resource (default branch `main`) and `multica repo checkout` against it is verified
@@ -198,13 +218,22 @@ window. The owner expects `/snow` to be hit at a rate comparable to `/latest` on
 because the same clients poll both. **Do not treat `/snow` as negligible** — it is a second hot path,
 and per request it is the *more* expensive of the two.
 
-`/latest` currently costs **7 TimescaleDB round trips plus 1 SQLite query per request** inside a
+`/latest` currently costs **12 TimescaleDB round trips plus 1 SQLite query per request** inside a
 202-line handler: latest reading, daily rain, monthly rain, yearly rain,
 `get_rainfall_with_recent()` (with a fallback query if it errors), `calculate_storm_rainfall()`,
-`calculate_wind_gust()`, and `GetSunTimes()`. At the measured volume that is roughly **124,000
-TimescaleDB queries** recomputing answers that change at most every two seconds.
+`calculate_wind_gust()`, and `GetSunTimes()`.
 
-`/snow` costs **7 round trips** in a 211-line handler: a snow-cache lookup, then
+> **Corrected by W3, 2026-10-28 — this table said 7.** Recounted against `remoteweather` @ `c3ec9f7`
+> rather than transcribed: `rg -n 'db.DB.Raw' internal/controllers/rainfall_calc.go` gives **8**
+> across four functions, plus `restserver/handlers.go` lines 263, 308, 335, 354 and 367. The
+> conclusion is unchanged and strengthened — at the measured volume that is roughly **213,000**
+> TimescaleDB queries, not 124,000, recomputing answers that change at most every two seconds. W3
+> Decision 35 is what removes them: the `/latest` handler performs **no** queries, enforced
+> structurally because `api:legacy` is not handed a `ReadingStore` handle.
+
+`/snow` costs **4 round trips on a cache hit and 8 on a miss** (corrected by W3 from "7"; see
+`internal/controllers/restserver/handlers.go:406-613` — the `snow_totals_cache` read at `:494` and
+the four function calls in the `else` arm) in a 211-line handler: a snow-cache lookup, then
 `get_new_snow_midnight()`, `get_new_snow_24h()`, `get_new_snow_72h()`,
 `calculate_total_season_snowfall()`, storm snowfall and snowfall rate. Several are window-scanning
 PL/pgSQL; the season total scans months. Note the shape: the handler reads the snow cache **and then
@@ -253,7 +282,18 @@ not yet owned by any prompt.
 | Aeris — **alerts** fetch (separate timer) | W2a |
 | Snow cache refresh | W2a |
 | Rainfall summary refresh (DB job) | W4 |
-| Sun-times precompute | W2a §4 |
+| ~~Sun-times precompute~~ | **deleted, not reassigned** — W2a Decision 36 |
+
+> **W2a Decision 36, recorded by W6.** The sun-times precompute is **deleted** rather than
+> rescheduled, so this row has no owner by design. The stored table is day-of-year keyed with no
+> horizon to exhaust, so neither offered trigger applies, and a pure Meeus evaluation is cheaper than
+> the lookup it replaces — it also fixes the stored table being slightly wrong in non-leap years.
+> **The deletion is gated on a check that did not exist when W2a wrote it:** OQ-B requires W1's
+> conformance runner to compare the served `sunrise`/`sunset` against a fresh evaluation, and the
+> runner asserts shape and formatting rather than values. That check is work item **N-10**
+> (`docs/implementation-plan.md` M5-3) and the deletion is M5-4, deliberately sequenced after it. If
+> they diverge, W2a §4.3 records the fallback component's shape. See `docs/reconciliation.md`
+> C-W2a-27.
 
 ### Services
 

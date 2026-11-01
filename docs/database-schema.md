@@ -35,6 +35,14 @@ TimescaleDB 2.31.0, `timescaledb_toolkit` 1.26.0, the same image the `database` 
 `fsync = on`, and PGDATA on node-local disk. The dataset is 35,942,400 raw rows: 4 stations at a
 2-second cadence over 208 days, 140 of the 216 columns populated, with a measured
 consecutive-identical ("hold") rate of **76.87%**. Production is ~143 columns and measures 19 GB/year;
+
+> **Corrected 2026-10-31 by measurement against production (W6 §5 Group A).** Two numbers in this
+> paragraph are wrong. Production's `weather` has **215 columns**, not ~143 — exactly the Go source
+> definition, so the "~72-column gap" (OQ-6) does not exist. And production's hold rate is **59.6%**,
+> not 76.87%, so **the 5.3× compression measured here is optimistic for this data**; W0's spike
+> established the ratio is driven almost entirely by that rate. The 19 GB/year figure is confirmed,
+> and it is *uncompressed* — production has zero compressed chunks. No decision moves (D-10), but
+> every capacity figure derived from 5.3× should be read as a floor.
 this load is 44 GB/year uncompressed, so it is roughly 2.3× production's volume at a comparable
 width. §6 states which figures are load-dependent and which are not.
 
