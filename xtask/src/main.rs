@@ -725,6 +725,79 @@ mod generated_compiles {
         assert!(m.body.contains("CREATE OR REPLACE FUNCTION mw_mean"));
     }
 
+    /// D-89 / G-3. Scans the emitted proto rather than the model, for the reason the
+    /// aggregate-SQL test gives: the model being right and the template being right are two
+    /// different claims, and this decision was made by three documents and implemented by
+    /// none of them for the whole design programme.
+    #[test]
+    fn every_metric_field_in_the_proto_carries_field_presence() {
+        let reg = load(&repo_root()).expect("registry is valid");
+        let files = super::gen::all(&reg);
+        let proto = files
+            .get("generated/proto/reading.proto")
+            .expect("the proto is generated");
+
+        for m in reg.live_metrics() {
+            let want = format!(
+                "optional {} {} = {};",
+                m.proto_type, m.proto_name, m.field_number
+            );
+            assert!(
+                proto.contains(&want),
+                "metric `{}` must be `optional` (D-89): without presence, an unreported metric \
+                 decodes as 0.0 and is stored instead of NULL, silently and permanently",
+                m.key
+            );
+        }
+    }
+
+    /// The converse, and the half that would rot first: a future generator change that
+    /// blanket-prefixed every field would break nothing visible and would put presence on
+    /// fields that are present by construction.
+    #[test]
+    fn no_dimension_field_in_the_proto_carries_field_presence() {
+        let reg = load(&repo_root()).expect("registry is valid");
+        let files = super::gen::all(&reg);
+        let proto = files
+            .get("generated/proto/reading.proto")
+            .expect("the proto is generated");
+
+        for d in &reg.dimensions {
+            let bad = format!("optional {} {} =", d.proto_type, d.proto_name);
+            assert!(
+                !proto.contains(&bad),
+                "dimension `{}` must not be `optional`: the time and partition dimensions are \
+                 present by construction, and the attribute dimensions are being removed \
+                 entirely (OQ-W4-2)",
+                d.key
+            );
+            let want = format!("{} {} = {};", d.proto_type, d.proto_name, d.field_number);
+            assert!(proto.contains(&want), "dimension `{}` is emitted", d.key);
+        }
+    }
+
+    /// `optional` is only wire-compatible because it changes no field number. This asserts
+    /// the property directly rather than trusting the claim in the generated header.
+    #[test]
+    fn field_presence_renumbers_nothing() {
+        let reg = load(&repo_root()).expect("registry is valid");
+        let files = super::gen::all(&reg);
+        let proto = files
+            .get("generated/proto/reading.proto")
+            .expect("the proto is generated");
+
+        for m in reg.live_metrics() {
+            let assignments = proto
+                .matches(&format!(" {} = {};", m.proto_name, m.field_number))
+                .count();
+            assert_eq!(
+                assignments, 1,
+                "`{}` must be assigned field number {} exactly once",
+                m.proto_name, m.field_number
+            );
+        }
+    }
+
     #[test]
     fn mean_is_stored_as_composable_state_in_a_wider_type() {
         let one_minute = aggregates::LEVELS[0];
