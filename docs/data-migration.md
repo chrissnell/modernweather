@@ -220,6 +220,26 @@ CREATE TABLE weather_1h_archive AS SELECT * FROM weather_1h;
 is **the only step in the whole procedure that writes to the source** — which is why it is a
 separate, explicitly named step rather than part of `all`.
 
+> **Source-side verified against production's version, 2026-11-01.** Everything else in this
+> document was exercised on `timescale/timescaledb-ha:pg17` (PostgreSQL 17.11 / TimescaleDB 2.31.0),
+> because that is what ships. Production turned out to be **PostgreSQL 16.6 / TimescaleDB 2.17.2**
+> (W6 O-1), and the half of this procedure that touches production had therefore never been run on
+> the version it will actually read from — W6's answer to O-1 settled the *target* side ("no in-place
+> upgrade, the new instance is pg17/2.31") and left this unexamined.
+>
+> Re-run on `timescale/timescaledb-ha:pg16.6-ts2.17.2`, the exact pair: `emit-old-schema.sh` builds
+> the Go schema and all four continuous aggregates cleanly, `00-preflight-source.sql` exits **0** with
+> empty stderr — so every `timescaledb_information.jobs`, `.job_stats`, `.continuous_aggregates` and
+> `.chunks` column it reads exists at 2.17.2 — and the §2 archive statements execute. `SRC_IMAGE` in
+> `lab/run-in-pod.sh` reproduces it.
+>
+> **Bounded claim:** this exercised the DDL and catalogue paths on an unseeded database, not a full
+> data run. The seeded end-to-end lab cannot be repeated at 2.17.2, because the target schema asserts
+> pg17/2.31 and refuses to build — which is correct, and is why the two halves are now separately
+> parameterised. Note also that `lab/10-seed.sh` manufactures the ~294 days of rollup-only history
+> on purpose; W6 §8 established production never had any, so the legacy-rollup path remains tested
+> only against a state that did not exist (D-71 keeps it anyway).
+
 **Through the view, not through `pg_dump -t`.** The prompt asserts that `pg_dump -t weather_1d`
 captures only a view definition. Verified:
 

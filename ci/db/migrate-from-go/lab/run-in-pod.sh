@@ -3,8 +3,15 @@
 # throwaway TimescaleDB pod, so that every statement the procedure sends to a production
 # database has already been executed against a faithful copy of the old schema.
 #
-# Production is unreachable from the agent runtime (W0 OQ-1), which is why this exists: a
-# migration procedure that has never been run is a proposal.
+# A migration procedure that has never been run is a proposal, which is why this exists.
+#
+# W0 OQ-1 recorded that production is unreachable from the agent runtime. That was wrong at
+# the network layer — the blocker was a credential — and production is PostgreSQL 16.6 with
+# TimescaleDB 2.17.2, not the pg17/2.31 this lab defaults to. The halves differ on purpose:
+# the TARGET is pg17/2.31 because that is what ships (D-2, asserted by
+# ci/sql/assert-timescaledb-version.sql), while the SOURCE is whatever pitcairn runs. Set
+# SRC_IMAGE to exercise the source half at production's version; see docs/data-migration.md
+# for the 2026-11-01 run that did.
 #
 #   ci/db/migrate-from-go/lab/run-in-pod.sh up        create the pod, both schemas, seed
 #   ci/db/migrate-from-go/lab/run-in-pod.sh migrate   run the whole procedure
@@ -17,6 +24,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 POD="${POD:-w9-migration-lab}"
 NS="${NS:-default}"
 IMAGE="${IMAGE:-timescale/timescaledb-ha:pg17}"
+# The source half only. Defaults to IMAGE so existing behaviour is unchanged; set it to
+# production's version to check the statements this procedure sends to pitcairn.
+SRC_IMAGE="${SRC_IMAGE:-$IMAGE}"
 OLD_DB=weather_v2_0_0
 NEW_DB=modernweather
 
