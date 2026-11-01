@@ -170,7 +170,8 @@ jobs:
             ci/db/migrate-from-go/extract-go-views.sh \
             ci/db/migrate-from-go/lab/run-in-pod.sh \
             ci/db/migrate-from-go/lab/emit-old-schema.sh \
-            ci/db/migrate-from-go/lab/10-seed.sh
+            ci/db/migrate-from-go/lab/10-seed.sh \
+            ci/conformance/go-target.sh
 
   gates:
     name: deferred gates
@@ -243,6 +244,98 @@ jobs:
           toolchain: ${{ env.RUST_STABLE }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo xtask gate conformance
+
+  conformance-fixtures:
+    name: frozen contract fixtures vs the Go daemon
+    runs-on: ubuntu-latest
+    services:
+      timescaledb:
+        # The same -ha image as the `database` job, for the same reason (DESIGN.md D-2): the
+        # daemon's startup provisioning uses timescaledb_toolkit, which the plain image has not
+        # got, so it would fail before serving a single fixture.
+        image: timescale/timescaledb-ha:pg17
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      # 127.0.0.1 rather than localhost: the service container publishes on IPv4 only, and the
+      # Go daemon's connection string is handed to lib/pq rather than to psql.
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGDATABASE: conformance
+      PGSSLMODE: disable
+    steps:
+      - uses: actions/checkout@v4
+      # The Go daemon is the target, so this job needs a Go toolchain as well as a Rust one.
+      # ci/conformance/go-target.sh checks remoteweather out itself, at the commit the fixtures
+      # were captured from, and verifies it got that commit.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: conformance-fixtures
+          # Two workspaces: the root one for xtask, which runs the gate, and
+          # contract/conformance, which is standalone on purpose (W1 Decision 7) so the runner
+          # stays buildable against the Go binary with no Rust daemon in the tree.
+          workspaces: |
+            .
+            contract/conformance
+      # The runner image ships both. The harness reaches the hypertable only through psql and
+      # writes the daemon's configuration only through sqlite3, so an image change that dropped
+      # either is worth one apt call rather than a confusing failure part-way through a run.
+      # Note the psql client may be a major version behind the server; that is fine for psql,
+      # unlike pg_dump, which is why the `database` job installs a 17 client and this one does not.
+      - name: Ensure psql and sqlite3 are present
+        run: |
+          missing=""
+          command -v psql    >/dev/null || missing="$missing postgresql-client"
+          command -v sqlite3 >/dev/null || missing="$missing sqlite3"
+          if [ -n "$missing" ]; then
+            sudo apt-get update
+            # shellcheck disable=SC2086  # deliberate word splitting: $missing is a package list
+            sudo apt-get install -y --no-install-recommends $missing
+          fi
+          psql --version
+          sqlite3 --version
+      # Both halves of W1 Decision 10 happen inside the gate: the fixtures are replayed against
+      # the daemon and must all pass, and then replayed through contract/tools/rig/mangle_proxy.py
+      # and must fail. A green run without the negative control is not accepted.
+      - name: Replay the fixtures against the Go daemon
+        run: cargo xtask gate conformance-fixtures
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo "## Conformance fixtures (Go target)"
+            echo
+            echo '```'
+            tail -n 3 target/conformance-go/direct.txt 2>/dev/null || echo "the accepted replay did not run"
+            echo '```'
+            echo '```'
+            tail -n 3 target/conformance-go/mangled.txt 2>/dev/null || echo "the negative control did not run"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the replay output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-fixtures-output
+          path: |
+            target/conformance-go/direct.txt
+            target/conformance-go/mangled.txt
+            target/conformance-go/logs/
+          if-no-files-found: ignore
 
   driver-emulators:
     name: Go emulators against Rust drivers
@@ -372,6 +465,7 @@ jobs:
       - codegen-drift
       - legacy-import-drift
       - conformance
+      - conformance-fixtures
       - driver-emulators
       - database
       - coverage

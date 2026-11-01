@@ -137,9 +137,21 @@ that is M5-5, after the migration has proved it reads them from `config.stations
 **Test strategy:** the round-trip above as a test, which is also the regression: today adding the
 5-minute level orphaned two files and left a tree `--check` rejects.
 
-### M1-4 — run the conformance suite against the Go daemon in CI *(N-3 / G-1)*
+### M1-4 — run the conformance suite against the Go daemon in CI *(N-3 / G-1)* — ✅ **DONE 2026-11-01**
 **Depends on:** nothing. **Blocks:** M2-5, and by the second ordering constraint every legacy
 endpoint in M4.
+**Landed:** `ci/conformance/go-target.sh` plus three SQL files and a README; a
+`conformance-fixtures` job in `pr.yml` wired into `gate`. 70/70 pass against the Go daemon, and
+the same harness fails 26 fixtures through `mangle_proxy.py`. Both failure directions were
+watched: `CONFORMANCE_FORCE_MANGLE=1` sends the accepted replay through the proxy and the gate
+goes red; `MIN_MANGLED_FAILURES=99` makes the negative-control floor reject a control that
+stopped biting. Two things had to be pinned for the run to be reproducible rather than
+green-by-luck, both documented in `ci/conformance/README.md`: the emulators derive their solar
+curve from their own wall clock, so they run in a fixed-offset zone at midday (otherwise
+`/almanac` loses `high_solar` on any runner whose clock reads after 18:00); and the hourly
+`refresh_almanac_cache` job is deleted after the migrations, because firing it post-seed adds
+four air-quality keys `almanac-populated` does not have. The `conformance` gate was confirmed
+deferred on `crates/modernweather/Cargo.toml`, a path M2-1 creates.
 The largest item in this milestone and the only one that is not small. Stand the Go daemon up in CI
 from `remoteweather` @ `c3ec9f7` against a `timescale/timescaledb-ha:pg17` service container, seed it
 with W1's rig (`contract/tools/rig/`), replay all 70 fixtures, and run

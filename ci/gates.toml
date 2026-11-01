@@ -81,21 +81,21 @@ owner = "implementation-plan.md M1-4 (work item N-3)"
 arms_when = "ci/conformance/go-target.sh"
 cmd = ["ci/conformance/go-target.sh"]
 note = """
-The half of DESIGN.md R-3 that is possible today and has never run: point the runner at
-the GO daemon, which proves the 70 fixtures describe reality rather than describing what
-the rewrite happens to do.
+The half of DESIGN.md R-3 that is possible today: point the runner at the GO daemon, which
+proves the 70 fixtures describe reality rather than describing what the rewrite happens to
+do. ARMED as of implementation-plan.md M1-4; it was declared here deferred by W8 and the
+work item that wrote ci/conformance/go-target.sh turned it on, which is the deferred
+mechanism used exactly as designed.
 
-W1 Decision 10 is the reason this is not just "replay and check green": a green
-conformance run is only accepted alongside a PASSING NEGATIVE CONTROL. The harness must
-run contract/tools/rig/mangle_proxy.py -- kept in-tree for exactly this purpose -- and
-assert the suite FAILS through it. A conformance suite that cannot be made to fail
-proves nothing.
+W1 Decision 10 is the reason this is not just "replay and check green": a green conformance
+run is only accepted alongside a PASSING NEGATIVE CONTROL. The harness replays the fixtures
+twice -- once against the daemon, where all 70 must pass, and once through
+contract/tools/rig/mangle_proxy.py, where it must FAIL on at least 26 of them. A suite that
+cannot be made to fail proves nothing, so the second replay failing is a precondition for
+the gate being green rather than a diagnostic.
 
-The harness needs a Go toolchain, a timescale/timescaledb-ha:pg17 service container and
-W1's seeding rig (contract/tools/rig/), so it is real work rather than a one-line fix --
-which is why it is a named work item and why this gate is declared deferred rather than
-armed. The work item that writes ci/conformance/go-target.sh turns the gate on, which is
-the deferred mechanism used as designed."""
+Run it locally with ci/conformance/README.md's one command; set CONFORMANCE_FORCE_MANGLE=1
+to watch the gate go red on demand."""
 
 [[gate]]
 id = "db-migrate-twice"
