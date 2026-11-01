@@ -2,3 +2,4 @@
 /dist
 /scratch
 Cargo.lock.orig
+/.conformance-go-src
