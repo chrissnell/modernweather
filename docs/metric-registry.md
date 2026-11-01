@@ -253,7 +253,8 @@ on an entry that is not deprecated, and one legacy JSON key claimed by two metri
 ### 2.2 Refused by default — one loud flag
 
 Column rename, SQL type change in either direction, protobuf type change, aggregation strategy
-change, mean-representation change, and un-deprecating a retired metric. Each of these is a
+change, mean-representation change, un-deprecating a retired entry, and **moving a dimension
+onto the `metadata` role**, which takes its column out of the generated DDL. Each of these is a
 real operation an operator may genuinely need, so each is refused rather than impossible.
 
 **The escape hatch is `cargo xtask migrate --allow-breaking`, and what it requires of the
@@ -266,6 +267,16 @@ decision to run it where it belongs. Concretely:
 - a **SQL type change** is emitted as `ALTER COLUMN ... TYPE`, with a comment saying that on a
   compressed hypertable this requires decompressing every chunk holding the column and
   recompressing afterwards, and that it should not be run against a live API.
+- a **move onto the `metadata` role** emits no `DROP COLUMN`, deliberately: a dropped column
+  keeps its attribute number forever and is charged twice against the ceiling once the
+  hypertable is compressed (H-4). The migration names the column, says it stays in place
+  unwritten, and warns that the writer must stop writing it first or readings lose the value
+  with no error. The identifier stays allocated in the snapshot either way.
+
+The snapshot records a dimension's stored-ness in its `kind` — `dimension` for a column,
+`metadata_dimension` for one that is not — which is what makes a role move visible to the
+diff at all. Nothing else about the entry changes when a role is edited, so without it the
+generator saw no change, reported `all check out`, and rewrote the DDL with the column gone.
 - a **protobuf type change** produces no SQL and a prominent comment, because the damage is
   entirely on the client side.
 - an **aggregation strategy change** produces a drop-and-recreate of every affected level.

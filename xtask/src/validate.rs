@@ -260,6 +260,12 @@ pub fn registry_internal(reg: &Registry) -> Result<(), String> {
                 m.key
             ));
         }
+        if !m.deprecated && m.deprecated_in.is_some() {
+            errs.push(format!(
+                "FATAL: metric '{}' names a deprecated_in version but is not deprecated",
+                m.key
+            ));
+        }
         if m.levels(&reg.defaults).is_empty() != m.aggregates.is_empty() {
             errs.push(format!(
                 "FATAL: metric '{}' has aggregates [{}] and levels [{}]. A metric with \
@@ -360,7 +366,7 @@ pub fn against_snapshot(
     // something, because the entry *is* the record that the identifiers are spoken for.
     for o in &snap.entries {
         if !new_keys.contains_key(o.key.as_str()) {
-            let how = if o.kind == "dimension" {
+            let how = if snapshot::is_dimension(&o.kind) {
                 "Removing a dimension does not delete its entry: set deprecated = true and \
                  deprecated_in = \"<version>\"\n\
                  \x20      so the identifiers stay allocated (D-21). Only a role = \"metadata\" \
@@ -1026,6 +1032,138 @@ introduced_in = "0.1.0"
             m.body.contains("there is nothing to do"),
             "and the migration says so:\n{}",
             m.body
+        );
+    }
+
+    /// Moving a dimension across the stored/not-stored line removes a column from the
+    /// generated DDL. Before `kind` distinguished the two, `from_registry` produced an
+    /// identical entry — same column, type, protobuf type, same `deprecated` — so the
+    /// diff saw **no change at all**: `validate` said "all check out" and `codegen`
+    /// quietly rewrote `020_observations.sql` with the column gone. M5-5 performs this
+    /// move on `station_name`, and this is the check that makes it say so.
+    #[test]
+    fn moving_a_dimension_to_the_metadata_role_is_breaking() {
+        let stored = format!(
+            "{PRELUDE}\n{}\n[[dimension]]\nkey = \"origin\"\ncolumn = \"origin\"\n\
+             sql_type = \"text\"\nrole = \"attribute\"\nfield_number = 900\n\
+             proto_name = \"origin\"\nproto_type = \"string\"\nlabel = \"Origin\"\n\
+             introduced_in = \"0.2.0\"\n",
+            metric("a", "ca", 4, "")
+        );
+        let before: Registry = toml::from_str(&stored).expect("fixture parses");
+        assert!(
+            crate::gen::all(&before)["generated/sql/020_observations.sql"].contains("origin"),
+            "it starts life as a column"
+        );
+        let s = snap(&before);
+
+        let after = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("")
+        ));
+        let e = against_snapshot(&after, &s, false).unwrap_err();
+        assert!(e.contains("REFUSED"), "{e}");
+        assert!(e.contains("column origin leaves the generated DDL"), "{e}");
+
+        // With the flag it is permitted, and the migration says what it will not do.
+        let changes = against_snapshot(&after, &s, true).expect("the flag permits it");
+        let m = crate::migrate::render(&after, &changes, false, "20260101000000", "to_metadata");
+        assert!(
+            m.body.contains("origin is no longer a generated column"),
+            "{}",
+            m.body
+        );
+        assert!(
+            !m.body.contains("DROP COLUMN origin"),
+            "a dropped column keeps its attribute number forever:\n{}",
+            m.body
+        );
+    }
+
+    /// The reverse. Not breaking — it adds a nullable column — but it must still be
+    /// seen, because a column that reaches `generated/sql/` and not the database is
+    /// exactly the drift D-8 exists to prevent.
+    #[test]
+    fn moving_a_dimension_off_the_metadata_role_adds_a_column() {
+        let before = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("")
+        ));
+        let s = snap(&before);
+        let after: Registry = toml::from_str(&format!(
+            "{PRELUDE}\n{}\n[[dimension]]\nkey = \"origin\"\ncolumn = \"origin\"\n\
+             sql_type = \"text\"\nrole = \"attribute\"\nfield_number = 900\n\
+             proto_name = \"origin\"\nproto_type = \"string\"\nlabel = \"Origin\"\n\
+             introduced_in = \"0.2.0\"\n",
+            metric("a", "ca", 4, "")
+        ))
+        .expect("fixture parses");
+
+        let changes = against_snapshot(&after, &s, false).expect("adding a column is not breaking");
+        let c = changes
+            .iter()
+            .find(|c| c.key == "origin")
+            .expect("the transition is classified");
+        assert_eq!(c.class, Class::AddColumn);
+        assert!(c.detail.contains("becomes a column"), "{}", c.detail);
+
+        let m = crate::migrate::render(&after, &changes, false, "20260101000000", "from_metadata");
+        assert!(
+            m.body.contains("ADD COLUMN origin text NULL"),
+            "the migration has to actually add it:\n{}",
+            m.body
+        );
+    }
+
+    /// `migrate` resolved an added column out of `reg.metrics` only, so a new
+    /// `[[dimension]]` produced a migration that classified itself "add nullable column"
+    /// and then emitted no DDL — a fresh install got the column and an upgrade did not,
+    /// with nothing recording the divergence. Before the guard it emitted
+    /// `ALTER TABLE observations ;` instead, which at least failed loudly.
+    #[test]
+    fn a_new_stored_dimension_actually_gets_its_alter_table() {
+        let before = reg(&metric("a", "ca", 4, ""));
+        let s = snap(&before);
+        let after: Registry = toml::from_str(&format!(
+            "{PRELUDE}\n{}\n[[dimension]]\nkey = \"probe\"\ncolumn = \"probe\"\n\
+             sql_type = \"text\"\nrole = \"attribute\"\nfield_number = 900\n\
+             proto_name = \"probe\"\nproto_type = \"string\"\nlabel = \"Probe\"\n\
+             introduced_in = \"0.2.0\"\n",
+            metric("a", "ca", 4, "")
+        ))
+        .expect("fixture parses");
+
+        let changes = against_snapshot(&after, &s, false).expect("not fatal");
+        let m = crate::migrate::render(&after, &changes, false, "20260101000000", "add_probe");
+        assert!(
+            m.body.contains("ADD COLUMN probe text NULL"),
+            "the generated DDL gains this column, so the migration must too:\n{}",
+            m.body
+        );
+        // And what `codegen` writes agrees with what the migration applies.
+        assert!(crate::gen::all(&after)["generated/sql/020_observations.sql"].contains("probe"));
+    }
+
+    #[test]
+    fn a_deprecated_in_without_deprecation_is_fatal_for_both_kinds() {
+        let d = reg(&format!(
+            "{}{}",
+            metric("a", "ca", 4, ""),
+            metadata_dimension("deprecated_in = \"0.3.0\"")
+        ));
+        let e = registry_internal(&d).unwrap_err();
+        assert!(
+            e.contains("dimension 'origin' names a deprecated_in version but is not deprecated"),
+            "{e}"
+        );
+
+        let m = reg(&metric("a", "ca", 4, "deprecated_in = \"0.3.0\""));
+        let e = registry_internal(&m).unwrap_err();
+        assert!(
+            e.contains("metric 'a' names a deprecated_in version but is not deprecated"),
+            "{e}"
         );
     }
 

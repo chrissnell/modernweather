@@ -135,7 +135,12 @@ impl Role {
     }
 
     /// Is the value absent-able, and therefore an `Option` / `| null` / non-required
-    /// property in the generated types?
+    /// property in the generated types — and, for a stored dimension, a nullable column?
+    ///
+    /// Those are two claims, and they coincide only because `stored() && optional()`
+    /// is today exactly `Attribute`: the DDL caller never sees a `Metadata` dimension,
+    /// because `table_sql` iterates `stored_dimensions()`. A fifth role for which they
+    /// disagreed would need them separated.
     pub fn optional(self) -> bool {
         matches!(self, Role::Attribute | Role::Metadata)
     }
@@ -422,11 +427,16 @@ impl Registry {
 
     /// Dimensions that are columns of the raw hypertable. A `metadata` dimension is
     /// not one: it reaches the daemon on the wire and is never written per row.
+    ///
+    /// Deliberately not filtered on `deprecated`. Storage and deprecation are
+    /// orthogonal, exactly as they are for a metric — `table_sql` emits every metric
+    /// including the deprecated ones, because a retired column stays in the raw table
+    /// with its identifiers (D-21) and only leaves the aggregates and the generated
+    /// types. Today no stored dimension can be deprecated, so the two filters would
+    /// agree; if `Role::retirable` ever admits a stored role, filtering here would
+    /// silently delete a live column from the DDL instead.
     pub fn stored_dimensions(&self) -> Vec<&Dimension> {
-        self.dimensions
-            .iter()
-            .filter(|d| d.role.stored() && !d.deprecated)
-            .collect()
+        self.dimensions.iter().filter(|d| d.role.stored()).collect()
     }
 
     pub fn time_column(&self) -> &Dimension {

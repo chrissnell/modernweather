@@ -389,11 +389,21 @@ fn derive_name(changes: &[snapshot::Change]) -> String {
         .iter()
         .filter(|c| c.class == Class::Deprecate)
         .count();
+    // "entries", not "metrics": a dimension can reach both of these now (N-14), and the
+    // name lands in a permanent migration filename.
+    let first = |class: snapshot::Class| {
+        changes
+            .iter()
+            .find(|c| c.class == class)
+            .map(|c| c.key.clone())
+            .unwrap_or_default()
+    };
     match (adds, deps) {
         (0, 0) => "registry_metadata".into(),
-        (1, 0) => format!("add_{}", changes[0].key),
-        (n, 0) => format!("add_{n}_metrics"),
-        (0, n) => format!("deprecate_{n}_metrics"),
+        (1, 0) => format!("add_{}", first(Class::AddColumn)),
+        (n, 0) => format!("add_{n}_entries"),
+        (0, 1) => format!("deprecate_{}", first(Class::Deprecate)),
+        (0, n) => format!("deprecate_{n}_entries"),
         (a, d) => format!("add_{a}_deprecate_{d}"),
     }
 }
@@ -762,17 +772,38 @@ mod generated_compiles {
             .get("generated/proto/reading.proto")
             .expect("the proto is generated");
 
+        // Presence is asserted over *every* dimension, retired ones included: a retired
+        // field is absent from the proto, so the assertion holds trivially, and a
+        // generator that blanket-prefixed the message would still be caught.
         for d in &reg.dimensions {
             let bad = format!("optional {} {} =", d.proto_type, d.proto_name);
             assert!(
                 !proto.contains(&bad),
                 "dimension `{}` must not be `optional`: the time and partition dimensions are \
-                 present by construction, and the attribute dimensions are being removed \
-                 entirely (OQ-W4-2)",
+                 present by construction, the attribute dimensions are being removed entirely \
+                 (OQ-W4-2), and a `metadata` dimension is wire metadata rather than a \
+                 measurement (N-14)",
                 d.key
             );
+        }
+        // Emission is asserted over the live ones only. A retired dimension leaves the
+        // message and keeps its number `reserved` (D-21, N-14), so requiring it here
+        // would fail the suite the first time anything used that half of M1-2.
+        for d in reg.live_dimensions() {
             let want = format!("{} {} = {};", d.proto_type, d.proto_name, d.field_number);
             assert!(proto.contains(&want), "dimension `{}` is emitted", d.key);
+        }
+        for d in reg.dimensions.iter().filter(|d| d.deprecated) {
+            let gone = format!("{} {} = {};", d.proto_type, d.proto_name, d.field_number);
+            assert!(!proto.contains(&gone), "dimension `{}` is retired", d.key);
+            assert!(
+                proto.contains(&format!("reserved {}", d.field_number))
+                    || proto.contains(&format!(", {};", d.field_number))
+                    || proto.contains(&format!(", {},", d.field_number)),
+                "retired dimension `{}` must keep protobuf field {} reserved",
+                d.key,
+                d.field_number
+            );
         }
     }
 
