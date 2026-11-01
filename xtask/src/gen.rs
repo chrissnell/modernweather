@@ -4,7 +4,7 @@
 // (R-2), and every file lands under `generated/` so that the drift check is one path
 // and a PR touching generated code without touching the registry is wrong on sight.
 
-use crate::registry::{Registry, Role, Tier};
+use crate::registry::{Registry, Tier};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -114,15 +114,18 @@ fn table_sql(reg: &Registry) -> String {
     );
     let _ = writeln!(s, "CREATE TABLE {RAW_TABLE} (");
     let mut lines: Vec<String> = Vec::new();
-    let width = reg
-        .dimensions
+    // A `metadata` dimension is on the wire and in the reading types and is not a
+    // column here (N-14). It is excluded from the alignment width too, so adding one
+    // does not reflow the whole table.
+    let stored = reg.stored_dimensions();
+    let width = stored
         .iter()
         .map(|d| d.column.len())
         .chain(reg.metrics.iter().map(|m| m.column.len()))
         .max()
         .unwrap_or(10);
-    for d in &reg.dimensions {
-        let null = if d.role == Role::Attribute {
+    for d in &stored {
+        let null = if d.role.optional() {
             "NULL"
         } else {
             "NOT NULL"
@@ -349,6 +352,10 @@ fn proto(reg: &Registry) -> String {
     );
     let mut reserved: Vec<u32> = Vec::new();
     for d in &reg.dimensions {
+        if d.deprecated {
+            reserved.push(d.field_number);
+            continue;
+        }
         let _ = writeln!(
             s,
             "    {} {} = {};  // {}",
@@ -374,7 +381,11 @@ fn proto(reg: &Registry) -> String {
         );
     }
     if !reserved.is_empty() {
-        s.push_str("\n    // Deprecated metrics. The numbers stay reserved forever (D-21).\n");
+        s.push_str(
+            "\n    // Deprecated entries. The numbers stay reserved forever (D-21): reusing one\n\
+             \x20   // silently reinterprets historical data on every client not yet rebuilt.\n",
+        );
+        reserved.sort_unstable();
         let list: Vec<String> = reserved.iter().map(|n| n.to_string()).collect();
         let _ = writeln!(s, "    reserved {};", list.join(", "));
     }
@@ -401,10 +412,15 @@ fn rust_reading(reg: &Registry) -> String {
          #[derive(Debug, Clone, PartialEq, Default)]\n\
          pub struct Reading {\n",
     );
-    for d in &reg.dimensions {
+    for d in reg.live_dimensions() {
         let ty = d.sql_type.rust();
-        let _ = writeln!(s, "    /// {} (`{}`)", d.label, d.column);
-        if d.role == Role::Attribute {
+        if d.role.stored() {
+            let _ = writeln!(s, "    /// {} (`{}`)", d.label, d.column);
+        } else {
+            // There is no column to name, which is the whole distinction.
+            let _ = writeln!(s, "    /// {} (wire metadata, not a column)", d.label);
+        }
+        if d.role.optional() {
             let _ = writeln!(s, "    pub {}: Option<{ty}>,", rust_ident(&d.key));
         } else {
             let _ = writeln!(s, "    pub {}: {ty},", rust_ident(&d.key));
@@ -621,10 +637,10 @@ fn openapi(reg: &Registry) -> String {
     use serde_json::{json, Map, Value};
     let mut reading = Map::new();
     let mut required = Vec::new();
-    for d in &reg.dimensions {
+    for d in reg.live_dimensions() {
         let (t, f) = d.sql_type.openapi();
         reading.insert(d.key.clone(), prop(t, f, &d.label, None));
-        if d.role != Role::Attribute {
+        if !d.role.optional() {
             required.push(Value::String(d.key.clone()));
         }
     }
@@ -639,7 +655,7 @@ fn openapi(reg: &Registry) -> String {
     // metrics (rainfall windows, wind gust, cardinal direction, moon phase, the
     // formatted sun times) are W1's and are deliberately absent.
     let mut legacy = Map::new();
-    for d in &reg.dimensions {
+    for d in reg.live_dimensions() {
         for k in &d.legacy_rest_keys {
             let (t, f) = d.sql_type.openapi();
             legacy.insert(k.clone(), prop(t, f, &d.label, None));
@@ -726,13 +742,13 @@ fn prop(t: &str, f: Option<&str>, label: &str, unit: Option<&str>) -> serde_json
 fn ts_reading(reg: &Registry) -> String {
     let mut s = header("//");
     s.push_str("export interface Reading {\n");
-    for d in &reg.dimensions {
-        let opt = if d.role == Role::Attribute {
-            " | null"
+    for d in reg.live_dimensions() {
+        let opt = if d.role.optional() { " | null" } else { "" };
+        if d.role.stored() {
+            let _ = writeln!(s, "  /** {} (`{}`) */", d.label, d.column);
         } else {
-            ""
-        };
-        let _ = writeln!(s, "  /** {} (`{}`) */", d.label, d.column);
+            let _ = writeln!(s, "  /** {} (wire metadata, not a column) */", d.label);
+        }
         let _ = writeln!(s, "  {}: {}{opt};", d.key, d.sql_type.ts());
     }
     s.push('\n');

@@ -106,16 +106,21 @@ pub fn render(
         .filter(|c| c.class == Class::AddColumn)
         .collect();
 
-    if !adds.is_empty() {
-        let cols: Vec<String> = adds
-            .iter()
-            .filter_map(|c| {
-                reg.metrics
-                    .iter()
-                    .find(|m| m.key == c.key)
-                    .map(|m| format!("ADD COLUMN {} {} NULL", m.column, m.sql_type.ddl()))
-            })
-            .collect();
+    // Guarded on the columns, not on the change count: a new `metadata` dimension is
+    // classified AddColumn so that the snapshot records its protobuf field number, and
+    // it adds no column at all. Keying the block on `adds` emitted `ALTER TABLE
+    // observations ;` for it.
+    let add_cols: Vec<String> = adds
+        .iter()
+        .filter_map(|c| {
+            reg.metrics
+                .iter()
+                .find(|m| m.key == c.key)
+                .map(|m| format!("ADD COLUMN {} {} NULL", m.column, m.sql_type.ddl()))
+        })
+        .collect();
+
+    if !add_cols.is_empty() {
         s.push_str(
             "-- Adding nullable columns. Measured at 11.6 ms against ~1 GB of compressed\n\
              -- chunks, 93 ms for twenty columns in one statement, and nothing decompressed\n\
@@ -138,7 +143,7 @@ pub fn render(
             s,
             "            ALTER TABLE {}\n                {};",
             gen::RAW_TABLE,
-            cols.join(",\n                ")
+            add_cols.join(",\n                ")
         );
         s.push_str(
             "            EXIT;\n\
@@ -212,11 +217,12 @@ pub fn render(
         );
     }
 
-    if adds.is_empty() && levels.is_empty() && breaking.is_empty() {
+    if add_cols.is_empty() && levels.is_empty() && breaking.is_empty() {
         s.push_str(
             "-- Beyond the finalisers above there is nothing to do: the registry changed only\n\
-             -- in metadata the database does not hold (labels, units, tiers, legacy key\n\
-             -- mappings). Regenerate and commit generated/ instead.\n",
+             -- in things the database does not hold (labels, units, tiers, legacy key\n\
+             -- mappings, and the protobuf-only `metadata` dimensions of N-14). Regenerate\n\
+             -- and commit generated/ instead.\n",
         );
     }
 

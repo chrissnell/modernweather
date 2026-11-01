@@ -65,7 +65,11 @@ pub fn from_registry(reg: &Registry) -> Vec<Allocated> {
             aggregates: vec![],
             mean_representation: None,
             levels: vec![],
-            deprecated: false,
+            // Read from the registry rather than hard-coded false. That constant was
+            // the one-way door: with it, no `[[dimension]]` could ever be retired,
+            // because the only escape from the disappearance FATAL is
+            // `deprecated = true` (N-14). Validation gates which roles may use it.
+            deprecated: d.deprecated,
             introduced_in: d.introduced_in.clone(),
         });
     }
@@ -167,13 +171,25 @@ pub fn diff(snap: &Snapshot, reg: &Registry) -> Vec<Change> {
 
     for n in &new {
         let Some(o) = old.get(n.key.as_str()) else {
+            // A `metadata` dimension allocates a protobuf field number and nothing
+            // else, so saying "new column" of it would be false. The change is still
+            // recorded: it is what makes `migrate` write the number into the snapshot,
+            // which is what keeps it from ever being handed to anything else (D-21).
+            let detail = if metadata_dimension(reg, &n.key) {
+                format!(
+                    "new metadata dimension {}, protobuf field {} — no column (N-14)",
+                    n.key, n.field_number
+                )
+            } else {
+                format!(
+                    "new {} {} ({} {}), protobuf field {}",
+                    n.kind, n.column, n.column, n.sql_type, n.field_number
+                )
+            };
             changes.push(Change {
                 class: Class::AddColumn,
                 key: n.key.clone(),
-                detail: format!(
-                    "new {} {} ({} {}), protobuf field {}",
-                    n.kind, n.column, n.column, n.sql_type, n.field_number
-                ),
+                detail,
             });
             continue;
         };
@@ -220,10 +236,18 @@ pub fn diff(snap: &Snapshot, reg: &Registry) -> Vec<Change> {
             });
         }
         if !o.deprecated && n.deprecated {
+            let detail = if metadata_dimension(reg, &n.key) {
+                format!(
+                    "metadata dimension {} retired; protobuf field {} stays reserved",
+                    n.key, n.field_number
+                )
+            } else {
+                format!("{} deprecated; identifiers retained", n.column)
+            };
             changes.push(Change {
                 class: Class::Deprecate,
                 key: n.key.clone(),
-                detail: format!("{} deprecated; identifiers retained", n.column),
+                detail,
             });
         }
         if o.deprecated && !n.deprecated {
@@ -272,6 +296,15 @@ pub fn affected_levels(reg: &Registry, changes: &[Change]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Whether `key` names a dimension that holds no column. The snapshot does not record
+/// a dimension's role, so the registry answers it; an entry the registry no longer
+/// lists is not reached from here, because disappearance is handled in `validate`.
+fn metadata_dimension(reg: &Registry, key: &str) -> bool {
+    reg.dimensions
+        .iter()
+        .any(|d| d.key == key && !d.role.stored())
 }
 
 pub fn strategy_names(s: &[Strategy]) -> Vec<String> {

@@ -342,13 +342,13 @@ pub fn all(reg: &Registry, go: &GoViews) -> Files {
 fn expected_raw_columns(reg: &Registry) -> Vec<(String, &'static str, &'static str)> {
     let mut v: Vec<(String, &'static str, &'static str)> = Vec::new();
     for d in &reg.dimensions {
-        if d.role == Role::Partition {
-            continue;
-        }
         let kind = match d.role {
             Role::Time => "time",
             Role::Attribute => "attribute",
-            Role::Partition => unreachable!(),
+            // The old table has no station_id, and a `metadata` dimension is not a
+            // column on either side of the import (N-14). Both are skipped here
+            // rather than above so there is one list of what this function covers.
+            Role::Partition | Role::Metadata => continue,
         };
         v.push((d.column.clone(), d.sql_type.ddl(), kind));
     }
@@ -1507,7 +1507,7 @@ mod tests {
             "the old table has no station_id"
         );
         for d in &reg.dimensions {
-            if d.role == Role::Partition {
+            if d.role == Role::Partition || !d.role.stored() {
                 continue;
             }
             assert!(staging.contains(&format!("('{}', ", d.column)));

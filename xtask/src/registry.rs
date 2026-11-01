@@ -57,6 +57,13 @@ pub struct Dimension {
     pub introduced_in: String,
     #[serde(default)]
     pub legacy_rest_keys: Vec<String>,
+    /// Only a `metadata` dimension may be deprecated (N-14). The other three roles
+    /// hold a PostgreSQL attribute number, which is never released, so retiring one
+    /// is not an operation the generator can express — validation refuses it.
+    #[serde(default)]
+    pub deprecated: bool,
+    #[serde(default)]
+    pub deprecated_in: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +116,43 @@ pub enum Role {
     Partition,
     /// Present in the raw table and the reading types, absent from the aggregates.
     Attribute,
+    /// Present in the protobuf and the reading types, absent from the raw DDL and
+    /// the aggregates (N-14 / OQ-W4-2). Wire metadata rather than a measurement: a
+    /// value the station reports that the database has no reason to store per row.
+    ///
+    /// It is the only dimension role that can be retired, and that is the point of
+    /// it. The other three consume a PostgreSQL attribute number the moment the
+    /// table is created, and an attribute number is never released; a `metadata`
+    /// dimension's only allocated identifier is its protobuf field number, which
+    /// `deprecated = true` keeps reserved forever exactly as it does for a metric.
+    Metadata,
+}
+
+impl Role {
+    /// Does this dimension occupy a column in the raw hypertable?
+    pub fn stored(self) -> bool {
+        !matches!(self, Role::Metadata)
+    }
+
+    /// Is the value absent-able, and therefore an `Option` / `| null` / non-required
+    /// property in the generated types?
+    pub fn optional(self) -> bool {
+        matches!(self, Role::Attribute | Role::Metadata)
+    }
+
+    /// May this dimension's identifiers be retired? See `Role::Metadata`.
+    pub fn retirable(self) -> bool {
+        matches!(self, Role::Metadata)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Time => "time",
+            Role::Partition => "partition",
+            Role::Attribute => "attribute",
+            Role::Metadata => "metadata",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -367,6 +411,21 @@ impl Registry {
         self.metrics_ordered()
             .into_iter()
             .filter(|m| !m.deprecated)
+            .collect()
+    }
+
+    /// Dimensions the generated types and the protobuf carry. A deprecated dimension
+    /// keeps its identifiers and leaves every artefact, as a deprecated metric does.
+    pub fn live_dimensions(&self) -> Vec<&Dimension> {
+        self.dimensions.iter().filter(|d| !d.deprecated).collect()
+    }
+
+    /// Dimensions that are columns of the raw hypertable. A `metadata` dimension is
+    /// not one: it reaches the daemon on the wire and is never written per row.
+    pub fn stored_dimensions(&self) -> Vec<&Dimension> {
+        self.dimensions
+            .iter()
+            .filter(|d| d.role.stored() && !d.deprecated)
             .collect()
     }
 
