@@ -31,10 +31,13 @@ use snapshot::Snapshot;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const REGISTRY: &str = "metrics/registry.toml";
 const SNAPSHOT: &str = "metrics/snapshot.toml";
 const MIGRATIONS: &str = "migrations";
+/// Wholly owned by the generator, which is what makes pruning it correct (N-15).
+const GENERATED: &str = "generated";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -95,7 +98,8 @@ fn usage() {
         "cargo xtask <command>\n\
          \n\
          the metric registry (W2)\n\
-         \x20 codegen            regenerate generated/ from metrics/registry.toml\n\
+         \x20 codegen            regenerate generated/ from metrics/registry.toml, removing\n\
+         \x20                    any file there that the generator no longer writes\n\
          \x20 codegen --check    regenerate into a temporary directory and diff; never\n\
          \x20                    writes into the working tree. Exit 1 on drift.\n\
          \x20 migrate            diff the registry against metrics/snapshot.toml and emit a\n\
@@ -166,7 +170,11 @@ fn load_snapshot(root: &Path) -> Option<Result<Snapshot, String>> {
 
 // ---------------------------------------------------------------------------
 
-fn codegen(root: &Path, check: bool) -> Result<ExitCode, String> {
+/// The registry, validated against the snapshot, expanded into exactly the files that
+/// `generated/` should hold. Separate from `codegen` so that both halves of the pair — the
+/// write and the drift check — are driven from one answer, and so that a test can ask for
+/// that answer without a process boundary.
+fn codegen_files(root: &Path) -> Result<gen::Files, String> {
     let reg = load(root)?;
     match load_snapshot(root) {
         Some(snap) => {
@@ -179,37 +187,29 @@ fn codegen(root: &Path, check: bool) -> Result<ExitCode, String> {
             ))
         }
     }
+    Ok(gen::all(&reg))
+}
 
-    let files = gen::all(&reg);
-
-    if !check {
-        for (path, body) in &files {
-            let full = root.join(path);
-            std::fs::create_dir_all(full.parent().unwrap())
-                .map_err(|e| format!("{}: {e}", full.display()))?;
-            std::fs::write(&full, body).map_err(|e| format!("{}: {e}", full.display()))?;
-        }
-        println!("codegen: wrote {} files to generated/", files.len());
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    // --check regenerates into a temporary location and diffs. It must never write
-    // into the working tree: a check that fixes the problem it is checking for
-    // always passes (R-2).
-    let tmp = std::env::temp_dir().join(format!("mw-codegen-check-{}", std::process::id()));
+/// `--check` regenerates into a temporary location and diffs. It must never write into the
+/// working tree: a check that fixes the problem it is checking for always passes (R-2).
+///
+/// Returns the temporary directory it regenerated into — the error message names it so the
+/// developer can diff against it — and one line per piece of drift. Empty means clean, and
+/// that is the gate's verdict, returned rather than only printed so that a test can assert
+/// on it.
+fn codegen_drift(root: &Path, files: &gen::Files) -> Result<(PathBuf, Vec<String>), String> {
+    let tmp = check_tmp_dir("codegen");
     let _ = std::fs::remove_dir_all(&tmp);
-    for (path, body) in &files {
+    for (path, body) in files {
         let full = tmp.join(path);
         std::fs::create_dir_all(full.parent().unwrap())
             .map_err(|e| format!("{}: {e}", full.display()))?;
         std::fs::write(&full, body).map_err(|e| format!("{}: {e}", full.display()))?;
     }
 
-    let on_disk = read_tree(&root.join("generated"), root);
-    let regenerated: BTreeMap<String, String> = files;
-
+    let on_disk = read_tree(&root.join(GENERATED), root);
     let mut drift: Vec<String> = Vec::new();
-    for (path, want) in &regenerated {
+    for (path, want) in files {
         match on_disk.get(path) {
             None => drift.push(format!("  missing from the tree: {path}")),
             Some(have) if have != want => {
@@ -218,17 +218,45 @@ fn codegen(root: &Path, check: bool) -> Result<ExitCode, String> {
             Some(_) => {}
         }
     }
-    for path in on_disk.keys() {
-        if !regenerated.contains_key(path) {
+    // Orphans are found by path, which is how the prune finds them too: the two halves of
+    // the pair have to agree on what an orphan is, and `read_tree` cannot see a file that
+    // is not valid UTF-8 — which, under `generated/`, cannot have come from an emitter.
+    let mut orphans = list_files(&root.join(GENERATED), root);
+    orphans.sort();
+    for path in orphans {
+        if !files.contains_key(&path) {
             drift.push(format!("  in the tree but not generated: {path}"));
         }
     }
-    let _ = std::fs::remove_dir_all(&tmp);
+    Ok((tmp, drift))
+}
+
+fn codegen(root: &Path, check: bool) -> Result<ExitCode, String> {
+    let files = codegen_files(root)?;
+
+    if !check {
+        let pruned = write_generated(root, GENERATED, &files)?;
+        println!("codegen: wrote {} files to {GENERATED}/", files.len());
+        if !pruned.is_empty() {
+            println!(
+                "codegen: removed {} file{} {GENERATED}/ no longer holds:",
+                pruned.len(),
+                if pruned.len() == 1 { "" } else { "s" }
+            );
+            for path in &pruned {
+                println!("  {path}");
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let (tmp, drift) = codegen_drift(root, &files)?;
 
     if drift.is_empty() {
+        let _ = std::fs::remove_dir_all(&tmp);
         println!(
             "codegen --check: {} generated files match metrics/registry.toml",
-            regenerated.len()
+            files.len()
         );
         Ok(ExitCode::SUCCESS)
     } else {
@@ -244,6 +272,103 @@ fn codegen(root: &Path, check: bool) -> Result<ExitCode, String> {
     }
 }
 
+/// Writes `files` under `root`, then deletes everything else under `root/dir`.
+///
+/// The deletion is the point (N-15 / OQ-W4-4). `dir` is wholly owned by the generator —
+/// every file under it carries a header saying so — and a file there that the generator no
+/// longer emits is reported by `--check` as `in the tree but not generated`. Without the
+/// prune, `codegen` exits 0 having produced a tree that the gate it is paired with rejects,
+/// which is a developer running `codegen`, committing, and watching CI fail on files
+/// `codegen` itself made stale.
+///
+/// Renumbering is what makes that routine rather than rare: the aggregate files are
+/// numbered by the level's position, so inserting a `[[level]]` renames every file above it
+/// and orphans one per level.
+///
+/// Returns the paths removed, repo-relative and sorted.
+fn write_generated(root: &Path, dir: &str, files: &gen::Files) -> Result<Vec<String>, String> {
+    for (path, body) in files {
+        let full = root.join(path);
+        std::fs::create_dir_all(full.parent().unwrap())
+            .map_err(|e| format!("{}: {e}", full.display()))?;
+        std::fs::write(&full, body).map_err(|e| format!("{}: {e}", full.display()))?;
+    }
+
+    let mut pruned: Vec<String> = Vec::new();
+    for rel in list_files(&root.join(dir), root) {
+        if files.contains_key(&rel) {
+            continue;
+        }
+        let full = root.join(&rel);
+        std::fs::remove_file(&full).map_err(|e| format!("{}: {e}", full.display()))?;
+        pruned.push(rel);
+    }
+    pruned.sort();
+    remove_empty_dirs(&root.join(dir));
+    Ok(pruned)
+}
+
+/// Every file under `dir`, repo-relative. Listed by path rather than by content, unlike
+/// `read_tree`: a file under `generated/` that is not valid UTF-8 cannot have come from an
+/// emitter, so it is an orphan too, and `read_tree` cannot see it to say so.
+///
+/// A symlink counts as a file and is never followed. Nothing the generator writes is one,
+/// and descending into one would take the prune outside the directory it owns.
+fn list_files(dir: &Path, root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            match std::fs::symlink_metadata(&p) {
+                Ok(md) if md.is_dir() => stack.push(p),
+                Ok(_) => out.push(rel_path(&p, root)),
+                Err(_) => {}
+            }
+        }
+    }
+    out
+}
+
+/// Bottom-up, so that pruning the last file out of `generated/<target>/` does not leave the
+/// directory behind for the next `ls` to puzzle over. `dir` itself always stays.
+fn remove_empty_dirs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if std::fs::symlink_metadata(&p).is_ok_and(|md| md.is_dir()) {
+            remove_empty_dirs(&p);
+            if std::fs::read_dir(&p).is_ok_and(|mut it| it.next().is_none()) {
+                let _ = std::fs::remove_dir(&p);
+            }
+        }
+    }
+}
+
+fn rel_path(p: &Path, root: &Path) -> String {
+    p.strip_prefix(root)
+        .unwrap_or(p)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Where a `--check` regenerates to. Unique per call rather than per process: `cargo test`
+/// runs cases concurrently in one process, so a pid-only path lets one case's cleanup land
+/// in the middle of another case's write.
+fn check_tmp_dir(tag: &str) -> PathBuf {
+    static N: AtomicU32 = AtomicU32::new(0);
+    std::env::temp_dir().join(format!(
+        "mw-{tag}-check-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 fn read_tree(dir: &Path, root: &Path) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -256,12 +381,7 @@ fn read_tree(dir: &Path, root: &Path) -> BTreeMap<String, String> {
             if p.is_dir() {
                 stack.push(p);
             } else if let Ok(text) = std::fs::read_to_string(&p) {
-                let rel = p
-                    .strip_prefix(root)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                out.insert(rel, text);
+                out.insert(rel_path(&p, root), text);
             }
         }
     }
@@ -539,6 +659,174 @@ fn legacy_import(root: &Path, flags: &[&str]) -> Result<ExitCode, String> {
             drift.join("\n")
         );
         Ok(ExitCode::from(1))
+    }
+}
+
+/// N-15 / OQ-W4-4: `codegen` owns `generated/`, so it has to remove what it no longer
+/// writes. The cases below run the real `codegen` against a scratch repository root
+/// holding a copy of `metrics/`, because the claim being tested is about a directory on
+/// disk and nothing smaller reaches it.
+#[cfg(test)]
+mod prune {
+    use super::{codegen, codegen_drift, codegen_files, repo_root, write_generated};
+    use super::{GENERATED, REGISTRY};
+    use std::path::{Path, PathBuf};
+
+    /// A repository root with nothing in it but `metrics/`. The real tree is never
+    /// written to: these tests add a level, regenerate, and remove it again, which is
+    /// exactly the sequence that must not be performed where someone could commit the
+    /// intermediate state.
+    fn scratch_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("mw-prune-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("metrics")).expect("scratch root");
+        for f in ["registry.toml", "snapshot.toml"] {
+            std::fs::copy(
+                repo_root().join("metrics").join(f),
+                root.join("metrics").join(f),
+            )
+            .expect("metrics/ is copied");
+        }
+        root
+    }
+
+    fn files_under(root: &Path, dir: &str) -> Vec<String> {
+        let mut v = super::list_files(&root.join(dir), root);
+        v.sort();
+        v
+    }
+
+    /// The second half of the done-criterion: `codegen` followed immediately by
+    /// `codegen --check` exits 0. Asserted on the drift list rather than on the exit
+    /// code, because `ExitCode` is opaque and a drift line is the thing worth reading.
+    fn assert_no_drift(root: &Path, when: &str) {
+        let files = codegen_files(root).expect("the registry is valid");
+        let (tmp, drift) = codegen_drift(root, &files).expect("the check runs");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            drift.is_empty(),
+            "`codegen --check` rejects the tree {when}:\n{}",
+            drift.join("\n")
+        );
+    }
+
+    /// Inserts a 2-minute level between `1m` and `5m` the way a developer would: the
+    /// block itself, the level above it re-pointed at it, and `[defaults].levels` plus
+    /// every metric's membership extended, since membership must stay contiguous from the
+    /// first level.
+    fn with_a_two_minute_level(registry: &str) -> String {
+        let was = "[[level]]\nname = \"5m\"\nbucket = \"5 minutes\"\nsource = \"1m\"\n";
+        let now = "[[level]]\nname = \"2m\"\nbucket = \"2 minutes\"\nsource = \"1m\"\n\
+                   materialized_only = true\n\n\
+                   [[level]]\nname = \"5m\"\nbucket = \"5 minutes\"\nsource = \"2m\"\n";
+        assert!(
+            registry.contains(was),
+            "the 5-minute level is declared the way this edit expects"
+        );
+        registry.replace(was, now).replace(
+            "levels = [\"1m\", \"5m\", \"1h\", \"1d\"]",
+            "levels = [\"1m\", \"2m\", \"5m\", \"1h\", \"1d\"]",
+        )
+    }
+
+    /// The regression, run as the round trip the plan asks for. The aggregate files are
+    /// numbered by the level's position, so inserting a `[[level]]` renames every file
+    /// above it: before the prune, `codegen` wrote the new names, left the old ones,
+    /// exited 0, and handed back a tree that `codegen --check` rejects with one
+    /// `in the tree but not generated` line per renumbered level.
+    #[test]
+    fn adding_and_removing_a_level_leaves_no_orphan() {
+        let root = scratch_root("roundtrip");
+        let original = std::fs::read_to_string(root.join(REGISTRY)).expect("the registry");
+
+        codegen(&root, false).expect("the baseline generates");
+        let baseline = files_under(&root, GENERATED);
+        let five = "generated/sql/040_observations_5m.sql".to_string();
+        assert!(
+            baseline.contains(&five),
+            "the 5-minute level is the fourth file; the renumbering case depends on it"
+        );
+        assert_no_drift(&root, "as committed");
+
+        std::fs::write(root.join(REGISTRY), with_a_two_minute_level(&original)).unwrap();
+        codegen(&root, false).expect("the added level generates");
+        let added = files_under(&root, GENERATED);
+        assert_eq!(
+            added.len(),
+            baseline.len() + 1,
+            "one level added is one file added and no file orphaned: {added:#?}"
+        );
+        assert!(added.contains(&"generated/sql/040_observations_2m.sql".to_string()));
+        assert!(
+            !added.contains(&five),
+            "{five} is the 5-minute level's *old* number and is now an orphan"
+        );
+        assert_no_drift(&root, "with a 2-minute level added");
+
+        std::fs::write(root.join(REGISTRY), &original).unwrap();
+        codegen(&root, false).expect("the removed level regenerates");
+        assert_eq!(
+            files_under(&root, GENERATED),
+            baseline,
+            "removing the level must restore the committed set exactly"
+        );
+        assert_no_drift(&root, "with the 2-minute level removed again");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `generated/` is the only directory the prune owns, and the directory tree inside it
+    /// is the generator's too. These are the claims the round trip above cannot make,
+    /// because the generator emits no nested directory, no file outside `generated/` and
+    /// nothing that is not valid UTF-8.
+    #[test]
+    fn the_prune_owns_the_generated_directory_and_nothing_else() {
+        let root = scratch_root("boundaries");
+        let files = codegen_files(&root).expect("the registry is valid");
+        write_generated(&root, GENERATED, &files).expect("the baseline is written");
+
+        // An orphan two directories down, a sibling of `generated/` that is not the
+        // generator's, and an orphan `read_tree` cannot read — a non-UTF-8 file under
+        // `generated/` cannot have come from an emitter, so it is stale by construction.
+        std::fs::create_dir_all(root.join("generated/stale/deeper")).unwrap();
+        std::fs::write(root.join("generated/stale/deeper/orphan.sql"), "-- stale\n").unwrap();
+        std::fs::write(root.join("generated/sql/not-utf8.bin"), [0xff_u8, 0xfe]).unwrap();
+        std::fs::write(root.join("metrics/keep.toml"), "# not the generator's\n").unwrap();
+
+        // The check and the prune have to agree on what an orphan is. The binary file is
+        // where a content-based answer and a path-based one come apart: `read_tree` cannot
+        // read it, so a check that looked only at content would call this tree clean and
+        // then watch `codegen` delete a file from it.
+        let (tmp, drift) = codegen_drift(&root, &files).expect("the check runs");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            drift,
+            vec![
+                "  in the tree but not generated: generated/sql/not-utf8.bin".to_string(),
+                "  in the tree but not generated: generated/stale/deeper/orphan.sql".to_string(),
+            ],
+        );
+
+        let pruned = write_generated(&root, GENERATED, &files).expect("the prune runs");
+        assert_eq!(
+            pruned,
+            vec![
+                "generated/sql/not-utf8.bin".to_string(),
+                "generated/stale/deeper/orphan.sql".to_string(),
+            ],
+            "every file under generated/ that the generator did not write, and only those"
+        );
+        assert!(
+            !root.join("generated/stale").exists(),
+            "a directory left empty by the prune goes with its files"
+        );
+        assert!(
+            root.join("metrics/keep.toml").exists(),
+            "the prune reached outside generated/"
+        );
+        assert_eq!(files_under(&root, GENERATED).len(), files.len());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

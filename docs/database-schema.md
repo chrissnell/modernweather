@@ -1261,6 +1261,8 @@ Adding the 5-minute level renumbered two generated files, leaving `040_observati
 
 *Recommendation:* **(b)**, a W2 follow-up of a few lines. `generated/` is wholly owned by the generator — the header on every file says so — so deleting what it no longer generates is the invariant it already claims.
 
+**Resolved as (b) by M1-3 (N-15).** `codegen` deletes every file under `generated/` that it did not write. §6.7's fourteen-file transcript above is the case it was found by, and is now a test.
+
 **OQ-W4-5. What should the retention windows be at production's real cadence and station count?**
 
 Decision 5's figures — 7, 14 and 90 days — are each "the band, plus the level above's refresh window, plus margin", sized at four stations. The *reason* for each is cadence-independent but the *cost* is not: ten stations triples the per-day figures and 337 MB becomes about 850 MB, which is still nothing.
