@@ -326,7 +326,22 @@ fn proto(reg: &Registry) -> String {
         "// Field numbers come from the registry and are never renumbered. A reused number\n\
          // silently reinterprets historical data on every client that has not been rebuilt,\n\
          // which is how the Go implementation ended up wedging station metadata into 188-192\n\
-         // and relays 8-10 into 193-195 (D-21).\n\n\
+         // and relays 8-10 into 193-195 (D-21).\n\
+         //\n\
+         // EVERY METRIC FIELD IS `optional` (D-89). Under proto3 without it, an unset field\n\
+         // and a field set to 0.0 are indistinguishable on the wire, so a satellite that does\n\
+         // not measure humidity would be decoded by its collector as reporting 0% humidity --\n\
+         // which the writer then stores instead of NULL, and the aggregate means include. The\n\
+         // failure is silent, plausible and permanent. It applies across a RESTART as well as\n\
+         // across a hop, because the spool record's payload is this message (W7 D-11).\n\
+         //\n\
+         // `optional` is wire-compatible: same field numbers, same tags, same encoding. It only\n\
+         // adds a presence bit on the decoding side.\n\
+         //\n\
+         // The dimensions deliberately do NOT carry it. `readingTimestamp` and `station_id` are\n\
+         // always present by construction, and the two attribute dimensions are on their way out\n\
+         // entirely (OQ-W4-2), so adding presence to a field slated for removal is churn. Nothing\n\
+         // reads station name or type off a reading -- that comes from the station registry.\n\n\
          syntax = \"proto3\";\n\n\
          package modernweather.v1;\n\n\
          import \"google/protobuf/timestamp.proto\";\n\n\
@@ -351,9 +366,10 @@ fn proto(reg: &Registry) -> String {
         } else {
             format!(" ({})", m.unit)
         };
+        // `optional` on every metric, never on a dimension -- see the header. D-89.
         let _ = writeln!(
             s,
-            "    {} {} = {};  // {}{unit}",
+            "    optional {} {} = {};  // {}{unit}",
             m.proto_type, m.proto_name, m.field_number, m.label
         );
     }

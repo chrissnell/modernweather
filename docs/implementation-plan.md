@@ -101,8 +101,11 @@ gate that is green *by deferral* while the deliverable it guards is complete —
 G-1. Leaving it until a Rust daemon exists means the suite's first real run is also the first run
 that can fail, against the binary it is meant to be validating.
 
-### M1-1 — proto3 field presence *(N-12 / G-3)*
+### M1-1 — proto3 field presence *(N-12 / G-3)* — ✅ **DONE 2026-10-31**
 **Depends on:** nothing. **Blocks:** M3-2, M3-4, M6-4.
+**Landed:** 212 `optional` metric fields in `generated/proto/reading.proto`, dimensions deliberately
+excluded, three tests scanning the emitted proto (presence on every metric, presence on no dimension,
+and that no field was renumbered). Both of the first two were verified able to fail.
 Emit `optional` on every metric field in `generated/proto/reading.proto`. One line per field in the
 generator; `generated/rust/reading.rs` is already `Option`-valued.
 **Done when:** `grep -c optional generated/proto/reading.proto` is **212** — one per metric; the four
