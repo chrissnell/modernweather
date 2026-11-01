@@ -164,8 +164,10 @@ fetch_pinned() {
     printf '    the commit is neither servable by SHA nor the tip of %s; deepening\n' "$RW_BRANCH"
     local deepen=()
     [ "$(git -C "$repo" rev-parse --is-shallow-repository)" = true ] && deepen=(--unshallow)
-    git -C "$repo" fetch -q --no-tags "${deepen[@]}" origin "$RW_BRANCH" \
-        || die "could not fetch $RW_BRANCH from $RW_URL"
+    git -C "$repo" fetch -q --no-tags "${deepen[@]}" origin "$RW_BRANCH" || {
+        git -C "$repo" remote -v
+        die "could not fetch $RW_BRANCH from the remote printed above"
+    }
     $have 2>/dev/null \
         || die "$RW_COMMIT is not reachable from $RW_BRANCH on $RW_URL. Set RW_BRANCH to a
     branch that contains it, or RW_REPO to a checkout that already has it."
@@ -235,10 +237,13 @@ if [ -n "${RW_REPO:-}" ]; then
 else
     go_repo=$WORKDIR/remoteweather
     say "Fetching remoteweather @ ${RW_COMMIT:0:7}"
-    if [ ! -d "$go_repo/.git" ]; then
-        git init -q "$go_repo"
-        git -C "$go_repo" remote add origin "$RW_URL"
-    fi
+    # From scratch every time, deliberately. Reusing whatever was in WORKDIR made this step
+    # depend on the state a previous run left behind -- and in CI that state arrives from
+    # Swatinem/rust-cache, which restores target/ wholesale. The fetch is shallow and takes
+    # seconds; RW_REPO is the supported way to reuse a checkout.
+    rm -rf "$go_repo"
+    git init -q "$go_repo"
+    git -C "$go_repo" remote add origin "$RW_URL"
     fetch_pinned "$go_repo"
     # The SHA, not FETCH_HEAD: after either fallback below FETCH_HEAD is the branch tip, which is
     # the pinned commit only until the branch moves. The assertion after this would catch it, but

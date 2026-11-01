@@ -291,9 +291,22 @@ jobs:
       PGSSLMODE: disable
     steps:
       - uses: actions/checkout@v4
+      # The Go daemon, at the commit the fixtures were captured from.
+      #
+      # go-target.sh can fetch this itself and does so when run by hand, but not here: an
+      # unauthenticated git fetch from an Actions runner is not dependable. This job's first run
+      # fetched c3ec9f7 by SHA; its second was refused with "upload-pack: not our ref" and its
+      # third could not even see refs/heads/master — same public repository, same commit, no
+      # change in between. actions/checkout uses the job's token, which is the supported path.
+      # The script still verifies that what it was handed is the pinned commit.
+      - name: Check out the Go daemon at the pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: chrissnell/remoteweather
+          ref: c3ec9f7d7dec2c5f71a1f48b8af2b9b0921b7bcf
+          path: .conformance-go-src
+          fetch-depth: 0
       # The Go daemon is the target, so this job needs a Go toolchain as well as a Rust one.
-      # ci/conformance/go-target.sh checks remoteweather out itself, at the commit the fixtures
-      # were captured from, and verifies it got that commit.
       - uses: actions/setup-go@v5
         with:
           go-version: stable
@@ -314,6 +327,15 @@ jobs:
       # either is worth one apt call rather than a confusing failure part-way through a run.
       # Note the psql client may be a major version behind the server; that is fine for psql,
       # unlike pg_dump, which is why the `database` job installs a 17 client and this one does not.
+      # Outside target/ on purpose. Swatinem/rust-cache restores target/ wholesale, so a
+      # WORKDIR underneath it arrives pre-populated with the previous run's Go checkout and
+      # binaries — which is what made this job's second run fail where its first had passed.
+      # It goes through GITHUB_ENV rather than the job's `env:` because the runner context is
+      # not available there.
+      - name: Point the harness at the checkout, and keep its workdir out of the cache
+        run: |
+          echo "RW_REPO=$GITHUB_WORKSPACE/.conformance-go-src" >> "$GITHUB_ENV"
+          echo "WORKDIR=$RUNNER_TEMP/conformance-go" >> "$GITHUB_ENV"
       - name: Ensure psql and sqlite3 are present
         run: |
           missing=""
@@ -338,10 +360,10 @@ jobs:
             echo "## Conformance fixtures (Go target)"
             echo
             echo '```'
-            tail -n 3 target/conformance-go/direct.txt 2>/dev/null || echo "the accepted replay did not run"
+            tail -n 3 "$WORKDIR/direct.txt" 2>/dev/null || echo "the accepted replay did not run"
             echo '```'
             echo '```'
-            tail -n 3 target/conformance-go/mangled.txt 2>/dev/null || echo "the negative control did not run"
+            tail -n 3 "$WORKDIR/mangled.txt" 2>/dev/null || echo "the negative control did not run"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload the replay output
@@ -350,9 +372,9 @@ jobs:
         with:
           name: conformance-fixtures-output
           path: |
-            target/conformance-go/direct.txt
-            target/conformance-go/mangled.txt
-            target/conformance-go/logs/
+            ${{ runner.temp }}/conformance-go/direct.txt
+            ${{ runner.temp }}/conformance-go/mangled.txt
+            ${{ runner.temp }}/conformance-go/logs/
           if-no-files-found: ignore
 
   driver-emulators:
