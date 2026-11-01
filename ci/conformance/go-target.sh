@@ -31,6 +31,7 @@
 #   PGHOST PGPORT PGUSER PGPASSWORD PGDATABASE PGSSLMODE   libpq-style target (see defaults)
 #   RW_REPO        path to an existing remoteweather checkout; cloned at RW_COMMIT if unset
 #   RW_COMMIT      the pinned Go commit (default: the one the fixtures were captured from)
+#   RW_BRANCH      branch to deepen from if the server will not serve a bare SHA (default master)
 #   WORKDIR        scratch directory (default: target/conformance-go)
 #   CONFORMANCE_BIN  prebuilt legacy-conformance binary; built with cargo if unset
 #   MIN_MANGLED_FAILURES  how many fixtures the negative control must break (default 26)
@@ -43,6 +44,8 @@ set -euo pipefail
 # is a different contract, so this is pinned rather than tracking a branch.
 RW_COMMIT=${RW_COMMIT:-c3ec9f7d7dec2c5f71a1f48b8af2b9b0921b7bcf}
 RW_URL=https://github.com/chrissnell/remoteweather.git
+# Only used to deepen the fetch when the server will not serve a bare SHA; see fetch_pinned.
+RW_BRANCH=${RW_BRANCH:-master}
 
 # contract/tools/rig/mangle_proxy.py hard-codes both of these: it forwards to 18080 and listens
 # on 18081. ci/conformance/config-seed.sql puts the daemon on 18080 to match.
@@ -139,6 +142,35 @@ await() {
     printf '    %s ready after %ss\n' "$what" "$waited"
 }
 
+# Fetch the pinned commit, escalating only as far as the server makes necessary.
+#
+# `git fetch <sha>` is the cheap and obviously-correct call, and github.com serves it only
+# sometimes: this gate's first CI run fetched c3ec9f7 by SHA and its second was refused with
+# "upload-pack: not our ref", for the same commit on the same public repository. (A local test
+# proves nothing here -- this runtime rewrites github.com URLs to an on-disk mirror, which always
+# allows it.) So try the SHA, then the branch tip, then the branch's full history, and check
+# after each whether the object actually arrived. The caller asserts HEAD is the pinned commit
+# regardless of which branch got there.
+fetch_pinned() {
+    local repo=$1
+    local have="git -C $repo cat-file -e $RW_COMMIT^{commit}"
+
+    if git -C "$repo" fetch -q --depth 1 origin "$RW_COMMIT" 2>/dev/null && $have 2>/dev/null; then
+        printf '    fetched the commit directly\n'; return 0
+    fi
+    if git -C "$repo" fetch -q --depth 1 origin "$RW_BRANCH" 2>/dev/null && $have 2>/dev/null; then
+        printf '    the server would not serve the bare SHA; it is the tip of %s\n' "$RW_BRANCH"; return 0
+    fi
+    printf '    the commit is neither servable by SHA nor the tip of %s; deepening\n' "$RW_BRANCH"
+    local deepen=()
+    [ "$(git -C "$repo" rev-parse --is-shallow-repository)" = true ] && deepen=(--unshallow)
+    git -C "$repo" fetch -q --no-tags "${deepen[@]}" origin "$RW_BRANCH" \
+        || die "could not fetch $RW_BRANCH from $RW_URL"
+    $have 2>/dev/null \
+        || die "$RW_COMMIT is not reachable from $RW_BRANCH on $RW_URL. Set RW_BRANCH to a
+    branch that contains it, or RW_REPO to a checkout that already has it."
+}
+
 # ---------------------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------------------
@@ -207,8 +239,11 @@ else
         git init -q "$go_repo"
         git -C "$go_repo" remote add origin "$RW_URL"
     fi
-    git -C "$go_repo" fetch -q --depth 1 origin "$RW_COMMIT"
-    git -C "$go_repo" checkout -q --detach FETCH_HEAD
+    fetch_pinned "$go_repo"
+    # The SHA, not FETCH_HEAD: after either fallback below FETCH_HEAD is the branch tip, which is
+    # the pinned commit only until the branch moves. The assertion after this would catch it, but
+    # checking out the thing we actually want is better than catching the wrong one.
+    git -C "$go_repo" checkout -q --detach "$RW_COMMIT"
 fi
 have=$(git -C "$go_repo" rev-parse HEAD)
 [ "$have" = "$RW_COMMIT" ] || die "remoteweather is at $have, expected $RW_COMMIT"
