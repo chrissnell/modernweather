@@ -15,6 +15,17 @@
 #
 # Adding a gate here is not a way to defer work you own. It is for checks whose subject
 # is owned by another work item.
+#
+# A gate may also declare what one exit code of its command means:
+#
+#   on_exit.<code> = "..."  -> printed in place of `note` when the command exits <code>
+#
+# `note` stays the catch-all for a code nobody declared. This exists because W2 D-18 gave
+# `cargo xtask codegen --check` two failure codes on purpose -- 1 is drift, 2 is a violated
+# invariant -- and the runner mapped both to one error string, so CI said "the gate failed"
+# for two problems whose fixes are different (docs/reconciliation.md C-W2-20). `cargo xtask
+# gate <id>` now exits with the command's own code, so the distinction survives out of
+# xtask as well as into the log.
 
 [[gate]]
 id = "codegen-drift"
@@ -26,6 +37,15 @@ note = """
 DESIGN.md R-2: the check regenerates into a temporary directory and diffs. It must never
 write into the working tree, because a check that fixes the problem it is checking for
 always passes."""
+on_exit.1 = """
+generated/ does not match metrics/registry.toml: regenerate and commit. Run `cargo xtask
+codegen` and commit its output together with the registry change -- the listing above names
+every file that differs. The working tree was not modified by the check."""
+on_exit.2 = """
+your registry change is not allowed. An invariant in metrics/registry.toml was violated, so
+nothing was generated and there is nothing to commit; the violation is printed above, and
+`cargo xtask validate` reproduces it on its own. W2 D-18 gave this its own exit code because
+the fix is the opposite one: change the registry edit, do not regenerate against it."""
 
 [[gate]]
 id = "legacy-import-drift"

@@ -194,11 +194,24 @@ job now reports that deferral into the PR summary instead of only into its log.
 `crates/modernweather/Cargo.toml`, done in W6's PR, and verify `cargo xtask gates` shows it deferred
 with an honest reason rather than an unreachable path.
 
-### M1-5 — the gate runner distinguishes exit 1 from exit 2 *(N-8 / C-W2-20)*
+### M1-5 — the gate runner distinguishes exit 1 from exit 2 *(N-8 / C-W2-20)* — ✅ **DONE 2026-11-01**
 **Depends on:** nothing. **Done when:** `cargo xtask gate codegen-drift` reports "regenerate and
 commit" on exit 1 and "your registry change is not allowed" on exit 2, and a gate may declare a
 per-code message in `ci/gates.toml`.
 **Test strategy:** two `xtask` tests driving a stub command that exits 1 and 2.
+**Landed:** `on_exit.<code>` in `ci/gates.toml`, declared for `codegen-drift`'s 1 and 2 and
+available to any gate; `note` stays the catch-all for an undeclared code. `gates::run` returns the
+command's own exit code instead of mapping every failure onto 2, so the distinction reaches the
+exit status as well as the log — `cargo xtask gate codegen-drift` exits 1 on drift and 2 on a
+rejected registry change. Both were watched end to end, not only through the stub: a line appended
+to `generated/ts/metrics.ts` produced exit 1 with "regenerate and commit", and a duplicated
+`field_number` produced exit 2 with "your registry change is not allowed". Nine `xtask` tests, and
+four negative controls were run rather than argued — reinstating the collapsed single string fails
+both code tests; emptying the manifest validator fails the three malformed-`on_exit` tests;
+deleting the two messages from `ci/gates.toml` fails the test that reads the shipped manifest; and
+hard-coding the message lookup to 1 fails the exit-2 and the fallback test.
+**Not in this item:** `legacy-import-drift` has the same 1-vs-2 shape and could declare the same
+pair, but it is W9's gate and nothing in this item requires it.
 
 ### M1-6 — `solarjoules`, and the four W2 follow-ups' loose ends *(N-9, N-7, N-13, N-16)*
 **Depends on:** nothing. Four independent small items, grouped because each is under an hour and none
