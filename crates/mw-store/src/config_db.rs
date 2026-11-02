@@ -32,7 +32,12 @@ use std::time::Duration;
 /// to be the schema that binary was built against: a daemon that read `migrations/config/`
 /// from the filesystem would apply whatever happened to be installed there, which is the
 /// same class of problem as the Go schema drifting 72 columns from its own source
-/// definition. `packaging/` still ships the files so an operator can read what will run.
+/// definition.
+///
+/// The Arch package also installs the files under `/usr/share/modernweather/migrations/` so
+/// an operator can read what will run. The `.deb` and `.rpm` asset lists in
+/// `crates/modernweather/Cargo.toml` do not, so that is an Arch-only convenience rather
+/// than a property of every artefact — W8's packaging to settle, not this module's.
 pub static MIGRATOR: Migrator = sqlx::migrate!("../../migrations/config");
 
 /// Errors from opening or migrating the configuration store.
@@ -172,8 +177,34 @@ mod tests {
             .expect("the ledger is readable")
     }
 
-    fn config_migrations_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations/config")
+    fn migrations_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations")
+    }
+
+    /// Every `.sql` under `migrations/`, recursively, as (path, comment-stripped body).
+    fn all_migration_sql() -> Vec<(PathBuf, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            let entries = std::fs::read_dir(dir).expect("migrations/ is readable");
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|x| x == "sql") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        walk(&migrations_root(), &mut paths);
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let body = std::fs::read_to_string(&path).expect("readable");
+                let stripped = strip_sql_comments(&body).to_uppercase();
+                (path, stripped)
+            })
+            .collect()
     }
 
     /// `--` line comments removed, so a comment *about* the idiom is not a use of it. The
@@ -276,27 +307,38 @@ mod tests {
         pool.close().await;
     }
 
+    /// Two scopes, because the two schemas are not in the same position, and
+    /// `ci/db/migrate-twice.sh` enforces exactly this pair so the shell half and the Rust
+    /// half of one rule agree.
+    ///
+    /// Everywhere under `migrations/`: `IF NOT EXISTS`, which is the work item's
+    /// done-criterion verbatim and which both schemas satisfy. Under `migrations/config/`
+    /// also `OR REPLACE` and `IF EXISTS`, because this schema is written from scratch and
+    /// has no legitimate use for either — while the weather schema does and always will,
+    /// since `cargo xtask codegen` emits `CREATE OR REPLACE FUNCTION mw_mean` and
+    /// `cargo xtask migrate` emits `DROP MATERIALIZED VIEW IF EXISTS ... CASCADE`. A rule
+    /// the repository's own generator cannot satisfy is not a rule.
     #[tokio::test]
-    async fn no_conditional_ddl_under_migrations_config() {
-        let dir = config_migrations_dir();
-        let mut files = std::fs::read_dir(&dir)
-            .expect("migrations/config/ is readable")
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "sql"))
-            .collect::<Vec<_>>();
-        files.sort();
-        assert!(!files.is_empty(), "{} holds no .sql", dir.display());
+    async fn no_conditional_ddl_under_migrations() {
+        let config_dir = migrations_root().join("config");
+        let files = all_migration_sql();
+        assert!(!files.is_empty(), "migrations/ holds no .sql");
+        assert!(
+            files.iter().any(|(p, _)| p.starts_with(&config_dir)),
+            "migrations/config/ holds no .sql"
+        );
 
-        for file in files {
-            let body = std::fs::read_to_string(&file).expect("readable");
-            let sql = strip_sql_comments(&body).to_uppercase();
-            for idiom in ["IF NOT EXISTS", "IF EXISTS", "OR REPLACE", "IF_NOT_EXISTS"] {
+        for (path, sql) in files {
+            let mut idioms: Vec<&str> = vec!["IF NOT EXISTS", "IF_NOT_EXISTS"];
+            if path.starts_with(&config_dir) {
+                idioms.extend(["OR REPLACE", "IF EXISTS"]);
+            }
+            for idiom in idioms {
                 assert!(
                     !sql.contains(idiom),
                     "{}: `{idiom}` in a statement. D-8/A-W6-2: a migration that tolerates \
                      being applied twice is how the Go schema froze at first-run shape.",
-                    file.display()
+                    path.display()
                 );
             }
         }
@@ -333,6 +375,90 @@ mod tests {
         pool.close().await;
     }
 
+    /// The pairing's service and the account's kind are written on two rows, and this is
+    /// the one join where they could disagree. A composite foreign key is what stops it;
+    /// `uploader_id` alone would not, and the same-service-in-two-places defect that
+    /// `station_service` exists to remove would come back wearing a join.
+    #[tokio::test]
+    async fn a_pairing_cannot_name_an_account_of_another_service() {
+        let scratch = Scratch::new("pairing");
+        let pool = open_and_migrate(&scratch.db()).await.expect("migrate");
+
+        for setup in [
+            "INSERT INTO uploader (kind, name) VALUES ('wunderground', 'wu')",
+            "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind,
+                                   transport_kind, transport_dev, transport_baud)
+             VALUES ('s', x'0193f3c28b207c71ae3f10cc92d4b7aa', 's', 'davis', 'fixed',
+                     'serial', '/dev/ttyUSB0', 19200)",
+        ] {
+            sqlx::query(setup).execute(&pool).await.expect("setup");
+        }
+
+        let err = sqlx::query(
+            "INSERT INTO station_service (station_key, service, uploader_id)
+             VALUES ('s', 'aprs', (SELECT id FROM uploader WHERE name = 'wu'))",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("an aprs pairing pointing at a wunderground account was accepted");
+        assert!(
+            err.to_string().to_uppercase().contains("FOREIGN KEY"),
+            "expected a foreign-key failure, got: {err}"
+        );
+
+        // And the matching pairing goes in, so the constraint is not simply rejecting
+        // everything.
+        sqlx::query(
+            "INSERT INTO station_service (station_key, service, uploader_id)
+             VALUES ('s', 'wunderground', (SELECT id FROM uploader WHERE name = 'wu'))",
+        )
+        .execute(&pool)
+        .await
+        .expect("the matching pairing was rejected");
+        pool.close().await;
+    }
+
+    /// The rows the design documents DO contain, which earlier constraints rejected. Each
+    /// one is a `docs/collector.md` §8.3 block or a Go `devices` column M7-4 has to move,
+    /// and §8 says those blocks are the shape of the `ci/examples/*.db` fixtures `plan()`
+    /// is checked against — so a constraint that rejects one makes a documented fixture
+    /// unrepresentable.
+    #[tokio::test]
+    async fn the_documented_configurations_are_representable() {
+        let scratch = Scratch::new("documented");
+        let pool = open_and_migrate(&scratch.db()).await.expect("migrate");
+
+        for (what, sql) in [
+            (
+                "§8.3's [[peer]] under a shared CA, which carries no auth material",
+                "INSERT INTO peers (node_id, name, auth_kind)
+                 VALUES (x'0193f3c27a107b649c2e4f1b8a6d0e11', 'satellite-a', 'mtls-ca')",
+            ),
+            (
+                "§8.3's second [[ingest]], which omits the CA the first one names",
+                "INSERT INTO ingest (listen, peer_auth) VALUES ('rest', 'mtls-ca')",
+            ),
+            (
+                "the configured-device type vocabulary /stationinfo freezes (§3.1)",
+                "INSERT INTO stations (station_key, owning_node_id, name, type,
+                                       identity_kind, transport_kind, transport_host,
+                                       transport_port)
+                 VALUES ('c', x'0193f3c28b207c71ae3f10cc92d4b7aa', 'c',
+                         'campbellscientific', 'fixed', 'tcp_out', '10.0.0.9', 6785)",
+            ),
+            (
+                "an Aeris pairing, which has no uploader because Aeris is not an egress",
+                "INSERT INTO station_service (station_key, service) VALUES ('c', 'aeris')",
+            ),
+        ] {
+            sqlx::query(sql)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("the schema rejected {what}: {e}"));
+        }
+        pool.close().await;
+    }
+
     /// The converse of the last case in the test below, and the reason that case is scoped
     /// to local stations. A station received by registration carries the SATELLITE's
     /// `station_type` (W7 §5.2), so a newer peer running a driver this collector has never
@@ -364,13 +490,14 @@ mod tests {
 
         let node = "x'0193f3c28b207c71ae3f10cc92d4b7aa'";
         let phc = "'$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$aGFzaGhhc2g'";
-        let cases: [(&str, String); 10] = [
+        let cases: [(&str, String); 19] = [
             (
                 "an inbound transport with a fixed identity (W2a §4a.4)",
                 format!(
                     "INSERT INTO stations (station_key, owning_node_id, name, type,
                                            identity_kind, transport_kind, transport_mount)
-                     VALUES ('a', {node}, 'a', 'ambient', 'fixed', 'http_in', '/i')"
+                     VALUES ('a', {node}, 'a', 'ambient-customized', 'fixed', 'http_in',
+                             '/i')"
                 ),
             ),
             (
@@ -419,8 +546,75 @@ mod tests {
                 "INSERT INTO website (name, hostname) VALUES ('w', 'EXAMPLE.COM')".to_string(),
             ),
             (
-                "a wildcard CORS origin (A-W5-3)",
+                "a bare wildcard CORS origin (A-W5-3)",
                 "INSERT INTO management_cors_origin (origin) VALUES ('*')".to_string(),
+            ),
+            (
+                // The case that matters, and the one the bare '*' above does NOT cover:
+                // '*' fails on the scheme CHECK and never reaches the wildcard CHECK, so
+                // without this row the wildcard rule is untested.
+                "a subdomain-wildcard CORS origin (A-W5-3)",
+                "INSERT INTO management_cors_origin (origin)
+                 VALUES ('https://*.example.com')"
+                    .to_string(),
+            ),
+            (
+                // SQLite's LIKE is ASCII-case-insensitive, so the GLOB form is load-bearing:
+                // an upper-case origin can never match a browser Origin header, and an
+                // allowlist entry that silently does nothing is worse than a rejected one.
+                "an upper-case CORS origin (A-W5-3)",
+                "INSERT INTO management_cors_origin (origin) VALUES ('HTTPS://EVIL.COM')"
+                    .to_string(),
+            ),
+            (
+                "a Weather Underground uploader carrying APRS KISS settings (D-66)",
+                "INSERT INTO uploader (kind, name, aprs_kiss_path)
+                 VALUES ('wunderground', 'leak', 'WIDE1-1')"
+                    .to_string(),
+            ),
+            (
+                "an APRS-IS uploader carrying a KISS TNC address (D-66)",
+                "INSERT INTO uploader (kind, name, aprs_transport, aprs_kiss_tcp_address)
+                 VALUES ('aprs', 'leak2', 'aprs-is', '127.0.0.1:8001')"
+                    .to_string(),
+            ),
+            (
+                "an mtls-ca peer carrying auth material the CA makes meaningless (W7 §8.3)",
+                "INSERT INTO peers (node_id, name, auth_kind, auth_material)
+                 VALUES (x'0193f3c27a107b649c2e4f1b8a6d0e11', 'p', 'mtls-ca', 'x')"
+                    .to_string(),
+            ),
+            (
+                "a grpc_out transport with no streaming flag for plan() to read (W2a §4a.3)",
+                format!(
+                    "INSERT INTO stations (station_key, owning_node_id, name, type,
+                                           identity_kind, transport_kind, transport_url)
+                     VALUES ('g', {node}, 'g', 'snowgauge', 'fixed', 'grpc_out',
+                             'https://h:1')"
+                ),
+            ),
+            (
+                // A CHECK that evaluates to NULL passes in SQLite, and `date('2026-99-99')`
+                // is NULL — so this case and the two below it are the ones that caught
+                // three accidentally-always-true constraints.
+                "a Calendar occurrence on a date that does not exist (W2a D-13)",
+                "INSERT INTO component_schedule
+                 VALUES ('c', '2026-99-99', 0, 1, 'ok')"
+                    .to_string(),
+            ),
+            (
+                "an APRS uploader with KISS settings and no KISS transport (D-66)",
+                "INSERT INTO uploader (kind, name, aprs_kiss_path)
+                 VALUES ('aprs', 'nulltrap', 'WIDE1-1')"
+                    .to_string(),
+            ),
+            (
+                "a received station carrying a transport field it has no transport for",
+                format!(
+                    "INSERT INTO stations (station_key, owning_node_id, name, type,
+                                           identity_kind, transport_streaming)
+                     VALUES ('n', {node}, 'n', 'davis', 'from_registration', 1)"
+                ),
             ),
             (
                 "a local station naming a driver that does not exist (W2a §4a.5)",
@@ -435,8 +629,18 @@ mod tests {
         ];
 
         for (what, sql) in cases {
-            let outcome = sqlx::query(&sql).execute(&pool).await;
-            assert!(outcome.is_err(), "the schema accepted {what}");
+            let err = match sqlx::query(&sql).execute(&pool).await {
+                Ok(_) => panic!("the schema accepted {what}"),
+                Err(e) => e.to_string(),
+            };
+            // Which failure matters. `is_err()` alone lets a case pass for the wrong
+            // reason — a typo in a column name is also an error — and the point of this
+            // test is that a constraint which is accidentally always-true becomes visible.
+            let upper = err.to_uppercase();
+            assert!(
+                upper.contains("CONSTRAINT FAILED") || upper.contains("UNIQUE CONSTRAINT"),
+                "{what} failed, but not on a constraint: {err}"
+            );
         }
         pool.close().await;
     }

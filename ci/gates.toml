@@ -141,9 +141,17 @@ a new one.
 
 Three checks on the configuration half, and the order matters:
 
-  1. no conditional DDL anywhere under migrations/, with line comments stripped so that a
-     migration SAYING "no IF NOT EXISTS, deliberately" is not reported as using it. This
-     runs first and needs no database, because the other two are meaningless without it.
+  1. no conditional DDL under migrations/, with line comments stripped so that a migration
+     SAYING "no IF NOT EXISTS, deliberately" is not reported as using it. This runs first and
+     needs no database, because the other two are meaningless without it.
+
+     TWO scopes. Repo-wide: `IF NOT EXISTS` and `if_not_exists`, which is M2-2's criterion
+     verbatim and which both schemas satisfy. Under migrations/config/ also `OR REPLACE` and
+     `IF EXISTS`, because that schema is written from scratch and has no use for either --
+     whereas `cargo xtask codegen` emits `CREATE OR REPLACE FUNCTION mw_mean` and `cargo
+     xtask migrate` emits `DROP MATERIALIZED VIEW IF EXISTS ... CASCADE`, so forbidding them
+     repo-wide would be a rule this repository's own generator cannot satisfy.
+     crates/mw-store/src/config_db.rs enforces the same pair.
   2. the same two-path comparison as the weather schema: empty -> HEAD against previous
      release -> seeded rows -> HEAD, compared over sqlite_master.
   3. the applier run AGAIN over a schema already at HEAD: no migration may run, the schema

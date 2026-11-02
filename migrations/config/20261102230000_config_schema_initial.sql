@@ -36,6 +36,14 @@
 --
 -- A CHECK constraint appears below only where a design document names the illegal state,
 -- never as general hygiene. Each one carries the reference.
+--
+-- One SQLite rule governs how they are written: **a CHECK that evaluates to NULL PASSES.**
+-- Only an explicit false rejects. So `x IS NULL OR y = 'z'` silently admits every row where
+-- `y` is NULL, and `date(d) = d` admits every invalid date, because `date()` returns NULL
+-- for one. Every constraint below that touches a nullable column therefore uses `IS`,
+-- `COALESCE` or an `IS NOT NULL` guard rather than bare `=`/`IN`. Three constraints in this
+-- file were accidentally always-true before that rule was applied, which is why it is
+-- written down here rather than remembered.
 
 -- ---------------------------------------------------------------------------------------
 -- The node, and the spool
@@ -142,9 +150,17 @@ INSERT INTO listener (id) VALUES (1);
 CREATE TABLE management_cors_origin (
     origin     TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    -- An exact match is exact: no wildcard, no suffix matching, no scheme-relative form.
-    CHECK (origin LIKE 'http://%' OR origin LIKE 'https://%'),
-    CHECK (origin NOT LIKE '%*%')
+    -- An exact match is exact: a scheme, a non-empty authority, and nothing else. GLOB
+    -- rather than LIKE throughout, because SQLite's LIKE is ASCII-case-insensitive --
+    -- `origin LIKE 'https://%'` accepts `HTTPS://EVIL.COM`, which can never match a
+    -- browser `Origin` header and therefore reads as an allowlist entry that silently does
+    -- nothing. Three independent clauses rather than one disjunction: a disjunction here is
+    -- how a constraint becomes accidentally always-true.
+    CHECK (origin GLOB 'http://?*' OR origin GLOB 'https://?*'),
+    -- No wildcard, and not a list in one row.
+    CHECK (origin NOT GLOB '*[*, ]*'),
+    -- No path, no trailing slash: the only two slashes are the scheme's.
+    CHECK (length(origin) - length(replace(origin, '/', '')) = 2)
 ) STRICT;
 
 -- ---------------------------------------------------------------------------------------
@@ -166,7 +182,9 @@ CREATE TABLE weather_database (
     -- One URL rather than the Go schema's host/port/database/user/password/ssl_mode/
     -- timezone columns. It carries a password, so it is a `SecretString` from the moment
     -- it is read (D-33) and `GET /api/v1/config` omits it rather than redacting it (W5 §3.2).
-    url        TEXT NOT NULL CHECK (url LIKE 'postgres://%' OR url LIKE 'postgresql://%'),
+    -- GLOB, not LIKE: LIKE is ASCII-case-insensitive, so `POSTGRES://` would pass a check
+    -- that claims to pin the scheme.
+    url        TEXT NOT NULL CHECK (url GLOB 'postgres://?*' OR url GLOB 'postgresql://?*'),
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
@@ -186,17 +204,28 @@ CREATE TABLE weather_database (
 -- `uploader` (D-66).
 
 CREATE TABLE stations (
-    station_key                 TEXT PRIMARY KEY,
+    -- The surrogate integer the FROZEN contract returns. `/stationinfo` emits
+    -- `stations[].id` as an integer (contract/fixtures/stationinfo-full.json: `{"id":4,
+    -- "name":"aqmon",...}`) and W3 §7's config payload emits `stationID` and
+    -- `airQualityDeviceID` as integers. `station_key` is the domain identity and is unique,
+    -- but it is text, so it cannot be the source of those three frozen fields -- which is
+    -- why the Go `devices.id` surrogate is carried forward rather than dropped.
+    id                          INTEGER PRIMARY KEY,
+    station_key                 TEXT NOT NULL UNIQUE,
     -- The node that measures this station. Equal to `node.node_id` for a local station;
     -- a peer's `node_id` for one that arrived by registration, which is what makes
     -- W5 §0.6's read-only "Received from {peer}" entry a query rather than a flag.
     -- Deliberately NOT a foreign key to `peers`: a station may be two hops away, so its
-    -- owning node is not necessarily a node this one has a peer row for (D-59).
+    -- owning node is not necessarily a node this one has a peer row for (W7 §8.4's relay,
+    -- and W7 D-36's default that stops it being the common case).
     owning_node_id              BLOB NOT NULL CHECK (length(owning_node_id) = 16),
     name                        TEXT NOT NULL,
-    -- There is no `grpc-receiver` type: the receiver is an `ingest` row, and a station that
-    -- arrives over it carries the satellite's own type (`StationMeta.station_type`,
-    -- W7 §5.2). The permitted set is constrained below, for local stations only.
+    -- The CONFIGURED device type, which is the vocabulary `/stationinfo` returns --
+    -- `campbellscientific`, not `campbell`. docs/legacy-api-contract.md §3.1 is explicit
+    -- that this and `/latest`'s driver-self-reported `stationtype` "are not the same set
+    -- and must not be unified": for Campbell the configured type is `campbellscientific`
+    -- and the driver name is `campbell`. Five frozen fixtures carry the configured form.
+    -- The permitted set is constrained below, for local stations only.
     type                        TEXT NOT NULL,
     -- W5 §1.2's "Collecting readings" toggle. Under W2a §2.5 this produces a plan diff
     -- that stops the station component; today it writes the column and nothing stops,
@@ -238,9 +267,14 @@ CREATE TABLE stations (
     -- right shape here, which is exactly what they are not for services (D-66).
     -- NULL for a station received from a peer: that station is inventory on this node, not
     -- a component, and its transport is configured on the node that owns it.
+    -- W2a §4a.3's `Transport`, minus `GrpcIn`. The one driver that used `GrpcIn` is the
+    -- gRPC receiver, which is an `ingest` row here (see the comment above on
+    -- `from_registration`) -- so listing it would admit a combination no driver has while
+    -- the combination §4a.5 DOES have, `GrpcIn` + `FromRegistration`, is rejected by the
+    -- transport/identity CHECK below. Removing it is what makes the two agree.
     transport_kind              TEXT CHECK (transport_kind IS NULL OR transport_kind IN (
                                     'serial', 'tcp_out', 'http_out', 'grpc_out', 'mqtt_sub',
-                                    'http_in', 'udp_in', 'grpc_in')),
+                                    'http_in', 'udp_in')),
     transport_dev               TEXT,
     transport_baud              INTEGER CHECK (transport_baud IS NULL OR transport_baud > 0),
     transport_host              TEXT,
@@ -248,6 +282,13 @@ CREATE TABLE stations (
                                                OR transport_port BETWEEN 1 AND 65535),
     transport_url               TEXT,
     transport_method            TEXT,
+    -- `HttpOut { auth: Option<SecretString> }` (W2a §4a.3), for §4a.7's vendor-cloud poll.
+    transport_auth              TEXT,
+    -- `GrpcOut { streaming: bool }` (W2a §4a.3). Load-bearing rather than descriptive: it
+    -- is what §4a.3's trigger-implication table reads to decide `Service` against `Every`,
+    -- and that implication "is checked at plan time", so M2-3 has to be able to see it.
+    transport_streaming         INTEGER CHECK (transport_streaming IS NULL
+                                               OR transport_streaming IN (0, 1)),
     transport_mount             TEXT,
     transport_group             TEXT,
     transport_topic             TEXT,
@@ -263,15 +304,21 @@ CREATE TABLE stations (
     -- A station has a local transport if and only if it was not received by registration.
     CHECK ((transport_kind IS NULL) = (identity_kind = 'from_registration')),
 
-    -- The seven drivers of W2a §4a.5 -- but only for a station this node reads itself. A
-    -- station received by registration carries the SATELLITE's `station_type`, and a newer
-    -- peer with a driver this collector has never heard of must not fail to enrol against
-    -- an older collector: W7 §5.2 puts `software` on the peer row precisely because
-    -- version skew between nodes is expected. For a local station the type has to name a
-    -- driver that exists, which is what this constrains.
+    -- The configured device types, in the spelling the frozen contract uses -- Go's
+    -- `validTypes` (pkg/config/provider.go:449) plus `weatherlink-live`, minus
+    -- `grpcreceiver`, which is an `ingest` row here and never a local transport. NOT the
+    -- driver names: `campbellscientific` and `ambient-customized` are what
+    -- docs/legacy-api-contract.md §3.1 freezes, and writing `campbell`/`ambient` here would
+    -- make M7-4's configuration migration either impossible or a silent contract break.
+    --
+    -- Local stations only. A station received by registration carries the SATELLITE's
+    -- `station_type`, and a newer peer with a driver this collector has never heard of must
+    -- not fail to enrol against an older collector: W7 §5.2 puts `software` on the peer row
+    -- precisely because version skew between nodes is expected. `/stationinfo` can still
+    -- emit `grpcreceiver` for such a row, which is the seventh name in §3.1's list.
     CHECK (transport_kind IS NULL OR type IN (
-               'davis', 'campbell', 'snowgauge', 'airgradient', 'ambient',
-               'weatherlink-live')),
+               'campbellscientific', 'davis', 'snowgauge', 'ambient-customized',
+               'airgradient', 'weatherlink-live')),
 
     -- W2a §4a.4, the invariant MQTT broke and the one that makes the Ambient bug
     -- unrepresentable: cardinality is One if and only if identity is Fixed, and connection
@@ -289,18 +336,22 @@ CREATE TABLE stations (
     CHECK (transport_kind <> 'tcp_out'
            OR (transport_host IS NOT NULL AND transport_port IS NOT NULL)),
     CHECK (transport_kind <> 'http_out' OR transport_url IS NOT NULL),
-    CHECK (transport_kind <> 'grpc_out' OR transport_url IS NOT NULL),
+    CHECK (transport_kind <> 'grpc_out'
+           OR (transport_url IS NOT NULL AND transport_streaming IS NOT NULL)),
+    -- COALESCE for the same reason: `transport_kind` is NULL on a received station, and
+    -- `NULL = 'grpc_out'` is NULL, so these two would admit a received station carrying a
+    -- streaming flag or a credential for a transport it does not have.
+    CHECK (transport_streaming IS NULL OR COALESCE(transport_kind, '') = 'grpc_out'),
+    CHECK (transport_auth IS NULL OR COALESCE(transport_kind, '') = 'http_out'),
     CHECK (transport_kind <> 'mqtt_sub'
            OR (transport_url IS NOT NULL AND transport_topic IS NOT NULL)),
     CHECK (transport_kind <> 'http_in' OR transport_mount IS NOT NULL),
-    CHECK (transport_kind <> 'grpc_in' OR transport_mount IS NOT NULL),
     CHECK (transport_kind <> 'udp_in' OR transport_port IS NOT NULL),
     -- A certificate without its key, again.
     CHECK ((transport_tls_cert_path IS NULL) = (transport_tls_key_path IS NULL))
 ) STRICT;
 
 CREATE INDEX stations_owning_node_id ON stations (owning_node_id);
-CREATE INDEX stations_enabled ON stations (enabled);
 -- Unique across local AND received stations, because the frozen contract looks a station up
 -- by name: `?station=davis-full` is in contract/fixtures/forecast-by-station-name.json, and
 -- `/latest`, `/span` and `/forecast` all accept it (D-68). The Go schema has
@@ -387,29 +438,57 @@ CREATE TABLE uploader (
     created_at              INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at              INTEGER NOT NULL DEFAULT (unixepoch()),
 
-    -- A column belongs to its kind. The Go `controller_configs` row carries every service's
-    -- columns at once because it is keyed by controller type, so `pws_api_key` on the APRS
-    -- row is a representable state nothing rejects.
+    -- Not redundant with the primary key: it is the parent index `station_service`'s
+    -- composite foreign key needs, which is what stops a pairing naming one service while
+    -- pointing at an account of another.
+    UNIQUE (id, kind),
+
+    -- A column belongs to its kind, and the list has to be EXHAUSTIVE to mean anything.
+    -- The Go `controller_configs` row carries every service's columns at once because it is
+    -- keyed by controller type, so `pws_api_key` on the APRS row is a representable state
+    -- nothing rejects -- and a partial exclusion list here is the same defect with fewer
+    -- columns in it.
     CHECK (kind = 'aprs' OR (aprs_passcode IS NULL AND aprs_symbol_table IS NULL
                              AND aprs_symbol_code IS NULL AND aprs_comment IS NULL
-                             AND aprs_server IS NULL AND aprs_transport IS NULL)),
+                             AND aprs_server IS NULL AND aprs_transport IS NULL
+                             AND aprs_kiss_serial_device IS NULL
+                             AND aprs_kiss_serial_baud IS NULL
+                             AND aprs_kiss_tcp_address IS NULL
+                             AND aprs_kiss_path IS NULL
+                             AND aprs_kiss_destination IS NULL)),
     CHECK (kind <> 'aprs' OR api_key IS NULL),
-    CHECK (aprs_transport IS NOT NULL OR (aprs_kiss_serial_device IS NULL
-                                          AND aprs_kiss_tcp_address IS NULL)),
+    -- And the KISS columns belong to a KISS transport, not merely to the APRS kind: a
+    -- `kiss_tcp_address` on an `aprs-is` uploader is configuration nothing will ever read.
+    -- COALESCE, not a bare IN: `NULL IN (...)` is NULL, so an APRS uploader with no
+    -- transport chosen yet would admit every KISS column.
+    CHECK (COALESCE(aprs_transport, '') IN ('kiss-serial', 'kiss-tcp')
+           OR (aprs_kiss_serial_device IS NULL AND aprs_kiss_serial_baud IS NULL
+               AND aprs_kiss_tcp_address IS NULL AND aprs_kiss_path IS NULL
+               AND aprs_kiss_destination IS NULL)),
     CHECK (aprs_transport <> 'kiss-serial'
-           OR (aprs_kiss_serial_device IS NOT NULL AND aprs_kiss_serial_baud IS NOT NULL)),
-    CHECK (aprs_transport <> 'kiss-tcp' OR aprs_kiss_tcp_address IS NOT NULL)
+           OR (aprs_kiss_serial_device IS NOT NULL AND aprs_kiss_serial_baud IS NOT NULL
+               AND aprs_kiss_tcp_address IS NULL)),
+    CHECK (aprs_transport <> 'kiss-tcp'
+           OR (aprs_kiss_tcp_address IS NOT NULL AND aprs_kiss_serial_device IS NULL
+               AND aprs_kiss_serial_baud IS NULL))
 ) STRICT;
 
 CREATE TABLE station_service (
     station_key       TEXT NOT NULL REFERENCES stations (station_key) ON DELETE CASCADE,
-    service           TEXT NOT NULL CHECK (service IN ('wunderground', 'pwsweather', 'aprs')),
+    -- `aeris` is here even though there is no Aeris `uploader`, because the Go `devices`
+    -- row carries `aeris_enabled` per station and M7-4 -- which depends on M2-2 -- has to
+    -- move it somewhere. "Which stations get forecasts and alerts" is a station/service
+    -- pairing like any other; the Aeris ACCOUNT (client id, secret, endpoint, refresh
+    -- interval) is M6-3's, and it is not an uploader, so the pairing carries no
+    -- `uploader_id`. That is also what makes W3 §7's `aerisWeatherEnabled` derivable.
+    service           TEXT NOT NULL CHECK (service IN ('wunderground', 'pwsweather',
+                                                       'aprs', 'aeris')),
     -- W7 §6.1's `for`, from the other end. The selector is written as a list there so that
     -- a future fleet-identity kind needs no migration; as rows, a list costs nothing and
     -- the one-station arity of `wu`/`pws`/`aprs` stays a `PlanError::UploaderArity` rather
     -- than a constraint, because W7 D-38 makes it a property of the KIND and not of the
     -- selector.
-    uploader_id       INTEGER NOT NULL REFERENCES uploader (id) ON DELETE CASCADE,
+    uploader_id       INTEGER,
     -- This station's identifier at the far end -- a Weather Underground or PWS Weather
     -- station id. A property of the pairing, not of the account: one account can carry
     -- several stations, each with its own id.
@@ -419,7 +498,14 @@ CREATE TABLE station_service (
     -- One pairing per station per service. There is deliberately no `enabled` column: the
     -- switch is `uploader.enabled`, and a second toggle on the same fact is the two-places
     -- defect this table exists to remove.
-    PRIMARY KEY (station_key, service)
+    PRIMARY KEY (station_key, service),
+    -- An upload pairing names an account; an Aeris pairing has none.
+    CHECK ((service = 'aeris') = (uploader_id IS NULL)),
+    -- A COMPOSITE foreign key, not `uploader_id` alone. The kind is written on both rows,
+    -- and this is the one join where that could disagree: without it, a pairing with
+    -- `service = 'aprs'` can point at an account with `kind = 'wunderground'`, which is the
+    -- same-service-in-two-places defect this table exists to remove, wearing a join.
+    FOREIGN KEY (uploader_id, service) REFERENCES uploader (id, kind) ON DELETE CASCADE
 ) STRICT;
 
 CREATE INDEX station_service_uploader_id ON station_service (uploader_id);
@@ -430,8 +516,12 @@ CREATE INDEX station_service_uploader_id ON station_service (uploader_id);
 -- The Go `weather_websites` row, carried forward (D-38: the website is carried forward
 -- as-is, except that template-generated JavaScript becomes static JavaScript plus a JSON
 -- config endpoint). The nine values that endpoint must carry are
--- docs/legacy-api-contract.md §9's list, every one of which is derivable from this table
--- plus the station it names.
+-- docs/legacy-api-contract.md §9's list, fixed as a payload by W3 §7.
+--
+-- Three of the nine are not on this table and are worth naming, because each one is a
+-- frozen field whose source had to exist somewhere: `stationID` and `airQualityDeviceID`
+-- are integers, which is why `stations` carries the `id` surrogate, and
+-- `aerisWeatherEnabled` is a `station_service` row with `service = 'aeris'`.
 
 CREATE TABLE website (
     id                      INTEGER PRIMARY KEY,
@@ -440,8 +530,13 @@ CREATE TABLE website (
     -- that behaviour exactly. Stored lower-case and unique: today the host table is a
     -- case-sensitive map, so `EXAMPLE.COM` silently serves the default website's data under
     -- the wrong hostname. The CHECK makes that unrepresentable rather than handled.
+    -- W3 §6.3 normalises a `Host` header in three steps before matching -- lower-case,
+    -- strip the port, strip a single trailing dot -- so a stored hostname that has not had
+    -- all three applied is a row that can never match. One CHECK per step.
     hostname                TEXT NOT NULL DEFAULT '' UNIQUE
-                                CHECK (hostname = lower(hostname)),
+                                CHECK (hostname = lower(hostname))
+                                CHECK (hostname NOT GLOB '*:*')
+                                CHECK (hostname NOT GLOB '*.'),
     page_title              TEXT NOT NULL DEFAULT '',
     about_station_html      TEXT NOT NULL DEFAULT '',
     -- The per-website primary station. W3 §2a.3 resolves a request to
@@ -480,7 +575,11 @@ CREATE TABLE website (
     CHECK (is_default_tls = 0 OR tls_cert_path IS NOT NULL)
 ) STRICT;
 
+-- One index per ON DELETE SET NULL reference. Without one SQLite scans the child table for
+-- every parent delete, and all three of these columns carry that clause.
 CREATE INDEX website_primary_station_key ON website (primary_station_key);
+CREATE INDEX website_snow_station_key ON website (snow_station_key);
+CREATE INDEX website_air_quality_station_key ON website (air_quality_station_key);
 -- At most one SNI fallback. A partial unique index rather than a CHECK, because "one row in
 -- the table has this" is not something a row-level constraint can say.
 CREATE UNIQUE INDEX website_default_tls ON website (is_default_tls) WHERE is_default_tls = 1;
@@ -497,9 +596,15 @@ CREATE TABLE peers (
     node_id       BLOB PRIMARY KEY CHECK (length(node_id) = 16),
     name          TEXT NOT NULL UNIQUE,
     auth_kind     TEXT NOT NULL CHECK (auth_kind IN ('mtls-ca', 'mtls-pinned', 'psk')),
-    -- A certificate PEM, an SPKI fingerprint, or a PSK hash, by `auth_kind`. A hash in the
-    -- PSK case: W7 §5.4 authenticates a peer, it does not need to reproduce its secret.
-    auth_material TEXT NOT NULL,
+    -- An SPKI fingerprint or a PSK hash, by `auth_kind`. A hash in the PSK case: W7 §5.4
+    -- authenticates a peer, it does not need to reproduce its secret.
+    --
+    -- NULL for `mtls-ca`, and that is the common case rather than an exception:
+    -- docs/collector.md §8.3's `[[peer]]` block is `node` / `id` / `relay` / `origins` and
+    -- carries nothing to put here, because under a shared CA the certificate chain does the
+    -- authenticating and the peer row only says who is allowed. `NOT NULL` would force a
+    -- placeholder, and a placeholder in a credential column is worse than a null.
+    auth_material TEXT,
     -- W7 D-36: false by default, so a peer may speak only for itself and a compromised leaf
     -- cannot inject history for another station.
     relay         INTEGER NOT NULL DEFAULT 0 CHECK (relay IN (0, 1)),
@@ -511,14 +616,17 @@ CREATE TABLE peers (
     last_seen     INTEGER,
     -- Revocation is a timestamp rather than a deletion, because "this peer was trusted
     -- until Tuesday" is what an operator needs to read off W5's fleet page.
-    revoked_at    INTEGER
+    revoked_at    INTEGER,
+    -- The material is required exactly where it is the thing being compared.
+    CHECK ((auth_material IS NOT NULL) = (auth_kind IN ('mtls-pinned', 'psk')))
 ) STRICT;
 
 CREATE TABLE peer_origins (
     node_id        BLOB NOT NULL REFERENCES peers (node_id) ON DELETE CASCADE,
     -- Which origins this peer may deliver. NOT a foreign key to `peers`: with `relay`, an
     -- origin can be a node two hops away that this node has no peer row for -- which is
-    -- the whole point of an ordered `path` (D-59).
+    -- what W7 §5.4's origin-authorisation clauses are checked against, and why D-59 makes
+    -- an envelope's `path` an ordered list rather than a set.
     origin_node_id BLOB NOT NULL CHECK (length(origin_node_id) = 16),
     PRIMARY KEY (node_id, origin_node_id)
 ) STRICT;
@@ -534,7 +642,7 @@ CREATE TABLE peer_enrolment_token (
     -- Argon2id PHC, D-35's primitive (W7 §5.3). The token itself is a `SecretString`,
     -- printed once and never logged -- unlike the current management token, which is
     -- printed in cleartext at startup and on every failed authentication.
-    token_hash  TEXT NOT NULL CHECK (token_hash LIKE '$argon2id$%'),
+    token_hash  TEXT NOT NULL CHECK (token_hash GLOB '$argon2id$?*'),
     issued_at   INTEGER NOT NULL DEFAULT (unixepoch()),
     expires_at  INTEGER NOT NULL,
     -- Single-use: burned in the same transaction that inserts the `peers` row.
@@ -551,11 +659,21 @@ CREATE INDEX peer_enrolment_token_open ON peer_enrolment_token (expires_at)
 -- mode (D-44). D-46: admission precedes the pipeline, so the authentication kind is
 -- configured on the listener rather than decided per reading.
 CREATE TABLE ingest (
-    listen     TEXT PRIMARY KEY CHECK (listen IN ('grpc', 'rest')),
-    peer_auth  TEXT NOT NULL CHECK (peer_auth IN ('mtls-ca', 'mtls-pinned', 'psk')),
-    ca_path    TEXT,
-    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    CHECK (peer_auth <> 'mtls-ca' OR ca_path IS NOT NULL)
+    listen          TEXT PRIMARY KEY CHECK (listen IN ('grpc', 'rest')),
+    peer_auth       TEXT NOT NULL CHECK (peer_auth IN ('mtls-ca', 'mtls-pinned', 'psk')),
+    -- Not required even for `mtls-ca`. docs/collector.md §8.3 sets `ca` on the gRPC listener
+    -- and omits it on the REST one with the same `peer_auth`, so the CA is a node-level
+    -- trust store that a listener may name rather than a per-listener setting -- and §8 says
+    -- those examples are the shape of the `ci/examples/*.db` fixtures `plan()` is checked
+    -- against. Requiring it per row made a documented fixture unrepresentable. "Where the
+    -- CA comes from when no listener names one" is M6-4's to decide, and a plan() check
+    -- rather than a constraint.
+    ca_path         TEXT,
+    -- docs/collector.md §5.4 and its plan-time check at §8.5: an ingest listener with no
+    -- TLS and no explicit opt-out is `PlanError::InsecureIngest`. The escape hatch has to
+    -- be expressible for M6-4 to be able to refuse its absence.
+    allow_insecure  INTEGER NOT NULL DEFAULT 0 CHECK (allow_insecure IN (0, 1)),
+    created_at      INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
 
 -- W7 §8.2's `[[uplink]]`. The other half of D-44.
@@ -590,7 +708,9 @@ CREATE TABLE admin_credential (
     -- re-hash in place when they fall below policy. That transparent upgrade is the whole
     -- reason for storing PHC rather than a bare digest, and the CHECK is what stops a bare
     -- digest being written here later.
-    password_phc             TEXT NOT NULL CHECK (password_phc LIKE '$argon2id$%'),
+    -- GLOB, not LIKE, for the same reason as above: `$ARGON2ID$...` is not a PHC string the
+    -- `argon2` crate will parse, and a check that accepts it is not checking the format.
+    password_phc             TEXT NOT NULL CHECK (password_phc GLOB '$argon2id$?*'),
     -- W5 §3.5's progressive delay: attempts 1-3 free, then min(2^(n-3), 30) seconds,
     -- per-username rather than per-IP, because there is one username and per-IP is
     -- trivially evaded. Persisted so a restart is not a way to clear the delay.
@@ -669,10 +789,17 @@ CREATE TABLE component_schedule (
     -- The occurrence key's local date, ISO-8601, in the component's resolved zone. Keyed on
     -- LOCAL DATE and slot rather than on an instant, which is what makes fall-back's second
     -- pass recognisable as already completed (W2a D-13).
+    -- `date()` rather than a GLOB over digits alone, which accepts '2026-99-99'. `IS`
+    -- rather than `=`: `date('2026-99-99')` is NULL, and `NULL = '2026-99-99'` is NULL,
+    -- which a CHECK treats as a pass.
     local_date   TEXT NOT NULL
-                     CHECK (local_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+                     CHECK (local_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+                            AND date(local_date) IS local_date),
     slot_index   INTEGER NOT NULL CHECK (slot_index >= 0),
     completed_at INTEGER NOT NULL,
+    -- `ok`, not `completed`: W3 §5.6's `ticks_total{outcome="ok"}` is the only enumerated
+    -- outcome vocabulary in the design, and the other four line up with `failed_total`,
+    -- `deadline_exceeded_total`, `skipped_total` and `misfired_total`. M2-3 writes both.
     outcome      TEXT NOT NULL CHECK (outcome IN (
-                     'completed', 'failed', 'deadline_exceeded', 'skipped', 'misfired'))
+                     'ok', 'failed', 'deadline_exceeded', 'skipped', 'misfired'))
 ) STRICT;

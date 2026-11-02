@@ -223,11 +223,29 @@ checks the PostgreSQL half cannot usefully make:
   than because the ledger held. That is D-64's reasoning applied to a property instead of a
   path: a check nobody has watched fail proves nothing.
 
-Before either database is touched, the script greps every file under `migrations/` for
-`IF NOT EXISTS`, `IF EXISTS`, `OR REPLACE` and `if_not_exists`, with `--` comments stripped
-so that a migration *saying* "no `IF NOT EXISTS`, deliberately" is not reported as using
-one. Both migration sets say exactly that, and a grep that could not tell prose from DDL
-would have to be either wrong or ignored.
+Before either database is touched, the script scans every file under `migrations/` for
+conditional DDL, with `--` comments stripped — both migration sets *say* "no
+`IF NOT EXISTS`, deliberately", and a scan that could not tell prose from DDL would have to
+be either wrong or ignored.
+
+**Two scopes, because the two schemas are not in the same position.** Repo-wide the rule is
+`IF NOT EXISTS` and `if_not_exists`, which is the work-item criterion verbatim and which both
+schemas satisfy. Under `migrations/config/` it also forbids `OR REPLACE` and `IF EXISTS`,
+because that schema is written from scratch and has no legitimate use for either — while the
+weather schema does and always will: `cargo xtask codegen` emits `CREATE OR REPLACE FUNCTION
+mw_mean` (`xtask/src/gen.rs`) and `cargo xtask migrate` emits `DROP MATERIALIZED VIEW IF
+EXISTS … CASCADE` (`xtask/src/migrate.rs`). A rule the repository's own generator cannot
+satisfy is not a rule, and `DROP … IF EXISTS` is not conditional-*create* DDL anyway.
+`crates/mw-store/src/config_db.rs` enforces the same pair, so the shell half and the Rust
+half of one rule agree.
+
+**The scan does not pipe into `grep -q`,** and that is the reason it works. Under `pipefail`
+a matching `grep -q` exits 0 and closes the pipe, the writer dies of SIGPIPE, and 141
+propagates as the pipeline's status — so `if printf '%s' "$body" | grep -qF "$idiom"` is
+false exactly when the idiom is *present*, on any input large enough that the writer has not
+already finished. The first version of this check did that and reported `clean` on the three
+weather migrations that do contain `OR REPLACE`; it is a `case` pattern now, which has no
+pipeline and no race.
 
 Three details that are load-bearing rather than incidental:
 
@@ -239,8 +257,10 @@ Three details that are load-bearing rather than incidental:
   finds the previous release and `git archive` extracts its `migrations/` — including
   `migrations/config/`, so both baselines come from the same extraction — and the baseline
   therefore cannot go stale. `MW_PREVIOUS_MIGRATIONS_DIR` overrides it for local use.
-- **Every `find` over `migrations/` is `-maxdepth 1`.** The two directories are two
-  databases, and a recursive find hands SQLite DDL to `psql`.
+- **Every `find` that feeds an *applier* is `-maxdepth 1`.** The two directories are two
+  databases, and a recursive find hands SQLite DDL to `psql`. The one deliberately
+  recursive `find` is the conditional-DDL preflight, which is a text scan and has to see
+  both sets.
 - **TimescaleDB's own schemas are excluded from the comparison, not filtered out of it.**
   Path B has chunks because it has rows; path A does not. Chunks are not schema. Excluding
   `_timescaledb_*` is the difference between a meaningful comparison and a permanent red.

@@ -47,6 +47,7 @@ DB_B="${DB_B:-mw_migrate_b}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# Set before the preflight below, which scopes part of its rule to this directory.
 CONFIG_MIGRATIONS_DIR="${CONFIG_MIGRATIONS_DIR:-$MIGRATIONS_DIR/config}"
 
 if [ ! -d "$MIGRATIONS_DIR" ]; then
@@ -71,18 +72,50 @@ fi
 # shape -- `CREATE TABLE IF NOT EXISTS` in a startup path, which never errors and never
 # updates.
 #
-# Line comments are stripped first, so a migration that SAYS "no IF NOT EXISTS, deliberately"
-# is not reported as using it. Both of the repository's migration sets say exactly that, and
-# a grep that could not tell prose from DDL would have to be either wrong or ignored.
+# TWO scopes, because the two schemas are not in the same position.
+#
+#   everywhere under migrations/   `IF NOT EXISTS` and `if_not_exists`. This is the work
+#                                  item's done-criterion verbatim, and both schemas satisfy
+#                                  it.
+#   migrations/config/ only        plus `OR REPLACE` and `IF EXISTS`. The configuration
+#                                  schema is written from scratch and has no legitimate use
+#                                  for either. The WEATHER schema does and always will:
+#                                  `cargo xtask codegen` emits `CREATE OR REPLACE FUNCTION
+#                                  mw_mean` (xtask/src/gen.rs:67) and `cargo xtask migrate`
+#                                  emits `DROP MATERIALIZED VIEW IF EXISTS ... CASCADE`
+#                                  (xtask/src/migrate.rs:216), so forbidding them repo-wide
+#                                  would be a rule the repository's own generator cannot
+#                                  satisfy. `DROP ... IF EXISTS` is not conditional-create
+#                                  DDL anyway.
+#
+# These are the scopes `crates/mw-store/src/config_db.rs` checks too, so the shell half and
+# the Rust half of one rule agree.
+#
+# Line comments are stripped first, so a migration that SAYS "no IF NOT EXISTS,
+# deliberately" is not reported as using it. Both migration sets say exactly that, and a
+# grep that could not tell prose from DDL would have to be either wrong or ignored.
+#
+# No pipe into `grep -q`. Under `pipefail` a matching `grep -q` exits 0 and closes the pipe,
+# the writer dies of SIGPIPE, and 141 propagates as the pipeline's status -- so
+# `if printf '%s' "$body" | grep -qF "$idiom"` is FALSE exactly when the idiom is present,
+# on any input large enough that the writer has not already finished. That is how this check
+# came to report `clean` on three migrations that do contain `OR REPLACE`. A `case` pattern
+# does the same job with no pipeline and no race.
 echo "=== no conditional DDL under $MIGRATIONS_DIR/ (D-8, A-W6-2)"
 conditional=0
 while IFS= read -r f; do
   body="$(sed -E 's/--.*$//' "$f" | tr '[:lower:]' '[:upper:]')"
-  for idiom in 'IF NOT EXISTS' 'IF EXISTS' 'OR REPLACE' 'IF_NOT_EXISTS'; do
-    if printf '%s' "$body" | grep -qF "$idiom"; then
-      echo "  $f: \`$idiom\` in a statement" >&2
-      conditional=1
-    fi
+  idioms=('IF NOT EXISTS' 'IF_NOT_EXISTS')
+  case "$f" in
+    "$CONFIG_MIGRATIONS_DIR"/*) idioms+=('OR REPLACE' 'IF EXISTS') ;;
+  esac
+  for idiom in "${idioms[@]}"; do
+    case "$body" in
+      *"$idiom"*)
+        echo "  $f: \`$idiom\` in a statement" >&2
+        conditional=1
+        ;;
+    esac
   done
 done < <(find "$MIGRATIONS_DIR" -name '*.sql' | sort)
 if [ "$conditional" -ne 0 ]; then
@@ -438,9 +471,14 @@ fi
 # has stopped testing anything. This is the half DESIGN.md D-64's reasoning applies to a
 # property rather than to a path: a check that has never been seen able to fail proves
 # nothing.
+#
+# What it sees: `sqlite3 -bail` stops at the first error, so this proves the FIRST statement
+# is unconditional and nothing about the rest. The preflight above is what covers every
+# statement in the file; this covers the case the preflight cannot see, which is a statement
+# that is re-appliable without naming one of the four idioms.
 echo "=== the configuration database: every migration body must REFUSE to re-apply"
 for f in $(find "$CONFIG_MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' | sort); do
-  if sq "$CFG_A" ".read $f" >/dev/null 2>&1; then
+  if sq "$CFG_A" ".read '$f'" >/dev/null 2>&1; then
     echo "  FAIL: $(basename "$f") applied twice without error." >&2
     echo "        Something in it is conditional, so the ledger is no longer load-bearing." >&2
     status=1
