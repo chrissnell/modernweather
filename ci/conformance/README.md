@@ -45,7 +45,9 @@ Useful overrides:
    Davis emulator and the Campbell emulator from it, against the committed vendor tree.
 3. Bootstraps a SQLite configuration database with `rw -config` and fills it from
    `config-seed.sql` — seven devices and six websites, chosen by W1 so that every branch of the
-   frozen contract is reachable.
+   frozen contract is reachable. The bootstrap daemon is waited out, not just signalled: it holds
+   the configuration database open while it shuts down, and seeding into that window failed
+   intermittently with `database is locked (5)` on the seed's first write.
 4. Starts both emulators and the daemon. The daemon provisions the entire TimescaleDB schema,
    continuous aggregates and functions on first start.
 5. Waits for both emulator-driven stations to report, then applies the five migrations the
