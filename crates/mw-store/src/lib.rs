@@ -12,3 +12,6 @@
 //! The writer stores `NULL` for a metric a station did not report. The frozen contract's
 //! zeros are produced one layer later, at the DTO in `mw-api-legacy`; the two facts live
 //! in two crates and cannot be confused (§1.7).
+
+/// The configuration store and its migrations (D-8, A-W6-2).
+pub mod config_db;

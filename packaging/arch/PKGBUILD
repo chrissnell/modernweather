@@ -47,11 +47,25 @@ package() {
     install -Dm644 README.md "$pkgdir/usr/share/doc/modernweather/README.md"
     install -Dm644 docs/release.md "$pkgdir/usr/share/doc/modernweather/release.md"
     # Migrations are shipped so that the operator can inspect what will run; the daemon
-    # applies them from its own embedded copy (DESIGN.md D-8).
-    if compgen -G "migrations/*/*.sql" > /dev/null; then
-        for dir in migrations/*/; do
-            install -dm755 "$pkgdir/usr/share/modernweather/$dir"
-            install -Dm644 "$dir"*.sql "$pkgdir/usr/share/modernweather/$dir"
-        done
+    # applies them from its own embedded copy (DESIGN.md D-8). Arch only: the .deb and .rpm
+    # asset lists in crates/modernweather/Cargo.toml carry no migrations.
+    #
+    # Two levels, because there are two schemas: migrations/*.sql is the weather schema and
+    # migrations/config/*.sql is the configuration schema (D-8 as amended by A-W6-2). This
+    # loop only had the subdirectory form, which matched nothing while migrations/ was flat
+    # -- so the artefact shipped no migrations at all, and the day a subdirectory arrived it
+    # would have shipped that one and not the weather set.
+    if compgen -G "migrations/*.sql" > /dev/null; then
+        install -dm755 "$pkgdir/usr/share/modernweather/migrations"
+        install -Dm644 migrations/*.sql "$pkgdir/usr/share/modernweather/migrations/"
     fi
+    # The guard is per-iteration, not once around the loop: `migrations/*/*.sql` asks
+    # whether ANY subdirectory has a .sql while the loop visits EVERY subdirectory, so one
+    # subdirectory without one makes `install` fail with "missing destination file operand"
+    # and takes package() down with it.
+    for dir in migrations/*/; do
+        compgen -G "$dir*.sql" > /dev/null || continue
+        install -dm755 "$pkgdir/usr/share/modernweather/$dir"
+        install -Dm644 "$dir"*.sql "$pkgdir/usr/share/modernweather/$dir"
+    done
 }

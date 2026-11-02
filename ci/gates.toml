@@ -121,14 +121,54 @@ to watch the gate go red on demand."""
 
 [[gate]]
 id = "db-migrate-twice"
-description = "Migrations apply from empty and from the previous release's snapshot"
-owner = "W4 (database schema)"
+description = "Both schemas apply from empty and from the previous release's snapshot, and a second application is a no-op"
+owner = "W4 (database schema); the configuration half is implementation-plan.md M2-2"
 arms_when = "migrations"
 cmd = ["ci/db/migrate-twice.sh"]
 note = """
-Two paths, one schema. See docs/release.md §2 for why the comparison is schema-and-
-aggregate equivalence rather than the union-view assertions the W8 prompt asked for:
-DESIGN.md D-5 rejected the union-view scheme, so there are no union views to assert on."""
+Two paths, TWO schemas. `migrations/` is the weather schema on PostgreSQL/TimescaleDB and
+`migrations/config/` is the configuration schema on SQLite; DESIGN.md D-8 as amended by
+A-W6-2 governs both, because "schema changes solely through migrations, no DDL at startup,
+no `IF NOT EXISTS`" is about every schema this system owns and not just the weather one.
+
+Until implementation-plan.md M2-2 the second directory did not exist, so this gate was
+silent about the database that is the actual instance of the defect D-8 was written about:
+the Go configuration store issues `CREATE TABLE IF NOT EXISTS` from a startup path and has
+therefore been frozen at first-run shape ever since (docs/reconciliation.md G-2). The gate's
+`arms_when` did not change -- `migrations/` already existed -- so this is one of the places
+where widening what an armed gate CHECKS is the work item's deliverable rather than arming
+a new one.
+
+Three checks on the configuration half, and the order matters:
+
+  1. no conditional DDL under migrations/, with line comments stripped so that a migration
+     SAYING "no IF NOT EXISTS, deliberately" is not reported as using it. This runs first and
+     needs no database, because the other two are meaningless without it.
+
+     TWO scopes. Repo-wide: `IF NOT EXISTS` and `if_not_exists`, which is M2-2's criterion
+     verbatim and which both schemas satisfy. Under migrations/config/ also `OR REPLACE` and
+     `IF EXISTS`, because that schema is written from scratch and has no use for either --
+     whereas `cargo xtask codegen` emits `CREATE OR REPLACE FUNCTION mw_mean` and `cargo
+     xtask migrate` emits `DROP MATERIALIZED VIEW IF EXISTS ... CASCADE`, so forbidding them
+     repo-wide would be a rule this repository's own generator cannot satisfy.
+     crates/mw-store/src/config_db.rs enforces the same pair.
+  2. the same two-path comparison as the weather schema: empty -> HEAD against previous
+     release -> seeded rows -> HEAD, compared over sqlite_master.
+  3. the applier run AGAIN over a schema already at HEAD: no migration may run, the schema
+     may not change, and ci/db/config-seed.sql's rows must survive. Then the converse --
+     every migration BODY re-applied directly, which must fail. A body that re-applies
+     cleanly means check 3 is green because the DDL is conditional rather than because the
+     ledger held, which is D-64's reasoning applied to a property instead of a path.
+
+See docs/release.md §2 for why the weather comparison is schema-and-aggregate equivalence
+rather than the union-view assertions the W8 prompt asked for: DESIGN.md D-5 rejected the
+union-view scheme, so there are no union views to assert on.
+
+The daemon applies the configuration migrations with `sqlx::migrate` through
+`mw_store::config_db`, whose own tests drive that real migrator over the same files. This
+script shells out to sqlite3 instead, because it must stay runnable with no Rust toolchain
+and because an applier that is not the one under test is a second opinion rather than a
+duplicate."""
 
 [[gate]]
 id = "driver-emulators"

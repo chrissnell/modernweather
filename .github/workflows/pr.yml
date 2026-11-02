@@ -547,6 +547,26 @@ jobs:
           echo /usr/lib/postgresql/17/bin >> "$GITHUB_PATH"
           /usr/lib/postgresql/17/bin/psql --version
           /usr/lib/postgresql/17/bin/pg_dump --version
+      # The gate covers two databases: the weather schema on this service container and the
+      # configuration schema on SQLite (D-8 as amended by A-W6-2). The runner image ships
+      # sqlite3, so this is one apt call rather than a failure part-way through the run.
+      - name: Ensure sqlite3 is present, and new enough
+        run: |
+          if ! command -v sqlite3 >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends sqlite3
+          fi
+          sqlite3 --version
+          # migrations/config/ needs STRICT (3.37) and unixepoch() (3.38). ubuntu-latest
+          # ships 3.45, but ubuntu-22.04 ships 3.37.2 — so on a runner-image change the
+          # floor should fail here, naming itself, rather than inside a migration. The
+          # daemon is unaffected either way: libsqlite3-sys is bundled.
+          if ! sqlite3 ':memory:' 'CREATE TABLE t (a INT) STRICT; SELECT unixepoch();' >/dev/null
+          then
+            v="$(sqlite3 --version | cut -d' ' -f1)"
+            echo "::error::sqlite3 $v is below the 3.38 floor migrations/config/ needs (STRICT, unixepoch())"
+            exit 1
+          fi
       - name: Assert the server version (D-42)
         run: psql --set ON_ERROR_STOP=1 "$DATABASE_URL" -f ci/sql/assert-timescaledb-version.sql
       - name: Apply the migrations twice and compare
