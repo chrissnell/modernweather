@@ -12,6 +12,15 @@
 --   * the four composite (station_id, bucket DESC) indexes
 --   * the three retention policies on 1m, 5m and 1h
 --   * all four continuous-aggregate refresh policies
+--   * and, after the W9 cutover, `observations_1d_with_legacy` and
+--     `observations_1h_with_legacy` — plain views over the level, created by
+--     ci/db/migrate-from-go/generated/20-legacy-rollup.sql, which /span reads where it
+--     would read the level because below the cutover the level is empty and the archive
+--     is all there is. Nothing in this repository recreates them: they are written by the
+--     import, which runs once. They do not exist yet, so this migration cannot restore
+--     them, and that is exactly why they are named here — the NEXT level rebuild after
+--     cutover removes the relation /span's 366-day band reads, with no error until a
+--     query hits it. Re-running the import's view step is the manual repair.
 --
 -- all of which were created by 20261029234500_w4_station_dimension_caches_indexes_and_
 -- policies.sql. The generator does not know they exist: refresh policy, compression and
@@ -21,8 +30,14 @@
 -- The consequence of not re-asserting them is not an error. It is the 1-minute level
 -- growing without bound at 24 MB/day of uncompressible data, and `window:rollup` missing
 -- its 10-second deadline because no job is materialising the minute bucket any more —
--- both silent. `ci/db/schema-assertions.sql` A-8 is what makes it loud, and it is why
--- this file exists rather than a note in a PR.
+-- both silent. `ci/db/schema-assertions.sql` A-8 and A-9 are what make the policy half
+-- loud, and it is why this file exists rather than a note in a PR.
+--
+-- The index half had no assertion at all until this change added **A-10**. Worth stating
+-- plainly: had this migration simply omitted the four `CREATE INDEX` lines, every gate in
+-- this repository would have stayed green, because A-1 to A-9 never looked at an index and
+-- `migrate-twice.sh` excludes `_timescaledb_internal`, which is where TimescaleDB puts an
+-- index created on a continuous aggregate. The only symptom would have been /span latency.
 --
 -- This is a recurring cost, not a one-off: any future registry change that rebuilds a
 -- level needs the same follow-up. The structural fix is to make W4's policy block

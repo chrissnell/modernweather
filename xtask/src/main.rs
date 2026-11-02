@@ -438,7 +438,13 @@ fn migrate_cmd(root: &Path, flags: &[&str]) -> Result<ExitCode, String> {
         Some(s) => {
             let snap = s?;
             let changes = validate::against_snapshot(&reg, &snap, allow_breaking)?;
-            if changes.is_empty() {
+            // `changes.is_empty()` used to mean "the snapshot agrees with the registry".
+            // Since N-13 the snapshot also records the level hierarchy, and a level whose
+            // bucket, source or `materialized_only` changed produces no entry-level
+            // `Change` at all — so returning here on the change count alone printed a
+            // claim the tool no longer checked, while `codegen` rewrote the level's SQL and
+            // no gate noticed. The level comparison is cheap and makes the message true.
+            if changes.is_empty() && snapshot::levels_from_registry(&reg) == snap.levels {
                 println!("migrate: registry and snapshot agree; nothing to emit");
                 return Ok(ExitCode::SUCCESS);
             }
@@ -451,10 +457,18 @@ fn migrate_cmd(root: &Path, flags: &[&str]) -> Result<ExitCode, String> {
         .map_err(|e| e.to_string())?
         .as_secs();
     let stamp = stamp_override.unwrap_or_else(|| migrate::stamp(secs));
+    // What to call a migration that changes nothing the entries can see. Before N-13 that
+    // could only be labels, units, tiers and legacy keys; now a level redefinition reaches
+    // it too, and the two deserve different names because one rebuilds an aggregate.
+    let rebuild_name = if snapshot::levels_from_registry(&reg) == prev.levels {
+        "registry_metadata"
+    } else {
+        "rebuild_aggregate_levels"
+    };
     let default_name = if bootstrap {
         "initial_schema".to_string()
     } else {
-        derive_name(&changes)
+        derive_name(&changes, rebuild_name)
     };
     let m = migrate::render(
         &reg,
@@ -510,7 +524,7 @@ fn flag_value_str(flags: &[&str], name: &str) -> Option<String> {
     flags.get(i + 1).map(|s| (*s).to_string())
 }
 
-fn derive_name(changes: &[snapshot::Change]) -> String {
+fn derive_name(changes: &[snapshot::Change], rebuild_name: &str) -> String {
     use snapshot::Class;
     if changes.iter().any(|c| c.class.breaking()) {
         return "breaking_schema_change".into();
@@ -533,7 +547,10 @@ fn derive_name(changes: &[snapshot::Change]) -> String {
             .unwrap_or_default()
     };
     match (adds, deps) {
-        (0, 0) => "registry_metadata".into(),
+        // A level-only change reaches here with no adds and no deprecations, and calling
+        // that "registry_metadata" would be wrong in a permanent filename: the migration
+        // rebuilds an aggregate. The caller passes `rebuild` for it.
+        (0, 0) => rebuild_name.into(),
         (1, 0) => format!("add_{}", first(Class::AddColumn)),
         (n, 0) => format!("add_{n}_entries"),
         (0, 1) => format!("deprecate_{}", first(Class::Deprecate)),

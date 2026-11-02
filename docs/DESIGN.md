@@ -656,6 +656,12 @@ procedure refreshes the `/span` bands first, bottom-up, before backfilling histo
 **0.87 s against 467 s** — a 537× difference between "the charts are right" and "everything is
 materialised" — so a new metric is queryable at recent resolution in under a second.
 
+*Partly superseded by N-16 (implementation-plan.md M1-6).* The recent-first, bottom-up ordering
+stands. "Each level over its own band" did not: it had the daily level aggregate a 366-day range out
+of a 14-day hourly level and cache the result, so phase 1 now refreshes each level over the widest
+band any level above it serves and is no longer sub-second. See `docs/database-schema.md` §4 and
+decision 23 there, and DEV-7 for the unrelated `solarjoules` value change from the same work item.
+
 **Why this is more than inconvenient.** "Adding a metric is cheap" is cited as the justification for
 D-3 and D-4. Both survive the correction — the alternative layouts are worse on this axis too — but
 a capacity plan written from the 11.6 ms figure alone schedules a metric addition as a no-op and

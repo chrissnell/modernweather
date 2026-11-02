@@ -651,16 +651,19 @@ error anywhere, which is why `--check-watermarks` exists.
 **Recent ranges first, oldest last — OQ-W2-2's half that is mine.** The script runs in two phases,
 both bottom-up:
 
-1. **The `/span` bands.** Each level over exactly the window `/span` can read it over — 6 h, 48 h,
-   14 d, 366 d — bottom-up. Measured at 35.9 M raw rows: §6 measurement 3b. This is the phase that
-   has to finish before the charts are right.
+1. **The `/span` bands** — but each level over the **widest** band any level above it serves, not
+   over its own, bottom-up. **N-16 changed this**, and the paragraph below records what it cost;
+   the original form refreshed each level over its own band (6 h, 48 h, 14 d, 366 d) and cached a
+   hole in `observations_1d` for doing so. Measured at 35.9 M raw rows: §6 measurement 3b.
 2. **Everything older**, bottom-up again, as a background concern.
 
-The asymmetry is the whole argument. A full rebuild of the minute level over 35.9 M rows is minutes;
-the last six hours of it is well under a second. Adding a metric forces a drop-and-recreate of every
-level that carries it (D-15), so without this ordering, "adding a metric" means a long window of
-empty charts at ten years of history — which is A-W2-2's point, restated as a procedure instead of a
-warning. With it, the charts are correct in seconds.
+Adding a metric forces a drop-and-recreate of every level that carries it (D-15), so without
+recent-first ordering, "adding a metric" means a long window of empty charts at ten years of
+history — which is A-W2-2's point, restated as a procedure instead of a warning. **The asymmetry
+that argument rests on is weaker than it was**: with each level over its own band, phase 1 was 0.87 s
+against 467 s, and under N-16 phase 1 is a bottom-up rebuild over the trailing year. What phase 1
+still buys over phase 2 is a bounded range rather than a sub-second one. §6 measurement 3b and
+decision 23 both quote the 0.87 s figure and both now describe the superseded form.
 
 Bottom-up is **required**, not merely preferable: each level reads the level below it, so a range
 materialised top-down has the upper level reading a hole and caching it. The generated rebuild script
@@ -676,7 +679,8 @@ migration for the 5-minute level drops and recreates all four levels, including 
 whose definition did not change. `snapshot::affected_levels` keyed off which metrics changed rather
 than which level definitions changed, and every metric's `levels` list changed. Correct under D-15
 and expensive in exactly the way OQ-W2-2 describes: an intact minute level would have let the new
-5-minute level be built from it in 77 s instead of forcing a full raw rescan.
+5-minute level be built from it in 59 s instead of forcing a 401 s full raw rescan (§6
+measurement 3; 77 s appeared here and nowhere else and was wrong).
 
 **Fixed by N-13** (implementation-plan.md M1-6). `metrics/snapshot.toml` now records each level's
 own definition alongside the allocated identifiers, and `affected_levels` compares each level's
@@ -696,7 +700,20 @@ is stated rather than hidden in `ci/db/rebuild-aggregates.sh`'s own header: phas
 seconds, because a correct 366-day daily level requires a correct 366-day hourly level beneath it
 and, under D-11, all the levels below that too. `--recent-only` now names what it left incomplete,
 which under these bands is `observations_1d` alone — the other three levels' whole retention
-windows are inside phase 1's band.
+windows are inside phase 1's band, and `/span` cannot read a daily bucket older than its own
+one-year maximum, so what is left short is reachable only by an ad-hoc query or a D-6 restore.
+
+**Two costs N-16 moves rather than removes, both raised as N-21.** Phase 1 now materialises roughly
+8.8 GB into `observations_1m` (4,175 bytes per bucket row, 24 MB/day at four stations) and ~1.8 GB
+into `observations_5m`, all of it inside levels that retain 7 and 14 days and will evict it — a
+transient storage requirement the script's header did not previously have to state. And because
+phase 1 now runs for minutes rather than a second, a retention job firing between the minute
+level's refresh and the 5-minute level's read of it would hand the upper level a truncated source
+and cache the hole N-16 exists to close. That hazard is **not new** — phase 2 has always refreshed
+every level over unbounded history and has always had the same exposure — but N-16 extends it to
+phase 1 and so to `--recent-only`. Suspending the three retention jobs for the duration is the
+fix, and it is deliberately not in M1-6: a `scheduled => false` with a trap to restore it has its
+own silent failure mode (retention left off), and it cannot be verified without a database.
 
 **Backup and restore (D-6).** `pg_dump` of the raw hypertable plus a rebuild is a complete backup,
 and the restore side is where the cost sits. Restore raw, then run this script: phase 1 brings
@@ -1054,7 +1071,10 @@ psql -c "SET synchronous_commit = off" \
 | `observations_1d` | last 1 d | 15 ms |
 | **all four** | | **0.87 s** |
 
-**0.87 s against 467 s — 537×.** That is OQ-W2-2's recommendation as a number: a new metric is
+**0.87 s against 467 s — 537×.** *(Measured against phase 1 as originally written — each level over
+its own band. N-16 widened phase 1 to the widest band above each level because the original form
+cached a hole in `observations_1d`; the ordering stands, the sub-second figure does not. See §4.)*
+That is OQ-W2-2's recommendation as a number: a new metric is
 queryable at every `/span` resolution in under a second, and the history backfill is a background
 concern rather than the thing standing between a migration and a working chart. A-W2-2 said "adding
 a metric is cheap" is false of the aggregates; it is true again of the part anyone looks at.
@@ -1237,7 +1257,7 @@ found. Noted as OQ-W4-4.
 20. **`observations.extra jsonb` is the escape hatch, `CHECK`ed to a ≤2 kB flat object, never aggregated and never indexed**, and deliberately outside the registry because the registry is for modelled metrics. The promotion path is a `[[metric]]` entry, `cargo xtask migrate`, and one backfill `UPDATE`.
 21. **Indexes: `UNIQUE (station_id, time DESC)` on raw — which doubles as every `/span` and cold-read access path — plus `(station_id, bucket DESC)` on each level.** The hypertable's own time index stays for cross-station ranges. Nothing on `extra`, nothing on `station_metrics.metric_key`.
 22. **`period_rain` survives as an aggregate-level column with no raw counterpart** (W1 assumption 11), as `rainincremental_total` exposed under the legacy key, asserted to roll up identically at all four levels.
-23. **The rebuild procedure is `ci/db/rebuild-aggregates.sh`, and it refreshes the `/span` bands first, bottom-up, before backfilling history** (OQ-W2-2's half that is W4's). Measured: 0.87 s against 467 s, a 537× difference between "the charts are right" and "everything is materialised".
+23. **The rebuild procedure is `ci/db/rebuild-aggregates.sh`, and it refreshes the `/span` bands first, bottom-up, before backfilling history** (OQ-W2-2's half that is W4's). Measured: 0.87 s against 467 s, a 537× difference between "the charts are right" and "everything is materialised". **Partly superseded by N-16** (implementation-plan.md M1-6): the recent-first *ordering* stands and is still bottom-up, but "each level over its own band" cached a hole in `observations_1d` (OQ-W9-3), so phase 1 now refreshes each level over the widest band any level above it serves. The 0.87 s / 537× figures measured the form that cached the hole and no longer describe the script; the two-phase split remains, bounded range against unbounded history. See §4 and the N-16 paragraph there.
 24. **Every refresh session sets `synchronous_commit = off`; ingest keeps full durability** (D-17). Worth 1.98× at this width rather than D-17's 12×, and still the difference between 15 and 8 minutes.
 25. **The `/span` bands are the rebuild's unit of work, and D-6's restore is faster than D-6 implies.** Only `observations_1d` has ten years of history to rebuild, and it rebuilds from the hourly level in 0.39 s at 208 days.
 26. **The 1-minute refresh policy is phase-locked with `initial_start`, 3 seconds past each boundary, `end_offset => 1 second`.** Measured lag 3.06–3.22 s against `window:rollup`'s 10-second deadline. A-9 asserts the fixed schedule, because without it the deadline is met by luck.
@@ -1252,7 +1272,7 @@ found. Noted as OQ-W4-4.
 
 The migration for decision 1 drops and recreates `observations_1m`, whose definition is byte-identical before and after. `snapshot::affected_levels` keys off which *metrics* changed, and every metric's `levels` list changed, so all four levels are in scope. Correct under D-15 and expensive in exactly the way A-W2-2 describes: an intact minute level would have let the new 5-minute level be built from it in 59 s instead of forcing a 401 s raw rescan, and at ten years of history that difference is hours.
 
-*Options.* (a) Leave it; §4's phase-1-first rebuild makes the user-visible part 0.87 s regardless, so the cost is background CPU. (b) Have `affected_levels` compare each level's rendered definition against the previous one and include only levels whose text changed — about ten lines, and the generator already renders both sides. (c) Have the migration generator emit the refresh ranges too, so the ordering in §4 is in the migration rather than in a script beside it.
+*Options.* (a) Leave it; §4's phase-1-first rebuild makes the user-visible part 0.87 s regardless, so the cost is background CPU. *(That premise no longer holds after N-16 — phase 1 is no longer sub-second — which strengthens the case for (b), the option taken.)* (b) Have `affected_levels` compare each level's rendered definition against the previous one and include only levels whose text changed — about ten lines, and the generator already renders both sides. (c) Have the migration generator emit the refresh ranges too, so the ordering in §4 is in the migration rather than in a script beside it.
 
 *Recommendation:* **(b)**, as a W2 follow-up, not urgent. It is a strictly better signal than the metric-level one and it makes "add a metric to one level" cost one level's rebuild. **Not fixed here**, because `affected_levels` is W2's and the behaviour is wasteful rather than wrong. **Done as N-13** (implementation-plan.md M1-6), with one addition the option as written did not have: the snapshot records each level's own definition too, because the rendered column list alone cannot see a level whose source relation changed.
 

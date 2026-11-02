@@ -757,7 +757,7 @@ different scale:
 
 | phase | what | time |
 |---|---|---|
-| 1 | all four `/span` bands, bottom-up | **1 s total** |
+| 1 | all four `/span` bands, bottom-up *(pre-N-16: each level over its own band)* | **1 s total** |
 | 2 | `observations_1m`, full history | 13 m 30 s |
 | 2 | `observations_5m`, full history | 242 s |
 | 2 | `observations_1h`, full history | 25 s |
@@ -775,6 +775,9 @@ It is corrected by phase 2, because materialising the hourly level invalidates t
 same range, so the daily level's phase-2 refresh rewrites it. But a `--recent-only` run, which exists
 and which §4 of W4 recommends for a metric addition, leaves `observations_1d` wrong beyond 14 days
 until a full run happens. Recorded as OQ-W9-3 rather than fixed, because the script is W4's.
+**Fixed as N-16** (implementation-plan.md M1-6): phase 1 refreshes each level over the widest band
+any level above it serves, so the daily level's source is complete, and `--recent-only` now names
+what it left short. The measured phase-1 figure below is from the form that cached the hole.
 
 ### 5.6 Add policies, then compression, then retention
 
@@ -973,7 +976,7 @@ window rather than declaring it.
 | M-14 | insert cost of four defined levels is inside the control spread | §5.2 | three 1-day fills with and without the levels |
 | M-15 | a day of rows below the threshold logs 1 invalidation, 24 kB | §5.2 | refresh to advance the threshold, then load an older day |
 | M-16 | the migrated raw table is 19% smaller, uncompressed | §5.3 | `hypertable_detailed_size` on both |
-| M-17 | phase 1 is 1 s; phase 2 is 13 m 30 s + 242 s + 25 s + 2 s | §5.5 | `PSQL=… ci/db/rebuild-aggregates.sh` |
+| M-17 | phase 1 is 1 s; phase 2 is 13 m 30 s + 242 s + 25 s + 2 s — phase 1's figure is pre-N-16 and measured the form that cached a hole in `observations_1d` | §5.5 | `PSQL=… ci/db/rebuild-aggregates.sh` |
 | M-18 | the retry collision, and the slice reset that fixes it | §5.4 | re-run a slice with rows already present |
 | M-19 | 1,182 digest rows `ok`; 42 spot checks `ok` with timestamps | §6.1, §6.2 | `migrate-from-go.sh reconcile` |
 | M-20 | 12 of 14 statistics bit-exact; 2 within `n × 2^-24` | §6.3 | `40-rollup-check.sql` R-4 |
@@ -1122,6 +1125,16 @@ source is complete — one line, and it makes phase 1 a few seconds instead of o
 `--recent-only` print a warning naming the levels it left incomplete.
 
 *Recommendation:* **(b), with (c) as well.** The script is W4's and this document does not change it.
+
+**Done as N-16** (implementation-plan.md M1-6), both halves. **One estimate in option (b) above was
+wrong and is worth correcting rather than deleting:** "a few seconds instead of one" is not what it
+costs. Making the daily level's source complete makes the *hourly* level's source complete too, and
+the 5-minute level's, and the minute level's — under D-11 there is no shortcut to raw for the levels
+in between — so phase 1 becomes a bottom-up rebuild over the trailing year. On this document's own
+lab figures (§5.5) that is minutes, not seconds; `observations_1m` over full history was 13 m 30 s
+and 366 days is most of it. The fix is still right — the second saved was the second of not doing
+work that was being cached as zeroes — but it was sized as free and it is not. The cost is now
+stated in the script's header and in `docs/database-schema.md` §4.
 
 **OQ-W9-4. Does `period_rain`'s accuracy improvement need recording as a contract deviation?**
 

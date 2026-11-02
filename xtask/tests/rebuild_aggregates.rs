@@ -106,7 +106,7 @@ fn the_refresh_order_is_still_bottom_up() {
 fn recent_only_names_the_levels_it_left_incomplete() {
     let (stdout, stderr) = run(&["--recent-only"]);
     assert!(
-        stderr.contains("These levels are INCOMPLETE"),
+        stderr.contains("These levels hold history older than phase 1 refreshed them over"),
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
@@ -125,6 +125,18 @@ fn recent_only_names_the_levels_it_left_incomplete() {
         );
     }
     assert!(stderr.contains("Re-run without --recent-only"), "{stderr}");
+    // And it must not overstate what is broken. `/span` cannot read a daily bucket older
+    // than its own one-year maximum and phase 1 now covers 366 days, so every band /span
+    // serves IS correct here. A warning that claims otherwise is false on every run, which
+    // is the same cry-wolf argument the loop above makes for the other three levels.
+    assert!(
+        !stderr.contains("/span read of them will be short"),
+        "the warning must not claim a /span band is short when none is:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Every band /span serves is correct"),
+        "{stderr}"
+    );
 }
 
 /// A full run does phase 1 and then phase 2 over unbounded history, and says nothing about
@@ -141,9 +153,31 @@ fn a_full_run_backfills_unbounded_history_and_warns_about_nothing() {
         );
     }
     assert!(
-        !stderr.contains("INCOMPLETE"),
+        !stderr.contains("hold history older than"),
         "a full run leaves nothing short:\n{stderr}"
     );
+}
+
+/// D-17's relaxed commit durability is required rather than an optimisation — 306 s against
+/// 25.6 s on the measured rebuild — and it is a property of these sessions only. Nothing
+/// else asserts it, so deleting it from `refresh()` would cost a twelvefold slowdown with
+/// no error anywhere.
+#[test]
+fn every_refresh_session_relaxes_commit_durability() {
+    for args in [
+        vec!["--recent-only"],
+        vec![],
+        vec!["--from", "2026-01-01", "--to", "2026-02-01"],
+    ] {
+        let (stdout, _) = run(&args);
+        let refreshes = stdout.matches("refresh_continuous_aggregate(").count();
+        let relaxed = stdout.matches("SET synchronous_commit = off").count();
+        assert!(refreshes > 0, "no refresh at all for {args:?}\n{stdout}");
+        assert_eq!(
+            relaxed, refreshes,
+            "every refresh session must set it, not just the first ({args:?})\n{stdout}"
+        );
+    }
 }
 
 /// A bounded `--from`/`--to` range is the operator's own window and is not phase 1: it

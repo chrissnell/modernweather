@@ -158,11 +158,24 @@ impl AllocatedLevel {
 /// An entry whose strategy, SQL type or mean representation this build cannot parse is
 /// rendered verbatim rather than skipped: two snapshots that spell it the same way still
 /// compare equal, and a change to it still shows up as a change.
-fn rendered_level(lvl: &AllocatedLevel, entries: &[Allocated]) -> String {
+fn rendered_level(
+    lvl: &AllocatedLevel,
+    entries: &[Allocated],
+    time_column: &str,
+    partition_column: &str,
+) -> String {
     let from_raw = lvl.source == "raw";
+    // The two dimension columns are in the header because `gen::aggregate_sql` interpolates
+    // them into every level — the time column as the first level's `time_bucket` argument,
+    // the partition column into the SELECT and the GROUP BY. Without them, renaming either
+    // one rewrote all four generated views and returned no level to rebuild: PostgreSQL
+    // propagates RENAME COLUMN into a dependent view's body but not into its output column
+    // names, so a migrated database ended up with a view whose body and whose output
+    // disagreed, and a fresh install did not. That is D-8's drift, from the tool that
+    // exists to prevent it. Reachable only behind --allow-breaking, and two lines to close.
     let mut s = format!(
-        "{} bucket={:?} source={:?} materialized_only={}\n",
-        lvl.name, lvl.bucket, lvl.source, lvl.materialized_only
+        "{} bucket={:?} source={:?} materialized_only={} time={:?} partition={:?}\n",
+        lvl.name, lvl.bucket, lvl.source, lvl.materialized_only, time_column, partition_column
     );
     let mut carried: Vec<&Allocated> = entries
         .iter()
@@ -180,8 +193,7 @@ fn rendered_level(lvl: &AllocatedLevel, entries: &[Allocated]) -> String {
         let repr = e
             .mean_representation
             .as_deref()
-            .map(MeanRepr::from_name)
-            .unwrap_or(Some(MeanRepr::SumCount));
+            .map_or(Some(MeanRepr::SumCount), MeanRepr::from_name);
         match (ty, strategies, repr) {
             (Some(ty), Some(strategies), Some(repr)) => {
                 for c in agg_columns_for(&e.column, ty, &strategies, repr) {
@@ -430,33 +442,73 @@ pub fn diff(snap: &Snapshot, reg: &Registry) -> Vec<Change> {
 /// definitions it keyed off which metrics changed, and inserting the 5-minute level
 /// changed every metric's `levels` list — so all four levels were dropped, including the
 /// minute level, whose definition was byte-identical before and after. An intact minute
-/// level would have built the new 5-minute level from it in 77 s instead of forcing a
-/// full raw rescan (OQ-W4-1, docs/database-schema.md §4).
+/// level would have built the new 5-minute level from it in 59 s instead of forcing a
+/// 401 s full raw rescan (OQ-W4-1, docs/database-schema.md §6 measurement 3).
 ///
 /// A level is rebuilt when its definition is not the one the snapshot records, and
 /// otherwise it is left alone. A level the snapshot does not mention is new, and new is
 /// a difference.
 pub fn affected_levels(reg: &Registry, prev: &Snapshot) -> Vec<String> {
-    // A snapshot written before M1-6 records no levels, so there is nothing to compare a
-    // definition against. Rebuild all of them: over-rebuilding is the behaviour this
-    // function had for its whole life, and it is the safe direction.
-    if prev.levels.is_empty() && !prev.entries.is_empty() {
-        return reg.levels.iter().map(|l| l.name.clone()).collect();
-    }
+    // A snapshot written before M1-6 records no levels, and an empty one records nothing at
+    // all. Neither needs its own branch: `find` below returns `None` for every level, so
+    // every level is a difference and every level is rebuilt. That is over-rebuilding,
+    // which is the behaviour this function had for its whole life and the safe direction.
     let new_entries = from_registry(reg);
+    // The two dimension columns, resolved on each side separately — the whole point is to
+    // notice when they differ. Matched by stable key rather than by name: a key is an
+    // identifier and reusing one is already fatal, so it is the only thing that reliably
+    // names the same dimension on both sides of a rename. A dimension the snapshot has
+    // never seen falls back to its current column, which makes it compare equal; it is new
+    // on this run and a new dimension does not change an existing level.
+    let column_of = |entries: &[Allocated], key: &str, fallback: &str| -> String {
+        entries
+            .iter()
+            .find(|e| e.key == key)
+            .map_or_else(|| fallback.to_string(), |e| e.column.clone())
+    };
+    let (t_key, t_col) = {
+        let d = reg.time_column();
+        (d.key.as_str(), d.column.as_str())
+    };
+    let (p_key, p_col) = {
+        let d = reg.partition_column();
+        (d.key.as_str(), d.column.as_str())
+    };
+    let t_new = column_of(&new_entries, t_key, t_col);
+    let p_new = column_of(&new_entries, p_key, p_col);
+    let t_old = column_of(&prev.entries, t_key, t_col);
+    let p_old = column_of(&prev.entries, p_key, p_col);
+
     let mut out = Vec::new();
     for l in &reg.levels {
-        let after = rendered_level(&AllocatedLevel::from_level(l), &new_entries);
+        let after = rendered_level(&AllocatedLevel::from_level(l), &new_entries, &t_new, &p_new);
         let before = prev
             .levels
             .iter()
-            .find(|p| p.name == l.name)
-            .map(|p| rendered_level(p, &prev.entries));
+            .find(|q| q.name == l.name)
+            .map(|q| rendered_level(q, &prev.entries, &t_old, &p_old));
         if before.as_deref() != Some(after.as_str()) {
             out.push(l.name.clone());
         }
     }
     out
+}
+
+/// Levels the snapshot records and the registry no longer declares.
+///
+/// They are not in `affected_levels` because they are not rebuilt — they are dropped and
+/// not recreated, which is a different statement and needs a different list. Before the
+/// snapshot recorded levels there was no way to produce this one at all, and the
+/// consequence was that removing a `[[level]]` left its continuous aggregate, its refresh
+/// policy and its retention policy in every deployed database forever, reading the level
+/// below it, with no file under `generated/` describing it. `codegen` prunes the generated
+/// file (N-15) and nothing dropped the relation.
+pub fn removed_levels(reg: &Registry, prev: &Snapshot) -> Vec<String> {
+    prev.levels
+        .iter()
+        .filter(|p| reg.level(&p.name).is_none())
+        .map(|p| p.name.clone())
+        .collect()
 }
 
 pub fn strategy_names(s: &[Strategy]) -> Vec<String> {
@@ -518,7 +570,7 @@ mod tests {
     /// **The case N-13 exists for.** Inserting the 5-minute level changes every metric's
     /// `levels` list, and the old rule keyed off exactly that — so all three levels were
     /// dropped and recreated, including the minute level, whose definition is
-    /// byte-identical before and after. Rebuilding the minute level is what turns a 77 s
+    /// byte-identical before and after. Rebuilding the minute level is what turns a 59 s
     /// build of the new level from the intact one into a full raw rescan (OQ-W4-1).
     #[test]
     fn inserting_a_level_leaves_the_level_below_it_alone() {
@@ -554,12 +606,13 @@ mod tests {
 
         let old_1h = s.levels.iter().find(|l| l.name == "1h").expect("recorded");
         let new_1h = AllocatedLevel::from_level(after.level("1h").expect("declared"));
+        let (t, p) = ("time", "station_id");
         assert_eq!(
-            rendered_level(old_1h, &s.entries)
+            rendered_level(old_1h, &s.entries, t, p)
                 .lines()
                 .skip(1)
                 .collect::<Vec<_>>(),
-            rendered_level(&new_1h, &from_registry(&after))
+            rendered_level(&new_1h, &from_registry(&after), t, p)
                 .lines()
                 .skip(1)
                 .collect::<Vec<_>>(),
@@ -635,6 +688,125 @@ mod tests {
         assert_eq!(affected_levels(&after, &empty), vec!["1m", "5m", "1h"]);
     }
 
+    /// Renaming the partition column rewrites every generated level — it is in the SELECT
+    /// and in the GROUP BY of all four — and before the dimension columns were part of the
+    /// rendered definition this returned nothing to rebuild. PostgreSQL propagates
+    /// RENAME COLUMN into a dependent view's body but not into its output column names, so
+    /// a migrated database got a view whose body and output disagreed while a fresh install
+    /// did not: D-8's drift, from the tool that exists to prevent it.
+    #[test]
+    fn renaming_the_partition_column_rebuilds_every_level() {
+        let before = reg(THREE, &["1m", "5m", "1h"], "degF");
+        let s = snap(&before);
+        let mut after = reg(THREE, &["1m", "5m", "1h"], "degF");
+        let p = after
+            .dimensions
+            .iter_mut()
+            .find(|d| d.key == "station_id")
+            .expect("declared");
+        p.column = "station".into();
+        assert_eq!(affected_levels(&after, &s), vec!["1m", "5m", "1h"]);
+    }
+
+    /// The same for the time column, which is the first level's `time_bucket` argument.
+    #[test]
+    fn renaming_the_time_column_rebuilds_every_level() {
+        let before = reg(THREE, &["1m", "5m", "1h"], "degF");
+        let s = snap(&before);
+        let mut after = reg(THREE, &["1m", "5m", "1h"], "degF");
+        let t = after
+            .dimensions
+            .iter_mut()
+            .find(|d| d.key == "time")
+            .expect("declared");
+        t.column = "observed_at".into();
+        assert_eq!(affected_levels(&after, &s), vec!["1m", "5m", "1h"]);
+    }
+
+    /// A level removed from the registry is dropped, not rebuilt, so it is a separate
+    /// list. Before the snapshot recorded levels this list could not be computed at all,
+    /// and removing a `[[level]]` left its continuous aggregate and both its policies in
+    /// every deployed database forever, reading the level below it.
+    #[test]
+    fn a_level_removed_from_the_registry_is_reported_as_gone_and_not_as_affected() {
+        let before = reg(THREE, &["1m", "5m", "1h"], "degF");
+        let s = snap(&before);
+        let after = reg(
+            &[("1m", "1 minute", "raw"), ("5m", "5 minutes", "1m")],
+            &["1m", "5m"],
+            "degF",
+        );
+        assert_eq!(removed_levels(&after, &s), vec!["1h"]);
+        assert!(
+            !affected_levels(&after, &s).contains(&"1h".to_string()),
+            "a level that is gone is not rebuilt"
+        );
+    }
+
+    /// The migration has to carry the drop, and must not also recreate it. `migrate_cmd`
+    /// reaches `render` only when something is pending, which is the other half of this —
+    /// see `a_level_only_change_is_not_nothing_to_emit`.
+    #[test]
+    fn a_removed_level_is_dropped_by_the_migration_and_not_recreated() {
+        let before = reg(THREE, &["1m", "5m", "1h"], "degF");
+        let s = snap(&before);
+        let after = reg(
+            &[("1m", "1 minute", "raw"), ("5m", "5 minutes", "1m")],
+            &["1m", "5m"],
+            "degF",
+        );
+        let changes = diff(&s, &after);
+        let m = crate::migrate::render(&after, &s, &changes, false, "20260101000000", "drop_1h");
+        assert!(
+            m.body
+                .contains("DROP MATERIALIZED VIEW IF EXISTS observations_1h CASCADE;"),
+            "the level has to actually be dropped:\n{}",
+            m.body
+        );
+        assert!(
+            !m.body.contains("CREATE MATERIALIZED VIEW observations_1h"),
+            "and must not come back:\n{}",
+            m.body
+        );
+        assert!(m.body.contains("dropped and NOT recreated"), "{}", m.body);
+    }
+
+    /// `changes.is_empty()` used to be the whole test for "the snapshot agrees with the
+    /// registry", and since the snapshot records levels it is not: a bucket change produces
+    /// no entry-level `Change` at all. `migrate_cmd` returned on the change count and
+    /// printed "registry and snapshot agree", while `codegen` rewrote the level's SQL.
+    /// This is the comparison that makes the message true.
+    #[test]
+    fn a_level_only_change_is_not_nothing_to_emit() {
+        let before = reg(THREE, &["1m", "5m", "1h"], "degF");
+        let s = snap(&before);
+        let after = reg(
+            &[
+                ("1m", "1 minute", "raw"),
+                ("5m", "10 minutes", "1m"),
+                ("1h", "1 hour", "5m"),
+            ],
+            &["1m", "5m", "1h"],
+            "degF",
+        );
+        assert!(
+            diff(&s, &after).is_empty(),
+            "no entry changed, which is exactly why the level record is needed"
+        );
+        assert_ne!(
+            levels_from_registry(&after),
+            s.levels,
+            "and the level comparison is what notices"
+        );
+        assert_eq!(affected_levels(&after, &s), vec!["5m"]);
+    }
+
+    #[test]
+    fn nothing_is_reported_gone_when_the_hierarchy_is_unchanged() {
+        let r = reg(THREE, &["1m", "5m", "1h"], "degF");
+        assert!(removed_levels(&r, &snap(&r)).is_empty());
+    }
+
     /// The shipped registry against the shipped snapshot: nothing pending, so nothing to
     /// rebuild. A migration generated today that dropped a level would be dropping it for
     /// no reason.
@@ -651,5 +823,6 @@ mod tests {
             "the committed snapshot records the level hierarchy (N-13)"
         );
         assert!(affected_levels(&r, &s).is_empty());
+        assert!(removed_levels(&r, &s).is_empty());
     }
 }

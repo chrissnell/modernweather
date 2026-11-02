@@ -256,6 +256,15 @@ generator enforces it by diffing the registry against `metrics/snapshot.toml`, w
 only by `cargo xtask migrate` and is the record of every identifier that has ever been
 allocated.
 
+It records one thing that is not an identifier, added by **N-13**: a `[[level]]` section holding
+each aggregate level's own definition (`name`, `bucket`, `source`, `materialized_only`) as last
+migrated. `snapshot::affected_levels` compares each level's rendered definition against it, so a
+migration drops the levels whose text changed and leaves the rest materialised. The level's own
+definition has to be recorded and not just its column list: inserting the 5-minute level left the
+hourly level's columns byte-identical and changed the relation it reads, which a column comparison
+cannot see. A snapshot with no `[[level]]` section — anything written before M1-6 — is read as "no
+previous definition", which rebuilds every level.
+
 ### 2.1 Fatal — no flag
 
 There is no override because there is no correct way to proceed. The identifier is already in a
@@ -529,11 +538,26 @@ irradiance; if `slr_mj` were a rate it would be `slr_w` times a constant and wou
 new. A mean of it is the mean increment per reading and moves when the logger's output interval
 does; the sum over a bucket is the bucket's insolation.
 
-The cost is on the import side and is accepted rather than hidden: no Go view computed a sum, so
-`solarjoules` joins the unconsumed archive columns and `solarjoules_total` lands NULL for
-pre-cutover history. An archived mean of per-reading increments is not convertible into a total
-without the logger's output interval, and a NULL says "the old system never had this number"
-where a converted one would lie.
+Two costs, both accepted rather than hidden.
+
+**On the frozen surface: `solarjoules` is on it,** contrary to M1-6's brief —
+`contract/legacy-v1.json` lists it on `/latest` and `/span/{span}` in the Go response type, the
+Swift response type and the client crosswalk. So `/span`'s value for that key changes by roughly
+the bucket's reading count: ~30× at the 6 h band to ~43,200× at 366 d. Recorded as **DEV-7** in
+`docs/reconciliation.md` §3, which is where a change to a byte a shipped client reads belongs, and
+marked as needing the owner's acknowledgement. The conformance suite compares shape, type and
+formatting rather than values, so it will not notice.
+
+**On the import side:** no Go view computed `sum(solarjoules)`, so `solarjoules` joins the
+unconsumed archive columns and `solarjoules_total` lands NULL for the ~294 pre-cutover rollup days.
+It would be wrong to call that unavoidable. The archive carries `avg(solarwatts)` for the same
+bucket, and mean irradiance × bucket seconds *is* the integral the instrument performs — so a
+derived total is available without knowing the logger's output interval, which an earlier draft of
+this paragraph claimed was the blocker. It is rejected on its merits instead: a derived number is
+not a measured one, it would silently differ in kind from every post-cutover bucket, and it depends
+on the `J_per_m2`-versus-MJ/m² question below being settled first. A NULL says "the old system
+never had this number" where a converted one would lie. **It is W9's call, not W2's** — the import
+is W9's artefact, and `w9.unconsumed_archive_column` already records the decision point.
 
 ---
 
@@ -963,6 +987,15 @@ Determining which requires reading `pkg/solar`, which is W7's territory.
 confirm against `pkg/solar` when it specifies the collector. One line in the registry if it
 turns out to be a total. The cost of being wrong is a wrong number in a chart, not a schema
 change.
+
+**Answered as N-16's sibling N-9** (implementation-plan.md M1-6): it is a **total**. Two things in
+the question above were wrong and are worth keeping rather than overwriting. `pkg/solar` is not
+where the answer lives — it holds clear-sky irradiance models in W/m² and never mentions
+`solarjoules`; the value is the Campbell logger's `slr_mj`, so the question belonged to the driver,
+not to the collector. And "the cost of being wrong is a wrong number in a chart, not a schema
+change" understated it twice over: an aggregation-strategy change *is* refused as breaking and needs
+a migration that rebuilds every level, and `solarjoules` is on the frozen `/span` surface, so the
+chart's numbers move by 30× to 43,200×. See §5.1 and **DEV-7**.
 
 **OQ-W2-4. Should the registry carry the legacy unit conversion?**
 

@@ -41,6 +41,18 @@
 # levels — because a correct 366-day daily bucket needs a correct 366-day hourly level
 # beneath it, and under D-11 there is no shortcut to raw for the levels in between.
 #
+# Two things that follow from the wider bands, both raised as N-21 rather than fixed here.
+# Phase 1 now materialises roughly 8.8 GB into `observations_1m` (4,175 bytes per bucket row,
+# 24 MB/day at four stations) and ~1.8 GB into `observations_5m` — into levels that retain 7
+# and 14 days and will evict all of it. Budget the transient space. And because phase 1 now
+# runs for minutes, a retention job firing between the minute level's refresh and the
+# 5-minute level's read of it would hand the upper level a truncated source and cache the
+# hole this change exists to close. That exposure is not new — phase 2 has always refreshed
+# every level over unbounded history and has always had it — but phase 1 has it now too.
+# Suspending the three retention jobs for the duration is the fix; it has its own silent
+# failure mode (retention left off after a hard kill) and cannot be verified without a
+# database, so it is a work item and not a line added here.
+#
 # Be clear about what that costs: phase 1 is no longer seconds. It is now the full
 # bottom-up rebuild over the trailing year, and on the measured instance the minute level
 # is the great majority of it. The seconds it used to take were the seconds of not doing
@@ -106,14 +118,22 @@ widest_above() {
 # back than the band phase 1 refreshed them over. Unbounded retention always does, which
 # is why `observations_1d` is on this list and the other three are not — their whole
 # retention window is inside phase 1's band.
+#
+# Note what this does NOT claim. `/span` cannot read a daily bucket older than its own
+# one-year maximum, and phase 1 now covers 366 days, so every band `/span` serves is
+# correct after phase 1 even for the level named here. What is missing is reachable by an
+# ad-hoc query over deeper history and by a D-6 restore, and that is what the warning says.
+# Claiming "/span will be short" would be false on every run, and a warning that is false
+# on every run is the one that gets ignored — which is the same argument this script uses
+# for not naming the other three levels.
 incomplete_after_phase_1() {
   local i w
   for i in "${!LEVELS[@]}"; do
     w=$(widest_above "$i")
     if [ "${RETENTION_HOURS[i]}" -eq 0 ]; then
-      printf '%s: materialised over the last %s; its retention is unbounded, so every\n' \
+      printf '%s: materialised over the last %s; its retention is unbounded, so it holds\n' \
              "${LEVELS[i]}" "${BANDS[w]}"
-      printf '  bucket older than that is missing.\n'
+      printf '    older buckets and none of them were refreshed.\n'
     elif [ "${RETENTION_HOURS[i]}" -gt "${BAND_HOURS[w]}" ]; then
       printf '%s: materialised over the last %s; it retains %s days.\n' \
              "${LEVELS[i]}" "${BANDS[w]}" "$((RETENTION_HOURS[i] / 24))"
@@ -188,9 +208,10 @@ if [ "$RECENT_ONLY" -eq 1 ]; then
   short="$(incomplete_after_phase_1)"
   if [ -n "$short" ]; then
     {
-      echo "!!! These levels are INCOMPLETE and a /span read of them will be short:"
+      echo "!!! These levels hold history older than phase 1 refreshed them over:"
       while IFS= read -r line; do echo "!!!   $line"; done <<<"$short"
-      echo "!!! Re-run without --recent-only to materialise the rest."
+      echo "!!! Every band /span serves is correct; an ad-hoc query or a D-6 restore over"
+      echo "!!! deeper history is not. Re-run without --recent-only to materialise the rest."
     } >&2
   else
     echo "    Nothing is left short: every level's retention window is inside its band."

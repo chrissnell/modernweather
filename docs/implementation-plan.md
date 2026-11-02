@@ -235,12 +235,29 @@ blocks anything:
   carries `slr_w` for the irradiance. The plan's "one registry line" is one registry line, and it
   is a **BREAKING** change against the snapshot (an aggregation-strategy change), so it also needs
   `migrate --allow-breaking`, a committed migration that drops and recreates all four levels, and a
-  regenerated snapshot. Two consequences the plan did not name: the rebuild's `CASCADE` takes W4's
-  four indexes, three retention policies and four refresh policies with it, so this item carries a
-  hand-written follow-up migration that re-asserts them (`ci/db/schema-assertions.sql` A-8 is what
-  catches the omission); and no Go view computed `sum(solarjoules)`, so `solarjoules` becomes the
-  fifth unconsumed archive column and `solarjoules_total` lands NULL for pre-cutover history rather
-  than importing a mean as a total.
+  regenerated snapshot. Three consequences the plan did not name, the first of which contradicts
+  this brief:
+    - **"`solarjoules` is not on the frozen surface" is wrong.** `contract/legacy-v1.json` lists it
+      on `/latest` and `/span/{span}` in the Go response type, the Swift response type and the
+      client crosswalk. `/span`'s value for that key therefore changes by roughly the bucket's
+      reading count — ~30× at the 6 h band to ~43,200× at 366 d — and `/latest`, which serves the
+      last raw reading, now reports a different physical quantity under the same key and the same
+      declared unit. Recorded as **DEV-7** in the deviation ledger and **marked as needing the
+      owner's acknowledgement**: the physics is an agent's judgement, whether a chart's numbers may
+      move three orders of magnitude is not. The conformance suite compares shape, type and
+      formatting rather than values, so nothing in CI will ever flag it.
+    - The rebuild's `CASCADE` takes W4's four composite indexes, three retention policies and four
+      refresh policies with it, so this item carries a hand-written follow-up migration that
+      re-asserts them. `ci/db/schema-assertions.sql` A-8 and A-9 catch the policy half; **the index
+      half had no assertion at all**, so an omission there would have been green on every gate in
+      the repository — this item adds **A-10**. After the W9 cutover the same `CASCADE` also takes
+      `observations_1d_with_legacy` and `observations_1h_with_legacy`, which only the import
+      recreates; both are now named in the migration header. **N-22** is the structural fix.
+    - No Go view computed `sum(solarjoules)`, so `solarjoules` becomes the fifth unconsumed archive
+      column and `solarjoules_total` lands NULL for pre-cutover history rather than importing a mean
+      as a total. The archive's `avg(solarwatts)` × bucket seconds *is* a route to a derived total,
+      so this is a decision rather than an impossibility; it is rejected on the merits — a derived
+      number is not a measured one, and it depends on **N-23** — and it is W9's to revisit.
 - **N-7 — a `[[unit]]` table.** 25 entries, `name` plus the `label` a reader is shown. `validate`
   rejects a unit no `[[unit]]` declares, naming the case-insensitive near miss when there is one;
   rejects a duplicate declaration; and rejects two declarations differing only in case, because
@@ -255,7 +272,16 @@ blocks anything:
   its column list because the 5-minute insertion is the case this exists for and the hourly level's
   *columns were identical* across it: only the relation it reads changed. A snapshot with no
   `[[level]]` section is read as "nothing to compare against" and rebuilds everything, which is the
-  safe direction and the behaviour this function had before.
+  safe direction and the behaviour this function had before. The rendered definition also carries
+  the time and partition column names, resolved on each side by stable key: `aggregate_sql`
+  interpolates both into every level, so without them renaming either rewrote all four generated
+  views and returned nothing to rebuild. A companion `removed_levels` reports levels the snapshot
+  records and the registry no longer declares — dropped and *not* recreated, which is a different
+  statement and so a different list; it could not be computed before the snapshot held levels, and
+  without it removing a `[[level]]` left its continuous aggregate and both its policies in every
+  deployed database forever, reading the level below it. And `migrate` no longer prints "registry
+  and snapshot agree" on a level-only change: `changes.is_empty()` stopped meaning that the moment
+  the snapshot grew a level record.
 - **N-16 — phase 1 uses the widest band above.** `ci/db/rebuild-aggregates.sh` refreshes each level
   over the widest band any level above it serves, and `--recent-only` names the levels it left
   incomplete — `observations_1d` alone under these bands, because it is the only level whose
@@ -263,31 +289,54 @@ blocks anything:
   is no longer seconds, because a correct 366-day daily level needs a correct 366-day hourly level
   beneath it and, under D-11, every level below that as well. The seconds it used to take were the
   seconds of not doing the work, and the work not done was being written into `observations_1d` as
-  zeroes.
+  zeroes. Two costs the fix moves rather than removes, both raised as **N-21**: phase 1 now
+  materialises ~8.8 GB into a level that retains 7 days, and because it runs for minutes a
+  retention job firing mid-phase could hand an upper level a truncated source — an exposure phase 2
+  has always had over unbounded history and that N-16 extends to `--recent-only`. **N-25** records a
+  cumulative-widening phasing that would be correct *and* keep D-23's sub-second first pass; it is
+  not taken here because its correctness rests on invalidation propagating between levels, which is
+  a property to verify against a database rather than to reason about. D-23 is marked partly
+  superseded where it is stated, and the 0.87 s / 537× figure is marked as measuring the superseded
+  form everywhere it appears.
 
-**Eighty-nine tests, twenty-one of them new.** Six for N-7 (the undeclared string, a
-no-near-miss control, the case collision, a duplicate declaration, an empty label, and the shipped
-registry against the emitted table); eight for N-13 (the 5-minute insertion asserting the minute
-level is *not* rebuilt, a source-only change, a bucket change, a deprecation, a change the levels
-cannot see, both no-previous-record paths, and the shipped pair forcing no rebuild); one for N-9
-against the emitted SQL at all four levels; six driving the shell script itself with `PSQL=echo`,
-which is testable only because W9 had already made the psql invocation overridable. Two existing
-`legacy` tests change their asserted figures, which is the N-9 decision arriving where it should.
+**Ninety-seven tests, twenty-nine of them new** after a review pass. Seven for N-7 (the undeclared
+string, a no-near-miss control, the case collision, a duplicate declaration, an empty label, a name
+that would not survive codegen, and the shipped registry against the emitted table); fourteen for
+N-13 (the 5-minute insertion asserting the minute level is *not* rebuilt, a source-only change, a
+bucket change, a deprecation, a change the levels cannot see, both no-previous-record paths, a
+time-column rename, a partition-column rename, a removed level reported as gone rather than
+affected, the migration that drops it without recreating it, a level-only change that is not
+"nothing to emit", an unchanged hierarchy reporting nothing gone, and the shipped pair forcing no
+rebuild); one for N-9 against the emitted SQL at all four levels; seven driving the shell script
+itself with `PSQL=echo`, which is testable only because W9 had already made the psql invocation
+overridable. Two existing `legacy` tests change their asserted figures, which is the N-9 decision
+arriving where it should.
 
-**Nine negative controls, each watched failing rather than argued:** deleting the unit check fails
+**Twelve negative controls, each watched failing rather than argued:** deleting the unit check fails
 two unit tests; removing the near-miss hint fails the one that reads the message; removing the
 case-collision check fails that test alone; declaring the units and not emitting them fails the
 shipped-registry test; reverting `affected_levels` to the metric-keyed rule fails five; dropping
 the level record from the rendered snapshot fails four; putting phase 1 back on each level's own
 band fails two script tests; removing the `--recent-only` warning fails one; and reverting the one
-`solarjoules` line fails the N-9 test and both `legacy` figures.
+`solarjoules` line fails six — the N-9 test, both `legacy` figures, the shipped-registry rebuild
+test and both `prune` tests, which is three more than was first claimed. The three controls added
+during review: making `removed_levels` return nothing fails two; deleting the unit-name charset
+check fails one; and the two rename tests were watched failing before the dimension columns were
+resolved per side rather than taken from the current registry on both — they reported `[]`, which
+is the defect itself. **A-10 has no local control**: it needs a database, so it runs for the first
+time in CI, and the honest statement is that its *absence* was demonstrated (no gate in the
+repository looked at an aggregate level's index) rather than its presence.
 
-**Not in this item:** `solarjoules` is declared `unit = "J_per_m2"` and the instrument reports
-`slr_mj`, which is MJ/m² — a factor of 10⁶ in a rendered label. It is a one-line, non-breaking
-registry edit and it belongs with whoever owns the rendered units, not with the aggregation
-question this item settled. Separately, W4's policy block needs re-asserting by hand after every
-level rebuild; making it re-assertable the way `migrate` already re-asserts the finalisers belongs
-with whoever owns the policy parameters.
+**Not in this item, and each is now a tracked work item rather than a paragraph** — prose under a
+heading is not a work item and does not surface again, which is G-5's whole lesson. **N-21**:
+suspend the retention jobs for a rebuild and state its transient storage. **N-22**: make W4's policy
+block re-assertable the way `migrate` already re-asserts the finalisers, which removes both the
+hand-copied follow-up migration and the window in which a deployed database has aggregates with no
+policies. **N-23**: `solarjoules` is declared `unit = "J_per_m2"` and `slr_mj` is MJ/m² — a factor
+of 10⁶ in a rendered label, one non-breaking line, deliberately not bundled with DEV-7's change to
+the meaning of the same key. **N-24**: `migrate` emits `ALTER COLUMN ... TYPE` before the drops, so
+§2.2's documented breaking type-change path has never been executable — pre-existing, found while
+reviewing the block N-13 rewrote. **N-25**: the cumulative-widening phase 1.
 
 **Milestone 1 done when:** every gate in `cargo xtask gates` is either armed-and-green or deferred
 for a reason that names a path a later milestone's done-criteria create (**D-64**); the conformance

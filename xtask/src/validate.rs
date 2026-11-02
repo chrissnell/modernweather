@@ -8,7 +8,7 @@
 
 use crate::registry::{Registry, Role, SqlType, Strategy};
 use crate::snapshot::{self, Class, Snapshot};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// PostgreSQL's hard limit, confirmed by probe on PostgreSQL 17 (D-19).
 pub const COLUMN_LIMIT: usize = 1600;
@@ -287,22 +287,43 @@ pub fn registry_internal(reg: &Registry) -> Result<(), String> {
         }
     }
 
-    // Units are a closed vocabulary (N-7). Three checks, and the third is the one the
+    // Units are a closed vocabulary (N-7). Four checks, and the third is the one the
     // work item exists for: 25 unit strings were in use with nothing checking them, so
     // `degf` for `degF` was a valid edit that reached the UI as a rendered label
     // (C-W2-19).
-    let mut units: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut units: BTreeSet<&str> = BTreeSet::new();
     let mut folded: BTreeMap<String, &str> = BTreeMap::new();
     for u in &reg.units {
-        if let Some(prev) = units.insert(&u.name, &u.name) {
+        if !units.insert(&u.name) {
             errs.push(format!(
-                "FATAL: unit '{prev}' is declared twice in [[unit]]"
+                "FATAL: unit '{}' is declared twice in [[unit]]",
+                u.name
+            ));
+        }
+        // The name reaches generated Rust and TypeScript inside a string literal and,
+        // unlike `label`, is not escaped on the way out: a unit named `a"b` emits a file
+        // that does not compile. Restricting the character set is the fix that cannot be
+        // got wrong again, and it costs nothing — the name is an internal key and `label`
+        // is the field that carries anything a reader sees.
+        if u.name.is_empty()
+            || !u
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            errs.push(format!(
+                "FATAL: unit name '{}' is not usable. A name is an internal key and must be \
+                 non-empty\n\
+                 \x20      ASCII alphanumerics and underscores, because it is emitted into \
+                 generated Rust and\n\
+                 \x20      TypeScript unescaped. Put the renderable form in `label`.",
+                u.name.escape_debug()
             ));
         }
         // Two spellings that differ only in case are how the hole reopens: the obvious
         // way to make `unit = \"degf\"` validate is to declare `degf`, and then both
         // spellings are legal and both reach the UI.
-        if let Some(prev) = folded.insert(u.name.to_lowercase(), &u.name) {
+        if let Some(prev) = folded.insert(u.name.to_ascii_lowercase(), &u.name) {
             if prev != u.name {
                 errs.push(format!(
                     "FATAL: units '{prev}' and '{}' differ only in case. One of them is a \
@@ -315,7 +336,7 @@ pub fn registry_internal(reg: &Registry) -> Result<(), String> {
         }
     }
     for m in &reg.metrics {
-        if units.contains_key(m.unit.as_str()) {
+        if units.contains(m.unit.as_str()) {
             continue;
         }
         let near = reg
@@ -1325,6 +1346,40 @@ label = "°F"
         let r: Registry = toml::from_str(&toml).expect("fixture parses");
         let e = registry_internal(&r).unwrap_err();
         assert!(e.contains("unit 'degF' is declared twice"), "{e}");
+    }
+
+    /// The name reaches generated Rust and TypeScript inside a string literal and is not
+    /// escaped there, so `a"b` emitted a file that does not compile. The label is escaped;
+    /// the name is restricted instead, because a unit name is an internal key.
+    #[test]
+    fn a_unit_name_that_would_not_survive_codegen_is_fatal() {
+        // Each element is the TOML right-hand side verbatim, quotes included, so the
+        // embedded-quote case can actually be expressed.
+        for bad in [
+            r#""a\"b""#,
+            r#""""#,
+            "\"\u{b0}F\"",
+            r#""J/m2""#,
+            r#""deg F""#,
+        ] {
+            let toml = format!(
+                "{PRELUDE}\n[[unit]]\nname = {bad}\nlabel = \"x\"\n\n{}",
+                metric("a", "ca", 4, "")
+            );
+            let r: Registry = toml::from_str(&toml).expect("fixture parses");
+            let e = registry_internal(&r).unwrap_err();
+            assert!(
+                e.contains("is not usable. A name is an internal key"),
+                "{bad} was accepted: {e}"
+            );
+        }
+        // And the shipped names all pass, so the rule is not merely strict.
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let r = Registry::load(&root.join("metrics/registry.toml")).expect("loads");
+        registry_internal(&r).expect("every shipped unit name is usable");
     }
 
     /// An empty label is a real answer, not a missing one: a state, a code, a bare index
