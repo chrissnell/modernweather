@@ -12,6 +12,36 @@
 
 schema_version = 1
 
+# The aggregate hierarchy as last migrated (N-13). `snapshot::affected_levels`
+# compares each level's rendered definition against this record, so that adding a
+# metric to one level rebuilds that level and not the three whose text did not
+# change. The column list alone would not be enough: inserting the 5-minute level
+# left the hourly level's columns untouched and changed the relation it reads.
+
+[[level]]
+name = "1m"
+bucket = "1 minute"
+source = "raw"
+materialized_only = true
+
+[[level]]
+name = "5m"
+bucket = "5 minutes"
+source = "1m"
+materialized_only = true
+
+[[level]]
+name = "1h"
+bucket = "1 hour"
+source = "5m"
+materialized_only = true
+
+[[level]]
+name = "1d"
+bucket = "1 day"
+source = "1h"
+materialized_only = true
+
 [[allocated]]
 kind = "dimension"
 key = "time"
@@ -600,7 +630,7 @@ column = "solarjoules"
 sql_type = "float4"
 field_number = 45
 proto_type = "float"
-aggregates = ["mean", "min", "max"]
+aggregates = ["total"]
 mean_representation = "sum_count"
 levels = ["1m", "5m", "1h", "1d"]
 deprecated = false

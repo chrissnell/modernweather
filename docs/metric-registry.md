@@ -73,7 +73,7 @@ metrics/snapshot.toml ──── what has ever been allocated; the only thing 
 
 ## 1. The registry format
 
-TOML, per D-20. Three kinds of entry.
+TOML, per D-20. Four kinds of entry.
 
 ### 1.1 Metrics
 
@@ -86,7 +86,7 @@ field_number = 7              # protobuf, allocated once, never reused
 proto_name = "outsideTemperature"
 proto_type = "float"
 label = "Temperature"         # user-facing; see §6.2
-unit = "degF"                 # the unit the column is STORED in; see §6.1
+unit = "degF"                 # must name a [[unit]]; see §1.6 and §6.1
 tier = "core"
 aggregates = ["mean", "min", "max"]
 levels = ["1m", "1h", "1d"]   # per-level inclusion (OQ-5)
@@ -222,12 +222,48 @@ so does the registry, which is correct for a counter that only rises within its 
 
 ---
 
+### 1.6 Units
+
+```toml
+[[unit]]
+name = "degF"               # what a metric's `unit` names
+label = "°F"                # what a reader is shown
+```
+
+A closed vocabulary, and closed is the whole value of it. Before N-7 there were 25 unit
+strings in use and nothing checking them, so `unit = "degf"` was a valid registry edit and
+`degf` reached the UI as a rendered label (C-W2-19). Three checks, and the third is the one
+the table exists for:
+
+- a `[[unit]]` name declared twice is **fatal**;
+- two names differing **only in case** are fatal, because declaring `degf` beside `degF` is
+  the obvious way to make the typo validate and would put the hole straight back;
+- a metric naming a unit no `[[unit]]` declares is fatal, and the message offers the
+  case-insensitive near miss when there is one.
+
+`label` is deliberately not `name`. The UI renders the label and never echoes the internal
+string, so D-36 holds by construction rather than by review, and `generated/rust/metrics.rs`
+and `generated/ts/metrics.ts` carry the table (`UNITS`, plus `UNIT_LABELS` in TypeScript) so
+there is somewhere to render it from. An empty label is a real answer and means "no suffix":
+a state, a code, a bare index and a timestamp all have none.
+
+---
+
 ## 2. The committed snapshot, and what is fatal
 
 The registry alone cannot enforce append-only: a human editing TOML can rename anything. The
 generator enforces it by diffing the registry against `metrics/snapshot.toml`, which is written
 only by `cargo xtask migrate` and is the record of every identifier that has ever been
 allocated.
+
+It records one thing that is not an identifier, added by **N-13**: a `[[level]]` section holding
+each aggregate level's own definition (`name`, `bucket`, `source`, `materialized_only`) as last
+migrated. `snapshot::affected_levels` compares each level's rendered definition against it, so a
+migration drops the levels whose text changed and leaves the rest materialised. The level's own
+definition has to be recorded and not just its column list: inserting the 5-minute level left the
+hourly level's columns byte-identical and changed the relation it reads, which a column comparison
+cannot see. A snapshot with no `[[level]]` section — anything written before M1-6 — is read as "no
+previous definition", which rebuilds every level.
 
 ### 2.1 Fatal — no flag
 
@@ -248,7 +284,9 @@ Plus the structural checks that would otherwise produce broken SQL: a level chai
 level, a metric carried at `1h` but not at `1m` (§A-W2-1), an aggregate on a `text` column,
 `mean` and `total` on the same metric (both emit a sum), a protobuf number in the reserved
 19000–19999 range, a deprecated metric or dimension with no `deprecated_in`, a `deprecated_in`
-on an entry that is not deprecated, and one legacy JSON key claimed by two metrics.
+on an entry that is not deprecated, one legacy JSON key claimed by two metrics, a unit string
+no `[[unit]]` declares, a `[[unit]]` declared twice, and two `[[unit]]` names differing only in
+case (§1.6).
 
 ### 2.2 Refused by default — one loud flag
 
@@ -489,8 +527,37 @@ deliberate departures:
 - **Enumerated and state columns get `min`/`max` and never `mean`.** The arithmetic mean of a
   relay state or an alarm code is not a number anybody wants. 55 metrics are in this shape.
 
-`solarjoules` keeps the Go view's `mean`/`min`/`max` even though a joule total would arguably
-be `total`; see **OQ-W2-3**.
+`solarjoules` is **`total`**, settled by N-9 and against the Go views, which stored
+`avg(solarjoules)`. OQ-W2-3 addressed the question to `pkg/solar`, and `pkg/solar` is not where
+the answer is: it holds the clear-sky irradiance models (ASCE, Bras, Ineichen-Perez) and the
+sunrise arithmetic, all in W/m², and never mentions `solarjoules`. Nothing computes the value —
+it is the Campbell datalogger's `slr_mj` field, carried through untouched by
+`internal/weatherstations/campbell/station.go`, and it is energy per unit area accumulated since
+the logger's previous output. That is why the same packet also carries `slr_w` for the
+irradiance; if `slr_mj` were a rate it would be `slr_w` times a constant and would say nothing
+new. A mean of it is the mean increment per reading and moves when the logger's output interval
+does; the sum over a bucket is the bucket's insolation.
+
+Two costs, both accepted rather than hidden.
+
+**On the frozen surface: `solarjoules` is on it,** contrary to M1-6's brief —
+`contract/legacy-v1.json` lists it on `/latest` and `/span/{span}` in the Go response type, the
+Swift response type and the client crosswalk. So `/span`'s value for that key changes by roughly
+the bucket's reading count: ~30× at the 6 h band to ~43,200× at 366 d. Recorded as **DEV-7** in
+`docs/reconciliation.md` §3, which is where a change to a byte a shipped client reads belongs, and
+marked as needing the owner's acknowledgement. The conformance suite compares shape, type and
+formatting rather than values, so it will not notice.
+
+**On the import side:** no Go view computed `sum(solarjoules)`, so `solarjoules` joins the
+unconsumed archive columns and `solarjoules_total` lands NULL for the ~294 pre-cutover rollup days.
+It would be wrong to call that unavoidable. The archive carries `avg(solarwatts)` for the same
+bucket, and mean irradiance × bucket seconds *is* the integral the instrument performs — so a
+derived total is available without knowing the logger's output interval, which an earlier draft of
+this paragraph claimed was the blocker. It is rejected on its merits instead: a derived number is
+not a measured one, it would silently differ in kind from every post-cutover bucket, and it depends
+on the `J_per_m2`-versus-MJ/m² question below being settled first. A NULL says "the old system
+never had this number" where a converted one would lie. **It is W9's call, not W2's** — the import
+is W9's artefact, and `w9.unconsumed_archive_column` already records the decision point.
 
 ---
 
@@ -920,6 +987,15 @@ Determining which requires reading `pkg/solar`, which is W7's territory.
 confirm against `pkg/solar` when it specifies the collector. One line in the registry if it
 turns out to be a total. The cost of being wrong is a wrong number in a chart, not a schema
 change.
+
+**Answered as N-16's sibling N-9** (implementation-plan.md M1-6): it is a **total**. Two things in
+the question above were wrong and are worth keeping rather than overwriting. `pkg/solar` is not
+where the answer lives — it holds clear-sky irradiance models in W/m² and never mentions
+`solarjoules`; the value is the Campbell logger's `slr_mj`, so the question belonged to the driver,
+not to the collector. And "the cost of being wrong is a wrong number in a chart, not a schema
+change" understated it twice over: an aggregation-strategy change *is* refused as breaking and needs
+a migration that rebuilds every level, and `solarjoules` is on the frozen `/span` surface, so the
+chart's numbers move by 30× to 43,200×. See §5.1 and **DEV-7**.
 
 **OQ-W2-4. Should the registry carry the legacy unit conversion?**
 

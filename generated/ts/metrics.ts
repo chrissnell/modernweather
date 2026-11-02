@@ -69,7 +69,7 @@ export const METRICS: readonly MetricMeta[] = [
   { key: 'year_rain', column: 'yearrain', label: 'Rainfall this year', unit: 'in', tier: 'core', fieldNumber: 42, aggregates: ['max'], legacyRestKeys: ['yearrain'] },
   { key: 'solar_watts', column: 'solarwatts', label: 'Solar radiation', unit: 'W_per_m2', tier: 'core', fieldNumber: 43, aggregates: ['mean', 'min', 'max'], legacyRestKeys: ['solarwatts'] },
   { key: 'potential_solar_watts', column: 'potentialsolarwatts', label: 'Clear-sky solar radiation', unit: 'W_per_m2', tier: 'core', fieldNumber: 44, aggregates: ['mean', 'min', 'max'], legacyRestKeys: ['potentialsolarwatts'] },
-  { key: 'solar_joules', column: 'solarjoules', label: 'Solar energy', unit: 'J_per_m2', tier: 'core', fieldNumber: 45, aggregates: ['mean', 'min', 'max'], legacyRestKeys: ['solarjoules'] },
+  { key: 'solar_joules', column: 'solarjoules', label: 'Solar energy', unit: 'J_per_m2', tier: 'core', fieldNumber: 45, aggregates: ['total'], legacyRestKeys: ['solarjoules'] },
   { key: 'uv', column: 'uv', label: 'UV index', unit: 'index', tier: 'core', fieldNumber: 46, aggregates: ['mean', 'min', 'max'], legacyRestKeys: ['uv'] },
   { key: 'radiation', column: 'radiation', label: 'Solar radiation (sensor)', unit: 'W_per_m2', tier: 'core', fieldNumber: 47, aggregates: ['mean', 'min', 'max'], legacyRestKeys: ['radiation'] },
   { key: 'day_et', column: 'dayet', label: 'Evapotranspiration today', unit: 'in', tier: 'extended', fieldNumber: 48, aggregates: ['max'], legacyRestKeys: [] },
@@ -244,3 +244,43 @@ export const METRICS: readonly MetricMeta[] = [
 
 export const METRICS_BY_KEY: Record<string, MetricMeta> =
   Object.fromEntries(METRICS.map((m) => [m.key, m]));
+
+// The unit vocabulary (N-7). `MetricMeta.unit` is a key into this table and is
+// never rendered: `label` is the user-facing form, and an empty label means the
+// number carries no suffix.
+
+export interface UnitMeta {
+  name: string;
+  label: string;
+}
+
+export const UNITS: readonly UnitMeta[] = [
+  { name: 'aqi', label: 'AQI' },
+  { name: 'cbar', label: 'cbar' },
+  { name: 'code', label: '' },
+  { name: 'count', label: '' },
+  { name: 'deg', label: '°' },
+  { name: 'degF', label: '°F' },
+  { name: 'degree_days', label: '°F·day' },
+  { name: 'in', label: 'in' },
+  { name: 'inHg', label: 'inHg' },
+  { name: 'in_per_hour', label: 'in/h' },
+  { name: 'index', label: '' },
+  { name: 'J_per_m2', label: 'J/m²' },
+  { name: 'mi', label: 'mi' },
+  { name: 'mm', label: 'mm' },
+  { name: 'mph', label: 'mph' },
+  { name: 'ms_epoch', label: '' },
+  { name: 'percent', label: '%' },
+  { name: 'ppm', label: 'ppm' },
+  { name: 'state', label: '' },
+  { name: 'text', label: '' },
+  { name: 'timestamp', label: '' },
+  { name: 'ug_per_m3', label: 'µg/m³' },
+  { name: 'unitless', label: '' },
+  { name: 'V', label: 'V' },
+  { name: 'W_per_m2', label: 'W/m²' },
+];
+
+export const UNIT_LABELS: Record<string, string> =
+  Object.fromEntries(UNITS.map((u) => [u.name, u.label]));

@@ -253,4 +253,38 @@ BEGIN
     END IF;
 END $$;
 
+-- ---------------------------------------------------------------------------
+-- A-10. Each aggregate level has its composite (station_id, bucket DESC) index.
+--
+-- These are W4's, created by 20261029234500, and until now nothing asserted them —
+-- A-8 and A-9 cover the retention and refresh policies and stop there. That gap is
+-- not theoretical: `DROP MATERIALIZED VIEW ... CASCADE` takes the index with the
+-- view, every registry change that rewrites a level's column set does exactly that,
+-- and the only symptom of forgetting to put them back is /span latency. A migration
+-- that omitted them would have been green on every gate in this repository.
+--
+-- Looked up by name across every schema, because TimescaleDB creates an index asked
+-- for on a continuous aggregate against the materialisation hypertable, which lives
+-- in _timescaledb_internal — the schema ci/db/migrate-twice.sh excludes from its
+-- pg_dump comparison, which is the other reason this had to be an assertion.
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE missing text;
+BEGIN
+    SELECT string_agg(v.want, ', ' ORDER BY v.want) INTO missing
+      FROM (VALUES ('observations_1m_station_bucket_idx'),
+                   ('observations_5m_station_bucket_idx'),
+                   ('observations_1h_station_bucket_idx'),
+                   ('observations_1d_station_bucket_idx')) v(want)
+     WHERE NOT EXISTS (
+        SELECT 1 FROM pg_class c
+         WHERE c.relname = v.want AND c.relkind = 'i');
+    IF missing IS NOT NULL THEN
+        RAISE EXCEPTION 'these aggregate level indexes are missing: %. '
+                        'A level rebuild drops them with the view (CASCADE) and '
+                        'the generator does not know they exist, so a migration '
+                        'that recreates a level must re-assert them.', missing;
+    END IF;
+END $$;
+
 \echo 'schema assertions: all passed'

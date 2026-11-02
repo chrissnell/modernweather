@@ -123,6 +123,141 @@ introduced_in = "0.1.0"
 legacy_rest_keys = ["stationtype"]
 
 # ---------------------------------------------------------------------------
+# Units (N-7). The closed vocabulary a metric's `unit` must name.
+#
+# Before this table there were 25 unit strings in use and nothing checking them, so
+# `degf` for `degF` was a valid registry edit that reached the UI as a rendered label
+# (C-W2-19). `cargo xtask validate` now rejects a unit a metric names and this table
+# does not declare, and rejects two declarations differing only in case — the other half
+# of the same hole, because declaring `degf` beside `degF` would make the typo legal
+# again.
+#
+# `label` is what a reader is shown, and it is deliberately not `name`: the UI renders
+# the label and never echoes the internal string, so D-36 holds by construction rather
+# than by review. An empty label is a real answer and means "render the number with no
+# suffix" — a state, a code, a bare index or a timestamp has none.
+# ---------------------------------------------------------------------------
+
+[[unit]]
+name = "aqi"
+label = "AQI"
+
+# Soil-moisture tension, as the sensors report it.
+[[unit]]
+name = "cbar"
+label = "cbar"
+
+# A small integer enumeration the station reports. Rendered by name, not as a number.
+[[unit]]
+name = "code"
+label = ""
+
+[[unit]]
+name = "count"
+label = ""
+
+# A compass bearing. Aggregated as a vector mean, never arithmetically (D-13).
+[[unit]]
+name = "deg"
+label = "°"
+
+# Fahrenheit. The stations report it and the frozen surface serves it.
+[[unit]]
+name = "degF"
+label = "°F"
+
+# Growing degree days.
+[[unit]]
+name = "degree_days"
+label = "°F·day"
+
+# Inches, of rainfall or of snow depth.
+[[unit]]
+name = "in"
+label = "in"
+
+# Barometric pressure.
+[[unit]]
+name = "inHg"
+label = "inHg"
+
+[[unit]]
+name = "in_per_hour"
+label = "in/h"
+
+# A bare index with no dimension, e.g. UV.
+[[unit]]
+name = "index"
+label = ""
+
+# Solar energy per unit area.
+[[unit]]
+name = "J_per_m2"
+label = "J/m²"
+
+[[unit]]
+name = "mi"
+label = "mi"
+
+# Millimetres, for the sensors that report metric depth directly.
+[[unit]]
+name = "mm"
+label = "mm"
+
+[[unit]]
+name = "mph"
+label = "mph"
+
+# Milliseconds since the Unix epoch, as an integer column.
+[[unit]]
+name = "ms_epoch"
+label = ""
+
+[[unit]]
+name = "percent"
+label = "%"
+
+[[unit]]
+name = "ppm"
+label = "ppm"
+
+# A named state the station reports: a battery flag, a forecast word, a
+# leaf-wetness state. Rendered by name.
+[[unit]]
+name = "state"
+label = ""
+
+# A free-text column.
+[[unit]]
+name = "text"
+label = ""
+
+# A `timestamptz` column. Rendered as a time, not with a suffix.
+[[unit]]
+name = "timestamp"
+label = ""
+
+# Particulate mass concentration.
+[[unit]]
+name = "ug_per_m3"
+label = "µg/m³"
+
+# A dimensionless ratio. The generator omits `x-unit` for this one.
+[[unit]]
+name = "unitless"
+label = ""
+
+# Battery and supply voltages.
+[[unit]]
+name = "V"
+label = "V"
+
+# Irradiance.
+[[unit]]
+name = "W_per_m2"
+label = "W/m²"
+
+# ---------------------------------------------------------------------------
 # Metrics, in protobuf field-number order.
 # ---------------------------------------------------------------------------
 
@@ -754,9 +889,37 @@ field_number = 45
 proto_name = "solarJoules"
 proto_type = "float"
 label = "Solar energy"
+# WRONG BY 10^6, tracked as N-23: `slr_mj` is MJ/m2, not J/m2. Not corrected here because
+# DEV-7 already asks the owner to acknowledge one change to what this key means, and the
+# rendered unit is W5's surface. N-7's [[unit]] table cannot catch a wrong-but-declared
+# unit, which is why this comment is here and not only in a work-item table.
 unit = "J_per_m2"
 tier = "core"
-aggregates = ["mean", "min", "max"]
+# A total, settled by N-9. The value is the Campbell datalogger's `slr_mj` field,
+# carried through untouched by internal/weatherstations/campbell/station.go at
+# remoteweather c3ec9f7: energy per unit area accumulated since the logger's last
+# output, which is why the same packet also carries `slr_w` for the irradiance. A mean
+# of it is the mean increment per reading and depends on the logger's output interval;
+# the sum over a bucket is the bucket's insolation, which is the number a chart wants.
+#
+# `pkg/solar` was the file this question was addressed to and it is not the answer:
+# it holds the clear-sky irradiance models (ASCE, Bras, Ineichen-Perez) and the sunrise
+# arithmetic, all in W/m2, and never mentions solarjoules. Nothing computes this value
+# — the instrument reports it.
+#
+# The Go views stored avg(solarjoules), and no Go view computed a sum, so W9's import
+# has no source for solarjoules_total and leaves pre-cutover history NULL rather than
+# importing a mean as a total. See docs/data-migration.md §4.3.
+#
+# This key IS on the frozen surface, contrary to M1-6's brief: contract/legacy-v1.json
+# lists solarjoules on /latest and /span/{span} in the Go response type, the Swift
+# response type and the client crosswalk. So /span's value for it changes by roughly the
+# bucket's reading count -- ~30x at the 6h band to ~43,200x at 366d -- and /latest, which
+# serves the last raw reading, now reports a different physical quantity under the same
+# key. Recorded as DEV-7 in docs/reconciliation.md and marked as needing the owner's
+# acknowledgement. The conformance suite compares shape and formatting, not values, so it
+# will not notice.
+aggregates = ["total"]
 levels = ["1m", "5m", "1h", "1d"]
 legacy_rest_keys = ["solarjoules"]
 introduced_in = "0.1.0"

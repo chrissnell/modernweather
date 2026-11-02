@@ -8,7 +8,7 @@
 
 use crate::gen;
 use crate::registry::Registry;
-use crate::snapshot::{self, Change, Class};
+use crate::snapshot::{self, Change, Class, Snapshot};
 use std::fmt::Write as _;
 
 pub struct Migration {
@@ -18,6 +18,7 @@ pub struct Migration {
 
 pub fn render(
     reg: &Registry,
+    prev: &Snapshot,
     changes: &[Change],
     bootstrap: bool,
     stamp: &str,
@@ -196,7 +197,28 @@ pub fn render(
         }
     }
 
-    let levels = snapshot::affected_levels(reg, changes);
+    // Which levels this migration drops and recreates. Compared against the snapshot's
+    // own record of each level's definition (N-13), so a change that leaves a level's
+    // text alone leaves the level alone.
+    let levels = snapshot::affected_levels(reg, prev);
+    // Levels the registry no longer declares. Dropped and not recreated, so they are a
+    // separate list from the rebuild set above — and before the snapshot recorded levels
+    // there was no way to compute this one, which is why removing a `[[level]]` used to
+    // leave its continuous aggregate and both its policies in the database forever.
+    let gone = snapshot::removed_levels(reg, prev);
+    if !gone.is_empty() {
+        s.push_str(
+            "-- Levels the registry no longer declares. These are dropped and NOT recreated.\n             -- Top-down, because a level that is still declared may read one of them.\n             -- CASCADE takes the refresh and retention policies with the view, which is\n             -- correct here: the level is gone, so its policies have nothing to act on.\n\n",
+        );
+        for name in gone.iter().rev() {
+            let _ = writeln!(
+                s,
+                "DROP MATERIALIZED VIEW IF EXISTS {}_{name} CASCADE;",
+                gen::RAW_TABLE
+            );
+        }
+        s.push('\n');
+    }
     if !levels.is_empty() {
         s.push_str(
             "-- Aggregates are disposable derived data (D-15): there is no in-place aggregate\n\
@@ -229,7 +251,7 @@ pub fn render(
         );
     }
 
-    if add_cols.is_empty() && levels.is_empty() && breaking.is_empty() {
+    if add_cols.is_empty() && levels.is_empty() && gone.is_empty() && breaking.is_empty() {
         s.push_str(
             "-- Beyond the finalisers above there is nothing to do: the registry changed only\n\
              -- in things the database does not hold (labels, units, tiers, legacy key\n\

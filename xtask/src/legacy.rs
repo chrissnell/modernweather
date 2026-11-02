@@ -1477,13 +1477,18 @@ mod tests {
         let (reg, go) = inputs();
         let cols = legacy_columns(&reg, &go, "1d");
         let with = cols.iter().filter(|c| c.expr.is_some()).count();
-        // Measured against the registry at this commit: 451 of 627 aggregate columns have a
-        // counterpart in the Go views and 176 do not. The numbers are asserted so that a
+        // Measured against the registry at this commit: 449 of 624 aggregate columns have a
+        // counterpart in the Go views and 175 do not. The numbers are asserted so that a
         // registry change which quietly widens the gap shows up as a failing test and a
         // documented figure rather than as more NULLs.
-        assert_eq!(cols.len(), 627, "aggregate columns at the 1d level");
-        assert_eq!(with, 451, "columns the Go archive can fill");
-        assert_eq!(cols.len() - with, 176, "columns that land NULL");
+        //
+        // Was 451 of 627 until N-9 settled solarjoules as a bucket total: four columns
+        // (`_sum`, `_count`, `_min`, `_max`) became one (`_total`), and the one is
+        // unfillable because no Go view computed sum(solarjoules). Net -3 columns, -2
+        // filled, -1 NULL.
+        assert_eq!(cols.len(), 624, "aggregate columns at the 1d level");
+        assert_eq!(with, 449, "columns the Go archive can fill");
+        assert_eq!(cols.len() - with, 175, "columns that land NULL");
         // Every unfilled column must say why. A NULL with no reason is indistinguishable
         // from a mapping bug.
         assert!(cols
@@ -1493,24 +1498,34 @@ mod tests {
     }
 
     #[test]
-    fn the_unconsumed_archive_columns_are_the_four_semantic_ones_and_the_truncated_means() {
+    fn the_unconsumed_archive_columns_are_the_five_semantic_ones_and_the_truncated_means() {
         let (reg, go) = inputs();
         let un = unconsumed(&reg, &go);
         let names: BTreeSet<&str> = un.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(un.len(), 43, "unconsumed archive columns: {names:?}");
+        assert_eq!(un.len(), 44, "unconsumed archive columns: {names:?}");
         for n in [
             "lightning_day",  // sum() in the old view, max in the registry
             "lightning_hour", // same
             "lightning_time", // timestamptz, no aggregate in the registry at all
             "min_gdd",        // min(gdd), and the registry gives gdd only max
+            // N-9: avg(solarjoules) in the old view, total in the registry. The archived
+            // mean is a mean of per-reading increments, so it is not a total and is not
+            // convertible into one without the logger's output interval. Left unconsumed
+            // on purpose: solarjoules_total lands NULL for pre-cutover history rather
+            // than carrying a number that is wrong by the sampling rate.
+            "solarjoules",
         ] {
             assert!(names.contains(n), "{n} should be unconsumed");
         }
         // The other 39 are the integer means the old view truncated with ::int.
+        // `solarjoules` is excluded by name rather than by predicate: it is also an avg()
+        // the transform does not consume, and it is not a truncated integer — it is the
+        // fifth semantic one, counted above.
         let truncated = go
             .columns
             .iter()
             .filter(|c| names.contains(c.name.as_str()) && c.func == "avg")
+            .filter(|c| c.name != "solarjoules")
             .count();
         assert_eq!(truncated, 39);
     }

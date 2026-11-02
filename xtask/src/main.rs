@@ -425,26 +425,30 @@ fn migrate_cmd(root: &Path, flags: &[&str]) -> Result<ExitCode, String> {
     let name = flag_value_str(flags, "--name");
     let stamp_override = flag_value_str(flags, "--stamp");
 
-    let (changes, bootstrap, next_snapshot) = match load_snapshot(root) {
+    let empty = Snapshot {
+        schema_version: 1,
+        levels: vec![],
+        entries: vec![],
+    };
+    let (changes, bootstrap, prev) = match load_snapshot(root) {
         None => {
-            let _ = validate::against_snapshot(
-                &reg,
-                &Snapshot {
-                    schema_version: 1,
-                    entries: vec![],
-                },
-                allow_breaking,
-            )?;
-            (vec![], true, snapshot::from_registry(&reg))
+            let _ = validate::against_snapshot(&reg, &empty, allow_breaking)?;
+            (vec![], true, empty)
         }
         Some(s) => {
             let snap = s?;
             let changes = validate::against_snapshot(&reg, &snap, allow_breaking)?;
-            if changes.is_empty() {
+            // `changes.is_empty()` used to mean "the snapshot agrees with the registry".
+            // Since N-13 the snapshot also records the level hierarchy, and a level whose
+            // bucket, source or `materialized_only` changed produces no entry-level
+            // `Change` at all — so returning here on the change count alone printed a
+            // claim the tool no longer checked, while `codegen` rewrote the level's SQL and
+            // no gate noticed. The level comparison is cheap and makes the message true.
+            if changes.is_empty() && snapshot::levels_from_registry(&reg) == snap.levels {
                 println!("migrate: registry and snapshot agree; nothing to emit");
                 return Ok(ExitCode::SUCCESS);
             }
-            (changes, false, snapshot::from_registry(&reg))
+            (changes, false, snap)
         }
     };
 
@@ -453,13 +457,22 @@ fn migrate_cmd(root: &Path, flags: &[&str]) -> Result<ExitCode, String> {
         .map_err(|e| e.to_string())?
         .as_secs();
     let stamp = stamp_override.unwrap_or_else(|| migrate::stamp(secs));
+    // What to call a migration that changes nothing the entries can see. Before N-13 that
+    // could only be labels, units, tiers and legacy keys; now a level redefinition reaches
+    // it too, and the two deserve different names because one rebuilds an aggregate.
+    let rebuild_name = if snapshot::levels_from_registry(&reg) == prev.levels {
+        "registry_metadata"
+    } else {
+        "rebuild_aggregate_levels"
+    };
     let default_name = if bootstrap {
         "initial_schema".to_string()
     } else {
-        derive_name(&changes)
+        derive_name(&changes, rebuild_name)
     };
     let m = migrate::render(
         &reg,
+        &prev,
         &changes,
         bootstrap,
         &stamp,
@@ -489,8 +502,14 @@ fn migrate_cmd(root: &Path, flags: &[&str]) -> Result<ExitCode, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join(&m.filename);
     std::fs::write(&path, &m.body).map_err(|e| format!("{}: {e}", path.display()))?;
-    std::fs::write(root.join(SNAPSHOT), snapshot::render(&next_snapshot))
-        .map_err(|e| format!("{SNAPSHOT}: {e}"))?;
+    std::fs::write(
+        root.join(SNAPSHOT),
+        snapshot::render(
+            &snapshot::from_registry(&reg),
+            &snapshot::levels_from_registry(&reg),
+        ),
+    )
+    .map_err(|e| format!("{SNAPSHOT}: {e}"))?;
     println!(
         "migrate: wrote {MIGRATIONS}/{} and updated {SNAPSHOT}",
         m.filename
@@ -505,7 +524,7 @@ fn flag_value_str(flags: &[&str], name: &str) -> Option<String> {
     flags.get(i + 1).map(|s| (*s).to_string())
 }
 
-fn derive_name(changes: &[snapshot::Change]) -> String {
+fn derive_name(changes: &[snapshot::Change], rebuild_name: &str) -> String {
     use snapshot::Class;
     if changes.iter().any(|c| c.class.breaking()) {
         return "breaking_schema_change".into();
@@ -528,7 +547,10 @@ fn derive_name(changes: &[snapshot::Change]) -> String {
             .unwrap_or_default()
     };
     match (adds, deps) {
-        (0, 0) => "registry_metadata".into(),
+        // A level-only change reaches here with no adds and no deprecations, and calling
+        // that "registry_metadata" would be wrong in a permanent filename: the migration
+        // rebuilds an aggregate. The caller passes `rebuild` for it.
+        (0, 0) => rebuild_name.into(),
         (1, 0) => format!("add_{}", first(Class::AddColumn)),
         (n, 0) => format!("add_{n}_entries"),
         (0, 1) => format!("deprecate_{}", first(Class::Deprecate)),
@@ -1022,7 +1044,12 @@ mod generated_compiles {
     #[test]
     fn every_migration_reasserts_the_finalisers() {
         let reg = load(&repo_root()).expect("registry is valid");
-        let m = super::migrate::render(&reg, &[], false, "20260101000000", "no_op");
+        let prev = super::Snapshot {
+            schema_version: 1,
+            levels: super::snapshot::levels_from_registry(&reg),
+            entries: super::snapshot::from_registry(&reg),
+        };
+        let m = super::migrate::render(&reg, &prev, &[], false, "20260101000000", "no_op");
         assert!(
             m.body
                 .contains("CREATE OR REPLACE FUNCTION mw_circular_mean"),
@@ -1141,6 +1168,46 @@ mod generated_compiles {
                 "{} accumulates a sum in the column's own type (D-14)",
                 c.column
             );
+        }
+    }
+
+    /// N-9. `solarjoules` carries the Campbell logger's `slr_mj`: energy per unit area
+    /// accumulated since its previous output, which is why the same packet also carries
+    /// `slr_w` for the irradiance. A bucket sums it; averaging it yields the mean
+    /// increment per reading, a number that moves when the logger's output interval does.
+    ///
+    /// Asserted against the emitted SQL and not only the registry, because the registry
+    /// being right and the four level templates agreeing with it are two claims.
+    #[test]
+    fn solarjoules_is_a_bucket_total_at_every_level() {
+        use crate::registry::Strategy;
+        let reg = load(&repo_root()).expect("registry is valid");
+        let m = reg
+            .metrics
+            .iter()
+            .find(|m| m.key == "solar_joules")
+            .expect("in the registry");
+        assert_eq!(m.aggregates, vec![Strategy::Total]);
+
+        let files = super::gen::all(&reg);
+        for (path, from_raw) in [
+            ("generated/sql/030_observations_1m.sql", true),
+            ("generated/sql/040_observations_5m.sql", false),
+            ("generated/sql/050_observations_1h.sql", false),
+            ("generated/sql/060_observations_1d.sql", false),
+        ] {
+            let body = files.get(path).expect("generated");
+            let want = if from_raw {
+                "sum(solarjoules::double precision) AS solarjoules_total"
+            } else {
+                "sum(solarjoules_total) AS solarjoules_total"
+            };
+            assert!(body.contains(want), "{path} is missing `{want}`");
+            // The mean's columns are gone, at every level. A level that kept them would
+            // be a level still storing the old quantity under the old name.
+            for gone in ["solarjoules_sum", "solarjoules_count", "solarjoules_min"] {
+                assert!(!body.contains(gone), "{path} still carries {gone}");
+            }
         }
     }
 }

@@ -26,8 +26,8 @@
 -- computed from raw, and costs 4 MB. docs/data-migration.md 3 and 5.
 
 -- ------------------------------------------------------------------
--- observations_1d_legacy: 627 aggregate columns, 451 of which the Go views
--- computed. The other 176 land NULL, which is correct: the old system never
+-- observations_1d_legacy: 624 aggregate columns, 449 of which the Go views
+-- computed. The other 175 land NULL, which is correct: the old system never
 -- had that number, and a NULL says so where a zero would lie.
 -- ------------------------------------------------------------------
 
@@ -174,10 +174,7 @@ CREATE TABLE observations_1d_legacy (
     potentialsolarwatts_count   bigint,
     potentialsolarwatts_min     float4,   -- NULL: the Go views never computed min(potentialsolarwatts)
     potentialsolarwatts_max     float4,   -- NULL: the Go views never computed max(potentialsolarwatts)
-    solarjoules_sum             double precision,
-    solarjoules_count           bigint,
-    solarjoules_min             float4,   -- NULL: the Go views never computed min(solarjoules)
-    solarjoules_max             float4,   -- NULL: the Go views never computed max(solarjoules)
+    solarjoules_total           double precision,   -- NULL: the Go views never computed total(solarjoules)
     uv_sum                      double precision,
     uv_count                    bigint,
     uv_min                      float4,
@@ -672,8 +669,8 @@ COMMENT ON TABLE observations_1d_legacy IS
      observations and not rebuildable from anything. Never truncate this.';
 
 -- ------------------------------------------------------------------
--- observations_1h_legacy: 627 aggregate columns, 451 of which the Go views
--- computed. The other 176 land NULL, which is correct: the old system never
+-- observations_1h_legacy: 624 aggregate columns, 449 of which the Go views
+-- computed. The other 175 land NULL, which is correct: the old system never
 -- had that number, and a NULL says so where a zero would lie.
 -- ------------------------------------------------------------------
 
@@ -820,10 +817,7 @@ CREATE TABLE observations_1h_legacy (
     potentialsolarwatts_count   bigint,
     potentialsolarwatts_min     float4,   -- NULL: the Go views never computed min(potentialsolarwatts)
     potentialsolarwatts_max     float4,   -- NULL: the Go views never computed max(potentialsolarwatts)
-    solarjoules_sum             double precision,
-    solarjoules_count           bigint,
-    solarjoules_min             float4,   -- NULL: the Go views never computed min(solarjoules)
-    solarjoules_max             float4,   -- NULL: the Go views never computed max(solarjoules)
+    solarjoules_total           double precision,   -- NULL: the Go views never computed total(solarjoules)
     uv_sum                      double precision,
     uv_count                    bigint,
     uv_min                      float4,
@@ -1397,8 +1391,6 @@ BEGIN
         solarwatts_count,
         potentialsolarwatts_sum,
         potentialsolarwatts_count,
-        solarjoules_sum,
-        solarjoules_count,
         uv_sum,
         uv_count,
         uv_min,
@@ -1850,8 +1842,6 @@ BEGIN
         CASE WHEN a.solarwatts IS NULL THEN NULL ELSE 1::bigint END,
         a.potentialsolarwatts::double precision,
         CASE WHEN a.potentialsolarwatts IS NULL THEN NULL ELSE 1::bigint END,
-        a.solarjoules::double precision,
-        CASE WHEN a.solarjoules IS NULL THEN NULL ELSE 1::bigint END,
         a.uv::double precision,
         CASE WHEN a.uv IS NULL THEN NULL ELSE 1::bigint END,
         a.min_uv,
@@ -2323,8 +2313,6 @@ BEGIN
         solarwatts_count,
         potentialsolarwatts_sum,
         potentialsolarwatts_count,
-        solarjoules_sum,
-        solarjoules_count,
         uv_sum,
         uv_count,
         uv_min,
@@ -2776,8 +2764,6 @@ BEGIN
         CASE WHEN a.solarwatts IS NULL THEN NULL ELSE 1::bigint END,
         a.potentialsolarwatts::double precision,
         CASE WHEN a.potentialsolarwatts IS NULL THEN NULL ELSE 1::bigint END,
-        a.solarjoules::double precision,
-        CASE WHEN a.solarjoules IS NULL THEN NULL ELSE 1::bigint END,
         a.uv::double precision,
         CASE WHEN a.uv IS NULL THEN NULL ELSE 1::bigint END,
         a.min_uv,
@@ -3341,10 +3327,7 @@ SELECT bucket, station_id,
        potentialsolarwatts_count,
        potentialsolarwatts_min,
        potentialsolarwatts_max,
-       solarjoules_sum,
-       solarjoules_count,
-       solarjoules_min,
-       solarjoules_max,
+       solarjoules_total,
        uv_sum,
        uv_count,
        uv_min,
@@ -3971,10 +3954,7 @@ SELECT bucket, station_id,
        potentialsolarwatts_count,
        potentialsolarwatts_min,
        potentialsolarwatts_max,
-       solarjoules_sum,
-       solarjoules_count,
-       solarjoules_min,
-       solarjoules_max,
+       solarjoules_total,
        uv_sum,
        uv_count,
        uv_min,
@@ -4602,10 +4582,7 @@ SELECT bucket, station_id,
        potentialsolarwatts_count,
        potentialsolarwatts_min,
        potentialsolarwatts_max,
-       solarjoules_sum,
-       solarjoules_count,
-       solarjoules_min,
-       solarjoules_max,
+       solarjoules_total,
        uv_sum,
        uv_count,
        uv_min,
@@ -5232,10 +5209,7 @@ SELECT bucket, station_id,
        potentialsolarwatts_count,
        potentialsolarwatts_min,
        potentialsolarwatts_max,
-       solarjoules_sum,
-       solarjoules_count,
-       solarjoules_min,
-       solarjoules_max,
+       solarjoules_total,
        uv_sum,
        uv_count,
        uv_min,
@@ -5744,6 +5718,7 @@ END $fn$;
 -- document. docs/data-migration.md 4.3 says what each one is.
 CREATE TABLE w9.unconsumed_archive_column (column_name text PRIMARY KEY, reason text NOT NULL);
 INSERT INTO w9.unconsumed_archive_column (column_name, reason) VALUES
+    ('solarjoules', 'avg(solarjoules) — the registry models solarjoules as total'),
     ('gdd', 'avg(gdd) — the registry models gdd as max'),
     ('min_gdd', 'min(gdd) — the registry models gdd as max'),
     ('leak1', 'avg(leak1) — the registry models leak1 as min+max'),

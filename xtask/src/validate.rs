@@ -8,7 +8,7 @@
 
 use crate::registry::{Registry, Role, SqlType, Strategy};
 use crate::snapshot::{self, Class, Snapshot};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// PostgreSQL's hard limit, confirmed by probe on PostgreSQL 17 (D-19).
 pub const COLUMN_LIMIT: usize = 1600;
@@ -287,6 +287,75 @@ pub fn registry_internal(reg: &Registry) -> Result<(), String> {
         }
     }
 
+    // Units are a closed vocabulary (N-7). Four checks, and the third is the one the
+    // work item exists for: 25 unit strings were in use with nothing checking them, so
+    // `degf` for `degF` was a valid edit that reached the UI as a rendered label
+    // (C-W2-19).
+    let mut units: BTreeSet<&str> = BTreeSet::new();
+    let mut folded: BTreeMap<String, &str> = BTreeMap::new();
+    for u in &reg.units {
+        if !units.insert(&u.name) {
+            errs.push(format!(
+                "FATAL: unit '{}' is declared twice in [[unit]]",
+                u.name
+            ));
+        }
+        // The name reaches generated Rust and TypeScript inside a string literal and,
+        // unlike `label`, is not escaped on the way out: a unit named `a"b` emits a file
+        // that does not compile. Restricting the character set is the fix that cannot be
+        // got wrong again, and it costs nothing — the name is an internal key and `label`
+        // is the field that carries anything a reader sees.
+        if u.name.is_empty()
+            || !u
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            errs.push(format!(
+                "FATAL: unit name '{}' is not usable. A name is an internal key and must be \
+                 non-empty\n\
+                 \x20      ASCII alphanumerics and underscores, because it is emitted into \
+                 generated Rust and\n\
+                 \x20      TypeScript unescaped. Put the renderable form in `label`.",
+                u.name.escape_debug()
+            ));
+        }
+        // Two spellings that differ only in case are how the hole reopens: the obvious
+        // way to make `unit = \"degf\"` validate is to declare `degf`, and then both
+        // spellings are legal and both reach the UI.
+        if let Some(prev) = folded.insert(u.name.to_ascii_lowercase(), &u.name) {
+            if prev != u.name {
+                errs.push(format!(
+                    "FATAL: units '{prev}' and '{}' differ only in case. One of them is a \
+                     typo of\n\
+                     \x20      the other, and declaring both is how the `degf`-for-`degF` hole \
+                     reopens: pick one spelling.",
+                    u.name
+                ));
+            }
+        }
+    }
+    for m in &reg.metrics {
+        if units.contains(m.unit.as_str()) {
+            continue;
+        }
+        let near = reg
+            .units
+            .iter()
+            .find(|u| u.name.eq_ignore_ascii_case(&m.unit))
+            .map(|u| format!(" Did you mean '{}'?", u.name))
+            .unwrap_or_default();
+        errs.push(format!(
+            "FATAL: metric '{}' names unit '{}', which no [[unit]] declares.{near}\n\
+             \x20      The unit vocabulary is closed (N-7): add a [[unit]] entry with a label \
+             for it, or\n\
+             \x20      use one of the {} already declared.",
+            m.key,
+            m.unit,
+            reg.units.len()
+        ));
+    }
+
     // A legacy REST key may be attached to more than one metric only if someone
     // deliberately records a duplicated legacy key. Warn loudly rather than fail:
     // W1 owns the surface and the duplication is already shipped.
@@ -534,6 +603,9 @@ proto_name = "station_id"
 proto_type = "string"
 label = "Station"
 introduced_in = "0.1.0"
+[[unit]]
+name = "degF"
+label = "°F"
 "#;
 
     /// A `metadata` dimension: on the wire, in the reading types, not a column (N-14).
@@ -562,7 +634,10 @@ introduced_in = "0.1.0"
     }
 
     fn snap(r: &Registry) -> Snapshot {
-        let rendered = crate::snapshot::render(&crate::snapshot::from_registry(r));
+        let rendered = crate::snapshot::render(
+            &crate::snapshot::from_registry(r),
+            &crate::snapshot::levels_from_registry(r),
+        );
         toml::from_str(&rendered).expect("snapshot round-trips")
     }
 
@@ -705,6 +780,7 @@ introduced_in = "0.1.0"
         registry_internal(&r).expect("the registry itself is well formed");
         let empty = Snapshot {
             schema_version: 1,
+            levels: vec![],
             entries: vec![],
         };
         let e = against_snapshot(&r, &empty, true).unwrap_err();
@@ -722,6 +798,7 @@ introduced_in = "0.1.0"
         let r = reg(&body);
         let empty = Snapshot {
             schema_version: 1,
+            levels: vec![],
             entries: vec![],
         };
         let e = against_snapshot(&r, &empty, true).unwrap_err();
@@ -746,6 +823,7 @@ introduced_in = "0.1.0"
         registry_internal(&r).expect("a metadata dimension is a valid registry entry");
         let empty = Snapshot {
             schema_version: 1,
+            levels: vec![],
             entries: vec![],
         };
         let changes = against_snapshot(&r, &empty, false).expect("and allocates cleanly");
@@ -1022,7 +1100,7 @@ introduced_in = "0.1.0"
         let changes = against_snapshot(&after, &s, false).expect("not fatal");
         assert!(changes.iter().any(|c| c.class == Class::AddColumn));
 
-        let m = crate::migrate::render(&after, &changes, false, "20260101000000", "add_origin");
+        let m = crate::migrate::render(&after, &s, &changes, false, "20260101000000", "add_origin");
         assert!(
             !m.body.contains("ALTER TABLE"),
             "a protobuf-only dimension changes no table:\n{}",
@@ -1068,7 +1146,8 @@ introduced_in = "0.1.0"
 
         // With the flag it is permitted, and the migration says what it will not do.
         let changes = against_snapshot(&after, &s, true).expect("the flag permits it");
-        let m = crate::migrate::render(&after, &changes, false, "20260101000000", "to_metadata");
+        let m =
+            crate::migrate::render(&after, &s, &changes, false, "20260101000000", "to_metadata");
         assert!(
             m.body.contains("origin is no longer a generated column"),
             "{}",
@@ -1109,7 +1188,14 @@ introduced_in = "0.1.0"
         assert_eq!(c.class, Class::AddColumn);
         assert!(c.detail.contains("becomes a column"), "{}", c.detail);
 
-        let m = crate::migrate::render(&after, &changes, false, "20260101000000", "from_metadata");
+        let m = crate::migrate::render(
+            &after,
+            &s,
+            &changes,
+            false,
+            "20260101000000",
+            "from_metadata",
+        );
         assert!(
             m.body.contains("ADD COLUMN origin text NULL"),
             "the migration has to actually add it:\n{}",
@@ -1136,7 +1222,7 @@ introduced_in = "0.1.0"
         .expect("fixture parses");
 
         let changes = against_snapshot(&after, &s, false).expect("not fatal");
-        let m = crate::migrate::render(&after, &changes, false, "20260101000000", "add_probe");
+        let m = crate::migrate::render(&after, &s, &changes, false, "20260101000000", "add_probe");
         assert!(
             m.body.contains("ADD COLUMN probe text NULL"),
             "the generated DDL gains this column, so the migration must too:\n{}",
@@ -1203,5 +1289,142 @@ introduced_in = "0.1.0"
         for (_, _, exprs) in &b.per_level {
             assert!(*exprs <= AGG_EXPRESSION_CEILING);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // N-7 / C-W2-19: the unit vocabulary
+    // -----------------------------------------------------------------------
+
+    /// The work item's done-criterion, and the exact edit C-W2-19 describes. `degf` is
+    /// not `degF`, there were 25 unit strings in use and nothing checking them, and the
+    /// consequence was a rendered label.
+    #[test]
+    fn an_undeclared_unit_string_is_fatal() {
+        let r = reg(&metric("a", "ca", 4, "").replace("unit = \"degF\"", "unit = \"degf\""));
+        let e = registry_internal(&r).unwrap_err();
+        assert!(
+            e.contains("metric 'a' names unit 'degf', which no [[unit]] declares"),
+            "{e}"
+        );
+        // And it says what to do about it, because a case typo is the whole failure mode.
+        assert!(e.contains("Did you mean 'degF'?"), "{e}");
+    }
+
+    /// A unit nobody mistyped still has to exist. Not a case problem — a missing entry.
+    #[test]
+    fn a_unit_with_no_near_miss_is_still_fatal_and_says_so_plainly() {
+        let r = reg(&metric("a", "ca", 4, "").replace("unit = \"degF\"", "unit = \"furlongs\""));
+        let e = registry_internal(&r).unwrap_err();
+        assert!(e.contains("names unit 'furlongs'"), "{e}");
+        assert!(!e.contains("Did you mean"), "there is nothing to mean: {e}");
+        assert!(e.contains("The unit vocabulary is closed"), "{e}");
+    }
+
+    /// The second half of the hole. The obvious way to make `unit = "degf"` validate is
+    /// to declare `degf`, at which point both spellings are legal and the table has
+    /// bought nothing.
+    #[test]
+    fn two_units_differing_only_in_case_are_fatal() {
+        let toml = format!(
+            "{PRELUDE}\n[[unit]]\nname = \"degf\"\nlabel = \"degrees\"\n\n{}",
+            metric("a", "ca", 4, "")
+        );
+        let r: Registry = toml::from_str(&toml).expect("fixture parses");
+        let e = registry_internal(&r).unwrap_err();
+        assert!(
+            e.contains("units 'degF' and 'degf' differ only in case"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_unit_declared_twice_is_fatal() {
+        let toml = format!(
+            "{PRELUDE}\n[[unit]]\nname = \"degF\"\nlabel = \"\u{b0}F\"\n\n{}",
+            metric("a", "ca", 4, "")
+        );
+        let r: Registry = toml::from_str(&toml).expect("fixture parses");
+        let e = registry_internal(&r).unwrap_err();
+        assert!(e.contains("unit 'degF' is declared twice"), "{e}");
+    }
+
+    /// The name reaches generated Rust and TypeScript inside a string literal and is not
+    /// escaped there, so `a"b` emitted a file that does not compile. The label is escaped;
+    /// the name is restricted instead, because a unit name is an internal key.
+    #[test]
+    fn a_unit_name_that_would_not_survive_codegen_is_fatal() {
+        // Each element is the TOML right-hand side verbatim, quotes included, so the
+        // embedded-quote case can actually be expressed.
+        for bad in [
+            r#""a\"b""#,
+            r#""""#,
+            "\"\u{b0}F\"",
+            r#""J/m2""#,
+            r#""deg F""#,
+        ] {
+            let toml = format!(
+                "{PRELUDE}\n[[unit]]\nname = {bad}\nlabel = \"x\"\n\n{}",
+                metric("a", "ca", 4, "")
+            );
+            let r: Registry = toml::from_str(&toml).expect("fixture parses");
+            let e = registry_internal(&r).unwrap_err();
+            assert!(
+                e.contains("is not usable. A name is an internal key"),
+                "{bad} was accepted: {e}"
+            );
+        }
+        // And the shipped names all pass, so the rule is not merely strict.
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let r = Registry::load(&root.join("metrics/registry.toml")).expect("loads");
+        registry_internal(&r).expect("every shipped unit name is usable");
+    }
+
+    /// An empty label is a real answer, not a missing one: a state, a code, a bare index
+    /// or a timestamp renders with no suffix. The check must not reject it.
+    #[test]
+    fn an_empty_unit_label_is_allowed() {
+        let toml = format!(
+            "{PRELUDE}\n[[unit]]\nname = \"state\"\nlabel = \"\"\n\n{}",
+            metric("a", "ca", 4, "").replace("unit = \"degF\"", "unit = \"state\"")
+        );
+        let r: Registry = toml::from_str(&toml).expect("fixture parses");
+        registry_internal(&r).expect("a dimensionless unit has an empty label");
+    }
+
+    /// The shipped registry, and the generated table the UI renders from. Without the
+    /// second half the table could be declared and never emitted, which is the shape of
+    /// defect this programme keeps finding.
+    #[test]
+    fn the_real_registry_declares_every_unit_it_uses_and_emits_them_all() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let r = Registry::load(&root.join("metrics/registry.toml")).expect("loads");
+        registry_internal(&r).expect("every unit in use is declared");
+        assert_eq!(r.units.len(), 25, "C-W2-19 counted 25 unit strings in use");
+
+        let files = crate::gen::all(&r);
+        let rust = files.get("generated/rust/metrics.rs").expect("generated");
+        let ts = files.get("generated/ts/metrics.ts").expect("generated");
+        for u in &r.units {
+            assert!(
+                rust.contains(&format!("name: \"{}\"", u.name)),
+                "{} is declared and not emitted into the Rust table",
+                u.name
+            );
+            assert!(
+                ts.contains(&format!("name: '{}'", u.name)),
+                "{} is declared and not emitted into the TypeScript table",
+                u.name
+            );
+        }
+        // The label is the point: a UI that renders `unit` instead of `label` is the
+        // defect C-W2-19 describes, and it cannot render a label that is not there.
+        assert!(rust.contains("label: \"\u{b0}F\""), "{rust}");
+        assert!(ts.contains("UNIT_LABELS"), "{ts}");
     }
 }

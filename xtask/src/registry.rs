@@ -17,6 +17,23 @@ pub struct Registry {
     pub dimensions: Vec<Dimension>,
     #[serde(default, rename = "metric")]
     pub metrics: Vec<Metric>,
+    /// The closed vocabulary a metric's `unit` must name (N-7).
+    #[serde(default, rename = "unit")]
+    pub units: Vec<Unit>,
+}
+
+/// One declared unit of measure.
+///
+/// The whole point is that the set is closed: before this table, 25 unit strings were in
+/// use with nothing checking them, so `degf` for `degF` was a valid registry edit and
+/// reached the UI as a rendered label (C-W2-19). `name` is what a metric writes;
+/// `label` is what a reader is shown, so the UI renders the label and never echoes the
+/// internal string.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Unit {
+    pub name: String,
+    pub label: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +193,24 @@ pub enum MeanRepr {
     StatsAgg,
 }
 
+impl MeanRepr {
+    pub fn name(self) -> &'static str {
+        match self {
+            MeanRepr::SumCount => "sum_count",
+            MeanRepr::StatsAgg => "stats_agg",
+        }
+    }
+
+    /// The inverse of `name`, for reading a snapshot entry back (N-13).
+    pub fn from_name(s: &str) -> Option<MeanRepr> {
+        Some(match s {
+            "sum_count" => MeanRepr::SumCount,
+            "stats_agg" => MeanRepr::StatsAgg,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Strategy {
@@ -199,6 +234,19 @@ pub enum SqlType {
 }
 
 impl SqlType {
+    /// The inverse of `ddl`. The committed snapshot stores the DDL spelling, and N-13
+    /// renders an aggregate level out of snapshot entries, so the round trip has to exist.
+    pub fn from_ddl(s: &str) -> Option<SqlType> {
+        Some(match s {
+            "float4" => SqlType::Float4,
+            "int4" => SqlType::Int4,
+            "int8" => SqlType::Int8,
+            "text" => SqlType::Text,
+            "timestamptz" => SqlType::Timestamptz,
+            _ => return None,
+        })
+    }
+
     pub fn ddl(self) -> &'static str {
         match self {
             SqlType::Float4 => "float4",
@@ -252,6 +300,18 @@ impl fmt::Display for Strategy {
 }
 
 impl Strategy {
+    /// The inverse of `name`, for reading a snapshot entry back (N-13).
+    pub fn from_name(s: &str) -> Option<Strategy> {
+        Some(match s {
+            "mean" => Strategy::Mean,
+            "min" => Strategy::Min,
+            "max" => Strategy::Max,
+            "total" => Strategy::Total,
+            "circular_mean" => Strategy::CircularMean,
+            _ => return None,
+        })
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Strategy::Mean => "mean",
@@ -299,103 +359,124 @@ impl Metric {
 
     /// Expand this metric into the aggregate columns its strategies require.
     pub fn agg_columns(&self, defaults: &Defaults) -> Vec<AggColumn> {
-        let c = &self.column;
-        let ty = self.sql_type.ddl();
-        let mut out = Vec::new();
-        for s in &self.aggregates {
-            match s {
-                Strategy::Mean => match self.mean_repr(defaults) {
-                    MeanRepr::SumCount => {
-                        out.push(AggColumn {
-                            name: format!("{c}_sum"),
-                            sql_type: "double precision",
-                            // H-1: the accumulator is wider than the column.
-                            from_raw: format!("sum({c}::double precision)"),
-                            from_level: format!("sum({c}_sum)"),
-                            strategy: *s,
-                        });
-                        out.push(AggColumn {
-                            name: format!("{c}_count"),
-                            sql_type: "bigint",
-                            // H-2: a zero count is stored as NULL, not as 0.
-                            //
-                            // The ::bigint on the roll-up is load-bearing, not cosmetic.
-                            // sum(bigint) returns numeric, so without it every level above
-                            // the first declares its count columns numeric while this
-                            // struct — and generated/rust/aggregates.rs with it — says
-                            // bigint. The consequences are not subtle: mw_mean is declared
-                            // (double precision, bigint) and numeric does not implicitly
-                            // narrow, so `mw_mean(c_sum, c_count)` fails outright on three
-                            // of /span's four bands, and sqlx decodes the column into the
-                            // wrong Rust type on all three. Found by running the query
-                            // (docs/database-schema.md §6, measurement 1), not by reading
-                            // the SQL. A count also has no business being variable-length.
-                            from_raw: format!("nullif(count({c}), 0)"),
-                            from_level: format!("nullif(sum({c}_count), 0)::bigint"),
-                            strategy: *s,
-                        });
-                    }
-                    MeanRepr::StatsAgg => out.push(AggColumn {
-                        name: format!("{c}_stats"),
-                        sql_type: "statssummary1",
-                        from_raw: format!("stats_agg({c}::double precision)"),
-                        from_level: format!("rollup({c}_stats)"),
-                        strategy: *s,
-                    }),
-                },
-                Strategy::Min => out.push(AggColumn {
-                    name: format!("{c}_min"),
-                    sql_type: ty,
-                    from_raw: format!("min({c})"),
-                    from_level: format!("min({c}_min)"),
-                    strategy: *s,
-                }),
-                Strategy::Max => out.push(AggColumn {
-                    name: format!("{c}_max"),
-                    sql_type: ty,
-                    from_raw: format!("max({c})"),
-                    from_level: format!("max({c}_max)"),
-                    strategy: *s,
-                }),
-                Strategy::Total => out.push(AggColumn {
-                    name: format!("{c}_total"),
-                    sql_type: "double precision",
-                    // H-1 again: a total is a sum.
-                    from_raw: format!("sum({c}::double precision)"),
-                    from_level: format!("sum({c}_total)"),
-                    strategy: *s,
-                }),
-                Strategy::CircularMean => {
-                    // D-13: sine sum, cosine sum, count. Verified to compose through
-                    // all three levels to within 3e-12 degrees. There is no column
-                    // here that holds a finished angle.
+        agg_columns_for(
+            &self.column,
+            self.sql_type,
+            &self.aggregates,
+            self.mean_repr(defaults),
+        )
+    }
+}
+
+/// `Metric::agg_columns` without the `Metric`.
+///
+/// Free-standing because N-13 renders the *previous* definition of an aggregate level
+/// out of `metrics/snapshot.toml`, whose entries carry a column, a SQL type, a strategy
+/// list and a mean representation and nothing else. Rendering both sides through one
+/// function is the point: a second copy of these expressions is a second place for H-1,
+/// H-2 and D-13 to be got wrong.
+pub fn agg_columns_for(
+    column: &str,
+    sql_type: SqlType,
+    aggregates: &[Strategy],
+    repr: MeanRepr,
+) -> Vec<AggColumn> {
+    let c = column;
+    let ty = sql_type.ddl();
+    let mut out = Vec::new();
+    for s in aggregates {
+        match s {
+            Strategy::Mean => match repr {
+                MeanRepr::SumCount => {
                     out.push(AggColumn {
-                        name: format!("{c}_sin_sum"),
+                        name: format!("{c}_sum"),
                         sql_type: "double precision",
-                        from_raw: format!("sum(sind({c}::double precision))"),
-                        from_level: format!("sum({c}_sin_sum)"),
+                        // H-1: the accumulator is wider than the column.
+                        from_raw: format!("sum({c}::double precision)"),
+                        from_level: format!("sum({c}_sum)"),
                         strategy: *s,
                     });
                     out.push(AggColumn {
-                        name: format!("{c}_cos_sum"),
-                        sql_type: "double precision",
-                        from_raw: format!("sum(cosd({c}::double precision))"),
-                        from_level: format!("sum({c}_cos_sum)"),
-                        strategy: *s,
-                    });
-                    out.push(AggColumn {
-                        name: format!("{c}_dir_count"),
+                        name: format!("{c}_count"),
                         sql_type: "bigint",
-                        // ::bigint for the same reason as `_count` above.
+                        // H-2: a zero count is stored as NULL, not as 0.
+                        //
+                        // The ::bigint on the roll-up is load-bearing, not cosmetic.
+                        // sum(bigint) returns numeric, so without it every level above
+                        // the first declares its count columns numeric while this
+                        // struct — and generated/rust/aggregates.rs with it — says
+                        // bigint. The consequences are not subtle: mw_mean is declared
+                        // (double precision, bigint) and numeric does not implicitly
+                        // narrow, so `mw_mean(c_sum, c_count)` fails outright on three
+                        // of /span's four bands, and sqlx decodes the column into the
+                        // wrong Rust type on all three. Found by running the query
+                        // (docs/database-schema.md §6, measurement 1), not by reading
+                        // the SQL. A count also has no business being variable-length.
                         from_raw: format!("nullif(count({c}), 0)"),
-                        from_level: format!("nullif(sum({c}_dir_count), 0)::bigint"),
+                        from_level: format!("nullif(sum({c}_count), 0)::bigint"),
                         strategy: *s,
                     });
                 }
+                MeanRepr::StatsAgg => out.push(AggColumn {
+                    name: format!("{c}_stats"),
+                    sql_type: "statssummary1",
+                    from_raw: format!("stats_agg({c}::double precision)"),
+                    from_level: format!("rollup({c}_stats)"),
+                    strategy: *s,
+                }),
+            },
+            Strategy::Min => out.push(AggColumn {
+                name: format!("{c}_min"),
+                sql_type: ty,
+                from_raw: format!("min({c})"),
+                from_level: format!("min({c}_min)"),
+                strategy: *s,
+            }),
+            Strategy::Max => out.push(AggColumn {
+                name: format!("{c}_max"),
+                sql_type: ty,
+                from_raw: format!("max({c})"),
+                from_level: format!("max({c}_max)"),
+                strategy: *s,
+            }),
+            Strategy::Total => out.push(AggColumn {
+                name: format!("{c}_total"),
+                sql_type: "double precision",
+                // H-1 again: a total is a sum.
+                from_raw: format!("sum({c}::double precision)"),
+                from_level: format!("sum({c}_total)"),
+                strategy: *s,
+            }),
+            Strategy::CircularMean => {
+                // D-13: sine sum, cosine sum, count. Verified to compose through
+                // all three levels to within 3e-12 degrees. There is no column
+                // here that holds a finished angle.
+                out.push(AggColumn {
+                    name: format!("{c}_sin_sum"),
+                    sql_type: "double precision",
+                    from_raw: format!("sum(sind({c}::double precision))"),
+                    from_level: format!("sum({c}_sin_sum)"),
+                    strategy: *s,
+                });
+                out.push(AggColumn {
+                    name: format!("{c}_cos_sum"),
+                    sql_type: "double precision",
+                    from_raw: format!("sum(cosd({c}::double precision))"),
+                    from_level: format!("sum({c}_cos_sum)"),
+                    strategy: *s,
+                });
+                out.push(AggColumn {
+                    name: format!("{c}_dir_count"),
+                    sql_type: "bigint",
+                    // ::bigint for the same reason as `_count` above.
+                    from_raw: format!("nullif(count({c}), 0)"),
+                    from_level: format!("nullif(sum({c}_dir_count), 0)::bigint"),
+                    strategy: *s,
+                });
             }
         }
-        out
     }
+    out
 }
 
 impl Registry {

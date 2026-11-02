@@ -465,3 +465,41 @@ pub static METRICS: [MetricMeta; 212] = [
     MetricMeta { key: MetricKey::Tz, name: "tz", column: "tz", label: "Station time zone", unit: "text", tier: Tier::Extended, field_number: 219, legacy_rest_keys: &[] },
     MetricMeta { key: MetricKey::DateUtc, name: "date_utc", column: "dateutc", label: "Station-reported UTC time", unit: "ms_epoch", tier: Tier::Extended, field_number: 220, legacy_rest_keys: &[] },
 ];
+
+// The unit vocabulary (N-7). `MetricMeta::unit` is a key into this table and
+// never something to render: `label` is the user-facing form, and an empty label
+// means the number carries no suffix.
+
+#[derive(Debug, Clone, Copy)]
+pub struct UnitMeta {
+    pub name: &'static str,
+    pub label: &'static str,
+}
+
+pub static UNITS: [UnitMeta; 25] = [
+    UnitMeta { name: "aqi", label: "AQI" },
+    UnitMeta { name: "cbar", label: "cbar" },
+    UnitMeta { name: "code", label: "" },
+    UnitMeta { name: "count", label: "" },
+    UnitMeta { name: "deg", label: "°" },
+    UnitMeta { name: "degF", label: "°F" },
+    UnitMeta { name: "degree_days", label: "°F·day" },
+    UnitMeta { name: "in", label: "in" },
+    UnitMeta { name: "inHg", label: "inHg" },
+    UnitMeta { name: "in_per_hour", label: "in/h" },
+    UnitMeta { name: "index", label: "" },
+    UnitMeta { name: "J_per_m2", label: "J/m²" },
+    UnitMeta { name: "mi", label: "mi" },
+    UnitMeta { name: "mm", label: "mm" },
+    UnitMeta { name: "mph", label: "mph" },
+    UnitMeta { name: "ms_epoch", label: "" },
+    UnitMeta { name: "percent", label: "%" },
+    UnitMeta { name: "ppm", label: "ppm" },
+    UnitMeta { name: "state", label: "" },
+    UnitMeta { name: "text", label: "" },
+    UnitMeta { name: "timestamp", label: "" },
+    UnitMeta { name: "ug_per_m3", label: "µg/m³" },
+    UnitMeta { name: "unitless", label: "" },
+    UnitMeta { name: "V", label: "V" },
+    UnitMeta { name: "W_per_m2", label: "W/m²" },
+];
