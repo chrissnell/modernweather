@@ -12,8 +12,10 @@
 # forbids nothing -- which is the right moment to add it, because it never has to be
 # retrofitted against existing call sites.
 disallowed-methods = [
-  { path = "tokio::spawn", reason = "spawn through mw_supervisor::task, so the task table owns the handle and a leak is unexpressible (§3.2)" },
-  { path = "tokio::task::spawn", reason = "spawn through mw_supervisor::task (§3.2)" },
+  # One entry, not two: `tokio::spawn` is a re-export of `tokio::task::spawn`, so a call
+  # written either way resolves to the latter and clippy reports it under that name. A
+  # separate `tokio::spawn` entry matched nothing, and its reason string was unreachable.
+  { path = "tokio::task::spawn", reason = "spawn through mw_supervisor::task, so the task table owns the handle and a leak is unexpressible (§3.2)" },
   { path = "std::thread::spawn", reason = "a blocking worker belongs to mw_supervisor::task like any other task (§3.2)" },
   { path = "tokio::time::interval", reason = "there is one clock for the whole process, in mw_supervisor::clock (§3.3)" },
 ]

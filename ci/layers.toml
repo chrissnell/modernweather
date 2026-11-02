@@ -10,8 +10,10 @@
 # when a decision has no mechanism: it becomes a code-review preference within a release or
 # two. This file is the mechanism.
 #
-# Four kinds of declaration:
+# Six kinds of declaration:
 #
+#   layers           the layer order, lowest first
+#   exempt_members   workspace members deliberately outside the gate
 #   [[crate]]        layer, the crates and third-party crates it may not name, and the
 #                    strings its own source may not contain
 #   [[dep_rule]]     a dependency only certain crates may declare
@@ -19,15 +21,33 @@
 #   [templates]      the escaping rule for crates/mw-web/templates
 #   [generated]      the do-not-edit header every generated file must carry
 #
-# Every crate directory under `crates/` must appear in exactly one `[[crate]]`, and every
-# `[[crate]]` must exist on disk. That pair of checks is what stops a nineteenth crate from
-# being outside the gate by simply not being mentioned here.
+# Plus four structural checks that are not declarations, because there is nothing to decide
+# about them:
 #
-# The dependency checks read `[dependencies]`, `[dev-dependencies]` AND
-# `[build-dependencies]`, and they resolve `package = "..."` renames, including through
-# `[workspace.dependencies]`. Dev-dependencies are included on purpose: W2a assumption 7
-# requires a golden test for the APRS encoder to link without a database or a transport,
-# and that property is destroyed by a dev-dependency as surely as by a dependency.
+#   members          every `[workspace] members` entry is `crates/*`, or a declared crate
+#                    under crates/, or in `exempt_members`
+#   roster           every crate directory under crates/ appears in exactly one `[[crate]]`
+#                    and every `[[crate]]` exists on disk, with the package name agreeing
+#   workspace-pinned-dependencies
+#                    every dependency in a crates/* manifest is `workspace = true` or a
+#                    path to a declared crate -- the allowlist that makes the denylists
+#                    below a complete answer
+#   unscanned-source every .rs file under crates/ is inside a declared crate, so the source
+#                    rules below are blind to nothing
+#
+# Those four exist because the gate's view of the workspace used to be a directory listing
+# of crates/, and three separate one-line bypasses followed from that: a member outside
+# crates/, a `#[path]` into a directory outside any crate, and a dependency pinned locally
+# rather than centrally.
+#
+# The dependency checks read `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`
+# AND every `[target.'cfg(...)'.dependencies]` table, and they resolve `package = "..."`
+# renames, including through `[workspace.dependencies]`. Dev-dependencies are included on
+# purpose: W2a assumption 7 requires a golden test for the APRS encoder to link without a
+# database or a transport, and that property is destroyed by a dev-dependency as surely as
+# by a dependency. The target tables are included because `cfg(unix)` is true on all four
+# release triples, so `[target."cfg(unix)".dependencies]` is an ordinary dependency wearing
+# a hat.
 
 # ---------------------------------------------------------------------------------------
 # Layer order, lowest first. A crate may depend only on crates in a STRICTLY LOWER layer,
@@ -40,6 +60,13 @@
 #
 # The names below are that grouping, nothing more.
 layers = ["types", "pure", "component", "service", "surface", "bin"]
+
+# The repository task runner. It is a workspace member and it is deliberately outside every
+# rule in this file: it is not part of the daemon, it ships to nobody, and it is where this
+# gate itself lives. Recorded rather than implied, so that a reader can tell
+# exempt-by-design from forgotten -- and the `members` check rejects a stale entry here as
+# well as an uncovered member there.
+exempt_members = ["xtask"]
 
 # ---------------------------------------------------------------------------------------
 # The eighteen crates of docs/service-architecture.md §1.2. `forbidden` is the column of
@@ -110,6 +137,12 @@ layer = "service"
 responsibility = "sqlx against PostgreSQL and SQLite; owns the pools and the store implementations"
 # "The storage layer must not be able to name an endpoint" (§1.2).
 forbidden = ["axum", "tonic", "tower-http", "mw-api-legacy", "mw-web", "mw-grpc", "mw-api-mgmt"]
+# `unwrap_or_default()` on an `Option<f32>` is `zf` with a different name, and this is one of
+# the two crates where §1.7's named consequence lands: a stored 0.0 that nothing can
+# distinguish from a reading the sensor actually sent. The rule is not "do not default", it
+# is "say what the default is" -- `unwrap_or_else(String::new)` for the harmless cases reads
+# as a decision, which `unwrap_or_default()` does not.
+forbidden_source = ["unwrap_or_default"]
 
 [[crate]]
 name = "mw-pipeline"
@@ -118,6 +151,8 @@ responsibility = "The OnReading path: Ingress, enrich, Sink, SpooledSink and the
 # It holds HANDLES, not implementations (§1.3 rule 1) -- which is also what makes decision
 # 87 ("admit does no I/O but the spool append") structurally true rather than aspirational.
 forbidden = ["sqlx", "axum", "tonic", "mw-store"]
+# The other half of mw-store's rule: this is the crate that builds the row that gets written.
+forbidden_source = ["unwrap_or_default"]
 
 [[crate]]
 name = "mw-station"
@@ -235,21 +270,66 @@ reason = """
 so the two are reconciled here rather than left for whoever writes that build script to
 discover: `mw-proto` may name the proto SCHEMA, and the rule above still gives `mw-types`
 sole access to the generated RUST. The distinction is the one the decision is actually
-about -- a hand-written module must not be able to reach a generated TYPE."""
+about -- a hand-written module must not be able to reach a generated TYPE.
+
+The `mw-proto` half of this exemption is currently unused: that build script does not exist
+yet (its `[build-dependencies]` arrive with it). It is declared now because the alternative is
+whoever writes it discovering that two sections of one design document disagree. When it
+lands, this `only` entry should narrow to `mw-proto`'s `build.rs` alone."""
+
+[[source_rule]]
+id = "one-seam"
+needles = ["#[path"]
+only = ["mw-types"]
+reason = """
+docs/service-architecture.md §1.6 says exactly one file in the workspace references generated
+code, and that file uses `#[path]`. The same attribute is also the one way a module's SOURCE
+can live outside the directory the crate owns -- `#[path = "../../../shared/x.rs"]` compiles
+fine and puts the code where every source rule in this file is blind to it. The
+`unscanned-source` check covers a stray .rs UNDER crates/; this covers one outside it.
+
+So the uniqueness §1.6 states in prose is a checked fact, and the cost is nil: `#[path]` has
+no other legitimate use here. If one arrives, it gets a line in this `only` list and a reason,
+which is a visible decision."""
 
 [[source_rule]]
 id = "only-mw-http-binds-a-socket"
-needles = ["axum::serve", "tonic::transport::Server", "TcpListener::bind"]
+needles = [
+  "axum::serve",
+  "tonic::transport::Server",
+  "transport::Server",
+  "Server::builder",
+  "TcpListener",
+  "UnixListener",
+  "TcpSocket::bind",
+]
 only = ["mw-http"]
 reason = """
 docs/service-architecture.md §1.4 and §1.5: the direct structural answer to seven
 listener-owning sites in the Go tree and to a single type that owned an HTTP server, an
 HTTPS server and a gRPC server at once. TLS is a resolver rather than a second server, and
-gRPC shares the socket by ALPN, so there is exactly one place a listener can exist."""
+gRPC shares the socket by ALPN, so there is exactly one place a listener can exist.
+
+§1.4 names three needles. The list is longer because the three it names are fully-qualified
+paths, and the idiomatic way to write any of them imports a prefix first:
+`use tonic::transport::{Channel, Server};` makes the path `tonic::transport::Server` appear
+on no line at all. So the type names are needles too, and `Server::builder` catches the call
+site when the import was a brace group.
+
+`UdpSocket::bind` is deliberately NOT here. §1.4 names listeners, and a receive socket is not
+one: implementation-plan.md M3-1 requires WeatherLink Live discovery over UDP broadcast in
+`mw-station`, so forbidding it would forbid a driver the plan calls for. The asymmetry is the
+decision, not an oversight."""
 
 [[source_rule]]
 id = "one-zero-fill"
-needles = ["unwrap_or(0.0)"]
+needles = [
+  "unwrap_or(0.",
+  "unwrap_or(0f32",
+  "unwrap_or(0_f32",
+  "map_or(0.",
+  "map_or(0f32",
+]
 only = ["mw-api-legacy"]
 reason = """
 docs/service-architecture.md §1.7. The domain type is `Option<f32>` end to end and the
@@ -257,11 +337,18 @@ writer stores NULL for a metric a station did not report -- that is D-3's densit
 D-9's nullable ADD COLUMN. The frozen contract's zeros are produced one layer later, at the
 DTO, by exactly one function: `fn zf(v: Option<f32>) -> f32 { v.unwrap_or(0.0) }`. A second
 zero-fill anywhere else means storage and presentation have been confused, and the symptom
-would be a zero in the database that nothing can distinguish from a reading."""
+would be a zero in the database that nothing can distinguish from a reading.
+
+The needles are prefixes on purpose: `unwrap_or(0.` is `unwrap_or(0.0)`, `unwrap_or(0.)` and
+`unwrap_or(0.0f32)` in one line, and the gate reports one violation per offending line however
+many of them match. `unwrap_or_default()` is the same mistake with no literal to match at all,
+so it is handled where it would do damage -- `forbidden_source` on `mw-store` and
+`mw-pipeline` -- rather than banned workspace-wide, where it is often the right call on an
+`Option<String>`."""
 
 [[source_rule]]
 id = "no-stdout-logging"
-needles = ["println!", "eprintln!", "print!", "eprint!", "dbg!"]
+needles = ["println!", "eprintln!", "print!", "eprint!", "dbg!", "io::stdout", "io::stderr"]
 only = ["modernweather"]
 reason = """
 docs/service-architecture.md §5.1 allows these only on the binary's argument-parsing path,
@@ -269,17 +356,40 @@ which is the one place a message has to reach a terminal before a subscriber exi
 crate is the finest unit this gate can enforce today; narrowing it to the module arrives with
 M2-4, which writes that path."""
 
+[[source_rule]]
+id = "no-template-escape-opt-out"
+needles = ['escape = "none"', "escape = 'none'"]
+only = []
+reason = """
+The `[templates]` check below reads the template files. This one reads Rust, because the
+strongest form of the same opt-out is not in a template at all: `#[template(escape = "none")]`
+on the derive turns escaping off for the WHOLE template, is one attribute rather than one
+expression, and is easier to write than `|safe`. A gate that only read the templates would
+have had nothing to say about it.
+
+Nobody may write it, so `only` is empty. W3 decision 81's reasoning is that `askama` was
+chosen for compile-time checking and escapes by default, which means an explicit opt-out is
+the only way such a template emits unescaped output -- and there is more than one place to
+write one."""
+
 # ---------------------------------------------------------------------------------------
 
 [templates]
 dir = "crates/mw-web/templates"
-needles = ["|safe", 'escape("none")', "escape('none')"]
+needles = ["|safe", 'escape("none")', "escape('none')", '|e("none")', "|e('none')"]
 reason = """
 W3 decision 81. `askama` is chosen because it is compile-time checked, so a missing field is
 a build error rather than a request-time one -- and escaping is on by default, so the only
-way such a template can emit unescaped output is an explicit opt-out. There are exactly two
-spellings of that opt-out and this is the gate that rejects both. Whitespace around the
-filter pipe is ignored, so `{{ x | safe }}` is caught as well as `{{ x|safe }}`."""
+way such a template can emit unescaped output is an explicit opt-out.
+
+Four spellings are rejected here: `|safe`, `escape("none")`, `escape('none')`, and `|e(...)`,
+which is askama's documented alias for the `escape` filter. The fifth lives in Rust rather
+than in a template and is handled by `no-template-escape-opt-out` above. Whitespace is
+ignored, so `{{ x | safe }}` is caught as well as `{{ x|safe }}`.
+
+Not covered, and worth knowing: an `askama.toml` that reassigns the `html` escaper would turn
+escaping off globally without any of these appearing anywhere. There is no such file, and the
+day one arrives it needs a rule of its own."""
 
 [generated]
 dir = "generated"

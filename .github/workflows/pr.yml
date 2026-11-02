@@ -275,13 +275,27 @@ jobs:
       # `cargo xtask conformance`, which M2-5 implements and which therefore exits 2 naming
       # its owner. A visible red from M2 onward rather than a discovery in M4 is the point.
       #
-      # It is NOT visible, though, and that is a separate defect this job should fix when
-      # M2-5 touches it. The default shell here is `bash -e`, without `-o pipefail`, so the
-      # exit status of `gate | tee` is tee's — zero, always. This step passes whatever the
-      # gate decides, which makes the job structurally incapable of reporting a conformance
-      # failure: docs/reconciliation.md G-1 in the job that exists to avoid it. Fixing it
-      # here would turn this PR red for a reason M2-5 owns, so it is recorded rather than
-      # taken. The `layout` job above deliberately does not pipe.
+      # It is NOT visible, and that is a second, separate defect. The default shell here is
+      # `bash -e`, WITHOUT `-o pipefail`, so the exit status of `gate | tee` is tee's — zero,
+      # always. This step passes whatever the gate decides, which makes the job structurally
+      # incapable of reporting a conformance failure: docs/reconciliation.md G-1 in the job
+      # that exists to avoid it. The `layout` job above deliberately does not pipe.
+      #
+      # Adding `set -o pipefail` is a one-line fix and it is NOT taken here, because the
+      # consequence is a decision this work item does not own. `conformance` is a dependency
+      # of the single required `gate` check, so an honest exit status blocks every merge from
+      # here until M4-2 earns a green replay — through M2-2, M2-3, M2-4, M2-5 and the whole
+      # of M3. Either that is intended and branch protection needs `conformance` out of the
+      # required set for the M2–M4 window, or it is not and the plan's "visible from M2
+      # onward" means something weaker than a red required check. Both answers are the
+      # programme owner's.
+      #
+      # Recorded here rather than left to be rediscovered, and raised on GRA-708 rather than
+      # left only here — a comment in a YAML file is not a work item (G-5), and M2-5's text
+      # is about implementing `cargo xtask conformance`, not about this workflow.
+      #
+      # `coverage-ratchet` below has the identical shape. It is harmless today only because
+      # the floor is 0.00, which is not a reason to leave it.
       - run: cargo xtask gate conformance | tee /tmp/conformance.txt
       - name: Report
         if: always()
