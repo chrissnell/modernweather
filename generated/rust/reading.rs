@@ -675,7 +675,7 @@ impl Reading {
             MetricKey::LightningTime => None,
             MetricKey::LightningDistance => self.lightning_distance.map(f64::from),
             MetricKey::Tz => None,
-            MetricKey::DateUtc => self.date_utc.map(f64::from),
+            MetricKey::DateUtc => self.date_utc.map(|v| v as f64),
         }
     }
 }

@@ -1,0 +1,22 @@
+[package]
+name = "mw-supervisor"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "plan(), the hard-edge digraph, the single timer heap, the task table, the spool fan-out."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Workspace crates, by layer (ci/layers.toml).
+mw-component.workspace = true
+mw-types.workspace = true
+
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+chrono.workspace = true

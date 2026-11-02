@@ -196,7 +196,20 @@ Declared by W6 per W3 assumption 55. See docs/reconciliation.md G-4."""
 id = "mgmt-schema-drift"
 description = "The management OpenAPI schema and its TypeScript client match the Rust handlers"
 owner = "W5 §4.3 (implementation-plan.md M7-1)"
-arms_when = "crates/mw-api-mgmt/Cargo.toml"
+# Repointed by implementation-plan.md M2-1. It previously named
+# `crates/mw-api-mgmt/Cargo.toml`, which M2-1 creates as one of W3 §1.2's eighteen stubs --
+# so this gate would have armed at M2-1 and failed from there until M7-1, because
+# `cargo xtask mgmt-schema` does not exist and neither does the schema it checks. That is
+# the mirror of the defect W6 fixed on the `conformance` gate above, and M7-1's own
+# done-criterion is "`mgmt-schema-drift` is armed and green", which only reads correctly if
+# the gate arms at M7-1. It now names the gate's actual subject: the committed schema, which
+# W5 §4.3 places at generated/openapi/management.json and M7-1 creates.
+#
+# Note the deliberate contrast with `conformance`, which M2-1 DOES arm into a failing state.
+# That is sanctioned by M2-1's own note -- the conformance suite exists, has 70 fixtures, and
+# a visible red from M2 onward is the point (G-1). Here there is nothing to replay and no
+# runner, so a red would carry no information for five milestones.
+arms_when = "generated/openapi/management.json"
 cmd = ["cargo", "xtask", "mgmt-schema", "--check"]
 note = """
 Separate from codegen-drift on purpose, following legacy-import-drift's precedent exactly.

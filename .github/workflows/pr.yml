@@ -109,6 +109,19 @@ jobs:
       - name: cargo test under ThreadSanitizer
         env:
           RUSTFLAGS: -Zsanitizer=thread
+          # RUSTDOCFLAGS has to carry the flag too, and this is not belt-and-braces: cargo
+          # does not propagate RUSTFLAGS to rustdoc, so the doctest harness was compiled
+          # WITHOUT the sanitizer while every dependency it links -- including the
+          # build-std `std` -- was compiled with it. `-Zsanitizer` changes the ABI, so
+          # rustc refuses: "mixing `-Zsanitizer` will cause an ABI mismatch in crate
+          # mw_types", nineteen times, after the lib tests had already passed. It appeared
+          # the moment M2-1 gave the workspace crates to compile; before that there was
+          # nothing for rustdoc to run.
+          #
+          # The alternative fix is `--all-targets`, which excludes doctests. Rejected: it
+          # drops a whole target class from the one job that observes real interleavings,
+          # and this job's instruction is to fix it rather than narrow it.
+          RUSTDOCFLAGS: -Zsanitizer=thread
           # A leak at process exit is not a race, and TSan's leak checker fires on
           # perfectly ordinary Box::leak of a static.
           TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 detect_leaks=0
@@ -134,10 +147,48 @@ jobs:
       # Exhaustive interleaving checks for lock-free code, on stable. There are none yet;
       # the invocation exists so that writing the first one needs no CI change. loom and
       # TSan are complementary: loom is exhaustive over a model, TSan observes a real run.
+      #
+      # Scoped to two crates rather than --workspace, and it is not a preference. RUSTFLAGS
+      # applies `--cfg loom` to EVERY crate in the graph, dependencies included, and
+      # `tokio` gates its whole `net` module behind `#![cfg(not(loom))]` -- so under this
+      # flag `tokio::net` ceases to exist and `hyper-util`, which uses
+      # `tokio::net::UnixStream`, fails to compile. `hyper-util` arrives through `axum` and
+      # `tonic`, so six of the eighteen crates can never build under `--cfg loom`. Nor can
+      # that be fixed by a feature: cargo evaluates `[target.'cfg(loom)'.dependencies]`
+      # against the target spec, not against RUSTFLAGS, so a dependency's own loom support
+      # is unreachable this way.
+      #
+      # The two named here are where W3 D-85 puts the concurrency tests -- config reload
+      # racing 64 readers, and shutdown with a stalled sink -- and neither depends on axum
+      # or tonic. implementation-plan.md M2-3 writes them.
       - name: cargo test --cfg loom
         env:
           RUSTFLAGS: --cfg loom
-        run: cargo test --workspace --locked
+          LOOM_PACKAGES: -p mw-supervisor -p mw-pipeline
+        run: |
+          # shellcheck disable=SC2086  # deliberate word splitting: a cargo -p list
+          cargo test $LOOM_PACKAGES --locked
+      # A scoped job can silently skip the thing it exists to run, which is
+      # docs/reconciliation.md G-1. So a loom test written in a crate outside the scope is
+      # a loud failure here rather than a test nobody runs.
+      - name: Assert every loom test is inside the scope
+        env:
+          LOOM_PACKAGES: -p mw-supervisor -p mw-pipeline
+        run: |
+          scoped=$(echo "$LOOM_PACKAGES" | tr " " "\n" | grep -v "^-p$" | grep -v "^$")
+          bad=0
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            crate=$(echo "$f" | cut -d/ -f2)
+            if ! echo "$scoped" | grep -qx "$crate"; then
+              echo "::error file=$f::$crate uses loom but the loom job does not build it"
+              bad=1
+            fi
+          done <<EOF
+          $(grep -rl "cfg(loom)" crates/ --include="*.rs" || true)
+          EOF
+          [ "$bad" -eq 0 ] || exit 1
+          echo "every cfg(loom) user is inside: $(echo "$scoped" | tr "\n" " ")"
 
   workflows:
     name: actionlint
@@ -192,6 +243,27 @@ jobs:
             cargo xtask gates --markdown
           } >> "$GITHUB_STEP_SUMMARY"
           cargo xtask gates
+
+  layout:
+    name: crate boundaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      # docs/service-architecture.md §1.4 says its three mechanisms "run in the existing
+      # gate without a workflow change". Two of them do -- Cargo rejects a missing
+      # dependency in `build`, and clippy.toml's disallowed-methods ride the `clippy` job --
+      # but the third does not: the `gates` job PRINTS the deferred set, it does not RUN
+      # anything, and no other job runs `cargo xtask gate layout`. A gate that `cargo xtask
+      # gates` reports as ARMED while nothing executes it is docs/reconciliation.md G-1
+      # exactly, so the job is here.
+      #
+      # No `| tee`: the exit code is the result. See the conformance job below for what
+      # piping it costs.
+      - run: cargo xtask gate layout
 
   codegen-drift:
     name: metric registry drift
@@ -248,6 +320,33 @@ jobs:
       # docs/reconciliation.md G-1, which is what let the original defect survive five stages —
       # so the job name says which target it covers and the DEFERRED line goes into the run
       # summary rather than only into the log. The Go-target half is `conformance-fixtures`.
+      #
+      # AS OF implementation-plan.md M2-1 THIS GATE IS ARMED AND FAILS. That is the state
+      # M2-1's note calls for: `crates/modernweather/Cargo.toml` now exists, so the gate runs
+      # `cargo xtask conformance`, which M2-5 implements and which therefore exits 2 naming
+      # its owner. A visible red from M2 onward rather than a discovery in M4 is the point.
+      #
+      # It is NOT visible, and that is a second, separate defect. The default shell here is
+      # `bash -e`, WITHOUT `-o pipefail`, so the exit status of `gate | tee` is tee's — zero,
+      # always. This step passes whatever the gate decides, which makes the job structurally
+      # incapable of reporting a conformance failure: docs/reconciliation.md G-1 in the job
+      # that exists to avoid it. The `layout` job above deliberately does not pipe.
+      #
+      # Adding `set -o pipefail` is a one-line fix and it is NOT taken here, because the
+      # consequence is a decision this work item does not own. `conformance` is a dependency
+      # of the single required `gate` check, so an honest exit status blocks every merge from
+      # here until M4-2 earns a green replay — through M2-2, M2-3, M2-4, M2-5 and the whole
+      # of M3. Either that is intended and branch protection needs `conformance` out of the
+      # required set for the M2–M4 window, or it is not and the plan's "visible from M2
+      # onward" means something weaker than a red required check. Both answers are the
+      # programme owner's.
+      #
+      # Recorded here rather than left to be rediscovered, and raised on GRA-708 rather than
+      # left only here — a comment in a YAML file is not a work item (G-5), and M2-5's text
+      # is about implementing `cargo xtask conformance`, not about this workflow.
+      #
+      # `coverage-ratchet` below has the identical shape. It is harmless today only because
+      # the floor is 0.00, which is not a reason to leave it.
       - run: cargo xtask gate conformance | tee /tmp/conformance.txt
       - name: Report
         if: always()
@@ -502,6 +601,7 @@ jobs:
       - race
       - loom
       - gates
+      - layout
       - codegen-drift
       - legacy-import-drift
       - conformance

@@ -1,0 +1,18 @@
+[package]
+name = "mw-aprs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Pure APRS/CWOP protocol: information-field encode and decode, base-91, passcode."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Workspace crates, by layer (ci/layers.toml).
+mw-types.workspace = true
+
+thiserror.workspace = true
