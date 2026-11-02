@@ -212,10 +212,7 @@ SELECT
     min(potentialsolarwatts_min) AS potentialsolarwatts_min,
     max(potentialsolarwatts_max) AS potentialsolarwatts_max,
     -- Solar energy [solar_joules]
-    sum(solarjoules_sum) AS solarjoules_sum,
-    nullif(sum(solarjoules_count), 0)::bigint AS solarjoules_count,
-    min(solarjoules_min) AS solarjoules_min,
-    max(solarjoules_max) AS solarjoules_max,
+    sum(solarjoules_total) AS solarjoules_total,
     -- UV index [uv]
     sum(uv_sum) AS uv_sum,
     nullif(sum(uv_count), 0)::bigint AS uv_count,
@@ -857,4 +854,4 @@ FROM observations_1h
 GROUP BY 1, 2
 WITH NO DATA;
 
--- 627 aggregate expressions over 194 metrics. Ceiling is 1598 (1598 + bucket + station_id = 1600).
+-- 624 aggregate expressions over 194 metrics. Ceiling is 1598 (1598 + bucket + station_id = 1600).

@@ -73,7 +73,7 @@ metrics/snapshot.toml ──── what has ever been allocated; the only thing 
 
 ## 1. The registry format
 
-TOML, per D-20. Three kinds of entry.
+TOML, per D-20. Four kinds of entry.
 
 ### 1.1 Metrics
 
@@ -86,7 +86,7 @@ field_number = 7              # protobuf, allocated once, never reused
 proto_name = "outsideTemperature"
 proto_type = "float"
 label = "Temperature"         # user-facing; see §6.2
-unit = "degF"                 # the unit the column is STORED in; see §6.1
+unit = "degF"                 # must name a [[unit]]; see §1.6 and §6.1
 tier = "core"
 aggregates = ["mean", "min", "max"]
 levels = ["1m", "1h", "1d"]   # per-level inclusion (OQ-5)
@@ -222,6 +222,33 @@ so does the registry, which is correct for a counter that only rises within its 
 
 ---
 
+### 1.6 Units
+
+```toml
+[[unit]]
+name = "degF"               # what a metric's `unit` names
+label = "°F"                # what a reader is shown
+```
+
+A closed vocabulary, and closed is the whole value of it. Before N-7 there were 25 unit
+strings in use and nothing checking them, so `unit = "degf"` was a valid registry edit and
+`degf` reached the UI as a rendered label (C-W2-19). Three checks, and the third is the one
+the table exists for:
+
+- a `[[unit]]` name declared twice is **fatal**;
+- two names differing **only in case** are fatal, because declaring `degf` beside `degF` is
+  the obvious way to make the typo validate and would put the hole straight back;
+- a metric naming a unit no `[[unit]]` declares is fatal, and the message offers the
+  case-insensitive near miss when there is one.
+
+`label` is deliberately not `name`. The UI renders the label and never echoes the internal
+string, so D-36 holds by construction rather than by review, and `generated/rust/metrics.rs`
+and `generated/ts/metrics.ts` carry the table (`UNITS`, plus `UNIT_LABELS` in TypeScript) so
+there is somewhere to render it from. An empty label is a real answer and means "no suffix":
+a state, a code, a bare index and a timestamp all have none.
+
+---
+
 ## 2. The committed snapshot, and what is fatal
 
 The registry alone cannot enforce append-only: a human editing TOML can rename anything. The
@@ -248,7 +275,9 @@ Plus the structural checks that would otherwise produce broken SQL: a level chai
 level, a metric carried at `1h` but not at `1m` (§A-W2-1), an aggregate on a `text` column,
 `mean` and `total` on the same metric (both emit a sum), a protobuf number in the reserved
 19000–19999 range, a deprecated metric or dimension with no `deprecated_in`, a `deprecated_in`
-on an entry that is not deprecated, and one legacy JSON key claimed by two metrics.
+on an entry that is not deprecated, one legacy JSON key claimed by two metrics, a unit string
+no `[[unit]]` declares, a `[[unit]]` declared twice, and two `[[unit]]` names differing only in
+case (§1.6).
 
 ### 2.2 Refused by default — one loud flag
 
@@ -489,8 +518,22 @@ deliberate departures:
 - **Enumerated and state columns get `min`/`max` and never `mean`.** The arithmetic mean of a
   relay state or an alarm code is not a number anybody wants. 55 metrics are in this shape.
 
-`solarjoules` keeps the Go view's `mean`/`min`/`max` even though a joule total would arguably
-be `total`; see **OQ-W2-3**.
+`solarjoules` is **`total`**, settled by N-9 and against the Go views, which stored
+`avg(solarjoules)`. OQ-W2-3 addressed the question to `pkg/solar`, and `pkg/solar` is not where
+the answer is: it holds the clear-sky irradiance models (ASCE, Bras, Ineichen-Perez) and the
+sunrise arithmetic, all in W/m², and never mentions `solarjoules`. Nothing computes the value —
+it is the Campbell datalogger's `slr_mj` field, carried through untouched by
+`internal/weatherstations/campbell/station.go`, and it is energy per unit area accumulated since
+the logger's previous output. That is why the same packet also carries `slr_w` for the
+irradiance; if `slr_mj` were a rate it would be `slr_w` times a constant and would say nothing
+new. A mean of it is the mean increment per reading and moves when the logger's output interval
+does; the sum over a bucket is the bucket's insolation.
+
+The cost is on the import side and is accepted rather than hidden: no Go view computed a sum, so
+`solarjoules` joins the unconsumed archive columns and `solarjoules_total` lands NULL for
+pre-cutover history. An archived mean of per-reading increments is not convertible into a total
+without the logger's output interval, and a NULL says "the old system never had this number"
+where a converted one would lie.
 
 ---
 

@@ -671,13 +671,32 @@ exactly the reason aggregates are disposable — a crash mid-rebuild costs a re-
 and scoped to these sessions only. Ingest keeps full durability. §6 measurement 3 reports what it is
 actually worth at this width, which is less than D-17 says and still worth having.
 
-**A note on what the generated migration does that the procedure then has to undo.** The migration
-for the 5-minute level drops and recreates all four levels, including `observations_1m`, whose
-definition did not change. `snapshot::affected_levels` keys off which metrics changed rather than
-which level definitions changed, and every metric's `levels` list changed. Correct under D-15 and
-expensive in exactly the way OQ-W2-2 describes: an intact minute level would have let the new
-5-minute level be built from it in 77 s instead of forcing a full raw rescan. Recorded as OQ-W4-1
-rather than fixed, because `affected_levels` is W2's.
+**A note on what the generated migration used to do that the procedure then had to undo.** The
+migration for the 5-minute level drops and recreates all four levels, including `observations_1m`,
+whose definition did not change. `snapshot::affected_levels` keyed off which metrics changed rather
+than which level definitions changed, and every metric's `levels` list changed. Correct under D-15
+and expensive in exactly the way OQ-W2-2 describes: an intact minute level would have let the new
+5-minute level be built from it in 77 s instead of forcing a full raw rescan.
+
+**Fixed by N-13** (implementation-plan.md M1-6). `metrics/snapshot.toml` now records each level's
+own definition alongside the allocated identifiers, and `affected_levels` compares each level's
+rendered definition — its bucket, the relation it reads, `materialized_only`, and every aggregate
+column with the expression that produces it — against that record. A level whose text did not
+change is not dropped. Recording the level and not only its column list is load-bearing: the
+hourly level's columns were identical across that migration and the relation it reads changed from
+`observations_1m` to `observations_5m`, so a column-only comparison would have left it alone and
+left it materialised from a view it no longer reads.
+
+**Phase 1's bands, and N-16.** Phase 1 refreshes each level over the **widest** band any level
+above it serves, not over its own. Over its own, bottom-up has `observations_1d` aggregate a
+366-day range out of an hourly level materialised over 14 days: the days past the fourteenth are
+computed from nothing and cached as nothing, a full run repairs it on the second pass and
+`--recent-only` — which §4 above recommends after a metric addition — never does. OQ-W9-3. The cost
+is stated rather than hidden in `ci/db/rebuild-aggregates.sh`'s own header: phase 1 is no longer
+seconds, because a correct 366-day daily level requires a correct 366-day hourly level beneath it
+and, under D-11, all the levels below that too. `--recent-only` now names what it left incomplete,
+which under these bands is `observations_1d` alone — the other three levels' whole retention
+windows are inside phase 1's band.
 
 **Backup and restore (D-6).** `pg_dump` of the raw hypertable plus a rebuild is a complete backup,
 and the restore side is where the cost sits. Restore raw, then run this script: phase 1 brings
@@ -1235,7 +1254,7 @@ The migration for decision 1 drops and recreates `observations_1m`, whose defini
 
 *Options.* (a) Leave it; §4's phase-1-first rebuild makes the user-visible part 0.87 s regardless, so the cost is background CPU. (b) Have `affected_levels` compare each level's rendered definition against the previous one and include only levels whose text changed — about ten lines, and the generator already renders both sides. (c) Have the migration generator emit the refresh ranges too, so the ordering in §4 is in the migration rather than in a script beside it.
 
-*Recommendation:* **(b)**, as a W2 follow-up, not urgent. It is a strictly better signal than the metric-level one and it makes "add a metric to one level" cost one level's rebuild. **Not fixed here**, because `affected_levels` is W2's and the behaviour is wasteful rather than wrong.
+*Recommendation:* **(b)**, as a W2 follow-up, not urgent. It is a strictly better signal than the metric-level one and it makes "add a metric to one level" cost one level's rebuild. **Not fixed here**, because `affected_levels` is W2's and the behaviour is wasteful rather than wrong. **Done as N-13** (implementation-plan.md M1-6), with one addition the option as written did not have: the snapshot records each level's own definition too, because the rendered column list alone cannot see a level whose source relation changed.
 
 **OQ-W4-2. Do `stationname` and `stationtype` leave the raw table, and who makes that possible? (OQ-W2-6)**
 

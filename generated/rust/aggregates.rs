@@ -43,7 +43,7 @@ pub struct Level {
     pub columns: &'static [AggregateColumn],
 }
 
-static LEVEL_1M_COLUMNS: [AggregateColumn; 627] = [
+static LEVEL_1M_COLUMNS: [AggregateColumn; 624] = [
     AggregateColumn { metric: MetricKey::Barometer, column: "barometer_sum", sql_type: "double precision", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::Barometer, column: "barometer_count", sql_type: "bigint", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::Barometer, column: "barometer_min", sql_type: "float4", strategy: Strategy::Min },
@@ -183,10 +183,7 @@ static LEVEL_1M_COLUMNS: [AggregateColumn; 627] = [
     AggregateColumn { metric: MetricKey::PotentialSolarWatts, column: "potentialsolarwatts_count", sql_type: "bigint", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::PotentialSolarWatts, column: "potentialsolarwatts_min", sql_type: "float4", strategy: Strategy::Min },
     AggregateColumn { metric: MetricKey::PotentialSolarWatts, column: "potentialsolarwatts_max", sql_type: "float4", strategy: Strategy::Max },
-    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_sum", sql_type: "double precision", strategy: Strategy::Mean },
-    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_count", sql_type: "bigint", strategy: Strategy::Mean },
-    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_min", sql_type: "float4", strategy: Strategy::Min },
-    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_max", sql_type: "float4", strategy: Strategy::Max },
+    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_total", sql_type: "double precision", strategy: Strategy::Total },
     AggregateColumn { metric: MetricKey::Uv, column: "uv_sum", sql_type: "double precision", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::Uv, column: "uv_count", sql_type: "bigint", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::Uv, column: "uv_min", sql_type: "float4", strategy: Strategy::Min },
@@ -673,7 +670,7 @@ static LEVEL_1M_COLUMNS: [AggregateColumn; 627] = [
     AggregateColumn { metric: MetricKey::LightningDistance, column: "lightning_distance_max", sql_type: "float4", strategy: Strategy::Max },
 ];
 
-static LEVEL_5M_COLUMNS: [AggregateColumn; 627] = [
+static LEVEL_5M_COLUMNS: [AggregateColumn; 624] = [
     AggregateColumn { metric: MetricKey::Barometer, column: "barometer_sum", sql_type: "double precision", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::Barometer, column: "barometer_count", sql_type: "bigint", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::Barometer, column: "barometer_min", sql_type: "float4", strategy: Strategy::Min },
@@ -813,10 +810,7 @@ static LEVEL_5M_COLUMNS: [AggregateColumn; 627] = [
     AggregateColumn { metric: MetricKey::PotentialSolarWatts, column: "potentialsolarwatts_count", sql_type: "bigint", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::PotentialSolarWatts, column: "potentialsolarwatts_min", sql_type: "float4", strategy: Strategy::Min },
     AggregateColumn { metric: MetricKey::PotentialSolarWatts, column: "potentialsolarwatts_max", sql_type: "float4", strategy: Strategy::Max },
-    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_sum", sql_type: "double precision", strategy: Strategy::Mean },
-    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_count", sql_type: "bigint", strategy: Strategy::Mean },
-    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_min", sql_type: "float4", strategy: Strategy::Min },
-    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_max", sql_type: "float4", strategy: Strategy::Max },
+    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_total", sql_type: "double precision", strategy: Strategy::Total },
     AggregateColumn { metric: MetricKey::Uv, column: "uv_sum", sql_type: "double precision", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::Uv, column: "uv_count", sql_type: "bigint", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::Uv, column: "uv_min", sql_type: "float4", strategy: Strategy::Min },
@@ -1303,7 +1297,7 @@ static LEVEL_5M_COLUMNS: [AggregateColumn; 627] = [
     AggregateColumn { metric: MetricKey::LightningDistance, column: "lightning_distance_max", sql_type: "float4", strategy: Strategy::Max },
 ];
 
-static LEVEL_1H_COLUMNS: [AggregateColumn; 627] = [
+static LEVEL_1H_COLUMNS: [AggregateColumn; 624] = [
     AggregateColumn { metric: MetricKey::Barometer, column: "barometer_sum", sql_type: "double precision", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::Barometer, column: "barometer_count", sql_type: "bigint", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::Barometer, column: "barometer_min", sql_type: "float4", strategy: Strategy::Min },
@@ -1443,10 +1437,7 @@ static LEVEL_1H_COLUMNS: [AggregateColumn; 627] = [
     AggregateColumn { metric: MetricKey::PotentialSolarWatts, column: "potentialsolarwatts_count", sql_type: "bigint", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::PotentialSolarWatts, column: "potentialsolarwatts_min", sql_type: "float4", strategy: Strategy::Min },
     AggregateColumn { metric: MetricKey::PotentialSolarWatts, column: "potentialsolarwatts_max", sql_type: "float4", strategy: Strategy::Max },
-    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_sum", sql_type: "double precision", strategy: Strategy::Mean },
-    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_count", sql_type: "bigint", strategy: Strategy::Mean },
-    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_min", sql_type: "float4", strategy: Strategy::Min },
-    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_max", sql_type: "float4", strategy: Strategy::Max },
+    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_total", sql_type: "double precision", strategy: Strategy::Total },
     AggregateColumn { metric: MetricKey::Uv, column: "uv_sum", sql_type: "double precision", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::Uv, column: "uv_count", sql_type: "bigint", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::Uv, column: "uv_min", sql_type: "float4", strategy: Strategy::Min },
@@ -1933,7 +1924,7 @@ static LEVEL_1H_COLUMNS: [AggregateColumn; 627] = [
     AggregateColumn { metric: MetricKey::LightningDistance, column: "lightning_distance_max", sql_type: "float4", strategy: Strategy::Max },
 ];
 
-static LEVEL_1D_COLUMNS: [AggregateColumn; 627] = [
+static LEVEL_1D_COLUMNS: [AggregateColumn; 624] = [
     AggregateColumn { metric: MetricKey::Barometer, column: "barometer_sum", sql_type: "double precision", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::Barometer, column: "barometer_count", sql_type: "bigint", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::Barometer, column: "barometer_min", sql_type: "float4", strategy: Strategy::Min },
@@ -2073,10 +2064,7 @@ static LEVEL_1D_COLUMNS: [AggregateColumn; 627] = [
     AggregateColumn { metric: MetricKey::PotentialSolarWatts, column: "potentialsolarwatts_count", sql_type: "bigint", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::PotentialSolarWatts, column: "potentialsolarwatts_min", sql_type: "float4", strategy: Strategy::Min },
     AggregateColumn { metric: MetricKey::PotentialSolarWatts, column: "potentialsolarwatts_max", sql_type: "float4", strategy: Strategy::Max },
-    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_sum", sql_type: "double precision", strategy: Strategy::Mean },
-    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_count", sql_type: "bigint", strategy: Strategy::Mean },
-    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_min", sql_type: "float4", strategy: Strategy::Min },
-    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_max", sql_type: "float4", strategy: Strategy::Max },
+    AggregateColumn { metric: MetricKey::SolarJoules, column: "solarjoules_total", sql_type: "double precision", strategy: Strategy::Total },
     AggregateColumn { metric: MetricKey::Uv, column: "uv_sum", sql_type: "double precision", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::Uv, column: "uv_count", sql_type: "bigint", strategy: Strategy::Mean },
     AggregateColumn { metric: MetricKey::Uv, column: "uv_min", sql_type: "float4", strategy: Strategy::Min },

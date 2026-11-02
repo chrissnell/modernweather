@@ -524,6 +524,26 @@ fn rust_metrics(reg: &Registry) -> String {
             keys.join(", ")
         );
     }
+    s.push_str("];\n\n");
+    s.push_str(
+        "// The unit vocabulary (N-7). `MetricMeta::unit` is a key into this table and\n\
+         // never something to render: `label` is the user-facing form, and an empty label\n\
+         // means the number carries no suffix.\n\n\
+         #[derive(Debug, Clone, Copy)]\n\
+         pub struct UnitMeta {\n\
+         \x20   pub name: &'static str,\n\
+         \x20   pub label: &'static str,\n\
+         }\n\n",
+    );
+    let _ = writeln!(s, "pub static UNITS: [UnitMeta; {}] = [", reg.units.len());
+    for u in &reg.units {
+        let _ = writeln!(
+            s,
+            "    UnitMeta {{ name: \"{}\", label: \"{}\" }},",
+            u.name,
+            u.label.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+    }
     s.push_str("];\n");
     s
 }
@@ -813,7 +833,27 @@ fn ts_metrics(reg: &Registry) -> String {
     }
     s.push_str(
         "];\n\nexport const METRICS_BY_KEY: Record<string, MetricMeta> =\n  \
-                Object.fromEntries(METRICS.map((m) => [m.key, m]));\n",
+                Object.fromEntries(METRICS.map((m) => [m.key, m]));\n\n\
+         // The unit vocabulary (N-7). `MetricMeta.unit` is a key into this table and is\n\
+         // never rendered: `label` is the user-facing form, and an empty label means the\n\
+         // number carries no suffix.\n\n\
+         export interface UnitMeta {\n\
+         \x20 name: string;\n\
+         \x20 label: string;\n\
+         }\n\n\
+         export const UNITS: readonly UnitMeta[] = [\n",
+    );
+    for u in &reg.units {
+        let _ = writeln!(
+            s,
+            "  {{ name: '{}', label: '{}' }},",
+            u.name,
+            u.label.replace('\\', "\\\\").replace('\'', "\\'")
+        );
+    }
+    s.push_str(
+        "];\n\nexport const UNIT_LABELS: Record<string, string> =\n  \
+                Object.fromEntries(UNITS.map((u) => [u.name, u.label]));\n",
     );
     s
 }

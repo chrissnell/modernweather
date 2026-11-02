@@ -213,7 +213,7 @@ hard-coding the message lookup to 1 fails the exit-2 and the fallback test.
 **Not in this item:** `legacy-import-drift` has the same 1-vs-2 shape and could declare the same
 pair, but it is W9's gate and nothing in this item requires it.
 
-### M1-6 — `solarjoules`, and the four W2 follow-ups' loose ends *(N-9, N-7, N-13, N-16)*
+### M1-6 — `solarjoules`, and the four W2 follow-ups' loose ends *(N-9, N-7, N-13, N-16)* — ✅ **DONE 2026-11-02**
 **Depends on:** nothing. Four independent small items, grouped because each is under an hour and none
 blocks anything:
 - **N-9** — read `remoteweather:pkg/solar` at `c3ec9f7` and settle whether `solarjoules` is a total
@@ -225,6 +225,69 @@ blocks anything:
 - **N-16** — `rebuild-aggregates.sh` phase 1 refreshes each level over the **widest** band any level
   above it serves, and `--recent-only` warns naming the levels it left incomplete.
 **Done when:** each has its own test; `cargo xtask validate` rejects an unknown unit string.
+**Landed:**
+
+- **N-9 — `solarjoules` is a `total`.** `pkg/solar` is not where the answer was: it holds the
+  clear-sky irradiance models and the sunrise arithmetic, all in W/m², and never mentions
+  `solarjoules`. Nothing computes the value — it is the Campbell datalogger's `slr_mj` field,
+  carried through untouched by `internal/weatherstations/campbell/station.go`, and it is energy per
+  unit area accumulated since the logger's previous output, which is why the same packet also
+  carries `slr_w` for the irradiance. The plan's "one registry line" is one registry line, and it
+  is a **BREAKING** change against the snapshot (an aggregation-strategy change), so it also needs
+  `migrate --allow-breaking`, a committed migration that drops and recreates all four levels, and a
+  regenerated snapshot. Two consequences the plan did not name: the rebuild's `CASCADE` takes W4's
+  four indexes, three retention policies and four refresh policies with it, so this item carries a
+  hand-written follow-up migration that re-asserts them (`ci/db/schema-assertions.sql` A-8 is what
+  catches the omission); and no Go view computed `sum(solarjoules)`, so `solarjoules` becomes the
+  fifth unconsumed archive column and `solarjoules_total` lands NULL for pre-cutover history rather
+  than importing a mean as a total.
+- **N-7 — a `[[unit]]` table.** 25 entries, `name` plus the `label` a reader is shown. `validate`
+  rejects a unit no `[[unit]]` declares, naming the case-insensitive near miss when there is one;
+  rejects a duplicate declaration; and rejects two declarations differing only in case, because
+  declaring `degf` beside `degF` is the obvious way to make the typo validate and would reopen the
+  hole. The table is emitted as `UNITS` into `generated/rust/metrics.rs` and
+  `generated/ts/metrics.ts` (plus `UNIT_LABELS`), so the UI has a label to render instead of the
+  internal string — which is the half of C-W2-19 a validator alone does not close.
+- **N-13 — `affected_levels` compares rendered level definitions.** `metrics/snapshot.toml` now
+  records each level's own definition — bucket, source, `materialized_only` — beside the allocated
+  identifiers, and `affected_levels` compares that against the registry's, with every aggregate
+  column and the expression that produces it. The level's own definition is recorded and not just
+  its column list because the 5-minute insertion is the case this exists for and the hourly level's
+  *columns were identical* across it: only the relation it reads changed. A snapshot with no
+  `[[level]]` section is read as "nothing to compare against" and rebuilds everything, which is the
+  safe direction and the behaviour this function had before.
+- **N-16 — phase 1 uses the widest band above.** `ci/db/rebuild-aggregates.sh` refreshes each level
+  over the widest band any level above it serves, and `--recent-only` names the levels it left
+  incomplete — `observations_1d` alone under these bands, because it is the only level whose
+  retention is unbounded. The cost is stated in the script's header rather than absorbed: phase 1
+  is no longer seconds, because a correct 366-day daily level needs a correct 366-day hourly level
+  beneath it and, under D-11, every level below that as well. The seconds it used to take were the
+  seconds of not doing the work, and the work not done was being written into `observations_1d` as
+  zeroes.
+
+**Eighty-nine tests, twenty-one of them new.** Six for N-7 (the undeclared string, a
+no-near-miss control, the case collision, a duplicate declaration, an empty label, and the shipped
+registry against the emitted table); eight for N-13 (the 5-minute insertion asserting the minute
+level is *not* rebuilt, a source-only change, a bucket change, a deprecation, a change the levels
+cannot see, both no-previous-record paths, and the shipped pair forcing no rebuild); one for N-9
+against the emitted SQL at all four levels; six driving the shell script itself with `PSQL=echo`,
+which is testable only because W9 had already made the psql invocation overridable. Two existing
+`legacy` tests change their asserted figures, which is the N-9 decision arriving where it should.
+
+**Nine negative controls, each watched failing rather than argued:** deleting the unit check fails
+two unit tests; removing the near-miss hint fails the one that reads the message; removing the
+case-collision check fails that test alone; declaring the units and not emitting them fails the
+shipped-registry test; reverting `affected_levels` to the metric-keyed rule fails five; dropping
+the level record from the rendered snapshot fails four; putting phase 1 back on each level's own
+band fails two script tests; removing the `--recent-only` warning fails one; and reverting the one
+`solarjoules` line fails the N-9 test and both `legacy` figures.
+
+**Not in this item:** `solarjoules` is declared `unit = "J_per_m2"` and the instrument reports
+`slr_mj`, which is MJ/m² — a factor of 10⁶ in a rendered label. It is a one-line, non-breaking
+registry edit and it belongs with whoever owns the rendered units, not with the aggregation
+question this item settled. Separately, W4's policy block needs re-asserting by hand after every
+level rebuild; making it re-assertable the way `migrate` already re-asserts the finalisers belongs
+with whoever owns the policy parameters.
 
 **Milestone 1 done when:** every gate in `cargo xtask gates` is either armed-and-green or deferred
 for a reason that names a path a later milestone's done-criteria create (**D-64**); the conformance

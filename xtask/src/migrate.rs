@@ -8,7 +8,7 @@
 
 use crate::gen;
 use crate::registry::Registry;
-use crate::snapshot::{self, Change, Class};
+use crate::snapshot::{self, Change, Class, Snapshot};
 use std::fmt::Write as _;
 
 pub struct Migration {
@@ -18,6 +18,7 @@ pub struct Migration {
 
 pub fn render(
     reg: &Registry,
+    prev: &Snapshot,
     changes: &[Change],
     bootstrap: bool,
     stamp: &str,
@@ -196,7 +197,10 @@ pub fn render(
         }
     }
 
-    let levels = snapshot::affected_levels(reg, changes);
+    // Which levels this migration drops and recreates. Compared against the snapshot's
+    // own record of each level's definition (N-13), so a change that leaves a level's
+    // text alone leaves the level alone.
+    let levels = snapshot::affected_levels(reg, prev);
     if !levels.is_empty() {
         s.push_str(
             "-- Aggregates are disposable derived data (D-15): there is no in-place aggregate\n\
