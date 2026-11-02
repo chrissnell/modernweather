@@ -315,10 +315,29 @@ the snapshot and the generator (R-2):
 | OpenAPI | `openapi/reading.json` | `Reading` by stable key, `LegacyWeatherReading` by frozen JSON key |
 | TypeScript | `ts/reading.ts`, `ts/metrics.ts` | the interface, and the label/unit table the management UI renders from |
 
-`--check` regenerates into `$TMPDIR/mw-codegen-check-<pid>` and compares; it never writes into
-the working tree, because a check that fixes the problem it is checking for always passes
-(R-2). It reports the first differing line of each file, and also reports a file present in
-the tree that the generator does not produce.
+`--check` regenerates into `$TMPDIR/mw-codegen-check-<pid>-<n>` and compares; it never writes
+into the working tree, because a check that fixes the problem it is checking for always
+passes (R-2). It reports the first differing line of each file, and also reports a file
+present in the tree that the generator does not produce.
+
+**`codegen` removes what it no longer writes** (N-15, answering OQ-W4-4). Every file under
+`generated/` carries a header saying the generator owns it, so a file there that the
+generator does not produce is stale — and leaving it behind is not harmless, because that is
+exactly what `--check` reports as drift. Without the prune, `codegen` exited 0 having
+produced a tree the gate it is paired with rejects: a developer ran `codegen`, committed, and
+CI failed on files `codegen` itself had just made stale. Renumbering is what makes that
+routine rather than rare, since the aggregate files are numbered by the level's position, so
+inserting a `[[level]]` renames every file above it — adding the 5-minute level orphaned two.
+
+So `codegen` now deletes every file under `generated/` that it did not write, names each one
+on stdout, and removes any directory the deletion leaves empty. It reaches nowhere else and
+never follows a symlink out of the directory it owns. The round trip — add a `[[level]]`,
+regenerate, remove it, regenerate — is a `cargo test -p xtask` case, and so is that boundary.
+
+The prune and the check now agree on what an orphan is, because both answer by path.
+`--check` used to list the tree by reading each file as UTF-8, which made a file under
+`generated/` that is not valid UTF-8 invisible to it while being stale by construction:
+nothing an emitter writes is binary.
 
 **The generated Rust is compiled, not merely written.** `generated/rust/metrics.rs` and
 `generated/rust/aggregates.rs` depend on nothing outside themselves, so `xtask`'s own test
@@ -832,7 +851,7 @@ command.**
 14. `metrics/snapshot.toml` is the allocation record, written only by `cargo xtask migrate`, and is what makes append-only enforceable rather than merely documented.
 15. Four conditions are fatal with no override: an identifier appearing on a different entry, an identifier disappearing without deprecation, the raw column budget over 1,595 allocated identifiers, and an aggregate over 1,598 expressions.
 16. Column rename, SQL type change, protobuf type change, aggregation strategy change, mean-representation change and un-deprecation are refused by default and permitted only by `cargo xtask migrate --allow-breaking`, which writes the destructive statements out with a header naming each one. `codegen` has no such flag.
-17. Generated output is thirteen committed files under `generated/`, each with a do-not-edit header naming the registry, the snapshot and the generator.
+17. Generated output is thirteen committed files under `generated/`, each with a do-not-edit header naming the registry, the snapshot and the generator. **`codegen` owns that directory outright and deletes every file under it that it did not write (N-15), so `codegen` cannot hand back a tree that `codegen --check` rejects.**
 18. `cargo xtask codegen --check` regenerates into `$TMPDIR` and diffs; exit 0 clean, 1 on drift, 2 on an invariant violation. **W8 owns the gate; this is the command and these are the codes.**
 19. The generated Rust metadata and aggregate tables are compiled by `xtask`'s own test suite, so "the generator emits Rust" is verified rather than assumed.
 20. Migrations come only from `cargo xtask migrate`; there is no DDL at startup and no `IF NOT EXISTS` anywhere in the generated output.

@@ -142,11 +142,25 @@ this is a one-way door until it is opened.
 **Scope note:** this item adds the *capability*. It does **not** move `stationname`/`stationtype`;
 that is M5-5, after the migration has proved it reads them from `config.stations` instead.
 
-### M1-3 — `codegen` prunes what it no longer writes *(N-15 / OQ-W4-4)*
+### M1-3 — `codegen` prunes what it no longer writes *(N-15 / OQ-W4-4)* — ✅ **DONE 2026-11-01**
 **Depends on:** nothing. **Done when:** adding and then removing a `[[level]]` leaves no orphan under
 `generated/`, and `cargo xtask codegen` followed immediately by `codegen --check` always exits 0.
 **Test strategy:** the round-trip above as a test, which is also the regression: today adding the
 5-minute level orphaned two files and left a tree `--check` rejects.
+**Landed:** `codegen` deletes every file under `generated/` that it did not write, names each one on
+stdout, and removes a directory the deletion leaves empty. It reaches nowhere else and does not
+follow a symlink out of the directory it owns. The round trip is a test — insert a 2-minute level
+between `1m` and `5m`, which renumbers three files, regenerate, remove it, regenerate — run against a
+scratch repository root holding a copy of `metrics/`, so the intermediate state is never somewhere it
+could be committed. `generated/` is byte-identical: the committed tree had no orphan to remove.
+**The prune and the check now agree on what an orphan is, which they did not.** `--check` listed the
+tree by reading each file as UTF-8, so a file under `generated/` that is not valid UTF-8 was invisible
+to it while being stale by construction — nothing an emitter writes is binary. Both halves now answer
+by path, driven from one `codegen_files` call, and the test asserts the agreement on exactly that
+file. Verified able to fail: with the delete removed the round trip reports the three
+`in the tree but not generated` lines of OQ-W4-4; with the prune walking the repository root instead
+of `generated/` it reports `metrics/keep.toml`; with orphan detection back on file contents it misses
+the binary one.
 
 ### M1-4 — run the conformance suite against the Go daemon in CI *(N-3 / G-1)* — ✅ **DONE 2026-11-01**
 **Depends on:** nothing. **Blocks:** M2-5, and by the second ordering constraint every legacy
