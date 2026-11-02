@@ -109,6 +109,19 @@ jobs:
       - name: cargo test under ThreadSanitizer
         env:
           RUSTFLAGS: -Zsanitizer=thread
+          # RUSTDOCFLAGS has to carry the flag too, and this is not belt-and-braces: cargo
+          # does not propagate RUSTFLAGS to rustdoc, so the doctest harness was compiled
+          # WITHOUT the sanitizer while every dependency it links -- including the
+          # build-std `std` -- was compiled with it. `-Zsanitizer` changes the ABI, so
+          # rustc refuses: "mixing `-Zsanitizer` will cause an ABI mismatch in crate
+          # mw_types", nineteen times, after the lib tests had already passed. It appeared
+          # the moment M2-1 gave the workspace crates to compile; before that there was
+          # nothing for rustdoc to run.
+          #
+          # The alternative fix is `--all-targets`, which excludes doctests. Rejected: it
+          # drops a whole target class from the one job that observes real interleavings,
+          # and this job's instruction is to fix it rather than narrow it.
+          RUSTDOCFLAGS: -Zsanitizer=thread
           # A leak at process exit is not a race, and TSan's leak checker fires on
           # perfectly ordinary Box::leak of a static.
           TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 detect_leaks=0
@@ -134,10 +147,48 @@ jobs:
       # Exhaustive interleaving checks for lock-free code, on stable. There are none yet;
       # the invocation exists so that writing the first one needs no CI change. loom and
       # TSan are complementary: loom is exhaustive over a model, TSan observes a real run.
+      #
+      # Scoped to two crates rather than --workspace, and it is not a preference. RUSTFLAGS
+      # applies `--cfg loom` to EVERY crate in the graph, dependencies included, and
+      # `tokio` gates its whole `net` module behind `#![cfg(not(loom))]` -- so under this
+      # flag `tokio::net` ceases to exist and `hyper-util`, which uses
+      # `tokio::net::UnixStream`, fails to compile. `hyper-util` arrives through `axum` and
+      # `tonic`, so six of the eighteen crates can never build under `--cfg loom`. Nor can
+      # that be fixed by a feature: cargo evaluates `[target.'cfg(loom)'.dependencies]`
+      # against the target spec, not against RUSTFLAGS, so a dependency's own loom support
+      # is unreachable this way.
+      #
+      # The two named here are where W3 D-85 puts the concurrency tests -- config reload
+      # racing 64 readers, and shutdown with a stalled sink -- and neither depends on axum
+      # or tonic. implementation-plan.md M2-3 writes them.
       - name: cargo test --cfg loom
         env:
           RUSTFLAGS: --cfg loom
-        run: cargo test --workspace --locked
+          LOOM_PACKAGES: -p mw-supervisor -p mw-pipeline
+        run: |
+          # shellcheck disable=SC2086  # deliberate word splitting: a cargo -p list
+          cargo test $LOOM_PACKAGES --locked
+      # A scoped job can silently skip the thing it exists to run, which is
+      # docs/reconciliation.md G-1. So a loom test written in a crate outside the scope is
+      # a loud failure here rather than a test nobody runs.
+      - name: Assert every loom test is inside the scope
+        env:
+          LOOM_PACKAGES: -p mw-supervisor -p mw-pipeline
+        run: |
+          scoped=$(echo "$LOOM_PACKAGES" | tr " " "\n" | grep -v "^-p$" | grep -v "^$")
+          bad=0
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            crate=$(echo "$f" | cut -d/ -f2)
+            if ! echo "$scoped" | grep -qx "$crate"; then
+              echo "::error file=$f::$crate uses loom but the loom job does not build it"
+              bad=1
+            fi
+          done <<EOF
+          $(grep -rl "cfg(loom)" crates/ --include="*.rs" || true)
+          EOF
+          [ "$bad" -eq 0 ] || exit 1
+          echo "every cfg(loom) user is inside: $(echo "$scoped" | tr "\n" " ")"
 
   workflows:
     name: actionlint

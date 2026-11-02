@@ -690,10 +690,7 @@ fn check_every_source_is_scanned(root: &Path, decl: &Layers, v: &mut Vec<Violati
     let declared: BTreeSet<&str> = decl.crates.iter().map(|c| c.name.as_str()).collect();
     let crates_dir = root.join(CRATES);
     let (files, unreadable) = rust_files(&crates_dir);
-    let paths = files
-        .into_iter()
-        .map(|(p, _)| p)
-        .chain(unreadable.into_iter());
+    let paths = files.into_iter().map(|(p, _)| p).chain(unreadable);
     for path in paths {
         let Ok(rel) = path.strip_prefix(&crates_dir) else {
             continue;
