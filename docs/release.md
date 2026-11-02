@@ -26,7 +26,7 @@ stronger than comparing union-view text. See §2 and the proposed amendment A-1 
 | `ci/gates.toml` | the deferred-gate manifest, and the mechanism that arms each one |
 | `ci/release.toml` | the target matrix, read by both `cargo xtask` and the workflow |
 | `ci/sql/assert-timescaledb-version.sql` | D-42's server-version assertion |
-| `ci/db/migrate-twice.sh` | apply migrations from empty and from the previous release |
+| `ci/db/migrate-twice.sh` | apply both schemas from empty and from the previous release, and prove a second application is a no-op |
 | `ci/spike/probe/` | the platform probe: the non-pure-Rust parts of the crate stack |
 | `ci/spike/armv6-cross-spike.sh` | builds the probe for a target and runs it under qemu |
 | `xtask/` | every gate and release step, runnable locally with the same command |
@@ -191,16 +191,43 @@ that would make the assertion pass on exactly the servers it exists to reject.
 2.31.0, Toolkit 1.26.0): passes, and with the required version raised to 9.9.9 it fails with
 `ERROR: timescaledb 2.31.0 is older than the required 9.9.9`. Both directions checked.
 
-**Migrations applied twice.** `ci/db/migrate-twice.sh`:
+**Migrations applied twice.** `ci/db/migrate-twice.sh`, over **two** schemas:
 
 ```
 path A   empty database            -> every migration at HEAD
 path B   previous release's schema -> seeded rows -> every migration at HEAD
 ```
 
-Then it asserts three things are identical between A and B: the `pg_dump --schema-only`
-output, the `timescaledb_information.continuous_aggregates` rows including each view's
-definition, and — on path B — that the seeded rows are still there.
+`migrations/` is the weather schema on PostgreSQL/TimescaleDB; `migrations/config/` is the
+configuration schema on SQLite, which `implementation-plan.md` M2-2 created. `DESIGN.md`
+D-8 as amended by **A-W6-2** governs both — "schema changes solely through migrations, no
+DDL at startup, no `IF NOT EXISTS`" is about every schema this system owns — and this
+document's assumption 12 below was written about W4's set only, which is how the
+configuration store came to be assumed into existence by four design documents with no DDL
+behind it at all (`docs/reconciliation.md` G-2).
+
+For the weather schema it then asserts three things are identical between A and B: the
+`pg_dump --schema-only` output, the `timescaledb_information.continuous_aggregates` rows
+including each view's definition, and — on path B — that the seeded rows are still there.
+
+For the configuration schema it compares `sqlite_master` between A and B, and adds two
+checks the PostgreSQL half cannot usefully make:
+
+- **The applier, run again over a schema already at HEAD.** No migration may run, the
+  schema may not change, and `ci/db/config-seed.sql`'s rows must survive. This is the
+  direct test of "a second application of every migration is a no-op", and it runs on every
+  build rather than only once there is a release to upgrade from — which matters while
+  `migrations/config/` has no previous version and path B is therefore a second path A.
+- **And its converse: every migration *body*, re-applied directly, must fail.** A body that
+  re-applies cleanly means the check above is green because the DDL is conditional rather
+  than because the ledger held. That is D-64's reasoning applied to a property instead of a
+  path: a check nobody has watched fail proves nothing.
+
+Before either database is touched, the script greps every file under `migrations/` for
+`IF NOT EXISTS`, `IF EXISTS`, `OR REPLACE` and `if_not_exists`, with `--` comments stripped
+so that a migration *saying* "no `IF NOT EXISTS`, deliberately" is not reported as using
+one. Both migration sets say exactly that, and a grep that could not tell prose from DDL
+would have to be either wrong or ignored.
 
 Three details that are load-bearing rather than incidental:
 
@@ -209,8 +236,11 @@ Three details that are load-bearing rather than incidental:
   and matches `sqlx-migrate` on the two properties that matter here: each migration applied
   exactly once, in filename order, inside a transaction.
 - **The previous schema comes from git, not from a committed dump.** `git describe --tags`
-  finds the previous release and `git archive` extracts its `migrations/`, so the baseline
-  cannot go stale. `MW_PREVIOUS_MIGRATIONS_DIR` overrides it for local use.
+  finds the previous release and `git archive` extracts its `migrations/` — including
+  `migrations/config/`, so both baselines come from the same extraction — and the baseline
+  therefore cannot go stale. `MW_PREVIOUS_MIGRATIONS_DIR` overrides it for local use.
+- **Every `find` over `migrations/` is `-maxdepth 1`.** The two directories are two
+  databases, and a recursive find hands SQLite DDL to `psql`.
 - **TimescaleDB's own schemas are excluded from the comparison, not filtered out of it.**
   Path B has chunks because it has rows; path A does not. Chunks are not schema. Excluding
   `_timescaledb_*` is the difference between a meaningful comparison and a permanent red.
@@ -223,7 +253,15 @@ the exact shape of "a fresh install and an upgraded install differ" — made it 
 print the offending `CREATE TABLE legacy_rollup` lines. Both directions checked.
 
 W4 arms this gate by creating `migrations/`, and owns `ci/db/seed.sql` and
-`ci/db/verify-seed.sql`. Until then the gate reports itself deferred.
+`ci/db/verify-seed.sql`. `implementation-plan.md` M2-2 owns `migrations/config/` and
+`ci/db/config-seed.sql`; it widened what this already-armed gate checks rather than arming a
+new one, because the path that arms the gate was already present.
+
+The daemon applies the configuration migrations with `sqlx::migrate` through
+`mw_store::config_db`, whose own tests drive that migrator over the same files. This script
+shells out to `sqlite3` instead, for the same reason it does not shell out to `sqlx-cli` for
+the weather schema: it must stay runnable with no Rust toolchain, and an applier that is not
+the one under test is a second opinion rather than a duplicate.
 
 ---
 
@@ -884,7 +922,10 @@ the first release or at all.
     and provides `ci/db/seed.sql` and `ci/db/verify-seed.sql`.
 12. **W4's migrations are idempotent in the sense `sqlx-migrate` means** — each file applied
     exactly once, tracked by name — not in the `CREATE TABLE IF NOT EXISTS` sense that froze
-    the Go schema at first-run shape (D-8).
+    the Go schema at first-run shape (D-8). **Corrected in scope by A-W6-2:** this is true of
+    *every* schema this system owns, including the SQLite configuration store, whose
+    migrations live in `migrations/config/` and are applied the same way
+    (`implementation-plan.md` M2-2).
 13. **W4 does not introduce union views or versioned aggregates** (D-5). If that decision is
     revisited, the migration gate's comparison needs revisiting with it.
 14. **W4's rebuild procedure can run inside CI's time budget** on a fixture-sized database.

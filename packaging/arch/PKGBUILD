@@ -48,6 +48,16 @@ package() {
     install -Dm644 docs/release.md "$pkgdir/usr/share/doc/modernweather/release.md"
     # Migrations are shipped so that the operator can inspect what will run; the daemon
     # applies them from its own embedded copy (DESIGN.md D-8).
+    #
+    # Two levels, because there are two schemas: migrations/*.sql is the weather schema and
+    # migrations/config/*.sql is the configuration schema (D-8 as amended by A-W6-2). This
+    # loop only had the subdirectory form, which matched nothing while migrations/ was flat
+    # -- so the artefact shipped no migrations at all, and the day a subdirectory arrived it
+    # would have shipped that one and not the weather set.
+    if compgen -G "migrations/*.sql" > /dev/null; then
+        install -dm755 "$pkgdir/usr/share/modernweather/migrations"
+        install -Dm644 migrations/*.sql "$pkgdir/usr/share/modernweather/migrations/"
+    fi
     if compgen -G "migrations/*/*.sql" > /dev/null; then
         for dir in migrations/*/; do
             install -dm755 "$pkgdir/usr/share/modernweather/$dir"

@@ -4,6 +4,16 @@
 #   path A   empty database            -> every migration at HEAD
 #   path B   previous release's schema -> seed rows -> every migration at HEAD
 #
+# TWO databases, not one. `migrations/` is the weather schema on PostgreSQL/TimescaleDB;
+# `migrations/config/` is the configuration schema on SQLite. DESIGN.md D-8 as amended by
+# A-W6-2 governs both -- "schema changes solely through migrations, no DDL at startup, no
+# `IF NOT EXISTS`" is about EVERY schema this system owns -- and until implementation-plan.md
+# M2-2 the second one did not exist, so this gate had nothing to say about the database that
+# is the actual instance of the defect D-8 was written about (docs/reconciliation.md G-2).
+# Each database gets the same two paths, and the config half adds a third check the weather
+# half cannot make: re-run the applier against the finished schema and assert that NOTHING
+# ran. See "the configuration database" below.
+#
 # Why both. A migration set is almost always tested the way path A tests it, from nothing,
 # and that is the path no production database ever takes. Path B is the one that matters,
 # and the two have to agree: if they do not, a fresh install and an upgraded install are
@@ -17,8 +27,13 @@
 # the one made below — the aggregate definitions and the values they return are identical
 # on both paths — and it is strictly stronger than comparing view texts.
 #
-# Requires: psql, pg_dump, and DATABASE_URL pointing at a server this script may create
-# and drop databases on. No Rust toolchain. Arms itself when migrations/ exists (see ci/gates.toml).
+# Requires: psql, pg_dump, sqlite3, and DATABASE_URL pointing at a server this script may
+# create and drop databases on. No Rust toolchain -- which is why the config half shells out
+# to sqlite3 rather than to the daemon's own `mw_store::config_db`. That module's tests drive
+# the real `sqlx` migrator over the same files; this script and those tests check different
+# things, and neither is the other's duplicate.
+#
+# Arms itself when migrations/ exists (see ci/gates.toml).
 
 set -euo pipefail
 
@@ -32,10 +47,52 @@ DB_B="${DB_B:-mw_migrate_b}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+CONFIG_MIGRATIONS_DIR="${CONFIG_MIGRATIONS_DIR:-$MIGRATIONS_DIR/config}"
+
 if [ ! -d "$MIGRATIONS_DIR" ]; then
   echo "no $MIGRATIONS_DIR/ — nothing to migrate. This script is armed by its existence." >&2
   exit 1
 fi
+
+missing=""
+for tool in psql pg_dump sqlite3; do
+  command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+if [ -n "$missing" ]; then
+  echo "missing required tool(s):$missing" >&2
+  exit 1
+fi
+
+# ----------------------------------------------------------------------------------------
+# D-8's third clause, checked before anything is applied because it needs no database and
+# because it is the clause the other two depend on: if a migration tolerates being applied
+# twice, then "a second application is a no-op" is green for the wrong reason and says
+# nothing. That is exactly how the Go configuration schema came to be frozen at first-run
+# shape -- `CREATE TABLE IF NOT EXISTS` in a startup path, which never errors and never
+# updates.
+#
+# Line comments are stripped first, so a migration that SAYS "no IF NOT EXISTS, deliberately"
+# is not reported as using it. Both of the repository's migration sets say exactly that, and
+# a grep that could not tell prose from DDL would have to be either wrong or ignored.
+echo "=== no conditional DDL under $MIGRATIONS_DIR/ (D-8, A-W6-2)"
+conditional=0
+while IFS= read -r f; do
+  body="$(sed -E 's/--.*$//' "$f" | tr '[:lower:]' '[:upper:]')"
+  for idiom in 'IF NOT EXISTS' 'IF EXISTS' 'OR REPLACE' 'IF_NOT_EXISTS'; do
+    if printf '%s' "$body" | grep -qF "$idiom"; then
+      echo "  $f: \`$idiom\` in a statement" >&2
+      conditional=1
+    fi
+  done
+done < <(find "$MIGRATIONS_DIR" -name '*.sql' | sort)
+if [ "$conditional" -ne 0 ]; then
+  echo >&2
+  echo "FAIL: a migration that tolerates being applied twice makes the apply-twice check" >&2
+  echo "      meaningless. DESIGN.md D-8, amended by A-W6-2. Write the unconditional form;" >&2
+  echo "      the ledger is what stops it running a second time." >&2
+  exit 1
+fi
+echo "    clean"
 
 # The server URL with the database component stripped, so psql can target each scratch
 # database and the maintenance database in turn.
@@ -67,7 +124,9 @@ apply_migrations() {
   local db="$1" dir="$2" f base
   on "$db" -c "CREATE TABLE IF NOT EXISTS $LEDGER (filename text PRIMARY KEY,
                                                    applied_at timestamptz NOT NULL DEFAULT now())"
-  for f in $(find "$dir" -name '*.sql' | sort); do
+  # -maxdepth 1 is load-bearing. migrations/config/ is a SECOND database (D-8 as amended
+  # by A-W6-2), and a recursive find would hand its SQLite DDL to psql.
+  for f in $(find "$dir" -maxdepth 1 -name '*.sql' | sort); do
     base="$(basename "$f")"
     if [ -n "$(on "$db" -At -c "SELECT 1 FROM $LEDGER WHERE filename = '$base'")" ]; then
       echo "  $base (already applied)"
@@ -130,7 +189,7 @@ apply_migrations "$DB_A" "$MIGRATIONS_DIR"
 echo "=== path B: previous schema -> seeded rows -> HEAD"
 recreate "$DB_B"
 seeded=0
-if [ -n "$(find "$PREV_DIR" -name '*.sql' 2>/dev/null)" ]; then
+if [ -n "$(find "$PREV_DIR" -maxdepth 1 -name '*.sql' 2>/dev/null)" ]; then
   apply_migrations "$DB_B" "$PREV_DIR"
   # Seeded rows exist so that the upgrade path is exercised against data rather than
   # against an empty table — a migration that rewrites a hypertable behaves differently
@@ -226,8 +285,8 @@ fi
 # difference between a gate that is green and a gate that is known to have tested
 # something — the state this check was in before W4 landed, with one migration in the
 # tree, was "green because both paths were the same path".
-prev_n=$(find "$PREV_DIR" -name '*.sql' 2>/dev/null | wc -l | tr -d ' ')
-head_n=$(find "$MIGRATIONS_DIR" -name '*.sql' | wc -l | tr -d ' ')
+prev_n=$(find "$PREV_DIR" -maxdepth 1 -name '*.sql' 2>/dev/null | wc -l | tr -d ' ')
+head_n=$(find "$MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' | wc -l | tr -d ' ')
 echo "=== path B applied $prev_n migration(s), then $((head_n - prev_n)) more to reach HEAD"
 if [ "$prev_n" -eq 0 ]; then
   echo "    WEAK: no previous migrations, so path B was a second path A." >&2
@@ -238,9 +297,170 @@ else
 fi
 
 if [ "$status" -eq 0 ]; then
-  echo "=== both paths produced the same schema"
+  echo "=== the weather schema: both paths produced the same schema"
 fi
 
 admin -c "DROP DATABASE IF EXISTS $DB_A WITH (FORCE)" >/dev/null
 admin -c "DROP DATABASE IF EXISTS $DB_B WITH (FORCE)" >/dev/null
+
+# ========================================================================================
+# The configuration database
+#
+# Same two paths, on SQLite. The third check below is the one this half adds, and it is the
+# work item's headline done-criterion: apply HEAD, seed rows, run the applier AGAIN over the
+# finished schema, and assert that no migration ran and that the rows are still there. On
+# the PostgreSQL side that check would be redundant with path B; here it is the direct test
+# of "a second application of every migration is a no-op", and it is the thing a startup DDL
+# path would pass by being conditional rather than by being ledgered -- which is why the
+# `IF NOT EXISTS` preflight above runs first.
+# ========================================================================================
+
+if [ ! -d "$CONFIG_MIGRATIONS_DIR" ]; then
+  echo "=== no $CONFIG_MIGRATIONS_DIR/ — the configuration schema is not in this tree" >&2
+  echo "    implementation-plan.md M2-2 creates it; this gate covers it from then on." >&2
+  exit "$status"
+fi
+
+CFG_A="$WORK/config-a.db"
+CFG_B="$WORK/config-b.db"
+CFG_C="$WORK/config-c.db"
+CFG_LEDGER="_mw_ci_applied"
+
+# sqlite3 exits 0 on a parse error without -bail, so every invocation has it. Foreign keys
+# are per-connection and OFF by default, so every invocation sets them: the references in
+# migrations/config/ are decorative on a connection that forgets, and `mw_store::config_db`
+# sets the same pragma for the daemon.
+sq() { sqlite3 -bail -cmd 'PRAGMA foreign_keys = ON' "$@"; }
+
+cfg_apply() {
+  local db="$1" dir="$2" f base applied=0
+  sq "$db" "CREATE TABLE IF NOT EXISTS $CFG_LEDGER (filename TEXT PRIMARY KEY) STRICT" >/dev/null
+  for f in $(find "$dir" -maxdepth 1 -name '*.sql' | sort); do
+    base="$(basename "$f")"
+    if [ -n "$(sq "$db" "SELECT 1 FROM $CFG_LEDGER WHERE filename = '$base'")" ]; then
+      echo "  $base (already applied)"
+      continue
+    fi
+    echo "  $base"
+    # One transaction per file, matching sqlx-migrate: a migration that fails half way
+    # through leaves nothing behind and the ledger stays truthful.
+    sq "$db" "BEGIN" ".read $f" "INSERT INTO $CFG_LEDGER (filename) VALUES ('$base')" "COMMIT"
+    applied=$((applied + 1))
+  done
+  echo "$applied" > "$WORK/cfg-applied-count"
+}
+
+# Every object the schema defines, as the SQL that defines it. Newlines and tabs collapse so
+# that a reformatted migration is not a schema difference; the CI ledger is excluded because
+# it is this script's bookkeeping and not schema. Compared instead of `.schema` output
+# because `.schema` prints in creation order, which the two paths legitimately differ on.
+cfg_schema() {
+  sq "$1" \
+    "SELECT type, name, replace(replace(replace(COALESCE(sql,''), char(10),' '), char(13),' '), char(9),' ')
+       FROM sqlite_master
+      WHERE name NOT LIKE 'sqlite_%' AND name <> '$CFG_LEDGER'
+      ORDER BY type, name"
+}
+
+echo "=== the configuration database, path A: empty -> HEAD"
+cfg_apply "$CFG_A" "$CONFIG_MIGRATIONS_DIR"
+
+echo "=== the configuration database, path B: previous schema -> seeded rows -> HEAD"
+cfg_prev_dir="$PREV_DIR/$(basename "$CONFIG_MIGRATIONS_DIR")"
+cfg_seeded=0
+cfg_prev_n=0
+if [ -n "$(find "$cfg_prev_dir" -maxdepth 1 -name '*.sql' 2>/dev/null)" ]; then
+  cfg_apply "$CFG_B" "$cfg_prev_dir"
+  cfg_prev_n=$(find "$cfg_prev_dir" -maxdepth 1 -name '*.sql' | wc -l | tr -d ' ')
+  if [ -f ci/db/config-seed.sql ]; then
+    echo "    seeding"
+    sq "$CFG_B" ".read ci/db/config-seed.sql"
+    cfg_seeded=1
+  else
+    echo "    note: ci/db/config-seed.sql does not exist, so the upgrade path runs against" >&2
+    echo "          empty tables, which is weaker than it should be." >&2
+  fi
+else
+  echo "    note: no previous $CONFIG_MIGRATIONS_DIR/, so path B is currently a second path A." >&2
+fi
+cfg_apply "$CFG_B" "$CONFIG_MIGRATIONS_DIR"
+
+echo "=== comparing"
+cfg_schema "$CFG_A" > "$WORK/cfg-a.schema"
+cfg_schema "$CFG_B" > "$WORK/cfg-b.schema"
+if ! diff -u "$WORK/cfg-a.schema" "$WORK/cfg-b.schema"; then
+  echo >&2
+  echo "FAIL: a fresh install and an upgraded install do not have the same configuration" >&2
+  echo "      schema." >&2
+  status=1
+fi
+
+# The third check: the applier, run again over a schema that is already at HEAD.
+echo "=== the configuration database: a second application"
+cfg_apply "$CFG_C" "$CONFIG_MIGRATIONS_DIR"
+cfg_schema "$CFG_C" > "$WORK/cfg-c.before"
+# The seed is applied here as well as on path B, so these rows are exercised on every run
+# rather than only once there is a release to upgrade from.
+sq "$CFG_C" ".read ci/db/config-seed.sql"
+cfg_rows_before="$(sq "$CFG_C" "SELECT (SELECT count(*) FROM stations) || '/' ||
+                                       (SELECT count(*) FROM uploader) || '/' ||
+                                       (SELECT count(*) FROM station_service) || '/' ||
+                                       (SELECT count(*) FROM website) || '/' ||
+                                       (SELECT count(*) FROM peers) || '/' ||
+                                       (SELECT count(*) FROM component_schedule)")"
+cfg_apply "$CFG_C" "$CONFIG_MIGRATIONS_DIR"
+cfg_ran="$(cat "$WORK/cfg-applied-count")"
+cfg_schema "$CFG_C" > "$WORK/cfg-c.after"
+cfg_rows_after="$(sq "$CFG_C" "SELECT (SELECT count(*) FROM stations) || '/' ||
+                                      (SELECT count(*) FROM uploader) || '/' ||
+                                      (SELECT count(*) FROM station_service) || '/' ||
+                                      (SELECT count(*) FROM website) || '/' ||
+                                      (SELECT count(*) FROM peers) || '/' ||
+                                      (SELECT count(*) FROM component_schedule)")"
+
+if [ "$cfg_ran" -ne 0 ]; then
+  echo "FAIL: the second application ran $cfg_ran migration(s). Applied-by-name means each" >&2
+  echo "      file runs exactly once." >&2
+  status=1
+fi
+if ! diff -u "$WORK/cfg-c.before" "$WORK/cfg-c.after"; then
+  echo "FAIL: the second application changed the configuration schema." >&2
+  status=1
+fi
+if [ "$cfg_rows_before" != "$cfg_rows_after" ]; then
+  echo "FAIL: the seeded configuration rows did not survive. $cfg_rows_before -> $cfg_rows_after" >&2
+  status=1
+fi
+
+# And the converse, which is what makes the check above worth having: the statements must NOT
+# tolerate a second application. If a migration body re-applies cleanly then the no-op above
+# is green because the DDL is conditional rather than because the ledger held, and the gate
+# has stopped testing anything. This is the half DESIGN.md D-64's reasoning applies to a
+# property rather than to a path: a check that has never been seen able to fail proves
+# nothing.
+echo "=== the configuration database: every migration body must REFUSE to re-apply"
+for f in $(find "$CONFIG_MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' | sort); do
+  if sq "$CFG_A" ".read $f" >/dev/null 2>&1; then
+    echo "  FAIL: $(basename "$f") applied twice without error." >&2
+    echo "        Something in it is conditional, so the ledger is no longer load-bearing." >&2
+    status=1
+  else
+    echo "  $(basename "$f") refused, as it must"
+  fi
+done
+
+echo "=== the configuration database: path B applied $cfg_prev_n migration(s) before HEAD"
+cfg_head_n=$(find "$CONFIG_MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' | wc -l | tr -d ' ')
+if [ "$cfg_prev_n" -eq 0 ]; then
+  echo "    WEAK: no previous $CONFIG_MIGRATIONS_DIR/, so path B was a second path A. The" >&2
+  echo "          second-application check above is the strong one on this run." >&2
+elif [ "$cfg_prev_n" -eq "$cfg_head_n" ]; then
+  echo "    WEAK: HEAD adds no configuration migration, so both paths ran the same set." >&2
+else
+  echo "    path B exercised a real upgrade over $( [ "$cfg_seeded" -eq 1 ] && echo seeded || echo empty ) tables."
+fi
+
+if [ "$status" -eq 0 ]; then
+  echo "=== both schemas: both paths agree, and a second application is a no-op"
+fi
 exit "$status"

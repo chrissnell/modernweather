@@ -547,6 +547,16 @@ jobs:
           echo /usr/lib/postgresql/17/bin >> "$GITHUB_PATH"
           /usr/lib/postgresql/17/bin/psql --version
           /usr/lib/postgresql/17/bin/pg_dump --version
+      # The gate covers two databases: the weather schema on this service container and the
+      # configuration schema on SQLite (D-8 as amended by A-W6-2). The runner image ships
+      # sqlite3, so this is one apt call rather than a failure part-way through the run.
+      - name: Ensure sqlite3 is present
+        run: |
+          if ! command -v sqlite3 >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends sqlite3
+          fi
+          sqlite3 --version
       - name: Assert the server version (D-42)
         run: psql --set ON_ERROR_STOP=1 "$DATABASE_URL" -f ci/sql/assert-timescaledb-version.sql
       - name: Apply the migrations twice and compare
