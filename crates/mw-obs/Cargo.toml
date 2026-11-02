@@ -1,0 +1,24 @@
+[package]
+name = "mw-obs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "tracing setup, the reload handle, the ring, dedupe and access-log layers, the metrics recorder."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Workspace crates, by layer (ci/layers.toml).
+mw-types.workspace = true
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-log.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+chrono.workspace = true
+thiserror.workspace = true

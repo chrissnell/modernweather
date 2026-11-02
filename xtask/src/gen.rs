@@ -4,7 +4,7 @@
 // (R-2), and every file lands under `generated/` so that the drift check is one path
 // and a PR touching generated code without touching the registry is wrong on sight.
 
-use crate::registry::{Registry, Tier};
+use crate::registry::{Registry, SqlType, Tier};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -447,14 +447,30 @@ fn rust_reading(reg: &Registry) -> String {
     );
     for m in reg.live_metrics() {
         let variant = pascal(&m.key);
-        if m.sql_type.numeric() {
-            let _ = writeln!(
-                s,
-                "            MetricKey::{variant} => self.{}.map(f64::from),",
-                rust_ident(&m.key)
-            );
-        } else {
-            let _ = writeln!(s, "            MetricKey::{variant} => None,");
+        let field = rust_ident(&m.key);
+        match m.sql_type {
+            // Both widen to f64 losslessly, so `From` is implemented and is the honest
+            // spelling.
+            SqlType::Float4 | SqlType::Int4 => {
+                let _ = writeln!(
+                    s,
+                    "            MetricKey::{variant} => self.{field}.map(f64::from),"
+                );
+            }
+            // `i64` has no lossless widening to f64 — 2^53 is where the mantissa runs out —
+            // so the standard library does not implement `From<i64> for f64` and the cast
+            // has to be written. `f64::from` here was a compile error for as long as
+            // nothing compiled this file; see the note in docs/implementation-plan.md's
+            // M2-1 entry.
+            SqlType::Int8 => {
+                let _ = writeln!(
+                    s,
+                    "            MetricKey::{variant} => self.{field}.map(|v| v as f64),"
+                );
+            }
+            SqlType::Text | SqlType::Timestamptz => {
+                let _ = writeln!(s, "            MetricKey::{variant} => None,");
+            }
         }
     }
     s.push_str("        }\n    }\n}\n");

@@ -1,0 +1,68 @@
+[package]
+name = "modernweather"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "The ModernWeather daemon."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "modernweather"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace crates, by layer (ci/layers.toml).
+mw-types.workspace = true
+mw-proto.workspace = true
+mw-codec.workspace = true
+mw-aprs.workspace = true
+mw-obs.workspace = true
+mw-component.workspace = true
+mw-supervisor.workspace = true
+mw-store.workspace = true
+mw-pipeline.workspace = true
+mw-station.workspace = true
+mw-http.workspace = true
+mw-api-legacy.workspace = true
+mw-web.workspace = true
+mw-grpc.workspace = true
+mw-output.workspace = true
+mw-collector.workspace = true
+mw-api-mgmt.workspace = true
+
+anyhow.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+tracing.workspace = true
+sd-notify.workspace = true
+
+# Packaging, verbatim from docs/release.md §6, which asks for exactly this block when
+# `crates/modernweather` lands. `cargo xtask dist` reads ci/release.toml for the target
+# matrix and `cargo deb` / `cargo generate-rpm` read these.
+[package.metadata.deb]
+maintainer = "Chris Snell <chris.snell@gmail.com>"
+depends = ""                      # statically linked; no shared-library dependencies
+section = "net"
+priority = "optional"
+assets = [
+  ["target/release/modernweather", "usr/bin/", "755"],
+  ["../../packaging/systemd/modernweather.service", "usr/lib/systemd/system/", "644"],
+  ["../../packaging/sysusers/modernweather.conf", "usr/lib/sysusers.d/", "644"],
+]
+conf-files = ["/var/lib/modernweather/config.db"]
+maintainer-scripts = "../../packaging/deb"
+
+[package.metadata.generate-rpm]
+assets = [
+  { source = "target/release/modernweather", dest = "/usr/bin/modernweather", mode = "755" },
+  { source = "../../packaging/systemd/modernweather.service", dest = "/usr/lib/systemd/system/modernweather.service", mode = "644" },
+  { source = "../../packaging/sysusers/modernweather.conf", dest = "/usr/lib/sysusers.d/modernweather.conf", mode = "644" },
+]
+pre_install_script = "../../packaging/rpm/preinstall.sh"
+post_install_script = "../../packaging/rpm/postinstall.sh"
+pre_uninstall_script = "../../packaging/rpm/preremove.sh"

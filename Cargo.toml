@@ -17,10 +17,132 @@ rust-version = "1.96"
 license = "MIT"
 repository = "https://github.com/chrissnell/modernweather"
 
-# W3 populates this as crates arrive. Pinning versions here keeps one version of each
-# crate across the workspace, which is what makes `cargo xtask codegen --check` and the
-# conformance replay compare like with like.
+# Pinning versions here keeps one version of each crate across the workspace, which is what
+# makes `cargo xtask codegen --check` and the conformance replay compare like with like.
+#
+# Every third-party entry below is a crate DESIGN.md §6 (D-32) or its amendment A-W3-1 /
+# A-W8-3 names for an idiom this program needs. A substitution is an amendment, not a
+# manifest edit. The five versions the ARMv6 measurement actually linked and ran --
+# `tokio` 1, `sqlx` 0.8, `axum` 0.8, `argon2` 0.5, `zerocopy` 0.8, `rustls` 0.23 with
+# `ring` -- are held at the versions `ci/spike/probe/Cargo.toml` measured, because that
+# probe is the evidence for docs/release.md Appendix A and a newer major would make the
+# measurement describe a different binary.
+#
+# Which crates may name which of these is `ci/layers.toml`, enforced by
+# `cargo xtask gate layout`.
 [workspace.dependencies]
+# The eighteen crates of docs/service-architecture.md §1.2, lowest layer first. The
+# binary is not listed: nothing may depend on it.
+mw-types = { path = "crates/mw-types" }
+mw-proto = { path = "crates/mw-proto" }
+mw-codec = { path = "crates/mw-codec" }
+mw-aprs = { path = "crates/mw-aprs" }
+mw-obs = { path = "crates/mw-obs" }
+mw-component = { path = "crates/mw-component" }
+mw-supervisor = { path = "crates/mw-supervisor" }
+mw-store = { path = "crates/mw-store" }
+mw-pipeline = { path = "crates/mw-pipeline" }
+mw-station = { path = "crates/mw-station" }
+mw-http = { path = "crates/mw-http" }
+mw-api-legacy = { path = "crates/mw-api-legacy" }
+mw-web = { path = "crates/mw-web" }
+mw-grpc = { path = "crates/mw-grpc" }
+mw-output = { path = "crates/mw-output" }
+mw-collector = { path = "crates/mw-collector" }
+mw-api-mgmt = { path = "crates/mw-api-mgmt" }
+
+# Errors: `thiserror` per module, `anyhow` only at the binary boundary (D-32, §4).
+anyhow = "1"
+thiserror = "2"
+
+# Async runtime, cancellation, framing. The feature list is the union of what the design
+# requires; a crate that does not need the runtime does not list `tokio` at all, which is
+# the part `ci/layers.toml` enforces.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "fs", "io-util", "sync", "signal", "process"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Sink composition, rate limiting (D-32). The layer order in component-model.md §4b.5 is
+# Retry outside RateLimit outside Timeout, which is why all three features are here.
+tower = { version = "0.5", features = ["retry", "limit", "timeout", "util"] }
+tower-http = { version = "0.7", features = ["compression-full", "cors", "set-header", "trace"] }
+
+# HTTP and gRPC on one listener (D-32). `hyper-util`'s auto connection builder serves
+# plaintext h2c for a LAN peer with no TLS (§6, decision 72).
+axum = "0.8"
+http = "1"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+
+# TLS and the SNI resolver: `rustls` + `ring` (A-W8-3). `ring` rather than `aws-lc-rs`
+# because it is smaller, needs no `cmake`, and is on the ARMv6 assembly allowlist.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
+
+# Both databases (D-32). One driver, two backends; `tls-rustls-ring` so there is one TLS
+# stack in the binary rather than two.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "sqlite", "macros", "migrate", "chrono"] }
+
+# One schema for REST-JSON and gRPC-protobuf (D-32), parsed at build time by `protox` so
+# no `protoc` binary is needed on any of the four cross targets or on a Pi (A-W3-1).
+prost = "0.14"
+pbjson = "0.9"
+prost-build = "0.14"
+pbjson-build = "0.9"
+protox = "0.10"
+
+# Serialisation. `mw-types` deliberately does not appear among the crates that may name
+# `serde`: the domain type carries no rename, which is what keeps a legacy key out of it
+# (§1.7).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1"
+
+# Time. `chrono::DateTime<Utc>` is what the generator emits and what `sqlx` maps (§1.6);
+# `chrono-tz` is needed for the calendar trigger's time zones.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono-tz = "0.10"
+
+# The public website: compile-time checked templates and one static binary per target.
+askama = "0.16"
+rust-embed = "8"
+
+# Logging and metrics are two surfaces, not one (A-W3-1, §5.10). `tracing-log` is
+# installed once so that `sqlx`, `hyper` and `rustls` land in the same pipeline.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
+tracing-log = "0.2"
+metrics = "0.24"
+# default-features = false: the exporter's own HTTP listener is not wanted, because only
+# `mw-http` may bind a socket (§1.4).
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+
+# Published snapshots read without a lock (D-32, §2a.2).
+arc-swap = "1"
+
+# Secrets, constant-time comparison, password hashing (D-32).
+secrecy = "0.10"
+subtle = "2"
+argon2 = "0.5"
+
+# Fixed-layout binary packet decode -- the Davis LOOP packet is a struct (D-32).
+zerocopy = { version = "0.8", features = ["derive"] }
+
+# The spool: a length, a `seq` and a CRC32C per record (W7 §3). Hardware-accelerated on
+# every release target.
+crc32c = "0.6"
+
+# `Envelope::path` is an ordered `SmallVec<[OriginId; 8]>` (D-59).
+smallvec = { version = "1", features = ["union"] }
+
+# The management OpenAPI schema is derived from the Rust handlers rather than
+# hand-maintained (A-W3-1, W5 D-37).
+utoipa = "6"
+
+# `Type=notify` without linking `libsystemd`, which a static musl build cannot (A-W3-1).
+sd-notify = "0.5"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

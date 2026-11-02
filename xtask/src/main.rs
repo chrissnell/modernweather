@@ -24,6 +24,7 @@ mod coverage;
 mod dist;
 mod gates;
 mod gen;
+mod layout;
 mod legacy;
 mod migrate;
 mod registry;
@@ -58,6 +59,9 @@ fn main() -> ExitCode {
         "budget" => budget(&root),
         "validate" => validate_cmd(&root),
         "gates" => gates::list(&owned).map(|()| ExitCode::SUCCESS),
+        // The `layout` gate's command. Separate from `gate layout`, which is the
+        // runner: `cargo xtask gate layout` consults ci/gates.toml and then runs this.
+        "gate-layout" => layout::main(&owned),
         // Not mapped to a code of its own: the gate's command has already decided what
         // its failure means, and collapsing that was C-W2-20.
         "gate" => gates::run(&owned),
@@ -128,6 +132,9 @@ fn usage() {
          \x20 gate <id>          run one gate, or report it as deferred and succeed.\n\
          \x20                    Exits with the command's own code, and reports the\n\
          \x20                    meaning that code has in ci/gates.toml.\n\
+         \x20 gate-layout        check the crate boundaries declared in ci/layers.toml:\n\
+         \x20                    the layer order, every crate's forbidden list, and the\n\
+         \x20                    source rules. Exit 1 on a violation.\n\
          \x20 coverage --check   compare line coverage against ci/coverage-floor.txt\n\
          \x20          --bump    raise the floor to the measured value\n\
          \x20 dist --target <t>  build and package one release artefact\n\

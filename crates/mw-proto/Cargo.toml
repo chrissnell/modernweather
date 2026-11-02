@@ -1,0 +1,22 @@
+[package]
+name = "mw-proto"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "The wire types: prost + pbjson over generated/proto/reading.proto."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Workspace crates, by layer (ci/layers.toml).
+mw-types.workspace = true
+
+prost.workspace = true
+pbjson.workspace = true
+serde.workspace = true
+chrono.workspace = true
+

@@ -1,0 +1,21 @@
+[package]
+name = "mw-codec"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Pure frame decoders: Davis LOOP, Campbell ASCII, WLL, Ambient, AirGradient, snow gauge."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Workspace crates, by layer (ci/layers.toml).
+mw-types.workspace = true
+
+thiserror.workspace = true
+zerocopy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
