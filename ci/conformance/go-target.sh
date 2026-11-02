@@ -300,7 +300,23 @@ start_bg bootstrap "$bin/rw" -config "$config_db"
 bootstrap_pid=$LAST_BG_PID
 await "the configuration schema" 60 \
     sqlite3 -bail "$config_db" "select count(*) from controller_configs"
+# SIGTERM is asynchronous, and `rw` holds the configuration database open until it has finished
+# shutting down. Seeding straight after the kill therefore raced it: the reads in the await above
+# share the lock happily, but config-seed.sql's first write -- `DELETE FROM devices`, line 30 --
+# failed with `database is locked (5)`. Wait for the process to be gone before writing, and
+# escalate to SIGKILL rather than carrying on into the same race.
 kill "$bootstrap_pid" 2>/dev/null || true
+# `wait` rather than a `kill -0` poll: it is exact, and on a child that has already exited it
+# returns at once instead of waiting out a one-second poll interval. The watchdog is what keeps
+# it bounded -- the thing the cleanup() comment warns about is an *unbounded* wait, and 15s of
+# SIGTERM being ignored is the escalation point, not a reason to seed into a held lock.
+bootstrap_started=$SECONDS
+( sleep 15; kill -9 "$bootstrap_pid" 2>/dev/null ) &
+bootstrap_watchdog=$!
+wait "$bootstrap_pid" 2>/dev/null || true
+kill "$bootstrap_watchdog" 2>/dev/null || true
+wait "$bootstrap_watchdog" 2>/dev/null || true
+printf '    the bootstrap daemon exited after %ss\n' "$((SECONDS - bootstrap_started))"
 # Dropped from the cleanup list by value: negative array subscripts need bash 4.3, and this
 # script is meant to run on a developer's machine as well as on a runner.
 remaining=()
@@ -312,10 +328,16 @@ pids=("${remaining[@]:-}")
 say "Seeding the configuration database"
 # -bail throughout: without it the sqlite3 CLI prints "Parse error" and exits 0, so a seed that
 # created nothing would look like a seed that worked.
-sqlite3 -bail "$config_db" < "$here/config-seed.sql"
+#
+# `.timeout` because the CLI's busy timeout defaults to 0, which turns any lock still held into
+# an immediate failure rather than a short wait. Belt to the braces of waiting for the bootstrap
+# daemon above: five seconds absorbs a slow shutdown, and a lock nobody releases still fails
+# loudly rather than being masked.
+sqlite_write() { sqlite3 -bail -cmd '.timeout 5000' "$@"; }
+sqlite_write "$config_db" < "$here/config-seed.sql"
 # The storage backend is the one row that cannot be committed: it carries the DSN of whatever
 # database this run was pointed at.
-sqlite3 -bail "$config_db" "INSERT INTO storage_configs
+sqlite_write "$config_db" "INSERT INTO storage_configs
     (config_id, backend_type, enabled, timescale_host, timescale_port,
      timescale_database, timescale_user, timescale_password, timescale_ssl_mode)
   VALUES (1, 'timescaledb', 1,
