@@ -15,3 +15,10 @@
 
 /// The configuration store and its migrations (D-8, A-W6-2).
 pub mod config_db;
+/// `ScheduleStore` over `component_schedule` alone -- the supervisor's own durable state
+/// (**D-41**).
+pub mod schedule;
+/// The startup database-version assertion (**D-62**).
+pub mod version;
+
+pub use crate::schedule::SqliteScheduleStore;

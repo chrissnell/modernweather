@@ -1378,6 +1378,7 @@ name = "modernweather"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "metrics",
  "mw-api-legacy",
  "mw-api-mgmt",
  "mw-aprs",
@@ -1396,8 +1397,11 @@ dependencies = [
  "mw-types",
  "mw-web",
  "sd-notify",
+ "secrecy",
  "sqlx",
+ "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -1525,6 +1529,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "mw-types",
+ "serde_json",
  "thiserror",
  "tracing",
  "tracing-log",
@@ -1591,6 +1596,7 @@ dependencies = [
  "chrono",
  "mw-component",
  "mw-types",
+ "secrecy",
  "serde",
  "sqlx",
  "thiserror",

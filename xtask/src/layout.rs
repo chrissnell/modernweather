@@ -72,10 +72,22 @@ pub struct DepRule {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceRule {
     pub id: String,
     pub needles: Vec<String>,
     pub only: Vec<String>,
+    /// Repository-relative paths the rule exempts, for a rule whose legitimate call site
+    /// is one FILE rather than one crate.
+    ///
+    /// `no-stdout-logging` is the case this exists for: §5.1 allows `println!` "only on
+    /// the binary's argument-parsing path", and the crate was the finest unit this gate
+    /// could express -- which made the rule a convention inside `crates/modernweather`
+    /// and left a note saying the narrowing arrives with implementation-plan.md M2-4. It
+    /// has. A path here is checked for existence by the self-check, so an exemption that
+    /// outlives the file it names is a load failure rather than a silent widening.
+    #[serde(default)]
+    pub only_paths: Vec<String>,
     pub reason: String,
 }
 
@@ -101,6 +113,20 @@ pub fn load(root: &Path) -> Result<Layers, String> {
         toml::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
     decl.self_check()
         .map_err(|e| format!("{}: {e}", path.display()))?;
+    // Path exemptions are checked against the tree, which `self_check` cannot see. An
+    // exemption naming a file that no longer exists is how a narrowed rule quietly
+    // becomes a wide one again.
+    for rule in &decl.source_rules {
+        for exempt in &rule.only_paths {
+            if !root.join(exempt).is_file() {
+                return Err(format!(
+                    "{}: source_rule `{}` exempts `{exempt}`, which is not a file in the tree",
+                    path.display(),
+                    rule.id
+                ));
+            }
+        }
+    }
     Ok(decl)
 }
 
@@ -650,7 +676,7 @@ fn check_sources(root: &Path, decl: &Layers, v: &mut Vec<Violation>) -> Result<(
         for (path, text) in files {
             let rel = crate::rel_path(&path, root);
             for rule in &decl.source_rules {
-                if rule.only.contains(&c.name) {
+                if rule.only.contains(&c.name) || rule.only_paths.contains(&rel) {
                     continue;
                 }
                 for (line, needles) in matches(&text, &rule.needles) {
@@ -969,6 +995,29 @@ mod tests {
                 "source_rule {id}"
             );
         }
+        // §5.1 allows `println!` on the binary's argument-parsing path and nowhere else.
+        // The crate was the finest unit this gate could express until
+        // implementation-plan.md M2-4 wrote that path; `only` being empty is what makes
+        // the rule name files rather than a crate, and an exemption added back at crate
+        // granularity would silence it for every handler in the binary.
+        let stdout = decl
+            .source_rules
+            .iter()
+            .find(|r| r.id == "no-stdout-logging")
+            .expect("the rule exists");
+        assert!(
+            stdout.only.is_empty(),
+            "no crate may be exempt from `no-stdout-logging`, only named files"
+        );
+        assert_eq!(
+            stdout.only_paths,
+            [
+                "crates/modernweather/src/args.rs",
+                "crates/mw-obs/src/stderr.rs"
+            ],
+            "the exempt set is the whole of this rule's narrowing, and widening it one \
+             file at a time is the gradual version of the hole the mechanism closed"
+        );
     }
 
     /// §1.2's load-bearing prohibitions, named here so that deleting one from
@@ -1081,6 +1130,13 @@ only = ["c-high"]
 reason = "only one crate may bind a socket"
 
 [[source_rule]]
+id = "one-printer"
+needles = ["println!"]
+only = []
+only_paths = ["crates/c-high/src/print.rs"]
+reason = "one file may reach a terminal"
+
+[[source_rule]]
 id = "one-seam"
 needles = ["#[path"]
 only = ["a-low"]
@@ -1101,6 +1157,12 @@ reason = "nothing hand-written lives in generated/"
                 me.crate_manifest(name, "");
                 me.write(&format!("crates/{name}/src/lib.rs"), "");
             }
+            // `one-printer` exempts this path, and a path exemption must name a file that
+            // exists -- so the clean tree has to contain it. In `c-high` rather than
+            // `b-low` because one case below removes that crate's whole directory, and a
+            // missing exemption is a LOAD failure: it would turn that case's assertion
+            // into this mechanism's error message.
+            me.write("crates/c-high/src/print.rs", "");
             me
         }
 
@@ -1472,6 +1534,46 @@ reason = "nothing hand-written lives in generated/"
             "fn go() { let l = TcpListener::bind(\"0.0.0.0:80\"); }\n",
         );
         assert!(s2.check().is_empty(), "{:?}", s2.check());
+    }
+
+    /// The narrowing implementation-plan.md M2-4 owed `no-stdout-logging`: an exemption
+    /// that is one FILE rather than one crate.
+    ///
+    /// Proved able to fail in both directions, because an exemption nobody has watched
+    /// reject anything is the same shape as a gate that never ran.
+    #[test]
+    fn a_path_exemption_covers_that_file_and_nothing_beside_it() {
+        let s = Scratch::new();
+        s.write(
+            "crates/c-high/src/print.rs",
+            "fn usage() { println!(\"usage\"); }\n",
+        );
+        assert!(
+            s.check().is_empty(),
+            "the exempt path may contain the needle: {:?}",
+            s.check()
+        );
+
+        // One directory entry away, in the same crate, is a violation. This is the case
+        // the crate-granular rule could not see.
+        let s2 = Scratch::new();
+        s2.write(
+            "crates/c-high/src/other.rs",
+            "fn debug() { println!(\"here\"); }\n",
+        );
+        assert_eq!(s2.rules(), ["one-printer"], "{:?}", s2.check());
+        assert!(s2.what("one-printer").contains("other.rs:1"));
+    }
+
+    /// An exemption that outlives the file it names would quietly widen the rule back to
+    /// the whole crate, so it fails the load rather than passing the check.
+    #[test]
+    fn a_path_exemption_naming_a_missing_file_fails_to_load() {
+        let s = Scratch::new();
+        std::fs::remove_file(s.root.join("crates/c-high/src/print.rs")).unwrap();
+        let err = super::check(&s.root).expect_err("the exemption names nothing");
+        assert!(err.contains("one-printer"), "{err}");
+        assert!(err.contains("not a file in the tree"), "{err}");
     }
 
     /// Whitespace is not a hiding place. A needle may also be written readably.

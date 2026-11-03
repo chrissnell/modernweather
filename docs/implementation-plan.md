@@ -483,6 +483,15 @@ unreported metric is **NULL**, not `0.0` (D-26); `station_metrics` reflects what
 skips** — `cargo xtask gate db-tests` is created and armed here, which is one of G-4's four
 undeclared gates and the one whose whole purpose is to make "green because it did not run"
 unreachable.
+**Constraint from M2-4, recorded here because this item is where it lands:** `db:postgres` must
+**assert the database version when it first connects**, reusing `mw_store::version::check`. M2-4
+asserts **D-62** in the boot sequence, but only against a server that answers: a server that is
+unreachable or slow at startup is logged and started past, because refusing to boot because
+TimescaleDB is down is the failure **D-27** rejects. That carve-out is only safe while something
+re-asserts, and this is the item that owns the pool. `tests/db.rs` should also cover
+`mw_store::version::probe` itself against the container — its SQL, its column aliases and its
+decoded types have no other test, because no gate runs PostgreSQL for `mw-store` until this item
+arms one.
 
 ### M3-4 — window rollup and the component-maintained values
 **Depends on:** M3-3. **Blocks:** M4-1, M6-2.

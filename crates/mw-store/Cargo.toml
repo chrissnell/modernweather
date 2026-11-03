@@ -18,6 +18,9 @@ mw-types.workspace = true
 
 sqlx.workspace = true
 serde.workspace = true
+# The weather database's URL carries a password, so it is a `SecretString` from the moment
+# it is read (**D-33**) rather than a `String` that somebody later remembers to redact.
+secrecy.workspace = true
 chrono.workspace = true
 tokio.workspace = true
 tracing.workspace = true

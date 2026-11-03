@@ -349,12 +349,42 @@ so it is handled where it would do damage -- `forbidden_source` on `mw-store` an
 [[source_rule]]
 id = "no-stdout-logging"
 needles = ["println!", "eprintln!", "print!", "eprint!", "dbg!", "io::stdout", "io::stderr"]
-only = ["modernweather"]
+only = []
+only_paths = [
+  "crates/modernweather/src/args.rs",
+  "crates/mw-obs/src/stderr.rs",
+]
 reason = """
 docs/service-architecture.md §5.1 allows these only on the binary's argument-parsing path,
 which is the one place a message has to reach a terminal before a subscriber exists. The
-crate is the finest unit this gate can enforce today; narrowing it to the module arrives with
-M2-4, which writes that path."""
+crate used to be the finest unit this gate could enforce, and the note here said the
+narrowing arrives with implementation-plan.md M2-4, which writes that path. It has: `only`
+is now empty and two FILES are exempt, so a `println!` anywhere else in the binary --
+including in a handler somebody debugs and forgets -- is a gate failure rather than a
+convention.
+
+Two paths, not one, because the rule's needles cover two different things. `println!` and
+friends belong to the pre-subscriber path: `crates/modernweather/src/args.rs` prints
+`--help`, prints the usage after a rejected command line, and carries the one `eprintln!`
+that reports a failure which happened before (or instead of) the subscriber -- a daemon
+that exits 1 silently is what `Type=notify` was adopted to stop.
+
+`io::stderr` is the other half, and `mw-obs` is where it has to be: §5.1's rule is "`tracing`
+macros only", and the stream `tracing` writes to has to be named somewhere. Collecting every
+environment read and the locked `write_all` into `crates/mw-obs/src/stderr.rs` makes that one
+file rather than one crate, which is also why the format detection next to it is a pure
+function over four booleans.
+
+A path here must exist: `cargo xtask gate-layout` fails to LOAD if one does not, so an
+exemption that outlives the file it names cannot quietly widen the rule back out. The
+exact set is also asserted by a test, because widening it one file at a time is the gradual
+version of the hole this narrowing closed.
+
+One property of the narrowing worth knowing before it surprises somebody: the scan is a
+whitespace-squeezed substring match over the whole file, so it does not know what a comment
+is. A doc comment in the binary that NAMES `println!` -- while explaining this rule, say --
+is a violation now that the crate is no longer exempt. `crates/modernweather/src/args.rs`
+contains exactly that, and passes only because it is one of the two exempt paths."""
 
 [[source_rule]]
 id = "no-template-escape-opt-out"
