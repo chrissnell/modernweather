@@ -19,7 +19,7 @@
 //!     .with(DedupeLayer)            // event_enabled -> whole-pipeline suppression
 //!     .with(reload::Layer<EnvFilter>)   // the global level, runtime-adjustable
 //!     .with(WriteLayer)             // stderr: pretty+ANSI on a TTY, JSON otherwise
-//!     .with(RingLayer::app.with_filter(..))   // the UI buffer, independently filterable
+//!     .with(RingLayer::app.filtered(..))      // the UI buffer, independently filterable
 //!     .with(RingLayer::access)      // target == "mw::access" -> the access ring
 //! ```
 //!
@@ -32,7 +32,19 @@
 //! The one interaction worth knowing: the global filter is a floor for the per-layer ones.
 //! An event the reload filter rejects never reaches the ring, however wide the ring's own
 //! filter is -- so "raise `mw_station::davis` to DEBUG for ten minutes" (§5.5) raises the
-//! *global* directive, and the ring's filter narrows from there rather than widening.
+//! *global* directive, and the ring's filter narrows from there rather than widening. The
+//! access ring has no filter of its own for the same reason: it sits under the global
+//! floor, so a global directive of `warn` empties it, and §5.7's sizing argument assumes
+//! it fills.
+//!
+//! **§5.2's `ring_layer.with_filter(ring_filter)` is spelled differently here, and the
+//! difference is a defect it would otherwise introduce.** `Filtered` hands the wrapped
+//! layer a `Context` carrying its own `FilterId`, so `Context::event_scope` yields only the
+//! spans *that* filter enabled -- and a ring filter narrower than a span's level then
+//! produces records with no `station` and no span chain, while the unfiltered stderr layer
+//! keeps both. [`RingLayer`] therefore owns its filter and consults it in `on_event`; the
+//! reasoning and the one consequence (span-field directives need the per-layer machinery)
+//! are on that type.
 //!
 //! # What is deliberately not here
 //!
@@ -46,10 +58,15 @@
 //!   stream that follows it needs a broadcast channel, which needs `tokio`, which
 //!   `ci/layers.toml` forbids this crate. It belongs with the management API that serves
 //!   it (implementation-plan.md M7-1).
-//! - **The ring's field predicate** (§5.4's `FilterFn` over a station id) and the TTL on a
-//!   scoped level raise (§5.5). Both are management-API surface over the handles this
-//!   crate publishes, and the TTL's expiry belongs in the supervisor's timer heap because
-//!   there is one clock for the whole process (§3.3).
+//! - **Both halves of §5.4's "reloadable pair"** -- the field predicate (a `FilterFn` over
+//!   a station id) *and* the reloadability. The ring's filter is fixed at startup here;
+//!   `install` returns no handle for it, because the thing that would call that handle is
+//!   the management route that offers the operator a station to filter by
+//!   (implementation-plan.md M7-1). The global directive is reloadable today, which is the
+//!   half that has a consumer.
+//! - **The TTL on a scoped level raise** (§5.5). The expiry belongs in the supervisor's
+//!   timer heap because there is one clock for the whole process (§3.3), and the API that
+//!   offers the TTL is M7-1's.
 
 mod dedupe;
 mod error;
@@ -183,7 +200,7 @@ pub fn install(options: &Options) -> Result<Obs, ObsError> {
         .with(DedupeLayer::new(Arc::clone(&dedupe)))
         .with(filter_layer)
         .with(WriteLayer::new(shape))
-        .with(RingLayer::app(Arc::clone(&rings)).with_filter(ring_filter))
+        .with(RingLayer::app(Arc::clone(&rings)).filtered(ring_filter))
         .with(RingLayer::access(Arc::clone(&rings)));
     tracing::subscriber::set_global_default(subscriber).map_err(|e| {
         ObsError::SubscriberInstalled {

@@ -20,16 +20,24 @@
 //!
 //! # Where the summary is emitted from, and why it is not emitted from here
 //!
-//! §5.6 writes the summary as a `warn!` from the suppression path. It cannot be: an event
-//! macro goes through `tracing::dispatcher::get_default`, which refuses to re-enter a
-//! dispatch that is already in progress on this thread and hands the event to
-//! `Dispatch::none()` -- so a summary emitted from inside `event_enabled` reaches no sink
-//! under a scoped subscriber, which is every test that would prove it works. So
-//! [`Dedupe::pending`] accumulates and [`Dedupe::sweep`] emits, called from the binary's
-//! own loop tick alongside the watchdog and the recorder's upkeep. The observable
-//! behaviour §5.6 specifies is unchanged -- 3 immediate lines plus one summary a minute
-//! instead of 3,600 lines an hour -- and `sweep_at` is a pure function of the clock, which
-//! is what makes the arithmetic a unit test rather than a sixty-second test.
+//! §5.6 writes the summary as a `warn!` from the suppression path. It cannot be, for two
+//! reasons, and the decisive one is the deadlock:
+//!
+//! - **`self.buckets` is held while the decision is being made.** An event emitted from
+//!   inside `event_enabled` re-enters this layer's `event_enabled`, which takes the same
+//!   non-reentrant `std::sync::Mutex`. That is unconditional and fatal.
+//! - A scoped subscriber would not deliver it anyway. `tracing::dispatcher::get_default`
+//!   hands a re-entrant event to `Dispatch::none()` when a scoped dispatcher is live --
+//!   which is every test that would prove the summary works. (Under a *global* subscriber
+//!   there is a fast path with no re-entrancy check, so this half is conditional. The
+//!   deadlock above is not.)
+//!
+//! So [`Dedupe::sweep_at`] decides and releases the lock, and [`Dedupe::sweep`] emits
+//! afterwards, called from the binary's own loop tick alongside the watchdog and the
+//! recorder's upkeep. The observable behaviour §5.6 specifies is unchanged -- 3 immediate
+//! lines plus one summary a minute instead of 3,600 lines an hour -- and `sweep_at` is a
+//! pure function of the clock, which is what makes the arithmetic a unit test rather than
+//! a sixty-second test.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -49,8 +57,9 @@ pub const AUDIT_TARGET: &str = "mw::audit";
 
 /// The target this layer's own summaries carry.
 ///
-/// Exempt from suppression for a mechanical reason: every summary shares one callsite, so
-/// a throttled summary stream would be one bucket for every key in the table, and the
+/// Exempt from suppression for a mechanical reason: the summaries at one level share a
+/// callsite ([`Dedupe::sweep`] has three, one per level it re-emits at), so a throttled
+/// summary stream would be one bucket for every key in the table at that level, and the
 /// second suppressed key of the minute would silence the first one's summary.
 pub const DEDUPE_TARGET: &str = "mw::dedupe";
 
@@ -194,7 +203,7 @@ impl Dedupe {
         now: Instant,
     ) -> bool {
         let target = meta.target();
-        if never_suppressed(target, class.as_deref()) {
+        if exempt_target(target) || class.as_deref() == Some(mw_types::Class::Fatal.as_str()) {
             return true;
         }
         let key = Key {
@@ -217,6 +226,13 @@ impl Dedupe {
             bucket.tokens -= 1;
             true
         } else {
+            if bucket.suppressed == 0 {
+                // The window starts when suppression does, not when the key was first
+                // seen. A key that was created, went quiet for ten minutes and then
+                // started repeating would otherwise report `window_s = 600` on its first
+                // summary -- and §5.6 sells `window_s` as how the operator reads the rate.
+                bucket.reported_at = now;
+            }
             bucket.suppressed += 1;
             false
         }
@@ -297,13 +313,14 @@ impl Dedupe {
     }
 }
 
-/// §5.6's exemptions, plus the two this stack's own shape forces.
+/// The three exemptions decided by the target alone.
+///
+/// Separate from the `class` one so that it can be answered before any field is read:
+/// §5.6's fourth exemption needs the event's values and these do not.
 ///
 /// - `mw::audit` and anything beneath it: an audit log with holes is not an audit log.
-/// - `class = "fatal"`: §5.6's second exemption, keyed on the classification rather than
-///   the level because that is where the decision is made (§4.2).
-/// - `mw::dedupe`: every summary shares one callsite, so throttling them would mean the
-///   second suppressed key of the minute silenced the first one's summary.
+/// - `mw::dedupe`: the summaries at one level share a callsite, so throttling them would
+///   mean the second suppressed key of the minute silenced the first one's summary.
 /// - `mw::access`: **the access stream is one callsite emitting thousands of distinct
 ///   records**, and `station` and `class` are the only things that split a key -- so a
 ///   token bucket over it would cap the access log at three lines per thirty seconds and
@@ -312,16 +329,23 @@ impl Dedupe {
 ///   agree if repetition control does not apply to this target. Suppressing a request log
 ///   is also the wrong thing on its own terms: two identical `GET /latest` lines are two
 ///   requests, not one event repeated.
-fn never_suppressed(target: &str, class: Option<&str>) -> bool {
+///
+/// The fourth exemption is §5.6's own: `class = "fatal"`, keyed on the classification
+/// rather than the level because that is where the decision is made (§4.2).
+fn exempt_target(target: &str) -> bool {
     target == AUDIT_TARGET
         || target.starts_with("mw::audit::")
         || target == DEDUPE_TARGET
         || target == crate::ring::ACCESS_TARGET
-        || class == Some(mw_types::Class::Fatal.as_str())
 }
 
 /// Evict the least recently seen key, counted so that a table that is too small is
 /// visible rather than merely slower.
+///
+/// A linear min-scan rather than an intrusive LRU list: at most `policy.keys` comparisons,
+/// on an insert that only happens once the table is full, at §5.5's "a few hundred events
+/// per second". A key evicted before its window closes loses its tally -- the eviction is
+/// counted, the suppression it was tracking is not -- which is the cost of a bound.
 fn evict_oldest(buckets: &mut HashMap<Key, Bucket>) {
     let victim = buckets
         .iter()
@@ -370,6 +394,13 @@ where
     }
 
     fn event_enabled(&self, event: &Event<'_>, ctx: Context<'_, S>) -> bool {
+        // Before `key_parts`, which allocates. Three of the four exemptions are decided by
+        // the target alone, and one of them -- `mw::access` -- is 93% of this process's
+        // events (§5.7) and carries `station` after host resolution, so deciding it after
+        // the visit would pay for a `String` per field on the hottest path in the system.
+        if exempt_target(event.metadata().target()) {
+            return true;
+        }
         let (station, class) = key_parts(event, &ctx);
         self.state
             .admit_at(event.metadata(), station, class, Instant::now())

@@ -462,16 +462,10 @@ impl Outcome {
     /// Here rather than in `mw-store` because the column's vocabulary and this enum have
     /// to be one fact: the migration's `CHECK (outcome IN (...))` lists exactly these five
     /// spellings, and a mapping written beside the query would be a second place for the
-    /// sixth one to be forgotten.
+    /// sixth one to be forgotten. Derived from [`Outcome::as_str`] for the same reason --
+    /// a second `match` over the spellings is a second place to forget it.
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "ok" => Some(Outcome::Ok),
-            "failed" => Some(Outcome::Failed),
-            "deadline_exceeded" => Some(Outcome::DeadlineExceeded),
-            "skipped" => Some(Outcome::Skipped),
-            "misfired" => Some(Outcome::Misfired),
-            _ => None,
-        }
+        Outcome::ALL.into_iter().find(|o| o.as_str() == s)
     }
 
     /// Every outcome, so that a round-trip test cannot miss one.
@@ -482,6 +476,27 @@ impl Outcome {
         Outcome::Skipped,
         Outcome::Misfired,
     ];
+
+    /// This outcome's position in [`Outcome::ALL`].
+    ///
+    /// An exhaustive match, which is the whole point: a sixth outcome fails to compile
+    /// *here*, so `ALL` is a checked fact rather than a hand-written list that happens to
+    /// be complete. Without it, adding a variant left `ALL` at five entries, `parse`
+    /// returning `None` for the new spelling, and both round-trip tests still green --
+    /// under precisely the change they exist to guard.
+    ///
+    /// `#[cfg(test)]` because nothing in the daemon wants a position: the enforcement is
+    /// at test-compile time, which `cargo test` in the PR gate runs.
+    #[cfg(test)]
+    const fn index(self) -> usize {
+        match self {
+            Outcome::Ok => 0,
+            Outcome::Failed => 1,
+            Outcome::DeadlineExceeded => 2,
+            Outcome::Skipped => 3,
+            Outcome::Misfired => 4,
+        }
+    }
 
     /// The stored and exported spelling.
     pub const fn as_str(self) -> &'static str {
@@ -516,6 +531,30 @@ mod tests {
             );
         }
         assert_eq!(Outcome::parse("completed"), None);
+    }
+
+    /// `ALL` is hand-written and `index` is exhaustive, so this is what ties them: a
+    /// sixth variant cannot compile without touching `index`, and `index` cannot
+    /// disagree with `ALL` without failing here.
+    #[test]
+    fn all_lists_every_outcome_exactly_once() {
+        for outcome in Outcome::ALL {
+            assert_eq!(
+                Outcome::ALL[outcome.index()],
+                outcome,
+                "{outcome} is not at its own index in ALL"
+            );
+        }
+        let highest = Outcome::ALL
+            .iter()
+            .map(|o| o.index())
+            .max()
+            .expect("ALL is not empty");
+        assert_eq!(
+            Outcome::ALL.len(),
+            highest + 1,
+            "ALL has a gap or a duplicate"
+        );
     }
     use super::*;
     use mw_types::DisplayChain;

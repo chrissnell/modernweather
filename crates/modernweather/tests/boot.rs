@@ -211,8 +211,10 @@ async fn an_empty_configuration_starts_converges_notifies_serves_and_stops() {
 
     // 5: SIGTERM, cleanly, inside the grace.
     terminate(&child);
-    let stopping = notified_with(&socket, "STOPPING=1").await;
-    assert!(!stopping.is_empty());
+    // `notified_with` panics if the needle never arrives, so reaching the next line *is*
+    // the assertion that STOPPING=1 was sent -- and it was sent after READY=1, which is
+    // the order §3.5 specifies.
+    notified_with(&socket, "STOPPING=1").await;
     let status = tokio::time::timeout(GRACE, child.wait())
         .await
         .expect("the daemon exits inside the 10-second grace")
@@ -256,16 +258,9 @@ async fn an_unreachable_weather_database_does_not_stop_the_daemon_starting() {
     configure(&config, port).await;
 
     // Port 1 on loopback: nothing listens there, and a connection is refused rather than
-    // timing out. The URL still has to satisfy the schema's scheme CHECK.
-    let pool = mw_store::config_db::open_and_migrate(&config)
-        .await
-        .expect("migrated");
-    sqlx::query("INSERT INTO weather_database (id, url) VALUES (1, ?1)")
-        .bind("postgres://mw:secret@127.0.0.1:1/weather")
-        .execute(&pool)
-        .await
-        .expect("the row is insertable");
-    pool.close().await;
+    // timing out. The URL still has to satisfy the schema's scheme CHECK. The slow shape
+    // of the same failure is `a_blackholed_weather_database_does_not_hold_the_boot_open`.
+    configure_weather_database(&config, "postgres://mw:secret@127.0.0.1:1/weather").await;
 
     let socket = notify_socket(&notify);
     let mut child = spawn(&config, &notify);
@@ -280,6 +275,96 @@ async fn an_unreachable_weather_database_does_not_stop_the_daemon_starting() {
         .expect("exits inside the grace")
         .expect("the exit status is readable");
     assert!(status.success(), "{status:?}");
+}
+
+/// An address that accepts no connection and refuses none either.
+///
+/// RFC 5737's TEST-NET-1, which is guaranteed never to be routed to a real host: a
+/// connection attempt hangs until the kernel gives up, which is minutes. That is the
+/// common production shape of "the database is unreachable" -- a firewall, a dead host on
+/// a routed subnet, a partition -- and it is the one a refused connection on loopback does
+/// not exercise.
+const BLACKHOLE_URL: &str = "postgres://mw:secret@192.0.2.1:5432/weather";
+
+async fn configure_weather_database(config: &Path, url: &str) {
+    let pool = mw_store::config_db::open_and_migrate(config)
+        .await
+        .expect("migrated");
+    sqlx::query("INSERT INTO weather_database (id, url) VALUES (1, ?1)")
+        .bind(url)
+        .execute(&pool)
+        .await
+        .expect("the row is insertable");
+    pool.close().await;
+}
+
+/// **D-27**, in the shape that actually bites: the boot sequence must be *bounded*, not
+/// merely tolerant of a fast failure.
+///
+/// Without a deadline on the D-62 probe the daemon never binds and never notifies, so
+/// systemd kills the start at `TimeoutStartSec=60` and `Restart=always` makes that a loop
+/// — "refusing to boot because TimescaleDB is down", which is what D-27 rejects.
+#[tokio::test]
+async fn a_blackholed_weather_database_does_not_hold_the_boot_open() {
+    let scratch = Scratch::new("db-blackhole");
+    let config = scratch.path("config.db");
+    let notify = scratch.path("notify.sock");
+    let port = free_port().await;
+    configure(&config, port).await;
+    configure_weather_database(&config, BLACKHOLE_URL).await;
+
+    let socket = notify_socket(&notify);
+    let mut child = spawn(&config, &notify);
+    let started = std::time::Instant::now();
+    notified_with(&socket, "READY=1").await;
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the boot waited {:?} on an unreachable database",
+        started.elapsed()
+    );
+
+    terminate(&child);
+    let status = tokio::time::timeout(GRACE, child.wait())
+        .await
+        .expect("exits inside the grace")
+        .expect("the exit status is readable");
+    assert!(status.success(), "{status:?}");
+}
+
+/// A `systemctl stop` that arrives mid-startup is an ordered exit, not a kill.
+///
+/// The signal handler used to be installed when the main loop started, so every step of
+/// the boot sequence ran with SIGTERM at its default disposition: the process died with
+/// status `signal: 15`, no `STOPPING=1`, and "killed by signal TERM" in the journal. The
+/// blackholed database is how the test gets a startup long enough to aim at, and the
+/// boot's own `STATUS=` lines are how it aims without a sleep.
+#[tokio::test]
+async fn sigterm_during_startup_is_an_ordered_exit() {
+    let scratch = Scratch::new("stop-during-start");
+    let config = scratch.path("config.db");
+    let notify = scratch.path("notify.sock");
+    let port = free_port().await;
+    configure(&config, port).await;
+    configure_weather_database(&config, BLACKHOLE_URL).await;
+
+    let socket = notify_socket(&notify);
+    let mut child = spawn(&config, &notify);
+    // Waited for rather than slept past: the daemon says which step it is on, so the
+    // signal lands inside the boot sequence by construction instead of by timing. The
+    // probe's status also proves the handler is installed, since it is sent after it.
+    notified_with(&socket, "asserting the database version").await;
+    terminate(&child);
+
+    let status = tokio::time::timeout(GRACE, child.wait())
+        .await
+        .expect("exits inside the grace")
+        .expect("the exit status is readable");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "an interrupted startup exits 0 rather than dying by signal: {status:?}"
+    );
+    notified_with(&socket, "STOPPING=1").await;
 }
 
 #[tokio::test]

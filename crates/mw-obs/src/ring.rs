@@ -27,8 +27,9 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use tracing::span::{Attributes, Id, Record as SpanRecord};
 use tracing::{Event, Subscriber};
-use tracing_subscriber::layer::{Context, Layer};
+use tracing_subscriber::layer::{Context, Filter, Layer};
 use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::EnvFilter;
 
 use crate::record::{Record, Stream};
 use crate::span;
@@ -45,7 +46,7 @@ pub const ACCESS_TARGET: &str = "mw::access";
 pub struct Ring {
     stream: Stream,
     capacity: usize,
-    records: Mutex<VecDeque<Record>>,
+    records: Mutex<VecDeque<Arc<Record>>>,
     dropped: AtomicU64,
 }
 
@@ -63,6 +64,13 @@ impl Ring {
 
     /// Append, evicting the oldest record if the ring is full.
     pub fn push(&self, record: Record) {
+        // `Arc` rather than the record itself, because [`Ring::snapshot`] is the UI's
+        // backfill and it runs while every event in the process is trying to push: a deep
+        // clone of 16,384 records -- thousands of allocations and ~5 MB for the access
+        // ring -- held this mutex for the duration, so one management-UI connect stalled
+        // the whole logging path. A record is immutable once pushed, so sharing it is
+        // free.
+        let record = Arc::new(record);
         let mut q = self.lock();
         let evicted = q.len() == self.capacity && q.pop_front().is_some();
         q.push_back(record);
@@ -95,7 +103,7 @@ impl Ring {
 
     /// The ring's contents, newest last, preceded by a gap record if anything was
     /// evicted. This is the backfill a subscriber gets on connect.
-    pub fn snapshot(&self) -> Vec<Record> {
+    pub fn snapshot(&self) -> Vec<Arc<Record>> {
         let dropped = self.dropped();
         let buffered = self.lock().iter().cloned().collect::<Vec<_>>();
         if dropped == 0 {
@@ -104,7 +112,7 @@ impl Ring {
         // Dated at the oldest surviving record, which is where the hole actually is.
         let at = buffered.first().map_or_else(Utc::now, |r| r.ts);
         let mut out = Vec::with_capacity(buffered.len() + 1);
-        out.push(Record::gap(self.stream, dropped, at));
+        out.push(Arc::new(Record::gap(self.stream, dropped, at)));
         out.extend(buffered);
         out
     }
@@ -112,7 +120,7 @@ impl Ring {
     /// A poisoned ring lock would mean losing the UI's log view for the life of the
     /// process, and every critical section here is a `VecDeque` operation that cannot
     /// panic -- so the lock is recovered rather than propagated.
-    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<Record>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<Arc<Record>>> {
         self.records
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -159,7 +167,7 @@ impl LogRings {
     /// One `merged()` is what collapses `/logs` and `/http-logs` into one route with a
     /// `stream` filter: an operator correlating a 500 with the query that failed reads one
     /// screen with one clock.
-    pub fn merged(&self) -> Vec<Record> {
+    pub fn merged(&self) -> Vec<Arc<Record>> {
         let mut all = self.app.snapshot();
         all.extend(self.access.snapshot());
         // Stable, so two records with the same millisecond keep the order they were
@@ -182,10 +190,31 @@ impl Default for LogRings {
 /// [`ACCESS_TARGET`] and [`RingLayer::access`] takes only it. §5.2 lists them as two
 /// layers, and a target comparison inside one implementation is the same thing without a
 /// second copy of the field visiting.
+///
+/// # Why the filter is owned here rather than applied with `with_filter`
+///
+/// §5.2 writes the ring layer as `ring_layer.with_filter(ring_filter)` -- "the UI buffers;
+/// independently filterable". Written literally that way it is a defect: `Filtered` hands
+/// the wrapped layer a `Context` carrying its own `FilterId`, and `Context::event_scope`
+/// then yields only the spans *that* filter enabled. So a ring filter narrower than a
+/// span's level produced records with no `station` and no span chain -- while the
+/// unfiltered stderr layer kept both, which is the one thing §5.8 exists to prevent. The
+/// configuration that triggered it is not exotic: it is §5.5's "raise `mw_station::davis`
+/// to DEBUG for ten minutes", which raises the *global* directive while this filter stays
+/// at its startup level, and §5.4's entire requirement is that the operator can then
+/// isolate that one device's story.
+///
+/// So the filter lives here and is consulted inside `on_event`, leaving the `Context`
+/// unfiltered. One consequence worth knowing: a directive's **span-field** predicates
+/// (`[span{field=value}]`) need the per-layer-filter machinery to maintain their state, so
+/// this consults the directive as a target-and-level matcher. §5.4's field predicate is a
+/// `FilterFn` over a station id and belongs to the management API that sets it
+/// (implementation-plan.md M7-1), which is where the reloadable half goes too.
 #[derive(Debug)]
 pub struct RingLayer {
     rings: Arc<LogRings>,
     stream: Stream,
+    filter: Option<EnvFilter>,
 }
 
 impl RingLayer {
@@ -194,6 +223,7 @@ impl RingLayer {
         RingLayer {
             rings,
             stream: Stream::App,
+            filter: None,
         }
     }
 
@@ -202,7 +232,15 @@ impl RingLayer {
         RingLayer {
             rings,
             stream: Stream::Access,
+            filter: None,
         }
+    }
+
+    /// Narrow what this ring buffers, independently of the global level.
+    #[must_use]
+    pub fn filtered(mut self, filter: EnvFilter) -> Self {
+        self.filter = Some(filter);
+        self
     }
 
     fn takes(&self, target: &str) -> bool {
@@ -225,6 +263,11 @@ where
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         if !self.takes(event.metadata().target()) {
             return;
+        }
+        if let Some(filter) = &self.filter {
+            if !Filter::enabled(filter, event.metadata(), &ctx) {
+                return;
+            }
         }
         self.rings
             .ring(self.stream)

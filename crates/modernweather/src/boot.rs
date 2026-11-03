@@ -8,8 +8,22 @@
 //! 4a. assert the database version                 <- D-62, after the pool, before plan()
 //! 5. specs = plan(&cfg, registrars)               pure; every structural error caught here
 //! 6. supervisor = Supervisor::new(pool.schedule_store(), log_control, ...)
+//! 6a. bind the listener                           <- NOT in §3.1; see below
 //! 7. supervisor.run(specs).await                  never returns until shutdown completes
 //! ```
+//!
+//! **Step 6a is a deviation from two sections and it is temporary.** §3.1 says `main`
+//! touches exactly three resources outside a component, and §6.1 gives the socket to an
+//! `http:listener` *component*. This binary binds one directly, because M2-4's
+//! done-criteria require `/metrics` to be served, §5.10 puts it on an additive route on
+//! the one listener, and §1.4 allows only `mw-http` to bind -- so the socket exists before
+//! the component that should own it. Two consequences, neither of which bites yet: `main`
+//! owns a fourth root resource, and the listener's teardown runs concurrently with the
+//! supervisor's reverse-topological component stops rather than being ranked by them, so
+//! §3.6's "a consumer must never observe a revoked capability" does not cover it. It is
+//! safe today because the only route closes over a renderer rather than over a capability
+//! handle. implementation-plan.md M4-3 builds `http:listener` and removes this step along
+//! with `mw_http::bind`, the `served` future and the `join!` arm.
 //!
 //! Step 3 before step 5 is forced and worth justifying: `plan()` is a pure function *of
 //! configuration*, and configuration lives in SQLite, so something has to read SQLite
@@ -23,6 +37,7 @@
 //! Step 4a is **D-62**, which discharges the half of **D-42** that had no owner.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use mw_component::Generation;
@@ -34,12 +49,13 @@ use mw_supervisor::{Roots, RunReport, Supervisor};
 use mw_types::Classify;
 use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::args::Args;
 use crate::config::Config;
 use crate::logctl::ObsLogControl;
-use crate::{notify, signals};
+use crate::notify;
+use crate::signals::Signals;
 
 /// Which component crates contribute specs.
 ///
@@ -50,6 +66,14 @@ use crate::{notify, signals};
 /// to this slice and edits nothing else, which is the shape `managers/controller.go` could
 /// not take.
 const REGISTRARS: &[&dyn Registrar<Config>] = &[];
+
+/// How long the **D-62** probe may take before the boot sequence gives up on it.
+///
+/// Chosen against `TimeoutStartSec=60` in W8's unit rather than against a round number:
+/// the probe is one of several startup steps and none of them may spend the start budget.
+/// Giving up is not the same as passing -- the version is then unasserted, which is the
+/// `Retryable` outcome, and `db:postgres` is what re-asserts it (see the call site).
+const PROBE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Run the daemon. Returns when shutdown has completed.
 pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
@@ -77,10 +101,28 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     );
     metrics::gauge!("mw_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
 
+    // Before anything that can block, so that a `systemctl stop` during startup is an
+    // ordered exit rather than a default-disposition kill. Until this exists SIGTERM has
+    // no handler, and the window is every step below: the migrations, the configuration
+    // read, the D-62 probe and the bind.
+    let shutdown = CancellationToken::new();
+    let mut signals = Signals::install();
+    // The first thing the service manager hears, and the first point at which SIGTERM is
+    // handled rather than fatal. Ordered this way deliberately: everything below can
+    // block, and an operator who runs `systemctl stop` during a slow start should get an
+    // ordered exit rather than "killed by signal TERM".
+    notify::starting("opening the configuration database");
+
     // Step 3: the root resource.
-    let pool = config_db::open_and_migrate(&args.config)
+    let Some(pool) = signals
+        .race(&shutdown, config_db::open_and_migrate(&args.config))
         .await
-        .with_context(|| format!("opening {}", args.config.display()))?;
+        .transpose()
+        .with_context(|| format!("opening {}", args.config.display()))?
+    else {
+        notify::stopping();
+        return Ok(RunReport::default());
+    };
 
     // Step 4.
     let cfg = Config::load(&pool)
@@ -99,6 +141,8 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
         None => info!("no node identity yet; this is a first start"),
     }
 
+    notify::starting("asserting the database version");
+
     // Step 4a -- D-62, and the one place its reading is not literal.
     //
     // A server that is too old, or that has no `timescaledb` extension, is a refusal to
@@ -110,23 +154,43 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     // classification beside the error already says which is which (§4.2), so this branch
     // reads it rather than deciding again.
     //
-    // The consequence, stated because it belongs to whoever writes `db:postgres`
-    // (implementation-plan.md M3-3): a server that was unreachable at boot has not been
-    // checked, so that component must assert the version when it first connects. This
-    // assertion covers the server that is there when we start.
-    match assert_database_version(&cfg, |url| async move { version::probe(&url).await }).await {
-        Ok(_) => {}
-        Err(e) if matches!(e.class(), mw_types::Class::Retryable { .. }) => warn!(
+    // The consequence belongs to whoever writes `db:postgres`, so it is recorded in that
+    // item's own text rather than only here: implementation-plan.md M3-3 now carries
+    // "assert the database version when it first connects" as a constraint from this
+    // item. A comment in a source file is not a work item (docs/reconciliation.md G-5).
+    // This assertion covers the server that is there when we start.
+    let asserting = assert_database_version(&cfg, |url| async move { version::probe(&url).await });
+    let probed = signals
+        .race(&shutdown, tokio::time::timeout(PROBE_DEADLINE, asserting))
+        .await;
+    let Some(probed) = probed else {
+        pool.close().await;
+        notify::stopping();
+        return Ok(RunReport::default());
+    };
+    match probed {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) if matches!(e.class(), mw_types::Class::Retryable { .. }) => warn!(
             err = %mw_types::DisplayChain(&e),
             class = mw_types::Class::RETRYABLE.as_str(),
             "the database version could not be asserted; starting anyway (D-27)"
         ),
-        Err(e) => return Err(e).context("asserting the database version (D-62)"),
+        Ok(Err(e)) => return Err(e).context("asserting the database version (D-62)"),
+        // The deadline is the same decision as the `Retryable` branch, reached a different
+        // way: a refused connection answers in microseconds, but a blackholed address --
+        // a firewall, a dead host on a routed subnet, a partition -- answers only when the
+        // kernel gives up, which is minutes. Without this the daemon never binds, never
+        // notifies, and systemd kills the start at `TimeoutStartSec=60` and restarts it
+        // forever: "refusing to boot because TimescaleDB is down", which is exactly what
+        // the branch above exists to avoid.
+        Err(_) => warn!(
+            deadline_s = PROBE_DEADLINE.as_secs(),
+            "the weather database did not answer inside the deadline; starting anyway (D-27)"
+        ),
     }
 
     // Step 5. Pure: every structural error in W2a Decision 2's list is caught here,
     // before anything is constructed.
-    let shutdown = CancellationToken::new();
     let log: Arc<dyn mw_component::LogControl> = Arc::new(ObsLogControl::new(obs.log()));
     let roots = Roots {
         schedule: Arc::new(SqliteScheduleStore::new(pool.clone())),
@@ -137,6 +201,7 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
         stream: None,
         log,
     };
+    notify::starting("planning the configuration");
     let ctx = PlanContext::new(Generation::ZERO).with_roots(roots.capabilities());
     let plan = plan(&cfg, REGISTRARS, &ctx).context("planning the configuration")?;
     info!(
@@ -172,15 +237,15 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
         let shutdown = shutdown.clone();
         async move {
             let outcome = bound.serve(shutdown.clone().cancelled_owned()).await;
-            if let Err(e) = &outcome {
+            if outcome.is_err() {
                 // A daemon that is not serving is not working, so the accept loop dying
                 // takes the process with it rather than leaving half of one running.
                 // `Restart=always` in W8's unit is what makes that the right answer: the
                 // supervisor still stops every component in order on the way out.
-                error!(
-                    err = %mw_types::DisplayChain(e),
-                    "the listener stopped; shutting down"
-                );
+                //
+                // Not logged here. The error is returned, and `main` logs the chain once
+                // for whatever ended the process -- two lines for one event would undo
+                // the care `main` takes to use whichever channel exists and not both.
                 shutdown.cancel();
             }
             outcome
@@ -190,8 +255,13 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
         supervisor.run(plan),
         served,
         notify::run(readiness, &obs, &shutdown),
-        signals::wait(&shutdown),
+        signals.wait(&shutdown),
     );
+    // The pool is `main`'s to close (D-41) and nothing can hold it by here: every
+    // component is stopped. WAL mode means the final checkpoint happens on the last
+    // connection closing, so skipping this leaves `-wal`/`-shm` beside the database and a
+    // `config.db` copied for backup missing its most recent commits.
+    pool.close().await;
     info!(
         stopped = report.stopped,
         aborted = report.aborted,
@@ -247,7 +317,6 @@ where
 mod tests {
     use super::*;
     use mw_store::config_db::{Listener, WeatherDatabase};
-    use mw_store::version::Version;
     use secrecy::SecretString;
 
     fn config(with_database: bool) -> Config {
@@ -269,11 +338,7 @@ mod tests {
     }
 
     fn observed(pg: u32, ts: &str) -> Observed {
-        Observed {
-            pg_major: pg,
-            timescale: Version::parse(ts),
-            toolkit: true,
-        }
+        Observed::new(pg, Some(ts), true)
     }
 
     #[tokio::test]

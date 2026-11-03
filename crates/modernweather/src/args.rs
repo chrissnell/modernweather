@@ -13,6 +13,8 @@
 //! and `--config <path>` is W8 assumption 2's entire requirement: the systemd unit and the
 //! Dockerfile both spell it that way, so what matters is that the spelling is exact.
 
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use mw_obs::Requested;
@@ -79,17 +81,27 @@ Options:
 ";
 
 /// Parse the arguments, with `--help` and `--version` handled here.
-pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, ArgsError> {
+///
+/// Over `OsString` rather than `String`, because the one argument that matters is a
+/// **path**: a filename on Linux is bytes, not UTF-8, and `std::env::args()` panics mid
+/// iteration on one that is not valid Unicode. A `--config` the daemon cannot spell is a
+/// usage error with an exit code, not an abort.
+pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, ArgsError> {
     let mut config = None;
     let mut format = None;
     let mut directive = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         // `--flag=value` and `--flag value` both, because the systemd unit writes the
-        // second and a Dockerfile `CMD` array often writes the first.
-        let (flag, inline) = match arg.split_once('=') {
-            Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
-            _ => (arg.clone(), None),
+        // second and a Dockerfile `CMD` array often writes the first. Split on the `=`
+        // BYTE so that a value which is not UTF-8 survives the split.
+        let bytes = arg.as_bytes();
+        let (flag, inline) = match bytes.iter().position(|b| *b == b'=') {
+            Some(at) if bytes.starts_with(b"--") => (
+                String::from_utf8_lossy(&bytes[..at]).into_owned(),
+                Some(OsStr::from_bytes(&bytes[at + 1..]).to_os_string()),
+            ),
+            _ => (arg.to_string_lossy().into_owned(), None),
         };
         let mut value = || match inline.clone() {
             Some(v) => Ok(v),
@@ -100,13 +112,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, ArgsErro
         match flag.as_str() {
             "--config" => config = Some(PathBuf::from(value()?)),
             "--log-format" => {
-                let v = value()?;
+                // Lossy here and not for `--config`: a format is one of two ASCII words,
+                // so anything that is not valid UTF-8 is a rejection either way, and the
+                // message should show what was typed.
+                let v = value()?.to_string_lossy().into_owned();
                 format = Some(Requested::parse(&v).ok_or(ArgsError::BadFormat {
                     value: v,
                     expected: Requested::SPELLINGS,
                 })?);
             }
-            "--log-level" => directive = Some(value()?),
+            "--log-level" => directive = Some(value()?.to_string_lossy().into_owned()),
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return Ok(Parsed::Printed);
@@ -115,7 +130,11 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, ArgsErro
                 println!("modernweather {}", env!("CARGO_PKG_VERSION"));
                 return Ok(Parsed::Printed);
             }
-            _ => return Err(ArgsError::Unknown { arg }),
+            _ => {
+                return Err(ArgsError::Unknown {
+                    arg: arg.to_string_lossy().into_owned(),
+                })
+            }
         }
     }
     Ok(Parsed::Run(Args {
@@ -144,14 +163,14 @@ mod tests {
     use super::*;
 
     fn parse_ok(args: &[&str]) -> Args {
-        match parse(args.iter().map(|s| (*s).to_string())) {
+        match parse(args.iter().map(OsString::from)) {
             Ok(Parsed::Run(a)) => a,
             other => panic!("expected a runnable command line, got {other:?}"),
         }
     }
 
     fn parse_err(args: &[&str]) -> ArgsError {
-        match parse(args.iter().map(|s| (*s).to_string())) {
+        match parse(args.iter().map(OsString::from)) {
             Err(e) => e,
             other => panic!("expected a rejection, got {other:?}"),
         }
@@ -183,10 +202,10 @@ mod tests {
             .lines()
             .find_map(|l| l.trim().strip_prefix("ExecStart="))
             .expect("the unit has an ExecStart");
-        let argv: Vec<String> = exec
+        let argv: Vec<OsString> = exec
             .split_whitespace()
             .skip(1)
-            .map(str::to_string)
+            .map(OsString::from)
             .collect();
         match parse(argv) {
             Ok(Parsed::Run(a)) => {
@@ -232,6 +251,31 @@ mod tests {
         assert!(e.to_string().contains("pretty, json"), "{e}");
     }
 
+    /// A filename on Linux is bytes. `std::env::args()` panics mid iteration on one that
+    /// is not valid Unicode, which would turn a mistyped path into an abort instead of an
+    /// exit code -- and the path is the one argument this daemon cannot do without.
+    #[test]
+    fn a_configuration_path_that_is_not_utf8_is_still_a_path() {
+        let invalid = OsStr::from_bytes(b"/var/lib/modernweather/\xff\xfe.db").to_os_string();
+        for argv in [
+            vec![OsString::from("--config"), invalid.clone()],
+            vec![{
+                let mut inline = OsString::from("--config=");
+                inline.push(&invalid);
+                inline
+            }],
+        ] {
+            match parse(argv.clone()) {
+                Ok(Parsed::Run(args)) => assert_eq!(
+                    args.config.as_os_str().as_bytes(),
+                    invalid.as_bytes(),
+                    "the bytes reach the path verbatim"
+                ),
+                other => panic!("{argv:?} should parse, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn a_missing_configuration_is_refused_rather_than_defaulted() {
         // Deliberately not defaulted to /var/lib/modernweather/config.db: a daemon that
@@ -260,7 +304,7 @@ mod tests {
     fn help_and_version_print_and_do_not_run() {
         for flag in ["-h", "--help", "-V", "--version"] {
             assert!(
-                matches!(parse([flag.to_string()]), Ok(Parsed::Printed)),
+                matches!(parse([OsString::from(flag)]), Ok(Parsed::Printed)),
                 "{flag} should print and stop"
             );
         }

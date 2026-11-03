@@ -72,6 +72,7 @@ pub struct DepRule {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceRule {
     pub id: String,
     pub needles: Vec<String>,
@@ -1008,9 +1009,14 @@ mod tests {
             stdout.only.is_empty(),
             "no crate may be exempt from `no-stdout-logging`, only named files"
         );
-        assert!(
-            !stdout.only_paths.is_empty(),
-            "the exempt paths are the whole of the rule's narrowing"
+        assert_eq!(
+            stdout.only_paths,
+            [
+                "crates/modernweather/src/args.rs",
+                "crates/mw-obs/src/stderr.rs"
+            ],
+            "the exempt set is the whole of this rule's narrowing, and widening it one \
+             file at a time is the gradual version of the hole the mechanism closed"
         );
     }
 

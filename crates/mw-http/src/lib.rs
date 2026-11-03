@@ -28,10 +28,21 @@
 //! which is also why `metrics-exporter-prometheus` is pinned `default-features = false` in
 //! `[workspace.dependencies]`: with `http-listener` on, the exporter would bind a port of
 //! its own and be the seventh listener-owning site this design exists to remove.
+//!
+//! **What does change outside this crate when M4-3 arrives:** today the binary binds and
+//! serves directly, which makes the listener a fourth root resource owned by `main`
+//! (§3.1 names three) and leaves its teardown outside the supervisor's reverse-topological
+//! shutdown (§3.6). That is recorded as a step in `crates/modernweather/src/boot.rs`'s own
+//! sequence rather than left implicit, and M4-3 removes it by making `http:listener` the
+//! component §6.1 describes -- at which point `bind`, the `serve` future and the binary's
+//! `join!` arm all go. What does *not* have to change is this crate's shape: the route is
+//! handed a renderer rather than a registry, so it becomes one entry in a route table
+//! instead of the only one.
 
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::{header, StatusCode};
 use axum::routing::get;
@@ -98,13 +109,32 @@ pub enum HttpError {
 }
 
 impl mw_types::Classify for HttpError {
-    /// Both fatal. A bind that failed because the port is taken does not succeed on a
-    /// retry inside the same process, and §3.4's classification exists so that the
+    /// Both fatal, which is right for the case that happens: a port another process holds
+    /// is not released by asking again, and §3.4's classification exists so that the
     /// supervisor does not re-decide this at the call site.
+    ///
+    /// The case this is *arguably* wrong for is `EADDRNOTAVAIL` -- a configured address on
+    /// an interface that has not come up -- where `Fatal` plus `Restart=always` is a
+    /// restart loop until it does. Left fatal deliberately: `After=network-online.target`
+    /// in W8's unit is what makes it unlikely, the loop is self-healing, and a retry here
+    /// would be a second place that decides how long to wait for a network.
     fn class(&self) -> mw_types::Class {
         mw_types::Class::Fatal
     }
 }
+
+/// How long in-flight requests get to finish once shutdown has been signalled.
+///
+/// §3.6's default grace, and for the same reason: `TimeoutStopSec=30` in W8's unit leaves
+/// room for it, and the daemon's own done-criterion is that it exits inside ten seconds.
+///
+/// **It has to be bounded, and that is not a precaution.** `with_graceful_shutdown` waits
+/// for every connection with an unfinished request and nothing else -- so one client that
+/// sent a request line and no blank line holds the drain open for as long as it likes, and
+/// `/metrics` is on the unauthenticated main port. Without a deadline, a stalled TCP peer
+/// or a scraper that died mid-request is enough to keep the process alive until systemd
+/// reaches `TimeoutStopSec` and sends SIGKILL -- or, outside systemd, indefinitely.
+pub const DRAIN: Duration = Duration::from_secs(10);
 
 /// A bound socket that is not yet serving.
 ///
@@ -126,16 +156,48 @@ impl Bound {
         self.addr
     }
 
-    /// Serve until `shutdown` completes, then drain in-flight requests.
+    /// Serve until `shutdown` completes, then drain in-flight requests for at most
+    /// [`DRAIN`].
     pub async fn serve<F>(self, shutdown: F) -> Result<(), HttpError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.serve_with_drain(shutdown, DRAIN).await
+    }
+
+    /// [`Bound::serve`] with the drain deadline chosen by the caller, for a test that does
+    /// not want to wait ten seconds to prove the deadline exists.
+    pub async fn serve_with_drain<F>(self, shutdown: F, drain: Duration) -> Result<(), HttpError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         let addr = self.addr;
-        axum::serve(self.listener, self.router)
-            .with_graceful_shutdown(shutdown)
-            .await
-            .map_err(|source| HttpError::Serve { addr, source })
+        // The shutdown future is consumed by `with_graceful_shutdown`, so the deadline is
+        // started from a second observation of the same signal: the channel fires when the
+        // first one resolves.
+        let (signalled, signal) = tokio::sync::oneshot::channel();
+        let shutdown = async move {
+            shutdown.await;
+            let _ = signalled.send(());
+        };
+        let serving = axum::serve(self.listener, self.router).with_graceful_shutdown(shutdown);
+        tokio::select! {
+            result = serving => result.map_err(|source| HttpError::Serve { addr, source }),
+            () = async move {
+                let _ = signal.await;
+                tokio::time::sleep(drain).await;
+            } => {
+                // Abandoning the drain is a `WARN` rather than an error: every component
+                // is already stopped by the time the binary gets here, and a client that
+                // never finished its request is not a reason to exit non-zero.
+                tracing::warn!(
+                    addr = %addr,
+                    drain_s = drain.as_secs(),
+                    "connections did not drain inside the deadline; closing the listener"
+                );
+                Ok(())
+            }
+        }
     }
 }
 

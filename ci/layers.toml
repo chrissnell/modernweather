@@ -376,7 +376,15 @@ file rather than one crate, which is also why the format detection next to it is
 function over four booleans.
 
 A path here must exist: `cargo xtask gate-layout` fails to LOAD if one does not, so an
-exemption that outlives the file it names cannot quietly widen the rule back out."""
+exemption that outlives the file it names cannot quietly widen the rule back out. The
+exact set is also asserted by a test, because widening it one file at a time is the gradual
+version of the hole this narrowing closed.
+
+One property of the narrowing worth knowing before it surprises somebody: the scan is a
+whitespace-squeezed substring match over the whole file, so it does not know what a comment
+is. A doc comment in the binary that NAMES `println!` -- while explaining this rule, say --
+is a violation now that the crate is no longer exempt. `crates/modernweather/src/args.rs`
+contains exactly that, and passes only because it is one of the two exempt paths."""
 
 [[source_rule]]
 id = "no-template-escape-opt-out"

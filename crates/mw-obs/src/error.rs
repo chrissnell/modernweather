@@ -1,11 +1,10 @@
 //! One error enum for this crate, classified beside its definition (§4.1, §4.2).
 //!
-//! Every variant here is `Fatal` except one, and the exception is the interesting one:
-//! a rejected filter directive is the *operator's* mistake, made through the management
-//! API, and no retry fixes it -- so it is `Fatal` as well. What a `Fatal` from this crate
-//! means to a caller is "refuse the request and leave logging exactly as it was", which
-//! is the property §5.5 asks for: a typo must not be able to leave the process with no
-//! logging at all.
+//! Every variant here is `Fatal`, including the one that looks transient: a rejected
+//! filter directive is the *operator's* mistake, made through the management API, and no
+//! retry fixes it. What a `Fatal` from this crate means to a caller is "refuse the request
+//! and leave logging exactly as it was", which is the property §5.5 asks for -- a typo
+//! must not be able to leave the process with no logging at all.
 
 use mw_types::{Class, Classify};
 

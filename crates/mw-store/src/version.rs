@@ -81,10 +81,16 @@ impl fmt::Display for Version {
 pub struct Observed {
     /// `server_version_num / 10000`, which is the major version on PostgreSQL 10 and up.
     pub pg_major: u32,
-    /// `extversion` from `pg_extension`, or `None` when the extension is not installed --
-    /// which the SQL reports before anything else, because every other check is
-    /// meaningless without it.
-    pub timescale: Option<Version>,
+    /// `extversion` from `pg_extension`, verbatim, or `None` when the extension is not
+    /// installed -- which the SQL reports before anything else, because every other check
+    /// is meaningless without it.
+    ///
+    /// The **raw string** rather than a parsed [`Version`], so that "present but
+    /// unparseable" is representable and [`check`] can reach it in the same order the SQL
+    /// does. Parsing in the probe instead made a `2.31.0-dev` extension on a PostgreSQL 15
+    /// server report the version it could not read, where the SQL reports the PostgreSQL
+    /// major first -- the same refusal, with the less useful half of the reason.
+    pub timescale: Option<String>,
     /// Whether `timescaledb_toolkit` is installed. A warning, not a requirement.
     pub toolkit: bool,
 }
@@ -97,6 +103,17 @@ impl fmt::Display for Observed {
             None => f.write_str("absent")?,
         }
         write!(f, " / toolkit {}", self.toolkit)
+    }
+}
+
+impl Observed {
+    /// What the server said, for a test or a diagnostic that wants to build one.
+    pub fn new(pg_major: u32, timescale: Option<&str>, toolkit: bool) -> Self {
+        Observed {
+            pg_major,
+            timescale: timescale.map(str::to_owned),
+            toolkit,
+        }
     }
 }
 
@@ -152,13 +169,24 @@ pub enum VersionError {
 }
 
 impl mw_types::Classify for VersionError {
-    /// `Unreachable` is retryable -- a database that is starting alongside us is the
-    /// ordinary case on a reboot -- and everything else is fatal. A server that is too old
-    /// does not become new enough by being asked again, and **D-62** wants a refusal at
-    /// startup rather than a surprise at the first `ADD COLUMN`.
+    /// A version that is wrong is fatal; a connection that is gone is not.
+    ///
+    /// A server that is too old does not become new enough by being asked again, and
+    /// **D-62** wants that refused at startup rather than discovered at the first
+    /// `ADD COLUMN`. A server that could not be reached is the ordinary case on a reboot,
+    /// and refusing to boot for it is the failure **D-27** rejects -- which is the
+    /// decision the binary reads off this impl rather than making a second time.
+    ///
+    /// `Query` is split rather than being wholly fatal, because it covers two unrelated
+    /// things: the connection dying mid-query (a server restarting alongside us -- the
+    /// same condition as `Unreachable`, reached one step later) and the query or its
+    /// column types being wrong (a defect in this build, which no retry fixes).
     fn class(&self) -> mw_types::Class {
         match self {
             VersionError::Unreachable { .. } => mw_types::Class::RETRYABLE,
+            VersionError::Query { source } if transport_failure(source) => {
+                mw_types::Class::RETRYABLE
+            }
             VersionError::TimescaleAbsent { .. }
             | VersionError::PostgresTooOld { .. }
             | VersionError::TimescaleTooOld { .. }
@@ -168,12 +196,30 @@ impl mw_types::Classify for VersionError {
     }
 }
 
+/// Whether a `sqlx` failure is the connection rather than the statement.
+///
+/// The distinction is the whole of `Query`'s classification: everything here is something
+/// that happened to the socket or the session, and everything else -- the server rejecting
+/// the statement, a column that is not there, a value that will not decode -- is this
+/// build disagreeing with the server it was built against.
+fn transport_failure(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::Protocol(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::WorkerCrashed
+    )
+}
+
 /// The comparison `ci/sql/assert-timescaledb-version.sql` makes, in the order it makes it.
 ///
 /// `Ok(false)` means "usable, but `timescaledb_toolkit` is absent" -- the SQL's `RAISE
 /// WARNING`, which the caller logs.
 pub fn check(observed: &Observed) -> Result<bool, VersionError> {
-    let Some(found) = observed.timescale.clone() else {
+    let Some(reported) = observed.timescale.as_deref() else {
         return Err(VersionError::TimescaleAbsent {
             required: Version::required_timescale(),
         });
@@ -184,6 +230,12 @@ pub fn check(observed: &Observed) -> Result<bool, VersionError> {
             found: observed.pg_major,
         });
     }
+    // After the PostgreSQL comparison, because that is where the SQL reaches
+    // `string_to_array` -- which raises `invalid input syntax for type integer` on an
+    // unparseable version just as this returns `Unreadable`.
+    let found = Version::parse(reported).ok_or_else(|| VersionError::Unreadable {
+        reported: reported.to_owned(),
+    })?;
     let required = Version::required_timescale();
     if found < required {
         return Err(VersionError::TimescaleTooOld { required, found });
@@ -205,68 +257,116 @@ pub async fn probe(url: &str) -> Result<Observed, VersionError> {
                 redacted: redact(url),
                 source,
             })?;
+    let answered = ask(&mut conn).await;
+    // Closed rather than dropped on **both** paths, so the server does not log an
+    // unexpected EOF -- including when the query is what failed, which is the path that
+    // used to produce exactly the EOF this exists to avoid.
+    let _ = conn.close().await;
+    answered
+}
+
+/// The three questions, over an open connection.
+async fn ask(conn: &mut PgConnection) -> Result<Observed, VersionError> {
     let row = sqlx::query(
         "SELECT current_setting('server_version_num')::int / 10000 AS pg_major, \
                 (SELECT extversion FROM pg_extension WHERE extname = 'timescaledb') AS ts, \
                 EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb_toolkit') \
                     AS toolkit",
     )
-    .fetch_one(&mut conn)
+    .fetch_one(conn)
     .await
     .map_err(|source| VersionError::Query { source })?;
-    // Closed rather than dropped, so the server does not log an unexpected EOF on every
-    // start. A failure to say goodbye is not a reason to refuse to run.
-    let _ = conn.close().await;
-
     let pg_major: i32 = row
         .try_get("pg_major")
         .map_err(|source| VersionError::Query { source })?;
-    let ts: Option<String> = row
+    let timescale: Option<String> = row
         .try_get("ts")
         .map_err(|source| VersionError::Query { source })?;
     let toolkit: bool = row
         .try_get("toolkit")
         .map_err(|source| VersionError::Query { source })?;
-    let timescale = match ts {
-        Some(reported) => {
-            Some(Version::parse(&reported).ok_or(VersionError::Unreadable { reported })?)
-        }
-        None => None,
-    };
     Ok(Observed {
-        pg_major: u32::try_from(pg_major).unwrap_or(0),
+        // `server_version_num / 10000` is never negative, so this cannot be reached --
+        // and a zero-fill would make the message read "PostgreSQL 0 is older than the
+        // required 17", which is the kind of number this module exists to not print.
+        pg_major: u32::try_from(pg_major).map_err(|_| VersionError::Unreadable {
+            reported: pg_major.to_string(),
+        })?,
         timescale,
         toolkit,
     })
 }
 
-/// Probe and decide, which is the whole of the startup assertion.
-///
-/// Returns what was observed so that the caller can log it: "PostgreSQL 17 / timescaledb
-/// 2.31.0" in the startup log is how an operator confirms which server the daemon actually
-/// reached.
-pub async fn assert_version(url: &str) -> Result<(Observed, bool), VersionError> {
-    let observed = probe(url).await?;
-    let toolkit = check(&observed)?;
-    Ok((observed, toolkit))
-}
-
-/// A connection URL with its password removed.
+/// A connection URL with every credential it can carry removed.
 ///
 /// The configured URL is a secret from the moment it is read (**D-33**), and this is the
-/// only form of it that may reach a log line. Textual rather than parsed, because the
-/// alternative is a URL-parsing dependency for one error message, and the rule is simple:
-/// everything between the scheme's `//` and the `@` is credentials.
+/// only form of it that may reach a log line -- which the `Unreachable` message does, on
+/// the most ordinary failure there is. So this has to be right for every URL shape the
+/// driver accepts, not just the obvious one:
+///
+/// - **userinfo**: `postgres://mw:hunter2@host/db`. The authority ends at the first `/`,
+///   `?` or `#` (RFC 3986) and userinfo ends at the **last** `@` inside it, so an `@` in
+///   the path or the query is not mistaken for a credential separator -- which also keeps
+///   `?application_name=mw@node1` readable instead of garbled.
+/// - **the query string**: `postgres://host/db?password=hunter2`. `sqlx` reads `password`
+///   from there (`sqlx-postgres`'s own URL parser does, and so does libpq), and the
+///   schema's `CHECK (url GLOB 'postgres://?*')` permits it -- so a URL written that way
+///   was previously returned *verbatim*, password and all, because there was no `@` to
+///   split on.
+///
+/// Textual rather than parsed, still: a URL crate for one error message is the trade the
+/// original comment refused, and the two rules above are the whole of it.
 pub fn redact(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return "<not a url>".to_string();
     };
-    match rest.split_once('@') {
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let authority = match authority.rsplit_once('@') {
         Some((userinfo, host)) => {
             let user = userinfo.split_once(':').map_or(userinfo, |(u, _)| u);
-            format!("{scheme}://{user}:***@{host}")
+            format!("{user}:{REDACTED}@{host}")
         }
-        None => format!("{scheme}://{rest}"),
+        None => authority.to_string(),
+    };
+    format!("{scheme}://{authority}{}", redact_query(tail))
+}
+
+/// What replaces a secret.
+const REDACTED: &str = "***";
+
+/// Every parameter name that carries a credential in a PostgreSQL URL.
+///
+/// `sslpassword` is here as well as `password` because it is the passphrase for the client
+/// key, which is no less a secret for being about TLS.
+const SECRET_PARAMS: [&str; 2] = ["password", "sslpassword"];
+
+/// Replace the value of any secret-bearing query parameter.
+fn redact_query(tail: &str) -> String {
+    let Some((path, query)) = tail.split_once('?') else {
+        return tail.to_string();
+    };
+    // The fragment is not part of the query, and a `#` inside one would otherwise make the
+    // last parameter look longer than it is.
+    let (query, fragment) = match query.split_once('#') {
+        Some((q, f)) => (q, Some(f)),
+        None => (query, None),
+    };
+    let redacted = query
+        .split('&')
+        .map(|pair| {
+            let name = pair.split_once('=').map_or(pair, |(n, _)| n);
+            if SECRET_PARAMS.contains(&name) {
+                format!("{name}={REDACTED}")
+            } else {
+                pair.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    match fragment {
+        Some(f) => format!("{path}?{redacted}#{f}"),
+        None => format!("{path}?{redacted}"),
     }
 }
 
@@ -275,11 +375,7 @@ mod tests {
     use super::*;
 
     fn observed(pg: u32, ts: Option<&str>, toolkit: bool) -> Observed {
-        Observed {
-            pg_major: pg,
-            timescale: ts.map(|v| Version::parse(v).expect("a literal")),
-            toolkit,
-        }
+        Observed::new(pg, ts, toolkit)
     }
 
     #[test]
@@ -326,6 +422,23 @@ mod tests {
             "{e:?} should be the absent-extension failure"
         );
         assert!(e.to_string().contains("2.31.0"), "{e}");
+    }
+
+    /// The SQL reaches `string_to_array` only after the PostgreSQL comparison, so a
+    /// server that is behind on both reports the version an operator can act on.
+    #[test]
+    fn an_unreadable_extension_version_is_reported_after_the_postgres_comparison() {
+        let e = check(&observed(15, Some("2.31.0-dev"), true)).expect_err("too old");
+        assert!(
+            matches!(e, VersionError::PostgresTooOld { .. }),
+            "{e:?}: the SQL compares the major first"
+        );
+        let e = check(&observed(17, Some("2.31.0-dev"), true)).expect_err("unreadable");
+        assert!(
+            matches!(e, VersionError::Unreadable { .. }),
+            "{e:?}: and reports what it could not read when that is all that is left"
+        );
+        assert!(e.to_string().contains("2.31.0-dev"), "{e}");
     }
 
     #[test]
@@ -377,16 +490,85 @@ mod tests {
         );
     }
 
+    /// The `Query` split is what keeps the D-62 x D-27 reading honest: a server that
+    /// restarts between the connect and the query must not refuse the boot, and a query
+    /// this build got wrong must.
+    #[test]
+    fn a_connection_lost_mid_query_is_retryable_and_a_bad_query_is_not() {
+        use mw_types::{Class, Classify};
+        let lost = VersionError::Query {
+            source: sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        };
+        assert!(
+            matches!(lost.class(), Class::Retryable { .. }),
+            "a reset connection is the same condition as Unreachable, one step later"
+        );
+        let wrong = VersionError::Query {
+            source: sqlx::Error::ColumnNotFound("pg_major".into()),
+        };
+        assert_eq!(
+            wrong.class(),
+            Class::Fatal,
+            "a column this build asked for and did not get is a defect, not a condition"
+        );
+    }
+
+    /// The test's name is a promise, so it covers every shape that can carry one rather
+    /// than the one shape that is easy to write.
     #[test]
     fn a_password_never_reaches_a_log_line() {
-        assert_eq!(
-            redact("postgres://mw:hunter2@db.internal:5432/weather"),
-            "postgres://mw:***@db.internal:5432/weather"
-        );
-        assert_eq!(
-            redact("postgresql://db.internal/weather"),
-            "postgresql://db.internal/weather"
-        );
+        for (url, expected) in [
+            // Userinfo, the obvious shape.
+            (
+                "postgres://mw:hunter2@db.internal:5432/weather",
+                "postgres://mw:***@db.internal:5432/weather",
+            ),
+            // The query string, which `sqlx` and libpq both read and which used to come
+            // back verbatim because there was no `@` to split on.
+            (
+                "postgres://db.internal/weather?password=hunter2",
+                "postgres://db.internal/weather?password=***",
+            ),
+            (
+                "postgres://db.internal/weather?user=mw&password=hunter2&sslmode=require",
+                "postgres://db.internal/weather?user=mw&password=***&sslmode=require",
+            ),
+            // The TLS key's passphrase is a secret too.
+            (
+                "postgres://db.internal/weather?sslpassword=hunter2",
+                "postgres://db.internal/weather?sslpassword=***",
+            ),
+            // Both at once.
+            (
+                "postgresql://mw:a@db/weather?password=b",
+                "postgresql://mw:***@db/weather?password=***",
+            ),
+            // No credential at all, unchanged.
+            (
+                "postgresql://db.internal/weather",
+                "postgresql://db.internal/weather",
+            ),
+            // An `@` after the authority is not a credential separator: the message
+            // exists to say WHICH database could not be reached, so garbling the host is
+            // its own defect.
+            (
+                "postgres://db.internal/weather?application_name=mw@node1",
+                "postgres://db.internal/weather?application_name=mw@node1",
+            ),
+            // A user with no password, and a `@` inside the userinfo.
+            ("postgres://mw@db/weather", "postgres://mw:***@db/weather"),
+            (
+                "postgres://mw%40corp:p@db/weather",
+                "postgres://mw%40corp:***@db/weather",
+            ),
+        ] {
+            assert_eq!(redact(url), expected, "redacting {url}");
+            assert!(
+                !redact(url).contains("hunter2"),
+                "the password survived in {}",
+                redact(url)
+            );
+        }
         assert_eq!(redact("nonsense"), "<not a url>");
     }
 }

@@ -19,9 +19,7 @@
 //! the review rule is that a new label must be justifiable as "there are N of these and N
 //! is in the configuration".
 
-use std::sync::Arc;
-
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle, PrometheusRecorder};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 use crate::error::ObsError;
 
@@ -32,10 +30,6 @@ pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 #[derive(Clone, Debug)]
 pub struct Metrics {
     handle: PrometheusHandle,
-    /// Set only by [`Metrics::detached`]. The installed recorder is owned by `metrics`
-    /// itself and lives for the process; a detached one has to be kept alive here, because
-    /// the handle reads the registry the recorder owns.
-    _detached: Option<Arc<PrometheusRecorder>>,
 }
 
 impl Metrics {
@@ -50,21 +44,7 @@ impl Metrics {
                 reason: e.to_string(),
             }
         })?;
-        Ok(Metrics {
-            handle,
-            _detached: None,
-        })
-    }
-
-    /// A recorder that is **not** installed globally, for a test that needs a handle
-    /// without claiming the process's only recorder slot.
-    pub fn detached() -> Self {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        Metrics {
-            handle,
-            _detached: Some(Arc::new(recorder)),
-        }
+        Ok(Metrics { handle })
     }
 
     /// The current exposition payload, rendered on demand.
@@ -73,6 +53,12 @@ impl Metrics {
     }
 
     /// Describe and zero the counters this crate owns.
+    ///
+    /// The names carry the `mw_` prefix every name in §5.10's table carries, so they are
+    /// `mw_ring_dropped_total` and `mw_dedupe_evicted_total` rather than §5.6's and
+    /// §5.7's unprefixed spellings. One namespace for one process's metrics is worth more
+    /// than two sections' literal text; recorded here because a reader grepping those
+    /// sections for the name will not otherwise find it.
     ///
     /// A Prometheus counter does not exist in the exposition until something touches it,
     /// so a daemon that has never dropped a log record and a daemon whose metrics are
@@ -95,11 +81,15 @@ impl Metrics {
         metrics::counter!("mw_dedupe_evicted_total").absolute(0);
     }
 
-    /// Expire idle histogram buckets.
+    /// Drain the exporter's histograms into its distributions.
     ///
-    /// `install_recorder` makes this the caller's job, and the caller is the binary's loop
-    /// tick -- there is one clock for the whole process (§3.3), so the exporter does not
-    /// get a timer of its own.
+    /// `install_recorder` makes this the caller's job and the caller is the binary's loop
+    /// tick, because there is one clock for the whole process (§3.3) and the exporter does
+    /// not get a timer of its own. It expires nothing: `run_upkeep` publishes outstanding
+    /// descriptions and folds recorded samples into the distributions the exposition
+    /// renders from. Idle-series expiry is a separate mechanism, applied at render time
+    /// from a builder idle timeout this build does not set -- a homelab scraper wants the
+    /// series to persist across a quiet period, not vanish from it.
     pub fn upkeep(&self) {
         self.handle.run_upkeep();
     }

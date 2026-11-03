@@ -23,6 +23,16 @@ use crate::record::{Fields, Value};
 /// Whichever layer's `on_new_span` runs first inserts it and the others find it, which is
 /// also why it is `pub`: two private copies in two modules would be two types and two
 /// visits.
+///
+/// **Two invariants this storage depends on, both load-bearing.** At least one layer with
+/// no per-layer filter must call [`store`], or a span the filtered layers rejected has no
+/// fields recorded at all; and **a layer that reads the scope must not sit behind
+/// `with_filter`**, because `Filtered` hands the wrapped layer a `Context` carrying its own
+/// `FilterId` and [`Context::event_scope`] then yields only the spans *that* filter
+/// enabled. The second one is why [`crate::RingLayer`] owns its filter and consults it
+/// inside `on_event` instead: with `with_filter`, a ring filter narrower than the span's
+/// level silently produced records with no `station` and no span chain -- in exactly the
+/// configuration §5.5's "raise the global level to DEBUG" creates.
 #[derive(Debug)]
 pub struct SpanFields(pub Fields);
 
@@ -39,6 +49,16 @@ where
 }
 
 /// Fold a late `Span::record` call into the stored fields.
+///
+/// **Replaces by name rather than appending**, for two reasons that both bite. It is
+/// `tracing`'s own semantic -- `Span::record` on a field that already has a value is an
+/// overwrite, not a second value -- and it is what makes this function *idempotent*, which
+/// it has to be: four layers in this stack implement `on_record`, so one
+/// `Span::record("status", 200)` arrives here four times. Appending stored it four times,
+/// printed it four times in the pretty rendering, and left a long-lived span's field list
+/// growing without bound -- a `Cx` component span lives for the process, and
+/// [`chain`] clones its whole list into every record beneath it, so §5.7's "~6 MB
+/// resident, bounded and constant" stopped holding.
 pub fn extend<S>(id: &Id, values: &SpanRecord<'_>, ctx: &Context<'_, S>)
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
@@ -48,8 +68,17 @@ where
     let late = Fields::of(values);
     match ext.get_mut::<SpanFields>() {
         Some(SpanFields(f)) => {
-            f.values.extend(late.values);
-            f.causes.extend(late.causes);
+            for (name, value) in late.values {
+                match f.values.iter_mut().find(|(n, _)| *n == name) {
+                    Some(slot) => slot.1 = value,
+                    None => f.values.push((name, value)),
+                }
+            }
+            // A re-recorded `err` replaces the chain rather than adding a second one, for
+            // the same reason: the four `on_record` calls are one event.
+            if !late.causes.is_empty() {
+                f.causes = late.causes;
+            }
             if let Some(m) = late.message {
                 f.message = Some(m);
             }

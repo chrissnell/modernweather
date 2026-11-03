@@ -107,9 +107,16 @@ impl Record {
 
     /// Build a record from an event and its span scope.
     ///
-    /// The one place a [`Record`] is made from a live event, so the ring and the stderr
-    /// renderer cannot disagree about what an event contains -- which is the whole of
-    /// §5.8's rule that the ring stores structure and ANSI is a rendering.
+    /// The one *function* that makes a [`Record`] from a live event, so the ring and the
+    /// stderr renderer cannot disagree about what an event contains -- which is the whole
+    /// of §5.8's rule that the ring stores structure and ANSI is a rendering.
+    ///
+    /// Not the one *record*: `tracing`'s `Layer` API offers no per-event extension, so
+    /// each layer that wants a record builds its own, and the two therefore carry `ts`
+    /// values microseconds apart for the same event. Deduplicating that would mean a
+    /// shared per-event slot keyed by thread, which costs more than the microseconds are
+    /// worth; what §5.8 is protecting is that both come from the same typed fields rather
+    /// than one being scraped from the other's text.
     pub fn from_event<S>(event: &tracing::Event<'_>, ctx: &Context<'_, S>, stream: Stream) -> Self
     where
         S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
@@ -199,7 +206,11 @@ impl Fields {
             // §4.3's convention: `err = %DisplayChain(&e)` is the whole chain. Kept as a
             // cause AND as a field, because the JSON rendering wants `err` and the pretty
             // one wants a `caused by:` line.
-            name @ ("err" | "error") => {
+            //
+            // Only a *string* value is treated as a chain. `warn!(error = false, ..)` is a
+            // boolean somebody named badly, and reading it as a cause both invented
+            // `caused by: false` and made the field vanish from every rendering.
+            name @ ("err" | "error") if matches!(value, Value::Str(_)) => {
                 self.causes.push(value.to_string());
                 self.values.push((name, value));
             }
@@ -231,10 +242,11 @@ impl Visit for Fields {
 
     fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
         // The chain, walked by the one thing in the workspace that knows how (§4.3).
+        // Through `push` like every other value, so that a `&dyn Error` recorded under a
+        // name that is not `err` is a field rather than silently also a cause: one rule
+        // for what a cause is, and it is the field's name.
         let chain = mw_types::DisplayChain(value);
-        self.causes.extend(chain.causes());
-        self.values
-            .push((field.name(), Value::Str(chain.to_string())));
+        self.push(field, Value::Str(chain.to_string()));
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {

@@ -6,6 +6,7 @@
 //! better than being permitted one.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use mw_http::{bind, MetricsRoute};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -113,4 +114,48 @@ async fn a_port_already_held_is_reported_with_the_address() {
         error.to_string().contains(&addr.to_string()),
         "the message names the address that could not be bound: {error}"
     );
+}
+
+#[tokio::test]
+async fn a_client_that_never_finishes_its_request_cannot_hold_the_drain_open() {
+    // `with_graceful_shutdown` on its own waits for every connection with an unfinished
+    // request, with no bound -- so a request line with no blank line after it kept the
+    // process alive for as long as the client cared to. `/metrics` is on the
+    // unauthenticated main port, which is what made that a remote problem rather than a
+    // developer's.
+    let route = MetricsRoute::new(Arc::new(String::new), CONTENT_TYPE);
+    let bound = bind("127.0.0.1:0".parse().expect("a literal address"), route)
+        .await
+        .expect("bindable");
+    let addr = bound.local_addr();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    // A short deadline so the test asserts the deadline exists rather than its value.
+    let drain = Duration::from_millis(200);
+    let server = bound.serve_with_drain(
+        async move {
+            let _ = stopped.await;
+        },
+        drain,
+    );
+    let client = async move {
+        let mut half_open = TcpStream::connect(addr)
+            .await
+            .expect("the listener accepts");
+        half_open
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .expect("the partial request is written");
+        // No blank line: the request is never complete.
+        stop.send(()).expect("still listening");
+        // Held open well past the drain deadline, which is the whole point: the deadline
+        // has to be ours, not the client's.
+        tokio::time::sleep(drain * 5).await;
+        half_open
+    };
+    let (served, _held_open) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(server, client)
+    })
+    .await
+    .expect("the listener abandons the drain instead of waiting for the client");
+    served.expect("an abandoned drain is a warning, not an error");
 }

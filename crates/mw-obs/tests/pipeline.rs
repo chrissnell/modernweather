@@ -5,6 +5,12 @@
 //! that `event_enabled` ANDs across the stack (§5.2), that a span's fields reach an event
 //! that did not repeat them (§5.4), and that the access stream does not evict the
 //! application stream (§5.7). None of those is observable from one layer.
+//!
+//! **The stack here differs from `install`'s in exactly two layers**, and the list is the
+//! point: no `WriteLayer`, which would write to the test runner's stderr, and no metrics
+//! recorder, which is one per process. Both filter layers are present, because they were
+//! not -- and the configuration they create is where the bug in
+//! `the_ring_sees_the_span_chain_even_when_its_own_filter_is_narrower` lived.
 
 use std::sync::Arc;
 
@@ -15,20 +21,26 @@ use mw_obs::{
 use tracing::{info, warn};
 use tracing_subscriber::prelude::*;
 
-/// The stack, minus the two layers that would write to the process's stderr and claim its
-/// one metrics recorder.
+/// The production stack: everything `install` assembles except the two layers that would
+/// touch the process's stderr and its one recorder slot.
 fn stack(rings: Arc<LogRings>) -> (impl tracing::Subscriber + Send + Sync, Arc<Dedupe>) {
-    stack_with(rings, DEDUPE)
+    stack_with(rings, DEDUPE, "trace", "trace")
 }
 
 fn stack_with(
     rings: Arc<LogRings>,
     policy: Policy,
+    global: &str,
+    ring: &str,
 ) -> (impl tracing::Subscriber + Send + Sync, Arc<Dedupe>) {
     let dedupe = Arc::new(Dedupe::new(policy));
     let subscriber = tracing_subscriber::registry()
         .with(DedupeLayer::new(Arc::clone(&dedupe)))
-        .with(RingLayer::app(Arc::clone(&rings)))
+        .with(mw_obs::parse(global).expect("a literal directive"))
+        .with(
+            RingLayer::app(Arc::clone(&rings))
+                .filtered(mw_obs::parse(ring).expect("a literal directive")),
+        )
         .with(RingLayer::access(rings));
     (subscriber, dedupe)
 }
@@ -174,6 +186,8 @@ fn the_suppression_summary_is_an_event_like_any_other_and_is_not_itself_suppress
             summary_every: std::time::Duration::ZERO,
             ..DEDUPE
         },
+        "trace",
+        "trace",
     );
     tracing::subscriber::with_default(subscriber, || {
         for station in ["backyard", "roof"] {
@@ -207,4 +221,102 @@ fn the_suppression_summary_is_an_event_like_any_other_and_is_not_itself_suppress
             "the operator is told where they came from: {summary:#?}"
         );
     }
+}
+
+/// §5.4's requirement, against the configuration §5.5's "raise the global level to DEBUG
+/// for ten minutes" creates.
+///
+/// The ring's filter is independent of the global one (§5.2), so it is routinely *narrower*
+/// than the level a span was created at. Written as §5.2 spells it --
+/// `ring_layer.with_filter(ring_filter)` -- `Filtered` then hands the ring a `Context`
+/// carrying its own `FilterId` and `event_scope` yields nothing, so every record arrived
+/// with no `station` and no span chain while stderr kept both. Three rows, because the
+/// default configuration (both filters equal, spans at INFO) is the one that happened to
+/// work.
+#[test]
+fn the_ring_sees_the_span_chain_even_when_its_own_filter_is_narrower() {
+    for (global, ring, span_level) in [
+        ("info", "info", tracing::Level::INFO),
+        ("trace", "info", tracing::Level::DEBUG),
+        ("trace", "warn", tracing::Level::INFO),
+    ] {
+        let rings = Arc::new(LogRings::new());
+        let (subscriber, _dedupe) = stack_with(Arc::clone(&rings), DEDUPE, global, ring);
+        tracing::subscriber::with_default(subscriber, || {
+            // One span per level, because a span's level is static metadata.
+            let span = if span_level == tracing::Level::DEBUG {
+                tracing::debug_span!("codec", station = "backyard")
+            } else {
+                tracing::info_span!("codec", station = "backyard")
+            };
+            let _entered = span.enter();
+            warn!(frame_len = 97, "frame rejected");
+        });
+
+        let records = rings.ring(Stream::App).snapshot();
+        let case = format!("global={global} ring={ring} span={span_level}");
+        assert_eq!(records.len(), 1, "{case}: the event is buffered");
+        assert_eq!(
+            records[0].field("station"),
+            Some(&Value::Str("backyard".into())),
+            "{case}: §5.4 needs the station on the record, not just on the span"
+        );
+        assert_eq!(records[0].spans, vec!["codec"], "{case}");
+    }
+}
+
+/// Four layers in this stack implement `on_record`, so a late field arrives four times.
+///
+/// It used to be stored four times: printed four times in the pretty rendering, on the
+/// `http.request` span that §5.4 puts on the highest-volume path in the system, and
+/// growing without bound on a span that lives for the process.
+#[test]
+fn a_late_recorded_span_field_is_stored_once_however_many_layers_see_it() {
+    let rings = Arc::new(LogRings::new());
+    let (subscriber, _dedupe) = stack(Arc::clone(&rings));
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!(
+            "http.request",
+            route = "/latest",
+            status = tracing::field::Empty,
+            latency_ms = tracing::field::Empty
+        );
+        let _entered = span.enter();
+        span.record("status", 200);
+        span.record("latency_ms", 7);
+        // Re-recording replaces, which is `tracing`'s own semantic for a field that
+        // already has a value.
+        span.record("status", 500);
+        warn!("slow request");
+    });
+
+    let records = rings.ring(Stream::App).snapshot();
+    let fields = &records[0].fields;
+    for name in ["status", "latency_ms", "route"] {
+        assert_eq!(
+            fields.iter().filter(|(k, _)| *k == name).count(),
+            1,
+            "{name} is stored once: {fields:?}"
+        );
+    }
+    assert_eq!(records[0].field("status"), Some(&Value::I64(500)));
+    assert_eq!(records[0].field("latency_ms"), Some(&Value::I64(7)));
+}
+
+/// §5.7's "~6 MB resident, bounded and constant" needs the backfill to be cheap as well
+/// as the buffer to be bounded: the UI's connect reads the ring while every event in the
+/// process is pushing to it.
+#[test]
+fn the_backfill_shares_records_rather_than_deep_copying_them() {
+    let rings = Arc::new(LogRings::new());
+    let (subscriber, _dedupe) = stack(Arc::clone(&rings));
+    tracing::subscriber::with_default(subscriber, || {
+        warn!(sink = "writer:timescale", "sink delivery failed");
+    });
+    let first = rings.ring(Stream::App).snapshot();
+    let second = rings.ring(Stream::App).snapshot();
+    assert!(
+        Arc::ptr_eq(&first[0], &second[0]),
+        "two snapshots share one record rather than cloning its fields twice"
+    );
 }

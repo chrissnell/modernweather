@@ -55,6 +55,18 @@ impl SqliteScheduleStore {
     }
 
     async fn write(&self, record: &OccurrenceRecord) -> Result<(), Error> {
+        // `%Y` emits `+12345` and `-0001` outside years 1-9999, which the column's
+        // `CHECK (local_date GLOB '[0-9][0-9][0-9][0-9]-...')` rejects -- so the INSERT
+        // would fail as a bare "querying component_schedule failed". Unreachable from a
+        // `Calendar` occurrence, and this module's error promises to name the column.
+        let local_date = record.key.local_date.format("%Y-%m-%d").to_string();
+        if !local_date.is_char_boundary(4) || local_date.len() != 10 {
+            return Err(Error::Column {
+                component: record.key.component.as_str().to_owned(),
+                column: "local_date",
+                value: local_date,
+            });
+        }
         // One row per component, not a history: a second occurrence replaces the first.
         sqlx::query(
             "INSERT INTO component_schedule \
@@ -67,8 +79,13 @@ impl SqliteScheduleStore {
                  outcome = excluded.outcome",
         )
         .bind(record.key.component.as_str())
-        .bind(record.key.local_date.format("%Y-%m-%d").to_string())
+        .bind(local_date)
         .bind(i64::from(record.key.slot))
+        // `completed_at INTEGER` is whole seconds, so a sub-second instant is truncated
+        // on the way in and a read-back is not bit-identical to what was written. That is
+        // the right granularity for "when did this occurrence finish" and it is stated
+        // because the round-trip test's fixture is a whole second, which would otherwise
+        // hide it.
         .bind(record.completed_at.timestamp())
         .bind(record.outcome.as_str())
         .execute(&self.pool)
@@ -108,6 +125,13 @@ impl ScheduleStore for SqliteScheduleStore {
 }
 
 /// Why a `component_schedule` row could not be read or written.
+///
+/// All three reach the supervisor as `ScheduleStoreError`, which classifies `Retryable`
+/// (`mw_component::schedule`). For `Query` that is literal; for the two parse failures it
+/// is "the caller's response is the same" rather than "retrying helps" -- the supervisor
+/// logs and carries on either way, because the worst consequence is that an idempotent
+/// `Calendar` occurrence is made up twice or not at all (W2a Decision 14). Returning
+/// `Fatal` would invite a future caller to stop the daemon over one unreadable row.
 ///
 /// Three variants rather than one, because a corrupt row and an unreachable database are
 /// different problems and the `STRICT` table's `CHECK`s mean the first should be

@@ -31,7 +31,9 @@ use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let args = match args::parse(std::env::args().skip(1)) {
+    // `args_os`, not `args`: the latter panics mid iteration on an argument that is not
+    // valid Unicode, and `--config` is a path.
+    let args = match args::parse(std::env::args_os().skip(1)) {
         Ok(args::Parsed::Run(args)) => args,
         Ok(args::Parsed::Printed) => return ExitCode::SUCCESS,
         Err(e) => {
