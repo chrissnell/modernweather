@@ -22,3 +22,8 @@ metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
+# §5.3 fixes the JSON rendering's key names (`ts`, `module`, `span`, `err` as an array),
+# which no off-the-shelf formatter emits, and §5.8 requires that rendering to be produced
+# from the same `Record` as the pretty one. So the encoder is here and the escaping is not
+# hand-rolled.
+serde_json.workspace = true

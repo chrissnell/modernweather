@@ -5,8 +5,56 @@
 //! its provider meet: the binary resolves handles, calls `plan()` and runs the supervisor,
 //! which is what lets every other crate name a trait instead of an implementation (§1.3).
 //!
-//! A stub. `--config <path>`, the SQLite pool as a root resource owned by `main`, the
-//! subscriber and metrics recorder, the database-version assertion and `sd-notify`
-//! readiness are implementation-plan.md M2-4; `plan()` itself is M2-3.
+//! The boot sequence is [`boot`], in the order W3 §3.1 writes it. This file is only the
+//! entry point and the exit code, because there are exactly three outcomes and they are
+//! worth keeping visible:
+//!
+//! - **2** -- the command line was wrong. Nothing was opened and nothing was logged,
+//!   because there was nothing to log with yet.
+//! - **1** -- the daemon could not start, or could not stay started. The reason is on
+//!   stderr either way: through the subscriber if there was one, and through
+//!   [`args::fatal`] if installing the subscriber is what failed.
+//! - **0** -- it ran and stopped cleanly.
+//!
+//! `Restart=always` in W8's unit means systemd restarts on all three, which is correct for
+//! 1 and would be an infinite loop for 2 -- except that 2 can only come from the unit's
+//! own `ExecStart`, so it is a packaging failure that one restart makes obvious.
 
-fn main() {}
+mod args;
+mod boot;
+mod config;
+mod logctl;
+mod notify;
+mod signals;
+
+use std::process::ExitCode;
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let args = match args::parse(std::env::args().skip(1)) {
+        Ok(args::Parsed::Run(args)) => args,
+        Ok(args::Parsed::Printed) => return ExitCode::SUCCESS,
+        Err(e) => {
+            args::fatal(&e.to_string());
+            args::usage();
+            return ExitCode::from(2);
+        }
+    };
+    match boot::run(&args).await {
+        Ok(_report) => ExitCode::SUCCESS,
+        Err(e) => {
+            // Whichever channel exists, and not both. Every failure after step 2 has a
+            // subscriber, so the chain goes through `tracing` and reaches the journal in
+            // the configured format; step 2 *itself* failing is the one case with no
+            // subscriber, and a daemon that exits 1 silently is what `Type=notify` was
+            // adopted to stop. `has_been_set` is the question that distinguishes them.
+            let chain = mw_types::DisplayChain(e.as_ref());
+            if tracing::dispatcher::has_been_set() {
+                tracing::error!(err = %chain, "modernweather stopped");
+            } else {
+                args::fatal(&chain.to_string());
+            }
+            ExitCode::FAILURE
+        }
+    }
+}

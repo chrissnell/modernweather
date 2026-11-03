@@ -19,10 +19,12 @@
 //!   migration files' own, and the only file it creates is the database file itself, which
 //!   has no schema in it.
 
+use secrecy::SecretString;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
+use sqlx::Row;
 use std::path::Path;
 use std::time::Duration;
 
@@ -58,6 +60,25 @@ pub enum ConfigDbError {
         path: String,
         #[source]
         source: sqlx::migrate::MigrateError,
+    },
+
+    /// A read the boot sequence depends on failed.
+    #[error("the configuration database could not be read: {what}")]
+    Query {
+        /// Which read, in words an operator can act on.
+        what: &'static str,
+        #[source]
+        source: sqlx::Error,
+    },
+
+    /// A column held something its own `CHECK` should have rejected, which means this
+    /// build and its schema disagree rather than that the operator did anything.
+    #[error("the configuration database column `{column}` holds `{value}`, which is out of range")]
+    Column {
+        /// Which column.
+        column: &'static str,
+        /// What it held.
+        value: String,
     },
 }
 
@@ -644,4 +665,149 @@ mod tests {
         }
         pool.close().await;
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// What the boot sequence reads
+//
+// Three tables, because the boot sequence needs three facts before any component exists
+// (W3 §3.1): where to bind, whether there is a weather database to assert the version of
+// (**D-62**), and whether this node has started before. The rest of the schema is read by
+// the components that consume it, through `ConfigStore` -- a reader here for a table no
+// consumer exists for yet would be a guess at the query that consumer wants.
+
+/// The listener row (W3 §6.1).
+///
+/// Seeded by the migration, so this row always exists: there is nothing here that has to
+/// be allocated, and a daemon that had to upsert its own listener row before it could bind
+/// would be a startup DDL path wearing different clothes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listener {
+    /// The address the main socket binds.
+    pub listen_addr: String,
+    /// The main port: HTTP, and gRPC over ALPN.
+    pub http_port: u16,
+    /// The TLS port, when one is configured.
+    pub https_port: Option<u16>,
+    /// The legacy gRPC port, which keeps its own socket (W3 D-92) so that no peer's
+    /// endpoint changes at upgrade.
+    pub grpc_port: u16,
+    /// The management API's address. Loopback by default (A-W5-3).
+    pub management_listen_addr: String,
+    /// The management API's port.
+    pub management_port: u16,
+}
+
+/// Read the listener row.
+pub async fn listener(pool: &SqlitePool) -> Result<Listener, ConfigDbError> {
+    let row = sqlx::query(
+        "SELECT listen_addr, http_port, https_port, grpc_port, \
+                management_listen_addr, management_port \
+         FROM listener WHERE id = 1",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|source| ConfigDbError::Query {
+        what: "the listener row",
+        source,
+    })?;
+    Ok(Listener {
+        listen_addr: row.get("listen_addr"),
+        http_port: port(&row, "http_port")?,
+        https_port: optional_port(&row, "https_port")?,
+        grpc_port: port(&row, "grpc_port")?,
+        management_listen_addr: row.get("management_listen_addr"),
+        management_port: port(&row, "management_port")?,
+    })
+}
+
+/// The weather database's connection URL (**D-33**: a secret from the moment it is read).
+#[derive(Debug, Clone)]
+pub struct WeatherDatabase {
+    /// The PostgreSQL URL. `GET /api/v1/config` omits it rather than redacting it.
+    pub url: SecretString,
+}
+
+/// Read the weather database row, if there is one.
+///
+/// **Its absence is meaningful**: a node with no row here has no `db:postgres` and
+/// therefore no `writer:timescale` (**D-44**, W7 §8.2). It is also what makes
+/// `modernweather --config <path>` on an empty configuration a legitimate start rather
+/// than a misconfiguration -- there is no database to assert a version against, and
+/// **D-62** has nothing to do.
+pub async fn weather_database(pool: &SqlitePool) -> Result<Option<WeatherDatabase>, ConfigDbError> {
+    let row = sqlx::query("SELECT url FROM weather_database WHERE id = 1")
+        .fetch_optional(pool)
+        .await
+        .map_err(|source| ConfigDbError::Query {
+            what: "the weather database row",
+            source,
+        })?;
+    Ok(row.map(|r| WeatherDatabase {
+        url: SecretString::from(r.get::<String, _>("url")),
+    }))
+}
+
+/// The node's own identity and spool settings (W7 §5.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Node {
+    /// 16 bytes, UUIDv7, allocated by the node itself.
+    pub node_id: Vec<u8>,
+    /// Operator-facing and mutable: renaming a node is not an identity change.
+    pub node_name: String,
+    /// `TzSource::Deployment` for components not scoped to a station.
+    pub timezone: String,
+    /// Where the spool lives.
+    pub spool_path: String,
+}
+
+/// Read the node row, if this node has one.
+///
+/// **An empty table means "not yet started"**, which the migration says in the comment
+/// above the table and leaves to the boot sequence to handle. It is handled by being a
+/// legitimate state: nothing in the boot sequence needs a node identity to converge, so a
+/// first start with no configuration starts, serves `/metrics` and stops cleanly. What
+/// *allocates* the identity is W7's enrolment (`node_id` is a UUIDv7 the node mints) and
+/// the row it writes also needs a `spool_path`, which has no default in the schema and no
+/// value in any design document -- so inventing one here would be this work item deciding
+/// something implementation-plan.md M6-4 owns.
+pub async fn node(pool: &SqlitePool) -> Result<Option<Node>, ConfigDbError> {
+    let row = sqlx::query("SELECT node_id, node_name, timezone, spool_path FROM node WHERE id = 1")
+        .fetch_optional(pool)
+        .await
+        .map_err(|source| ConfigDbError::Query {
+            what: "the node row",
+            source,
+        })?;
+    Ok(row.map(|r| Node {
+        node_id: r.get("node_id"),
+        node_name: r.get("node_name"),
+        timezone: r.get("timezone"),
+        spool_path: r.get("spool_path"),
+    }))
+}
+
+/// A port column, which SQLite hands back as an `i64` and whose range the schema already
+/// constrains to 1-65535.
+fn port(row: &sqlx::sqlite::SqliteRow, column: &'static str) -> Result<u16, ConfigDbError> {
+    let value: i64 = row.get(column);
+    u16::try_from(value).map_err(|_| ConfigDbError::Column {
+        column,
+        value: value.to_string(),
+    })
+}
+
+fn optional_port(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &'static str,
+) -> Result<Option<u16>, ConfigDbError> {
+    let Some(value) = row.get::<Option<i64>, _>(column) else {
+        return Ok(None);
+    };
+    u16::try_from(value)
+        .map(Some)
+        .map_err(|_| ConfigDbError::Column {
+            column,
+            value: value.to_string(),
+        })
 }

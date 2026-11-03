@@ -456,6 +456,33 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// The inverse of [`Outcome::as_str`], for reading the `component_schedule` column
+    /// back.
+    ///
+    /// Here rather than in `mw-store` because the column's vocabulary and this enum have
+    /// to be one fact: the migration's `CHECK (outcome IN (...))` lists exactly these five
+    /// spellings, and a mapping written beside the query would be a second place for the
+    /// sixth one to be forgotten.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "ok" => Some(Outcome::Ok),
+            "failed" => Some(Outcome::Failed),
+            "deadline_exceeded" => Some(Outcome::DeadlineExceeded),
+            "skipped" => Some(Outcome::Skipped),
+            "misfired" => Some(Outcome::Misfired),
+            _ => None,
+        }
+    }
+
+    /// Every outcome, so that a round-trip test cannot miss one.
+    pub const ALL: [Outcome; 5] = [
+        Outcome::Ok,
+        Outcome::Failed,
+        Outcome::DeadlineExceeded,
+        Outcome::Skipped,
+        Outcome::Misfired,
+    ];
+
     /// The stored and exported spelling.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -476,6 +503,20 @@ impl fmt::Display for Outcome {
 
 #[cfg(test)]
 mod tests {
+    /// `component_schedule.outcome` is written with `as_str` and read with `parse`, so a
+    /// sixth outcome that forgot one of them would be a row the supervisor cannot read
+    /// back after a restart.
+    #[test]
+    fn every_outcome_round_trips_through_its_stored_spelling() {
+        for outcome in Outcome::ALL {
+            assert_eq!(
+                Outcome::parse(outcome.as_str()),
+                Some(outcome),
+                "{outcome} does not round-trip"
+            );
+        }
+        assert_eq!(Outcome::parse("completed"), None);
+    }
     use super::*;
     use mw_types::DisplayChain;
 

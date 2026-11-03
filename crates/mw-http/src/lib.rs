@@ -9,3 +9,168 @@
 //!
 //! It mounts route tables; it does not know what is in them. So it may not depend on
 //! `mw-store`, `mw-pipeline`, `mw-api-legacy` or `mw-web`.
+//!
+//! # What exists so far
+//!
+//! One listener and one route: `/metrics`. Nothing else in this crate yet, and that is a
+//! scope boundary rather than a stub -- the router, `RouteTable` mounting, host routing
+//! and the SNI resolver are implementation-plan.md M4-3, which is two milestones away.
+//!
+//! What forces a socket to exist now is M2-4's own done-criteria: the daemon has to serve
+//! `/metrics`, §5.10 puts it on **an additive route on the one listener**, and §1.4 says
+//! only this crate may bind. So [`bind`] is the one listener in the shape it has today,
+//! with exactly the route that has a consumer. When M4-3 arrives, `/metrics` becomes one
+//! entry in the route table instead of the only one, and nothing outside this crate has to
+//! change: the binary already hands in a renderer rather than a registry.
+//!
+//! The metrics *recorder* is `mw-obs`'s (§5.10), and this crate does not depend on
+//! `metrics` or on its exporter. It is handed a closure that renders the current payload,
+//! which is also why `metrics-exporter-prometheus` is pinned `default-features = false` in
+//! `[workspace.dependencies]`: with `http-listener` on, the exporter would bind a port of
+//! its own and be the seventh listener-owning site this design exists to remove.
+
+use std::future::Future;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use axum::http::{header, StatusCode};
+use axum::routing::get;
+use axum::Router;
+use tokio::net::TcpListener;
+
+/// Renders the current metrics payload on demand.
+///
+/// A closure rather than a trait: the only implementation is `mw-obs`'s handle, and a
+/// trait would have to live in `mw-component` -- a capability for one consumer, which is
+/// the thing **D-52** declined to add for the log handle.
+pub type Render = Arc<dyn Fn() -> String + Send + Sync>;
+
+/// What `/metrics` serves, and in what content type.
+#[derive(Clone)]
+pub struct MetricsRoute {
+    render: Render,
+    content_type: &'static str,
+}
+
+impl std::fmt::Debug for MetricsRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetricsRoute")
+            .field("content_type", &self.content_type)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MetricsRoute {
+    /// A `/metrics` route over a renderer and the content type its payload is in.
+    pub fn new(render: Render, content_type: &'static str) -> Self {
+        MetricsRoute {
+            render,
+            content_type,
+        }
+    }
+}
+
+/// Why the listener could not be bound or served.
+#[derive(Debug, thiserror::Error)]
+pub enum HttpError {
+    /// The address is in use, or the port is privileged and the capability is not held.
+    ///
+    /// The address is in the message because "permission denied" without one is the least
+    /// useful thing a failed bind can say, and the unit grants `CAP_NET_BIND_SERVICE`
+    /// precisely so that a low port works -- so an operator seeing this needs to know
+    /// which address was tried.
+    #[error("cannot bind {addr}")]
+    Bind {
+        /// What was tried.
+        addr: SocketAddr,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The accept loop failed.
+    #[error("the listener on {addr} stopped serving")]
+    Serve {
+        /// Where it was listening.
+        addr: SocketAddr,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl mw_types::Classify for HttpError {
+    /// Both fatal. A bind that failed because the port is taken does not succeed on a
+    /// retry inside the same process, and §3.4's classification exists so that the
+    /// supervisor does not re-decide this at the call site.
+    fn class(&self) -> mw_types::Class {
+        mw_types::Class::Fatal
+    }
+}
+
+/// A bound socket that is not yet serving.
+///
+/// Bind and serve are separate so that the caller knows the port is actually held before
+/// it tells the service manager anything. §3.5's `READY=1` means the supervisor has
+/// converged; a readiness notification sent while the socket might still fail to bind
+/// would be the `Type=simple` problem with extra steps.
+#[derive(Debug)]
+pub struct Bound {
+    listener: TcpListener,
+    router: Router,
+    addr: SocketAddr,
+}
+
+impl Bound {
+    /// The address actually bound, which is how a caller that asked for port 0 finds out
+    /// what it got.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Serve until `shutdown` completes, then drain in-flight requests.
+    pub async fn serve<F>(self, shutdown: F) -> Result<(), HttpError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let addr = self.addr;
+        axum::serve(self.listener, self.router)
+            .with_graceful_shutdown(shutdown)
+            .await
+            .map_err(|source| HttpError::Serve { addr, source })
+    }
+}
+
+/// Bind the listener.
+pub async fn bind(addr: SocketAddr, metrics: MetricsRoute) -> Result<Bound, HttpError> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|source| HttpError::Bind { addr, source })?;
+    // `0.0.0.0:0` is a legitimate request and the kernel chooses the port, so the bound
+    // address is read back rather than echoed.
+    let addr = listener
+        .local_addr()
+        .map_err(|source| HttpError::Bind { addr, source })?;
+    Ok(Bound {
+        listener,
+        router: router(metrics),
+        addr,
+    })
+}
+
+fn router(metrics: MetricsRoute) -> Router {
+    Router::new()
+        .route(
+            "/metrics",
+            get(move || {
+                let metrics = metrics.clone();
+                async move {
+                    (
+                        [(header::CONTENT_TYPE, metrics.content_type)],
+                        (metrics.render)(),
+                    )
+                }
+            }),
+        )
+        // DEV-3 in advance: a path with no route is a 404 with no body rather than a
+        // directory listing or a 405. One route table means one fallback.
+        .fallback(|| async { StatusCode::NOT_FOUND })
+}

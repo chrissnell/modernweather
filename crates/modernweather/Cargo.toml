@@ -36,10 +36,23 @@ mw-collector.workspace = true
 mw-api-mgmt.workspace = true
 
 anyhow.workspace = true
+# `anyhow` at the binary boundary and `thiserror` per module (D-32, §4) -- the boundary is
+# not the crate, it is the point where the last answer really is "print it and exit". The
+# command line and the listen address are classified errors like any other.
+thiserror.workspace = true
 tokio.workspace = true
+# The supervisor's shutdown is a `CancellationToken` (§3.6) and `main` is what cancels it.
+tokio-util.workspace = true
 sqlx.workspace = true
 tracing.workspace = true
 sd-notify.workspace = true
+# `mw_build_info` is a fact about this binary, so the one crate that knows its version is
+# the one that records it. Every other metric in §5.10's table belongs to the component
+# that owns the thing being counted.
+metrics.workspace = true
+# The weather database's URL is a `SecretString` from the moment it is read (**D-33**), so
+# the one place that hands it to a connection has to be able to expose it.
+secrecy.workspace = true
 
 # Packaging, verbatim from docs/release.md §6, which asks for exactly this block when
 # `crates/modernweather` lands. `cargo xtask dist` reads ci/release.toml for the target
