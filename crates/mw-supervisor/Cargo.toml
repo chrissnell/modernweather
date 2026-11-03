@@ -17,6 +17,41 @@ mw-component.workspace = true
 mw-types.workspace = true
 
 tokio.workspace = true
+# `CancellationToken`: stopping is cancellation plus `Drop`, with no stop method anywhere
+# in the abstraction (D-24).
+tokio-util.workspace = true
+# The one published snapshot of component state (D-32, W3 §2a.2).
+arc-swap.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+# `Calendar` occurrences are computed in an IANA zone, in the supervisor rather than in a
+# component (W2a §1.6).
+chrono-tz.workspace = true
+# `mw_component_state` and the six per-component counters of §5.10. The recorder is
+# `mw-obs`'s; this crate only emits.
+metrics.workspace = true
+
+# Exhaustive interleaving checks for the one published snapshot (W3 D-85).
+#
+# Optional, and reached through the `loom` FEATURE rather than as a dev-dependency, because
+# `src/publish.rs` substitutes the cell under `--cfg loom` and a dev-dependency is not
+# linkable from the library. `[target.'cfg(loom)'.dependencies]` would be the tidier
+# spelling and does not work: cargo evaluates that selector against the target spec, not
+# against RUSTFLAGS. So the `loom` job in .github/workflows/pr.yml passes
+# `--features mw-supervisor/loom` alongside `--cfg loom`, and `publish.rs` fails the build
+# with a message if one is set without the other.
+#
+# Test infrastructure, so outside D-32's scope by amendment A-4.
+loom = { workspace = true, optional = true }
+
+[features]
+# Not enabled by default and not enabled by any other crate: the daemon never links loom.
+loom = ["dep:loom"]
+
+[dev-dependencies]
+# `tokio::time::pause()` for the shutdown test, which is what makes it deterministic and
+# finish in milliseconds rather than sleeping through a 10-second grace (W3 §8.4).
+tokio = { workspace = true, features = ["test-util", "rt", "macros"] }
+# The test doubles in `testing` carry a cause chain, which needs an error type.
+thiserror.workspace = true
