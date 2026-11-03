@@ -605,7 +605,20 @@ jobs:
       # because docs/release.md §5 keeps write credentials out of CI, and partly because a
       # floor that moves on its own is not a reviewed decision.
       - name: Check the ratchet
+        # `set -o pipefail` because the default shell is `bash -e` without it, so the exit
+        # status of `gate | tee` is tee's -- always zero. Until this line the ratchet could
+        # not fail: a coverage drop printed its diagnosis into the summary and the job went
+        # green, which is docs/reconciliation.md G-1 in the job that guards against
+        # regression. Demonstrated rather than reasoned about: under `bash -e`,
+        # `( exit 2 ) | tee` exits 0, and with pipefail it exits 2.
+        #
+        # Safe to turn on here, and this is the whole reason this is separable from the
+        # identical pipe in the `conformance` job above: coverage is 83.54% against a 75.00
+        # floor, so `cargo xtask gate coverage-ratchet` exits 0 today -- verified by running
+        # it. The conformance gate exits 2 by design until M4-2, so an honest status there
+        # blocks every merge, which is a decision this does not take.
         run: |
+          set -o pipefail
           cargo xtask gate coverage-ratchet | tee /tmp/coverage.txt
       - name: Report
         if: always()
