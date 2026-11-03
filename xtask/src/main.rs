@@ -20,6 +20,7 @@
 //! gate that runs `codegen --check` keeps the 1-means-drift, 2-means-rejected
 //! distinction that code made (C-W2-20).
 
+mod conformance;
 mod coverage;
 mod dist;
 mod gates;
@@ -65,6 +66,9 @@ fn main() -> ExitCode {
         // Not mapped to a code of its own: the gate's command has already decided what
         // its failure means, and collapsing that was C-W2-20.
         "gate" => gates::run(&owned),
+        // The `conformance` gate's command, and the same split as `gate-layout` above:
+        // `cargo xtask gate conformance` consults ci/gates.toml and then runs this.
+        "conformance" => conformance::main(&owned),
         "coverage" => coverage::main(&owned).map(|()| ExitCode::SUCCESS),
         "dist" => dist::main(&owned).map(|()| ExitCode::SUCCESS),
         "targets" => dist::targets(&owned).map(|()| ExitCode::SUCCESS),
@@ -132,6 +136,17 @@ fn usage() {
          \x20 gate <id>          run one gate, or report it as deferred and succeed.\n\
          \x20                    Exits with the command's own code, and reports the\n\
          \x20                    meaning that code has in ci/gates.toml.\n\
+         \x20 conformance        replay contract/fixtures/ against the built daemon: build\n\
+         \x20                    it, bring it up against a freshly migrated TimescaleDB\n\
+         \x20                    and a seeded configuration database, and run\n\
+         \x20                    contract/conformance with --locked against it\n\
+         \x20     --target-binary <p>  which binary to replay against\n\
+         \x20                          (default target/debug/modernweather)\n\
+         \x20     --release            build and target target/release/ instead\n\
+         \x20     --no-build           replay against the binary already at that path\n\
+         \x20     --workdir <d>        logs and replay output (default\n\
+         \x20                          target/conformance-rust)\n\
+         \x20     --keep-running       leave the daemon up after a green run\n\
          \x20 gate-layout        check the crate boundaries declared in ci/layers.toml:\n\
          \x20                    the layer order, every crate's forbidden list, and the\n\
          \x20                    source rules. Exit 1 on a violation.\n\
@@ -142,8 +157,9 @@ fn usage() {
          \x20 targets            the release matrix from ci/release.toml, as JSON for a\n\
          \x20        [--linux-only]  GitHub Actions strategy.matrix\n\
          \n\
-         Exit codes: 0 ok \u{b7} 1 drift found by --check \u{b7} 2 invariant violated or bad \
-         usage \u{b7} gate <id>: the gate command's own code"
+         Exit codes: 0 ok \u{b7} 1 drift found by --check, or a conformance replay that \
+         did not conform \u{b7} 2 invariant violated, bad usage, or a conformance run that \
+         reached no verdict \u{b7} gate <id>: the gate command's own code"
     );
 }
 

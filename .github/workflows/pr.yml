@@ -356,45 +356,89 @@ jobs:
   conformance:
     name: frozen contract conformance (Rust target)
     runs-on: ubuntu-latest
+    # Starts a daemon and a proxy and waits on them, the same as conformance-fixtures below.
+    # A deadline turns a wedged daemon into a failed check rather than one that pends until
+    # the job limit.
+    timeout-minutes: 25
+    services:
+      timescaledb:
+        # The same -ha image as the `database` job, for the same reason (DESIGN.md D-2). The
+        # daemon asserts the server version at startup (D-62) and refuses to start against a
+        # server that is too old, so a plain pg image here would fail this gate in a way that
+        # looks nothing like its cause.
+        image: timescale/timescaledb-ha:pg17
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      # 127.0.0.1 rather than localhost: the service container publishes on IPv4 only, and
+      # the URL in the configuration database is handed to sqlx rather than to psql.
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGDATABASE: mw_conformance
+      PGSSLMODE: disable
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_STABLE }}
       - uses: Swatinem/rust-cache@v2
-      # This gate is still deferred: there is no Rust daemon to replay against. A green check
-      # named "frozen contract conformance" that ran nothing is the shape of
-      # docs/reconciliation.md G-1, which is what let the original defect survive five stages —
-      # so the job name says which target it covers and the DEFERRED line goes into the run
-      # summary rather than only into the log. The Go-target half is `conformance-fixtures`.
+        with:
+          key: conformance
+          # Two workspaces, for the same reason conformance-fixtures names two: the root one
+          # builds xtask and the daemon, and contract/conformance is standalone on purpose
+          # (W1 Decision 7).
+          workspaces: |
+            .
+            contract/conformance
+      # psql reaches the weather schema and sqlite3 reads the configuration database's
+      # migration ledger; the runner image ships both, so this is one apt call rather than a
+      # failure part-way through a run. The client may be a major version behind the server,
+      # which is fine for psql -- nothing here runs pg_dump.
+      - name: Ensure psql and sqlite3 are present
+        run: |
+          missing=""
+          command -v psql    >/dev/null || missing="$missing postgresql-client"
+          command -v sqlite3 >/dev/null || missing="$missing sqlite3"
+          if [ -n "$missing" ]; then
+            sudo apt-get update
+            # shellcheck disable=SC2086  # deliberate word splitting: $missing is a package list
+            sudo apt-get install -y --no-install-recommends $missing
+          fi
+          psql --version
+          sqlite3 --version
+      # THIS JOB IS RED, AND THAT IS THE POINT.
       #
-      # AS OF implementation-plan.md M2-1 THIS GATE IS ARMED AND FAILS. That is the state
-      # M2-1's note calls for: `crates/modernweather/Cargo.toml` now exists, so the gate runs
-      # `cargo xtask conformance`, which M2-5 implements and which therefore exits 2 naming
-      # its owner. A visible red from M2 onward rather than a discovery in M4 is the point.
+      # `cargo xtask conformance` builds the daemon, stands it up against a freshly migrated
+      # TimescaleDB and a seeded configuration database, and replays all 70 frozen fixtures
+      # at it. No legacy endpoint exists until implementation-plan.md M4-2, so all 70 fail on
+      # the status line and the gate exits 1. M2-5's done-criteria call for exactly that: a
+      # gate that is armed and honest from Milestone 2 onward rather than discovered in
+      # Milestone 4 (docs/reconciliation.md G-1).
       #
-      # It is NOT visible, and that is a second, separate defect. The default shell here is
-      # `bash -e`, WITHOUT `-o pipefail`, so the exit status of `gate | tee` is tee's — zero,
-      # always. This step passes whatever the gate decides, which makes the job structurally
-      # incapable of reporting a conformance failure: docs/reconciliation.md G-1 in the job
-      # that exists to avoid it. The `layout` job above deliberately does not pipe.
+      # `set -o pipefail` is what makes that visible. The default shell is `bash -e` WITHOUT
+      # it, so the exit status of `gate | tee` was tee's -- always zero -- and this job was
+      # structurally incapable of reporting a conformance failure: G-1 in the job that exists
+      # to avoid it. M2-1 recorded the defect and assigned the fix here, because this is the
+      # work item that gives the gate something true to say. `coverage-ratchet` had the
+      # identical pipe and was fixed the same way in c1b645f.
       #
-      # Adding `set -o pipefail` is a one-line fix and it is NOT taken here, because the
-      # consequence is a decision this work item does not own. `conformance` is a dependency
-      # of the single required `gate` check, so an honest exit status blocks every merge from
-      # here until M4-2 earns a green replay — through M2-2, M2-3, M2-4, M2-5 and the whole
-      # of M3. Either that is intended and branch protection needs `conformance` out of the
-      # required set for the M2–M4 window, or it is not and the plan's "visible from M2
-      # onward" means something weaker than a red required check. Both answers are the
-      # programme owner's.
-      #
-      # Recorded here rather than left to be rediscovered, and raised on GRA-708 rather than
-      # left only here — a comment in a YAML file is not a work item (G-5), and M2-5's text
-      # is about implementing `cargo xtask conformance`, not about this workflow.
-      #
-      # `coverage-ratchet` below has the identical shape. It is harmless today only because
-      # the floor is 0.00, which is not a reason to leave it.
-      - run: cargo xtask gate conformance | tee /tmp/conformance.txt
+      # The CONSEQUENCE is a policy question this item does not answer: `conformance` is a
+      # dependency of the single required `gate` check, so an honest status here blocks every
+      # merge until M4-2 earns a green replay. Removing it from that job's `needs` for the
+      # M2-M4 window is a one-line change and it is the programme owner's to make -- taking
+      # it by way of a lint fix is how a required check quietly stops being required.
+      - name: Replay the fixtures against the Rust binary
+        run: |
+          set -o pipefail
+          cargo xtask gate conformance | tee /tmp/conformance.txt
       - name: Report
         if: always()
         run: |
@@ -404,7 +448,21 @@ jobs:
             echo '```'
             cat /tmp/conformance.txt 2>/dev/null || echo "the gate did not run"
             echo '```'
+            echo '```'
+            tail -n 3 target/conformance-rust/direct.txt 2>/dev/null \
+              || echo "the replay did not run"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the replay output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-rust-output
+          path: |
+            target/conformance-rust/direct.txt
+            target/conformance-rust/mangled.txt
+            target/conformance-rust/logs/
+          if-no-files-found: ignore
 
   conformance-fixtures:
     name: frozen contract fixtures vs the Go daemon

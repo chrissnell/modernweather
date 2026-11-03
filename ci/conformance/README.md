@@ -1,18 +1,61 @@
-# `ci/conformance/` — the frozen contract, replayed against the Go daemon
+# The frozen contract, replayed — against the Go daemon here, and against the Rust one
+
+This directory is the Go half. The Rust half is `cargo xtask conformance`, and both are described
+here because neither means anything without the other (`DESIGN.md` R-3).
 
 `DESIGN.md` R-3 splits the conformance suite into two checks against the same 70 fixtures:
 
-| | Target | Proves | Gate |
-|---|---|---|---|
-| 1 | the **Go** daemon | the fixtures describe reality | `conformance-fixtures` — this directory |
-| 2 | the **Rust** daemon | the rewrite matches | `conformance` — deferred until `crates/modernweather/Cargo.toml` exists |
+| | Target | Proves | Gate | Harness |
+|---|---|---|---|---|
+| 1 | the **Go** daemon | the fixtures describe reality | `conformance-fixtures` | `go-target.sh`, this directory |
+| 2 | the **Rust** daemon | the rewrite matches | `conformance` | `cargo xtask conformance` (`xtask/src/conformance.rs`) |
 
 Check 1 has been possible since W1 landed and had never run. `docs/reconciliation.md` G-1 is the
 record of what that cost: the `conformance` gate reported green by deferral for five stages while
 the suite whose own done-criteria required it to pass had never executed. The existence of
 `go-target.sh` is what arms `conformance-fixtures` in `ci/gates.toml`.
 
-## Running it
+**Check 2 is armed and failing, which is its correct state until `implementation-plan.md` M4-2.**
+The Rust daemon serves `/metrics` and a 404 fallback, so `cargo xtask conformance` reports 70
+fixtures attempted and 70 failed and exits 1. That red is the deliverable of M2-5: the failure is
+visible from Milestone 2 onward instead of being discovered in Milestone 4. The two harnesses do the
+same job in the same order and assert the same things — read `go-target.sh` before changing either —
+and the differences are only the ones the target forces:
+
+| | `go-target.sh` | `cargo xtask conformance` |
+|---|---|---|
+| target | `rw`, built from `remoteweather` @ `c3ec9f7` | `target/debug/modernweather`, built from this tree |
+| configuration | `rw -config` + `config-seed.sql`, 7 devices and 6 websites | `migrations/config/`, applied by the daemon, then the `listener` and `weather_database` rows |
+| weather data | W1's rig (`contract/tools/rig/`), plus five migrations the Go daemon does not provision | nothing yet; seeding readings for the five frozen endpoints is M4-2's, which is what will make a *green* replay mean something |
+| port | 18080, with the emulators on 22222 and 8123 | 18080, which is the port `mangle_proxy.py` forwards to |
+| negative control | always, and the run is accepted only if it fails | only once the direct replay is clean, because there is nothing to control for while every fixture already fails |
+| language | shell, because it must run with no Rust daemon in the tree | Rust, because the verdict — 70 attempted, transport failures, the control's three parts — is then unit-testable without a database |
+
+## Running the Rust target
+
+```sh
+cargo xtask gate conformance
+```
+
+Same libpq variables as below (the default database is `mw_conformance`), and it needs `psql`,
+`sqlite3` and `python3` on `PATH` and a TimescaleDB it may **drop and recreate** `$PGDATABASE` on.
+It fails rather than skipping when it cannot have them, for the reason W3 Decision 84 gives about
+the database tests: "green because it did not run" has to be unreachable.
+
+`cargo xtask conformance --help`-worth of knobs lives in `cargo xtask help`; the two that matter
+when reading a failure are `--no-build` (replay against the binary already at `--target-binary`)
+and `--keep-running` (leave the daemon up after a green run). Replay output and the daemon's log
+land in `target/conformance-rust/`.
+
+Its two failure codes are declared in `ci/gates.toml` and mean different things: **1** is "the
+replay reached a verdict and the binary does not conform", which is today's expected state, and
+**2** is "the run reached no verdict" — a missing tool, a busy port, a database that would not
+answer, a daemon that never asserted its database version, a fixture count that is not 70, failures
+at the transport layer, or a negative control that did not hold. The split exists because a dead
+daemon and a wrong contract both produce 70 failures, and calling the first the second is the
+expensive direction for this gate to be wrong in.
+
+## Running the Go target
 
 ```sh
 cargo xtask gate conformance-fixtures
@@ -114,6 +157,18 @@ CONFORMANCE_FORCE_MANGLE=1 cargo xtask gate conformance-fixtures   # 26 fixtures
 MIN_MANGLED_FAILURES=99    cargo xtask gate conformance-fixtures   # negative control too weak, gate red
 ```
 
+The Rust target's equivalents, each watched against a real run rather than reasoned about:
+
+```sh
+CONFORMANCE_FIXTURES=/some/subset cargo xtask conformance   # "attempted 3 fixtures, expected 70", exit 2
+CONFORMANCE_FORCE_MANGLE=1        cargo xtask conformance   # the replay goes through the proxy
+PATH=/usr/bin:/bin                cargo xtask conformance   # "missing required tool(s): psql, sqlite3", exit 2
+```
+
+`CONFORMANCE_FORCE_MANGLE=1` does not change the Rust target's verdict today — the direct replay is
+already red — but it is the one knob that exercises the proxy, the port it listens on and the second
+replay before M4-2 needs them. Occupying 18080 before a run produces the preflight's other exit 2.
+
 The transport-failure guard was watched failing the same way, against real runner output: point
 `legacy-conformance` at a port nothing is listening on and it emits 70 `FAIL` lines, every one of
 them `request failed: … Connection refused`. A bare floor accepts that as "70 fixtures failed";
@@ -127,3 +182,6 @@ the guard rejects it.
 | `config-seed.sql` | the capture rig's devices, websites and remote stations, as data |
 | `freeze-jobs.sql` | stops the almanac refresh job from rewriting a seeded snapshot mid-run |
 | `nullfill.sql` | the NULL→0 fill `contract/tools/README.md` leaves as a comment |
+
+The Rust half has no files here: it is `xtask/src/conformance.rs`, because `ci/gates.toml` declares
+its command as `cargo xtask conformance` and the judgement it makes is worth having tests for.
