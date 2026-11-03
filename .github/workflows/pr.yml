@@ -165,9 +165,15 @@ jobs:
         env:
           RUSTFLAGS: --cfg loom
           LOOM_PACKAGES: -p mw-supervisor -p mw-pipeline
+          # `--cfg loom` substitutes the cell inside `mw-supervisor::publish`, so the
+          # library links loom -- which a dev-dependency cannot do. The feature is
+          # optional, off by default, and enabled by nothing else, so the daemon never
+          # links loom. implementation-plan.md M2-3 added it; `publish.rs` fails the build
+          # with a message if one of the two is set without the other.
+          LOOM_FEATURES: --features mw-supervisor/loom
         run: |
           # shellcheck disable=SC2086  # deliberate word splitting: a cargo -p list
-          cargo test $LOOM_PACKAGES --locked
+          cargo test $LOOM_PACKAGES $LOOM_FEATURES --locked
       # A scoped job can silently skip the thing it exists to run, which is
       # docs/reconciliation.md G-1. So a loom test written in a crate outside the scope is
       # a loud failure here rather than a test nobody runs.

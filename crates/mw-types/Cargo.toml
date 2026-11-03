@@ -13,3 +13,11 @@ workspace = true
 
 [dependencies]
 chrono.workspace = true
+# `Provenance::path` is an ordered `SmallVec<[OriginId; 8]>` (D-59).
+smallvec.workspace = true
+
+[dev-dependencies]
+# `error.rs`'s own test needs two error types to make a chain out of. `thiserror` is not a
+# dependency of this crate: §4.1 puts error ENUMS in the nine crates above this one, and
+# what lives here is the classification they implement.
+thiserror.workspace = true

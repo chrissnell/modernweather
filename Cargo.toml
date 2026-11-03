@@ -137,6 +137,11 @@ crc32c = "0.6"
 # `Envelope::path` is an ordered `SmallVec<[OriginId; 8]>` (D-59).
 smallvec = { version = "1", features = ["union"] }
 
+# Exhaustive interleaving checks for the lock-free publish/read of W3 §8.4. Optional in
+# `mw-supervisor` and off by default, so the daemon never links it: D-32 governs the
+# daemon's dependencies and test infrastructure is out of its scope (amendment A-4).
+loom = "0.7"
+
 # The management OpenAPI schema is derived from the Rust handlers rather than
 # hand-maintained (A-W3-1, W5 D-37).
 utoipa = "6"
@@ -147,6 +152,11 @@ sd-notify = "0.5"
 [workspace.lints.rust]
 unsafe_code = "warn"
 missing_debug_implementations = "warn"
+# `--cfg loom` is set by the `loom` job in .github/workflows/pr.yml for the whole
+# dependency graph, so the crates that model their lock-free code under it compile with a
+# cfg cargo knows nothing about. Declared here rather than per crate, because
+# `[lints] workspace = true` cannot be mixed with a local `[lints.rust]` table.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [workspace.lints.clippy]
 # `-D warnings` on the command line covers the default set; these raise a few groups that

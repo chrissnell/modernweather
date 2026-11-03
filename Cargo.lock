@@ -1475,6 +1475,8 @@ dependencies = [
  "chrono-tz",
  "mw-types",
  "thiserror",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -1600,11 +1602,16 @@ dependencies = [
 name = "mw-supervisor"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "chrono",
+ "chrono-tz",
+ "loom",
+ "metrics",
  "mw-component",
  "mw-types",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -1613,6 +1620,8 @@ name = "mw-types"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "smallvec",
+ "thiserror",
 ]
 
 [[package]]
