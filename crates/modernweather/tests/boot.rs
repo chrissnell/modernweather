@@ -1,5 +1,30 @@
 //! M2-4's done-criteria, against the real binary.
 //!
+//! **Not run under ThreadSanitizer**, and the `race` job sets `--cfg mw_sanitizer` to say
+//! so. Two reasons, both about what a sanitizer can observe here:
+//!
+//! 1. The thing worth instrumenting is a **child process**. TSan's findings about the
+//!    daemon are reported in the daemon, and with `halt_on_error=1` the first report kills
+//!    it -- so a race anywhere in its dependency graph surfaces in this file as a
+//!    `ConnectionReset` on an HTTP read or a timed-out `wait`, which is the least
+//!    informative possible rendering of it. The in-process concurrency the `race` job
+//!    exists for is `mw-supervisor`'s, and `crates/mw-supervisor/tests/concurrency.rs`
+//!    covers that where TSan can actually see it.
+//! 2. There is a standing false positive on the path only this binary takes. `tokio`
+//!    publishes a `ScheduledIo` to its I/O driver by handing the pointer to the kernel as
+//!    an `epoll_ctl` token and reading it back from `epoll_wait`; TSan does not model
+//!    those syscalls as synchronisation, so it reports the allocating write against the
+//!    driver thread's atomic load. It needs a **multi-threaded** runtime for the two to be
+//!    different threads, which makes this binary the only thing in the workspace that
+//!    triggers it -- every `#[tokio::test]` target is `current_thread`. No `tokio` version
+//!    fixes it: it needs `__tsan_acquire`/`release` annotations wherever the pointer
+//!    crosses the kernel. Reproduce by removing `--cfg mw_sanitizer` from the `race` job.
+//!
+//! The assertions are not weakened and nothing is skipped: `cargo test` runs this file in
+//! the gate's own `test` job, which is where its subject -- process lifecycle, signals,
+//! exit codes and the readiness protocol -- is actually testable.
+#![cfg(not(mw_sanitizer))]
+//!
 //! > `modernweather --config <path>` starts with an empty configuration, converges,
 //! > notifies readiness, serves `/metrics`, and exits cleanly on SIGTERM inside the
 //! > 10-second grace.

@@ -152,11 +152,18 @@ sd-notify = "0.5"
 [workspace.lints.rust]
 unsafe_code = "warn"
 missing_debug_implementations = "warn"
-# `--cfg loom` is set by the `loom` job in .github/workflows/pr.yml for the whole
-# dependency graph, so the crates that model their lock-free code under it compile with a
-# cfg cargo knows nothing about. Declared here rather than per crate, because
-# `[lints] workspace = true` cannot be mixed with a local `[lints.rust]` table.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+# Two cfgs the CI jobs set for the whole dependency graph, which cargo otherwise knows
+# nothing about. Declared here rather than per crate, because `[lints] workspace = true`
+# cannot be mixed with a local `[lints.rust]` table.
+#
+#   loom          the `loom` job, for the crates that model their lock-free code under it
+#   mw_sanitizer  the `race` job, for the test targets that cannot say anything under a
+#                 sanitizer -- see that job's comment and crates/modernweather/tests/boot.rs
+#
+# `cfg(sanitize = "thread")` would be the obvious spelling of the second one and cannot be
+# used: it is unstable, and these files have to compile on the pinned stable toolchain that
+# every other job uses.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(mw_sanitizer)'] }
 
 [workspace.lints.clippy]
 # `-D warnings` on the command line covers the default set; these raise a few groups that

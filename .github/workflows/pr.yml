@@ -106,9 +106,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: tsan
+      # One exclusion, and it is a cfg rather than a narrowed command so that the set of
+      # excluded targets is visible in the source and guarded below.
+      # `crates/modernweather/tests/boot.rs` spawns the daemon as a CHILD process and
+      # asserts on its exit status, its sockets and its sd-notify datagrams. A sanitizer
+      # has nothing to say about that: its findings about the child are reported in the
+      # child, `halt_on_error=1` kills the child on the first one, and the failure reaches
+      # the test as a `ConnectionReset` or a timed-out `wait` instead of as a race report.
+      # The in-process concurrency this job exists for is `mw-supervisor`'s, and
+      # `crates/mw-supervisor/tests/concurrency.rs` is where TSan can see it.
+      #
+      # There is also a standing false positive on the one path only that binary takes:
+      # `tokio` publishes a `ScheduledIo` to its I/O driver as an `epoll_ctl` token and
+      # reads it back from `epoll_wait`, and TSan does not model those syscalls as
+      # synchronisation, so it reports the allocating write against the driver thread's
+      # atomic load. It needs a MULTI-THREADED runtime for those to be two threads, which
+      # is why no `#[tokio::test]` target (all `current_thread`) trips it. No `tokio`
+      # release fixes that: it needs `__tsan_acquire`/`release` annotations wherever the
+      # pointer crosses the kernel. If a suppression file is ever wanted instead,
+      # `race:tokio::runtime::io::` is the frame, and the reproduction is
+      # `cargo test -p modernweather --test boot` with `--cfg mw_sanitizer` removed.
       - name: cargo test under ThreadSanitizer
         env:
-          RUSTFLAGS: -Zsanitizer=thread
+          RUSTFLAGS: -Zsanitizer=thread --cfg mw_sanitizer
           # RUSTDOCFLAGS has to carry the flag too, and this is not belt-and-braces: cargo
           # does not propagate RUSTFLAGS to rustdoc, so the doctest harness was compiled
           # WITHOUT the sanitizer while every dependency it links -- including the
@@ -121,7 +141,7 @@ jobs:
           # The alternative fix is `--all-targets`, which excludes doctests. Rejected: it
           # drops a whole target class from the one job that observes real interleavings,
           # and this job's instruction is to fix it rather than narrow it.
-          RUSTDOCFLAGS: -Zsanitizer=thread
+          RUSTDOCFLAGS: -Zsanitizer=thread --cfg mw_sanitizer
           # A leak at process exit is not a race, and TSan's leak checker fires on
           # perfectly ordinary Box::leak of a static.
           TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 detect_leaks=0
@@ -132,6 +152,21 @@ jobs:
         run: |
           cargo test --workspace --all-features --locked \
             -Z build-std --target x86_64-unknown-linux-gnu
+      # The same guard the loom job has, for the same reason: an exclusion nobody has
+      # counted is how a job stops running the thing it exists to run
+      # (docs/reconciliation.md G-1). Adding a file to this list is a reviewable line.
+      - name: Assert every sanitizer exclusion is declared
+        if: always()
+        run: |
+          expected="crates/modernweather/tests/boot.rs"
+          found=$(grep -rl "cfg(not(mw_sanitizer))" crates/ --include="*.rs" | sort)
+          if [ "$found" != "$expected" ]; then
+            echo "::error::sanitizer exclusions changed"
+            echo "expected: $expected"
+            echo "found:    $found"
+            exit 1
+          fi
+          echo "excluded from the sanitizer, as declared: $found"
 
   loom:
     name: loom interleavings
