@@ -63,13 +63,33 @@ impl StateTable {
 
     /// Whether every component's `applied_generation` has caught up with `generation`.
     ///
-    /// Not what the UI asks — W5 compares only the components a write *affects* — but it
-    /// is what the concurrency test asserts, because the writer builds every table so that
-    /// the invariant holds, and a torn read is then visible as a violation.
+    /// The production reading of W5 §2.2, and deliberately **one-directional**: a
+    /// component can legitimately be *behind* the committed generation (it has not been
+    /// restarted yet) and can legitimately be *ahead* of it only in the instant between
+    /// a plan being applied and the next publication, which never leaves this process.
+    ///
+    /// This is **not** the torn-read sentinel. `>=` cannot see a reader that observed a
+    /// stale `generation` beside fresh rows, which is one of the two ways a split
+    /// publication tears — so a test that used this would miss half of what it claims to
+    /// check. [`StateTable::is_coherent`] is the sentinel.
     pub fn is_fully_applied(&self) -> bool {
         self.components
             .iter()
             .all(|c| c.applied_generation >= self.generation)
+    }
+
+    /// Whether this table's rows agree **exactly** with the generation they were published
+    /// with — the torn-read sentinel.
+    ///
+    /// A property of how the writer builds a table rather than a field the production path
+    /// reads: the concurrency tests commit every row at the table's own generation, so any
+    /// disagreement in *either* direction means the reader saw a mixture of two commits.
+    /// That is what makes the assertion "no torn read" rather than "no crash" — `ArcSwap`
+    /// would not crash even if the design were wrong.
+    pub fn is_coherent(&self) -> bool {
+        self.components
+            .iter()
+            .all(|c| c.applied_generation == self.generation)
     }
 }
 
@@ -156,6 +176,7 @@ mod tests {
     fn a_published_table_is_internally_consistent() {
         let published = Publication::new(table(1));
         assert!(published.load().is_fully_applied());
+        assert!(published.load().is_coherent());
         published.store(table(2));
         let seen = published.load();
         assert_eq!(seen.generation, Generation::new(2));
@@ -189,6 +210,13 @@ mod tests {
         assert!(
             torn.components[0].applied_generation > torn.generation,
             "a component cannot have applied a generation that has not been committed"
+        );
+        // The sentinel the concurrency tests use catches it in this direction, which is
+        // the one `is_fully_applied`'s `>=` is blind to.
+        assert!(!torn.is_coherent());
+        assert!(
+            torn.is_fully_applied(),
+            "which is exactly why the production predicate is not the sentinel"
         );
 
         generation.store(Arc::new(Generation::new(2)));

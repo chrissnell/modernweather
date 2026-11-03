@@ -119,9 +119,45 @@ pub enum ControlError {
         trigger: &'static str,
     },
 
+    /// `run_now` on a component that is not live — `Waiting` on a capability, `Stopped`,
+    /// or still `Starting`.
+    ///
+    /// Reported rather than accepted, because the supervisor would log the request and
+    /// drop it: a 200 for a check that did not run is worse than a refusal that says
+    /// which state the component is in.
+    #[error("`{id}` is {state}, so there is nothing to run now")]
+    NotLive {
+        /// The component.
+        id: ComponentId,
+        /// Its state's one-word name.
+        state: &'static str,
+    },
+
     /// The supervisor is shutting down and is not accepting control requests.
     #[error("the supervisor is shutting down")]
     ShuttingDown,
+}
+
+impl mw_types::Classify for ControlError {
+    /// `ShuttingDown` is the one transient case: the supervisor is going away and the
+    /// request would succeed against the next process. The other two are the caller
+    /// asking for something that does not exist or cannot be done, which no retry fixes.
+    fn class(&self) -> mw_types::Class {
+        match self {
+            ControlError::ShuttingDown => mw_types::Class::RETRYABLE,
+            ControlError::NoSuchComponent { .. }
+            | ControlError::NotRunnable { .. }
+            | ControlError::NotLive { .. } => mw_types::Class::Fatal,
+        }
+    }
+}
+
+impl mw_types::Classify for LogControlError {
+    /// A rejected directive is the operator's to fix; a missing reload handle is this
+    /// build's to fix. Neither is retryable.
+    fn class(&self) -> mw_types::Class {
+        mw_types::Class::Fatal
+    }
 }
 
 /// The runtime log-level handle.

@@ -97,6 +97,15 @@ impl ComponentControl for Control {
                 trigger: status.trigger,
             });
         }
+        // Refused rather than accepted-and-dropped. The supervisor's own fireability check
+        // would log the request and discard it, so without this the management API would
+        // answer 200 for a check that never ran.
+        if !matches!(status.state.as_str(), "running" | "backoff") {
+            return Err(ControlError::NotLive {
+                id: id.clone(),
+                state: status.state.as_str(),
+            });
+        }
         self.send(Command::RunNow(id.clone()))
     }
 

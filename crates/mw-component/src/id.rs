@@ -40,7 +40,10 @@ pub enum ComponentIdError {
         found: char,
     },
     /// Longer than anything legitimate, and long enough to be a mistake worth naming.
-    #[error("component id `{id}` is {len} bytes; the limit is {}", MAX_LEN)]
+    #[error(
+        "component id `{id}` is {len} bytes; the limit is {}",
+        ComponentId::MAX_LEN
+    )]
     TooLong {
         /// The rejected id.
         id: String,
@@ -49,11 +52,14 @@ pub enum ComponentIdError {
     },
 }
 
-/// The longest a component id may be. Generous for `kind:station:detail` and far short of
-/// anything that belongs in a metric label.
-pub const MAX_LEN: usize = 128;
-
 impl ComponentId {
+    /// The longest a component id may be. Generous for `kind:station:detail` and far short
+    /// of anything that belongs in a metric label.
+    ///
+    /// On the type rather than on the module, so a caller that wants to check a length
+    /// before constructing one can reach it — the module is private.
+    pub const MAX_LEN: usize = 128;
+
     /// Validate and wrap. The only constructor: an unvalidated id would reach a metric
     /// label and a database key, and both would accept it.
     pub fn new(id: impl AsRef<str>) -> Result<Self, ComponentIdError> {
@@ -61,7 +67,7 @@ impl ComponentId {
         if id.is_empty() {
             return Err(ComponentIdError::Empty);
         }
-        if id.len() > MAX_LEN {
+        if id.len() > Self::MAX_LEN {
             return Err(ComponentIdError::TooLong {
                 id: id.to_string(),
                 len: id.len(),
@@ -91,11 +97,13 @@ impl ComponentId {
     /// The first segment — `aprs` in `aprs:backyard`. W5's `display.section` is derived
     /// from this, once, in `mw-api-mgmt`.
     pub fn kind(&self) -> &str {
-        self.0.split(':').next().unwrap_or(&self.0)
+        // `split` always yields at least one item, and `new` rejects the empty id.
+        self.0.split(':').next().unwrap_or_default()
     }
 
-    /// Everything after the first `:`, or `None` for a singleton like `db:postgres`'s
-    /// consumers would have. W5 renders this as `display.qualifier`.
+    /// Everything after the first `:` — `backyard` in `aprs:backyard`, and
+    /// `postgres` in `db:postgres`. `None` for an id with no `:` at all, which is what a
+    /// component with a single instance has. W5 renders this as `display.qualifier`.
     pub fn instance(&self) -> Option<&str> {
         self.0.split_once(':').map(|(_, rest)| rest)
     }
@@ -176,7 +184,13 @@ mod tests {
         let id = ComponentId::new("aprs:backyard").unwrap();
         assert_eq!(id.kind(), "aprs");
         assert_eq!(id.instance(), Some("backyard"));
-        assert_eq!(ComponentId::new("db.postgres").unwrap().instance(), None);
+        let db = ComponentId::new("db:postgres").unwrap();
+        assert_eq!(db.kind(), "db");
+        assert_eq!(db.instance(), Some("postgres"));
+        // No `:` at all: one instance, nothing to qualify.
+        let bare = ComponentId::new("db.postgres").unwrap();
+        assert_eq!(bare.kind(), "db.postgres");
+        assert_eq!(bare.instance(), None);
     }
 
     #[test]
@@ -195,7 +209,7 @@ mod tests {
         ));
         assert!(matches!(ComponentId::new(""), Err(ComponentIdError::Empty)));
         assert!(matches!(
-            ComponentId::new("a".repeat(MAX_LEN + 1)),
+            ComponentId::new("a".repeat(ComponentId::MAX_LEN + 1)),
             Err(ComponentIdError::TooLong { .. })
         ));
     }

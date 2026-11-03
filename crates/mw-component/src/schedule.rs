@@ -90,6 +90,17 @@ pub enum ScheduleStoreError {
     },
 }
 
+impl mw_types::Classify for ScheduleStoreError {
+    /// Retryable, and the doc on the enum says why: the worst consequence of a lost
+    /// occurrence row is that an idempotent `Calendar` occurrence is made up twice or not
+    /// at all, so the supervisor logs and carries on rather than treating this as fatal.
+    /// Recording that answer here rather than in prose is what stops each call site from
+    /// deciding it again.
+    fn class(&self) -> mw_types::Class {
+        mw_types::Class::RETRYABLE
+    }
+}
+
 impl ScheduleStoreError {
     /// Wrap a store failure.
     pub fn backend<E>(source: E) -> Self

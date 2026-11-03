@@ -30,11 +30,20 @@
 //! station exists — and `mw-supervisor` may not depend on `mw-station` or `mw-store` at
 //! all. Being generic over `C` keeps the supervisor ignorant of both, and the binary — the
 //! one place a consumer and a provider meet — chooses the type.
+//!
+//! Two smaller deviations from the same sketch, recorded here so they are not read as
+//! oversights. `plan()` takes a [`PlanContext`] as well, because the root set is what
+//! distinguishes `UnknownCapability` from `Unprovided` and the generation is what every
+//! started component records as `applied_generation`; and it returns a [`Plan`] rather
+//! than a bare `Vec<ComponentSpec>`, because the ranks it computed are what the supervisor
+//! starts and shuts down in and recomputing them would be a second implementation of the
+//! same sort.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use mw_component::{
     Arity, BodyKind, Capability, ComponentId, ComponentSpec, Generation, PlanError, ProviderClass,
+    Scope,
 };
 
 /// Which root capabilities this process provides.
@@ -239,10 +248,12 @@ pub fn plan<C: ?Sized>(
 /// every structural error below a unit test rather than a fixture-configuration exercise.
 ///
 /// **The order of the checks is deliberate**, because a spec can fail more than one and the
-/// first failure is what an operator reads: per-component declarations first (they are
-/// about one component and name it), then provisions, then requirements, then routes, then
-/// the graph. A cycle is reported last because a plan with a bad deadline *and* a cycle has
-/// two problems, and the one inside a single component is the cheaper one to fix.
+/// first failure is what an operator reads: duplicate ids first (everything downstream is
+/// keyed by the id, so nothing else is meaningful until they are unique), then
+/// per-component declarations (they are about one component and name it), then provisions,
+/// then requirements, then routes, then the graph. A cycle is reported last because a plan
+/// with a bad deadline *and* a cycle has two problems, and the one inside a single
+/// component is the cheaper one to fix.
 pub fn validate(specs: Vec<ComponentSpec>, ctx: &PlanContext) -> Result<Plan, PlanError> {
     check_unique_ids(&specs)?;
     for spec in &specs {
@@ -286,6 +297,15 @@ pub fn diff(old: &Plan, new: &Plan) -> PlanDiff {
 fn check_unique_ids(specs: &[ComponentSpec]) -> Result<(), PlanError> {
     let mut seen = BTreeSet::new();
     for spec in specs {
+        // The runtime spine publishes the root capabilities under this id, and stopping a
+        // component withdraws everything that id provides -- so a component called `spine`
+        // would, on its first stop, revoke `ComponentControl` and `ReadingStream` for the
+        // whole process.
+        if spec.id.as_str() == crate::SPINE {
+            return Err(PlanError::ReservedComponentId {
+                id: spec.id.clone(),
+            });
+        }
         if !seen.insert(&spec.id) {
             return Err(PlanError::DuplicateComponentId {
                 id: spec.id.clone(),
@@ -350,9 +370,7 @@ fn check_declarations(spec: &ComponentSpec) -> Result<(), PlanError> {
             if tz.zone().is_none() {
                 return Err(PlanError::MissingTimeZone {
                     id: spec.id.clone(),
-                    station: tz
-                        .station()
-                        .map_or_else(|| "the deployment default".to_string(), |s| s.to_string()),
+                    station: tz.station(),
                 });
             }
         }
@@ -462,20 +480,35 @@ fn check_routes(specs: &[ComponentSpec]) -> Result<(), PlanError> {
             let ProvisionDetail::Routes(manifest) = &provision.detail else {
                 continue;
             };
-            for (owner, existing) in &claimed {
-                if existing.scope != manifest.scope {
-                    continue;
+            // A route manifest on anything but `HttpRoutes` would be checked for conflicts
+            // here and then never mounted, because `http:listener` consumes exactly one
+            // capability. Nothing would say so.
+            if provision.capability != Capability::HttpRoutes {
+                return Err(PlanError::RoutesOnNonRouteCapability {
+                    capability: provision.capability,
+                    provider: spec.id.clone(),
+                });
+            }
+            for entry in &manifest.entries {
+                if let Some(reason) = route_problem(entry) {
+                    return Err(PlanError::BadRoute {
+                        id: spec.id.clone(),
+                        pattern: entry.pattern.clone(),
+                        reason,
+                    });
                 }
+            }
+            for (owner, existing) in &claimed {
                 for a in &existing.entries {
                     for b in &manifest.entries {
-                        if a.conflicts_with(b) {
-                            return Err(PlanError::RouteConflict {
-                                scope: manifest.scope,
-                                pattern: b.pattern.clone(),
-                                methods: a.methods,
-                                a: (*owner).clone(),
-                                b: spec.id.clone(),
-                            });
+                        if scopes_overlap(existing.scope, manifest.scope) && a.conflicts_with(b) {
+                            return Err(conflict(
+                                manifest.scope.max(existing.scope),
+                                owner,
+                                a,
+                                &spec.id,
+                                b,
+                            ));
                         }
                     }
                 }
@@ -485,13 +518,7 @@ fn check_routes(specs: &[ComponentSpec]) -> Result<(), PlanError> {
             for (i, a) in manifest.entries.iter().enumerate() {
                 for b in &manifest.entries[i + 1..] {
                     if a.conflicts_with(b) {
-                        return Err(PlanError::RouteConflict {
-                            scope: manifest.scope,
-                            pattern: b.pattern.clone(),
-                            methods: a.methods,
-                            a: spec.id.clone(),
-                            b: spec.id.clone(),
-                        });
+                        return Err(conflict(manifest.scope, &spec.id, a, &spec.id, b));
                     }
                 }
             }
@@ -499,6 +526,72 @@ fn check_routes(specs: &[ComponentSpec]) -> Result<(), PlanError> {
         }
     }
     Ok(())
+}
+
+/// Whether two scopes can serve the same request.
+///
+/// `Scope::Any` means every host, so it overlaps both a per-site router and the management
+/// one: one `Router` is served on every socket (§6.1) and hostname routing selects the
+/// site (§6.3), so a per-site route that shadowed an `Any` route would make a **frozen**
+/// REST path unreachable on that host — D-51's own failure mode, arriving through a gap in
+/// D-51's check. Two different sites do not overlap (three websites each declaring `/` is
+/// the ordinary configuration), and a site route does not overlap a management one.
+fn scopes_overlap(a: Scope, b: Scope) -> bool {
+    match (a, b) {
+        (Scope::Any, _) | (_, Scope::Any) => true,
+        (Scope::Site(x), Scope::Site(y)) => x == y,
+        (Scope::Management, Scope::Management) => true,
+        (Scope::Site(_), Scope::Management) | (Scope::Management, Scope::Site(_)) => false,
+    }
+}
+
+/// A conflict naming **both** patterns and the methods they actually share.
+///
+/// Both patterns, because a prefix mount against a route inside it is the case where they
+/// differ and reporting one of them loses the owner's half of the problem; the
+/// intersection, because reporting one owner's whole method set says `ANY` where the real
+/// overlap is `GET`.
+fn conflict(
+    scope: Scope,
+    a_owner: &ComponentId,
+    a: &mw_component::RouteEntry,
+    b_owner: &ComponentId,
+    b: &mw_component::RouteEntry,
+) -> PlanError {
+    PlanError::RouteConflict {
+        scope,
+        pattern: if a.pattern == b.pattern {
+            b.pattern.clone()
+        } else {
+            format!("{} / {}", a.pattern, b.pattern)
+        },
+        methods: a.methods.intersection(b.methods),
+        a: a_owner.clone(),
+        b: b_owner.clone(),
+    }
+}
+
+/// Why a declared route cannot be mounted.
+///
+/// Caught here rather than by the router at mount time, which is D-51's whole argument: a
+/// missing leading slash is an `axum` panic in `http:listener`, *after* its siblings have
+/// started.
+fn route_problem(entry: &mw_component::RouteEntry) -> Option<&'static str> {
+    if entry.pattern.is_empty() {
+        return Some("the pattern is empty");
+    }
+    if !entry.pattern.starts_with('/') {
+        return Some("the pattern does not start with `/`");
+    }
+    if entry.methods.is_empty() {
+        return Some("no methods are declared");
+    }
+    let opens = entry.pattern.matches('{').count();
+    let closes = entry.pattern.matches('}').count();
+    if opens != closes {
+        return Some("the pattern has unbalanced `{}`");
+    }
+    None
 }
 
 /// Kahn's algorithm over the hard edges, in plan order so the result is deterministic.
@@ -577,35 +670,63 @@ fn order(
 }
 
 /// Walk the cyclic remainder to produce a path a reader can follow.
+///
+/// **Backwards**, along provider edges rather than consumer edges, and that is the whole
+/// of the correctness argument: after Kahn's algorithm stops, every node left has
+/// in-degree ≥ 1 *within the remainder* — that is what "left" means — so stepping to a
+/// predecessor always succeeds and the walk must repeat a node rather than dead-end.
+/// Out-degree has no such guarantee: a forward walk can leave the cycle down an acyclic
+/// tail and stop, and then the reported "cycle" is a path that does not close and names a
+/// component that is not part of the problem.
+///
+/// The repeat is the cycle. Everything the walk visited before reaching it is the tail
+/// that led in, and is dropped.
 fn find_cycle(
     specs: &[ComponentSpec],
     edges: &[Vec<usize>],
     remaining: &[usize],
 ) -> Vec<ComponentId> {
-    let in_remaining = |n: usize| remaining.contains(&n);
-    for &start in remaining {
-        let mut path = vec![start];
-        let mut seen = BTreeSet::new();
-        seen.insert(start);
-        let mut node = start;
-        // Follow any edge that stays inside the cyclic remainder. Every node there has an
-        // incoming edge from it, so this terminates in a repeat rather than a dead end.
-        while let Some(&next) = edges[node].iter().find(|&&n| in_remaining(n)) {
-            path.push(next);
-            if next == start {
-                return path.iter().map(|&i| specs[i].id.clone()).collect();
+    // Provider edges, restricted to the remainder.
+    let mut providers: Vec<Vec<usize>> = vec![Vec::new(); specs.len()];
+    for (provider, consumers) in edges.iter().enumerate() {
+        if !remaining.contains(&provider) {
+            continue;
+        }
+        for consumer in consumers {
+            if remaining.contains(consumer) {
+                providers[*consumer].push(provider);
             }
-            if !seen.insert(next) {
-                // Reached a cycle that `start` leads into but is not part of; report the
-                // cycle itself rather than the tail that found it.
-                let from = path.iter().position(|&n| n == next).unwrap_or(0);
-                let mut cycle: Vec<ComponentId> =
-                    path[from..].iter().map(|&i| specs[i].id.clone()).collect();
-                cycle.push(specs[next].id.clone());
-                return cycle;
-            }
-            node = next;
         }
     }
-    remaining.iter().map(|&i| specs[i].id.clone()).collect()
+
+    let start = match remaining.first() {
+        Some(n) => *n,
+        None => return Vec::new(),
+    };
+    let mut walk = vec![start];
+    let mut seen = vec![false; specs.len()];
+    seen[start] = true;
+    let mut node = start;
+    while let Some(&previous) = providers[node].first() {
+        if seen[previous] {
+            // Found the repeat. Slice off the tail and render the cycle in dependency
+            // order -- provider first -- with the first component repeated at the end.
+            let from = walk.iter().position(|n| *n == previous).unwrap_or(0);
+            let mut cycle: Vec<usize> = walk[from..].to_vec();
+            cycle.reverse();
+            cycle.push(cycle[0]);
+            return cycle.into_iter().map(|i| specs[i].id.clone()).collect();
+        }
+        seen[previous] = true;
+        walk.push(previous);
+        node = previous;
+    }
+    // Unreachable for a Kahn remainder, per the argument above. Returning the remainder
+    // is a worse message than a cycle but a true one -- these components are the ones
+    // that could not be ordered.
+    debug_assert!(
+        false,
+        "a node in the cyclic remainder had no provider in it"
+    );
+    remaining.iter().map(|i| specs[*i].id.clone()).collect()
 }

@@ -34,10 +34,23 @@ use mw_component::{
 use mw_types::{Class, Classify, DisplayChain};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info_span, warn, Instrument};
 
 use crate::clock::Occurrence;
+
+/// Which attempt a task is, so the supervisor can tell a live task's report from the
+/// trailing report of one it has already replaced.
+///
+/// Every event carries it, and the supervisor discards anything that is not the current
+/// epoch. That is deliberately not a "we are expecting an exit" flag: a task that is
+/// cancelled still reports, and that report arrives *after* `stop` has already awaited
+/// the handle and decided the state -- so a flag has to be cleared by the arriving event,
+/// and a flag that a lost event can leave set swallows the **next** real exit, leaving a
+/// dead component reported as `Running`. An epoch cannot be poisoned: a stale report is
+/// stale by construction.
+pub type Epoch = u64;
 
 /// What a running component task tells the supervisor.
 ///
@@ -50,11 +63,15 @@ pub enum Event {
     Ready {
         /// Whose.
         id: ComponentId,
+        /// Which attempt.
+        epoch: Epoch,
     },
     /// One occurrence finished.
     Occurred {
         /// Whose.
         id: ComponentId,
+        /// Which attempt.
+        epoch: Epoch,
         /// Which occurrence.
         occurrence: Occurrence,
         /// How it went.
@@ -68,6 +85,8 @@ pub enum Event {
     Exited {
         /// Whose.
         id: ComponentId,
+        /// Which attempt.
+        epoch: Epoch,
         /// Why.
         exit: Exit,
     },
@@ -110,6 +129,10 @@ struct Task {
     /// The occurrence channel, for a `Tick` body. `None` for `Serve` and `OnReading`,
     /// which are not fired.
     fires: Option<mpsc::Sender<Fire>>,
+    /// When this attempt started. §3.2 sketches this field and it earns its keep in one
+    /// place: backoff resets after an uptime longer than the cap, and "how long was it up"
+    /// is a fact about the task rather than about the component.
+    started: Instant,
 }
 
 /// One occurrence, handed to a `Tick` body's task.
@@ -128,6 +151,9 @@ pub enum StopOutcome {
     Stopped,
     /// It did not, and was aborted. Counted as `stop_timeout_total`.
     Aborted,
+    /// It had already unwound. The exit was still reported, because the report is in a
+    /// `Drop` guard rather than in the body's own return path.
+    Panicked,
     /// There was no task to stop.
     NotRunning,
 }
@@ -159,6 +185,22 @@ impl TaskTable {
     ) where
         F: Future<Output = ()> + Send + 'static,
     {
+        // `insert` would otherwise overwrite -- dropping the previous token (a drop is not
+        // a cancel) and the previous handle (a drop is not an abort), leaving two live
+        // bodies for one component. That is a removal path that does not await, which is
+        // exactly what this type exists to make unexpressible, so it is asserted here as
+        // well as guarded at every caller.
+        debug_assert!(
+            !self.tasks.contains_key(&id),
+            "spawning `{id}` while it already has a task: stop it first"
+        );
+        if let Some(existing) = self.tasks.remove(&id) {
+            // Release-build backstop. Cancelling and aborting is the best that can be done
+            // without an await here; the caller is the bug.
+            warn!(component = %id, "replacing a live task; the caller should have stopped it");
+            existing.token.cancel();
+            existing.handle.abort();
+        }
         let span = info_span!("component", component = %id);
         // The one permitted spawn site, with `clock` (§3.3). `clippy.toml` forbids it
         // everywhere else, which is the lint half of this invariant.
@@ -170,26 +212,51 @@ impl TaskTable {
                 token,
                 handle,
                 fires,
+                started: Instant::now(),
             },
         );
     }
 
+    /// How long this component's current task has been running, if it has one.
+    pub fn uptime(&self, id: &ComponentId) -> Option<Duration> {
+        self.tasks.get(id).map(|t| t.started.elapsed())
+    }
+
     /// The **only** way a task leaves the table.
     ///
-    /// Cancel, then await the handle within the grace deadline, then abort. Resource
-    /// release is `Drop` rather than a method, which is what makes "removing a controller
-    /// leaks its listeners" structurally impossible rather than merely fixed (**D-24**).
+    /// Cancel, await the handle within the grace deadline, then **abort and await the
+    /// abort**. Resource release is `Drop` rather than a method, which is what makes
+    /// "removing a controller leaks its listeners" structurally impossible rather than
+    /// merely fixed (**D-24**).
+    ///
+    /// The second await is the part that is easy to leave out and the part that matters:
+    /// `timeout(grace, handle)` on its own *drops* the handle when the grace elapses, and
+    /// dropping a `JoinHandle` **detaches** the task rather than cancelling it. A body
+    /// that ignores its token would then keep running -- past shutdown, or alongside the
+    /// replacement a plan diff just started -- while `stop` reported `Aborted`.
     pub async fn stop(&mut self, id: &ComponentId, grace: Duration) -> StopOutcome {
-        let Some(task) = self.tasks.remove(id) else {
+        let Some(mut task) = self.tasks.remove(id) else {
             return StopOutcome::NotRunning;
         };
         task.token.cancel();
-        match tokio::time::timeout(grace, task.handle).await {
-            Ok(_) => {
+        // `&mut handle` rather than `handle`, so the handle survives the timeout and can
+        // still be aborted.
+        match tokio::time::timeout(grace, &mut task.handle).await {
+            Ok(Ok(())) => {
                 debug!(component = %id, "stopped");
                 StopOutcome::Stopped
             }
+            Ok(Err(e)) if e.is_panic() => {
+                warn!(component = %id, "the body panicked");
+                StopOutcome::Panicked
+            }
+            // Already cancelled by something else; the task is gone either way.
+            Ok(Err(_)) => StopOutcome::Stopped,
             Err(_) => {
+                task.handle.abort();
+                // Awaiting the abort is what makes "the task is gone when this returns"
+                // true rather than hopeful.
+                let _ = task.handle.await;
                 warn!(
                     component = %id,
                     grace_s = grace.as_secs(),
@@ -198,6 +265,34 @@ impl TaskTable {
                 StopOutcome::Aborted
             }
         }
+    }
+
+    /// Stop a whole rank, with **one** grace deadline for the rank rather than one each.
+    ///
+    /// §3.6 specifies siblings stopping concurrently, and the reason is a bound rather
+    /// than speed: twenty components stopped in sequence is twenty times the grace, which
+    /// outlives `TimeoutStopSec` and gets the daemon `SIGKILL`ed -- killing bodies
+    /// mid-write, which is the thing the grace exists to prevent.
+    ///
+    /// Every token is cancelled first, so each body's grace runs concurrently with the
+    /// others', and then each handle is awaited against the shared deadline.
+    pub async fn stop_rank(
+        &mut self,
+        ids: &[ComponentId],
+        grace: Duration,
+    ) -> Vec<(ComponentId, StopOutcome)> {
+        for id in ids {
+            if let Some(task) = self.tasks.get(id) {
+                task.token.cancel();
+            }
+        }
+        let deadline = Instant::now() + grace;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            out.push((id.clone(), self.stop(id, remaining).await));
+        }
+        out
     }
 
     /// Hand an occurrence to a running `Tick` body.
@@ -234,6 +329,84 @@ impl TaskTable {
     }
 }
 
+/// Reports a task's events, and **guarantees exactly one exit event** for the task.
+///
+/// The guarantee is why this is a type rather than a function. §3.2 says "every spawned
+/// future is wrapped so that on completion it sends `(id, Outcome)`" -- but a `send` at the
+/// end of the body is *inside* the future, which is precisely where a panic escapes it. A
+/// panicking body would then report nothing: no exit, no state change, `in_flight` stuck
+/// true, and the component reported `Running` for the life of the process while its only
+/// trace is a climbing `skipped_total`.
+///
+/// So the exit lives in `Drop`. A panic unwinds the future, which drops this, which
+/// reports. An abort drops the future, which does the same. A body that returned normally
+/// has already reported and `Drop` stays quiet.
+struct Reporter {
+    id: ComponentId,
+    epoch: Epoch,
+    events: mpsc::UnboundedSender<Event>,
+    reported: bool,
+}
+
+impl Reporter {
+    fn new(id: ComponentId, epoch: Epoch, events: mpsc::UnboundedSender<Event>) -> Self {
+        Self {
+            id,
+            epoch,
+            events,
+            reported: false,
+        }
+    }
+
+    /// A non-terminal event.
+    fn send(&self, event: Event) {
+        if self.events.send(event).is_err() {
+            // The channel closes only once the supervisor's loop has finished, which is
+            // after shutdown has already cancelled every task -- so this means "nobody is
+            // listening any more", not "the event was lost".
+            debug!(component = %self.id, "the supervisor is gone; event dropped");
+        }
+    }
+
+    fn ready(&self) {
+        self.send(Event::Ready {
+            id: self.id.clone(),
+            epoch: self.epoch,
+        });
+    }
+
+    /// The task's one exit event.
+    fn exit(&mut self, exit: Exit) {
+        self.reported = true;
+        self.send(Event::Exited {
+            id: self.id.clone(),
+            epoch: self.epoch,
+            exit,
+        });
+    }
+}
+
+impl Drop for Reporter {
+    fn drop(&mut self) {
+        if self.reported {
+            return;
+        }
+        let exit = if std::thread::panicking() {
+            Exit::Failed("the component body panicked".to_string())
+        } else {
+            // The future was dropped without returning: an abort, or a runtime shutting
+            // down underneath it.
+            Exit::Failed("the component task ended without reporting an outcome".to_string())
+        };
+        self.reported = true;
+        let _ = self.events.send(Event::Exited {
+            id: self.id.clone(),
+            epoch: self.epoch,
+            exit,
+        });
+    }
+}
+
 /// How deep a `Tick` body's occurrence channel is.
 ///
 /// One. A deeper channel would be a queue of occurrences, and a queue that later fires as
@@ -245,23 +418,20 @@ pub async fn run_tick(
     builder: BuildFn<Box<dyn Tick>>,
     bcx: BuildCx,
     cx: Cx,
+    epoch: Epoch,
     once: bool,
     mut fires: mpsc::Receiver<Fire>,
     events: mpsc::UnboundedSender<Event>,
 ) {
+    let mut reporter = Reporter::new(cx.id().clone(), epoch, events);
     let mut body = match builder(bcx).await {
         Ok(body) => body,
         Err(e) => {
-            send(&events, build_failed(cx.id(), &e));
+            reporter.exit(Exit::BuildFailed(DisplayChain(&e).to_string()));
             return;
         }
     };
-    send(
-        &events,
-        Event::Ready {
-            id: cx.id().clone(),
-        },
-    );
+    reporter.ready();
 
     loop {
         // The firing is taken inside the `select!` and handled outside it, so the body's
@@ -271,46 +441,23 @@ pub async fn run_tick(
             fire = fires.recv() => fire,
         };
         let Some(fire) = fire else {
-            send(
-                &events,
-                Event::Exited {
-                    id: cx.id().clone(),
-                    exit: Exit::Cancelled,
-                },
-            );
+            reporter.exit(Exit::Cancelled);
             return;
         };
 
-        // A child of the component's token: cancelling an occurrence on its deadline must
-        // not kill the component, and cancelling the component must kill the occurrence
-        // (W3 §3.4).
-        let child = cx.token().child_token();
-        let occurrence_cx = Cx::new(
-            cx.id().clone(),
-            child,
-            cx.generation(),
-            cx.generation_watch(),
-        );
-        let result = tokio::time::timeout(fire.deadline, body.tick(&occurrence_cx)).await;
-        let (outcome, error) = interpret(result);
-        send(
-            &events,
-            Event::Occurred {
-                id: cx.id().clone(),
-                occurrence: fire.occurrence,
-                outcome,
-                error,
-                at: Utc::now(),
-            },
-        );
+        let (occurrence, child) = occurrence_cx(&cx);
+        let result = tokio::time::timeout(fire.deadline, body.tick(&occurrence)).await;
+        let (outcome, error) = finish(result, &child);
+        reporter.send(Event::Occurred {
+            id: cx.id().clone(),
+            epoch,
+            occurrence: fire.occurrence,
+            outcome,
+            error,
+            at: Utc::now(),
+        });
         if once && outcome == Outcome::Ok {
-            send(
-                &events,
-                Event::Exited {
-                    id: cx.id().clone(),
-                    exit: Exit::Finished,
-                },
-            );
+            reporter.exit(Exit::Finished);
             return;
         }
     }
@@ -325,23 +472,20 @@ pub async fn run_on_reading(
     builder: BuildFn<Box<dyn OnReading>>,
     bcx: BuildCx,
     cx: Cx,
+    epoch: Epoch,
     mut subscription: Box<dyn ReadingSubscription>,
     deadline: Duration,
     events: mpsc::UnboundedSender<Event>,
 ) {
+    let mut reporter = Reporter::new(cx.id().clone(), epoch, events);
     let mut body = match builder(bcx).await {
         Ok(body) => body,
         Err(e) => {
-            send(&events, build_failed(cx.id(), &e));
+            reporter.exit(Exit::BuildFailed(DisplayChain(&e).to_string()));
             return;
         }
     };
-    send(
-        &events,
-        Event::Ready {
-            id: cx.id().clone(),
-        },
-    );
+    reporter.ready();
 
     loop {
         let next = tokio::select! {
@@ -349,55 +493,40 @@ pub async fn run_on_reading(
             batch = subscription.next_batch() => Some(batch),
         };
         let (Some(Some(batch)), false) = (next, cx.is_cancelled()) else {
-            send(
-                &events,
-                Event::Exited {
-                    id: cx.id().clone(),
-                    exit: Exit::Cancelled,
-                },
-            );
+            reporter.exit(Exit::Cancelled);
             return;
         };
 
-        let child = cx.token().child_token();
-        let occurrence_cx = Cx::new(
-            cx.id().clone(),
-            child,
-            cx.generation(),
-            cx.generation_watch(),
-        );
-        let result = tokio::time::timeout(deadline, body.readings(batch, &occurrence_cx)).await;
-        let (outcome, error) = interpret(result);
-        send(
-            &events,
-            Event::Occurred {
-                id: cx.id().clone(),
-                occurrence: Occurrence::Demand,
-                outcome,
-                error: error.clone(),
-                at: Utc::now(),
-            },
-        );
-        if outcome != Outcome::Ok {
-            send(
-                &events,
-                Event::Exited {
-                    id: cx.id().clone(),
-                    exit: Exit::Failed(error.unwrap_or_else(|| outcome.to_string())),
-                },
-            );
-            return;
+        let (occurrence, child) = occurrence_cx(&cx);
+        let result = tokio::time::timeout(deadline, body.readings(batch, &occurrence)).await;
+        let (outcome, error) = finish(result, &child);
+        reporter.send(Event::Occurred {
+            id: cx.id().clone(),
+            epoch,
+            occurrence: Occurrence::Demand,
+            outcome,
+            error: error.clone(),
+            at: Utc::now(),
+        });
+        match outcome {
+            Outcome::Ok => {}
+            // An `Ignorable` error is not a failure, and the same reasoning has to apply
+            // here as in `run_serve`: a body that noticed cancellation mid-delivery is
+            // stopping, not failing, and backing the component off for it would both
+            // count a restart and replay a batch nobody is waiting for.
+            Outcome::Skipped => {
+                reporter.exit(Exit::Cancelled);
+                return;
+            }
+            _ => {
+                reporter.exit(Exit::Failed(error.unwrap_or_else(|| outcome.to_string())));
+                return;
+            }
         }
         // Acknowledged only on a handled batch, which is what makes a `Durable`
         // subscription's cursor mean "delivered" rather than "read".
         if let Err(e) = subscription.ack().await {
-            send(
-                &events,
-                Event::Exited {
-                    id: cx.id().clone(),
-                    exit: Exit::Failed(DisplayChain(&e).to_string()),
-                },
-            );
+            reporter.exit(Exit::Failed(DisplayChain(&e).to_string()));
             return;
         }
     }
@@ -408,23 +537,19 @@ pub async fn run_serve(
     builder: BuildFn<Box<dyn Serve>>,
     bcx: BuildCx,
     cx: Cx,
+    epoch: Epoch,
     events: mpsc::UnboundedSender<Event>,
 ) {
+    let mut reporter = Reporter::new(cx.id().clone(), epoch, events);
     let body = match builder(bcx).await {
         Ok(body) => body,
         Err(e) => {
-            send(&events, build_failed(cx.id(), &e));
+            reporter.exit(Exit::BuildFailed(DisplayChain(&e).to_string()));
             return;
         }
     };
-    send(
-        &events,
-        Event::Ready {
-            id: cx.id().clone(),
-        },
-    );
+    reporter.ready();
 
-    let id = cx.id().clone();
     let cancelled = cx.token().clone();
     let exit = match body.serve(cx).await {
         Ok(()) if cancelled.is_cancelled() => Exit::Cancelled,
@@ -434,14 +559,40 @@ pub async fn run_serve(
         Err(e) if e.class() == Class::Ignorable => Exit::Cancelled,
         Err(e) => Exit::Failed(DisplayChain(&e).to_string()),
     };
-    send(&events, Event::Exited { id, exit });
+    reporter.exit(exit);
 }
 
-fn build_failed(id: &ComponentId, e: &mw_component::BuildError) -> Event {
-    Event::Exited {
-        id: id.clone(),
-        exit: Exit::BuildFailed(DisplayChain(e).to_string()),
+/// A context for one occurrence, with its own child token.
+///
+/// The token is a **child** of the component's: cancelling an occurrence on its deadline
+/// must not kill the component, and cancelling the component must kill the occurrence (W3
+/// §3.4).
+fn occurrence_cx(cx: &Cx) -> (Cx, CancellationToken) {
+    let child = cx.token().child_token();
+    (
+        Cx::new(
+            cx.id().clone(),
+            child.clone(),
+            cx.generation(),
+            cx.generation_watch(),
+        ),
+        child,
+    )
+}
+
+/// Interpret one occurrence's result, cancelling its token if the deadline elapsed.
+///
+/// Dropping the body's future is what actually ends the work; `cancel()` is what a body
+/// awaiting something cooperative -- a `tower` stack, a subscription, another component's
+/// watch -- observes, and without it that call never learns the occurrence is over.
+fn finish(
+    result: Result<Result<(), ComponentError>, tokio::time::error::Elapsed>,
+    child: &CancellationToken,
+) -> (Outcome, Option<String>) {
+    if result.is_err() {
+        child.cancel();
     }
+    interpret(result)
 }
 
 /// Map a body's result onto the five-word outcome vocabulary.
@@ -469,16 +620,5 @@ fn interpret(
             Outcome::DeadlineExceeded,
             Some(ComponentError::DeadlineExceeded.to_string()),
         ),
-    }
-}
-
-/// Send an event, tolerating a closed channel.
-///
-/// The channel closes only when the supervisor has finished its loop, which happens after
-/// shutdown has already cancelled every task — so a failed send here means "nobody is
-/// listening any more", not "the event was lost".
-fn send(events: &mpsc::UnboundedSender<Event>, event: Event) {
-    if events.send(event).is_err() {
-        debug!("the supervisor is gone; event dropped");
     }
 }

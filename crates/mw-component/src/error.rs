@@ -33,6 +33,34 @@ pub enum PlanError {
         id: ComponentId,
     },
 
+    /// A component called `spine`, which is the id the runtime spine publishes the root
+    /// capabilities under.
+    #[error("`{id}` is reserved for the runtime spine's own capabilities")]
+    ReservedComponentId {
+        /// The rejected id.
+        id: ComponentId,
+    },
+
+    /// A route manifest declared on a capability that is not `HttpRoutes`.
+    #[error("`{provider}` declares routes on {capability}, which no listener mounts")]
+    RoutesOnNonRouteCapability {
+        /// The capability it was declared on.
+        capability: Capability,
+        /// Who declared it.
+        provider: ComponentId,
+    },
+
+    /// A route pattern the listener could not mount.
+    #[error("`{id}` declares the route `{pattern}`: {reason}")]
+    BadRoute {
+        /// The component.
+        id: ComponentId,
+        /// The pattern as declared.
+        pattern: String,
+        /// Why it cannot be mounted.
+        reason: &'static str,
+    },
+
     /// A requirement for a capability **nothing in this build can ever provide**: a root
     /// capability the process was not given.
     ///
@@ -184,14 +212,14 @@ pub enum PlanError {
     ///
     /// A plan error rather than a silent fallback to UTC, which is what every rollover in
     /// the Go tree does today (W2a Decision 11).
-    #[error(
-        "`{id}` schedules in the time zone of station {station}, which has none that is valid"
-    )]
+    #[error("{}", missing_zone(id, *station))]
     MissingTimeZone {
         /// The component.
         id: ComponentId,
-        /// The station whose zone was asked for.
-        station: String,
+        /// The station whose zone was asked for, or `None` for the deployment default —
+        /// which renders differently, because "the time zone of station the deployment
+        /// default" is not a sentence.
+        station: Option<mw_types::StationId>,
     },
 
     /// A trigger and a body that do not agree — a `Service` with a `Tick`, say. The
@@ -213,6 +241,18 @@ pub enum PlanError {
         /// What it said.
         reason: String,
     },
+}
+
+fn missing_zone(id: &ComponentId, station: Option<mw_types::StationId>) -> String {
+    match station {
+        Some(station) => format!(
+            "`{id}` schedules in the time zone of station {station}, which has none that is valid"
+        ),
+        None => format!(
+            "`{id}` schedules in the deployment's default time zone, which is not set to a \
+             valid IANA zone"
+        ),
+    }
 }
 
 fn render_cycle(path: &[ComponentId]) -> String {
@@ -271,11 +311,24 @@ pub enum BuildError {
         capability: Capability,
     },
 
+    /// A component tried to take an exclusive capability as a live additive subscription.
+    #[error("{capability} is exclusive and cannot be resolved as an additive subscription")]
+    NotAdditive {
+        /// The capability.
+        capability: Capability,
+    },
+
     /// A resource the component owns could not be acquired — a serial port, a
     /// certificate, a socket. The ordinary case, and the one backoff exists for.
     #[error("{what} could not be acquired")]
     Resource {
         /// What could not be acquired, in words an operator can act on.
+        ///
+        /// This reaches the management API verbatim, through `State::Failed` and
+        /// `ComponentStatus::last_error`. **Never interpolate a credential into it** — not
+        /// a connection string, not an APRS-IS passcode, not a station secret. D-33's
+        /// wrapper types redact in `Debug` and `Display` precisely so that the obvious
+        /// thing to write here is also the safe one.
         what: String,
         /// The cause.
         #[source]
@@ -304,6 +357,7 @@ impl Classify for BuildError {
             BuildError::HandleTypeMismatch { .. }
             | BuildError::UndeclaredNeed { .. }
             | BuildError::UndeclaredProvision { .. }
+            | BuildError::NotAdditive { .. }
             | BuildError::Configuration { .. } => Class::Fatal,
         }
     }
@@ -365,8 +419,9 @@ impl Classify for ComponentError {
     fn class(&self) -> Class {
         match self {
             ComponentError::Build(e) => e.class(),
-            // Transient, and the classification of the boxed source is deliberately not
-            // consulted: it is no longer reachable through `dyn Error`, and the
+            // Transient, and the boxed source's own classification is deliberately not
+            // consulted: the source is reachable through `dyn Error` but its `Classify`
+            // impl is not, since `dyn Error` does not carry it -- and the
             // supervisor's answer to a failed occurrence is the same either way -- record
             // it, count it, and the next scheduled occurrence IS the retry (W2a Decision
             // 29). Classification earns its keep one layer in, at the `tower` stack,

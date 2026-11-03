@@ -1,0 +1,64 @@
+M2-3 review fixes: a stop that detaches, and five quiet deaths
+
+Code review found seven defects on the invariants this item exists to
+establish, five of them confirmed by probe. Each fix has a test that fails
+against the code as it was, and every one of those tests was run against the
+old implementation to confirm it bites.
+
+TaskTable::stop never aborted. `timeout(grace, handle)` drops the handle, and
+dropping a JoinHandle detaches the task rather than cancelling it — so a body
+that ignored its token kept running past shutdown and alongside the
+replacement a plan diff had just started, while stop reported Aborted and
+incremented stop_timeout_total. It now awaits `&mut handle`, aborts, and
+awaits the abort, so "the task is gone when this returns" is true rather than
+hopeful. The test observes the body's Drop, because the counter cannot tell
+an abort from a detach.
+
+A panicking body reported nothing: the exit was sent from inside the future,
+which is where a panic escapes it, leaving in_flight stuck, the state Running
+and a climbing skipped_total as the only trace. The report moved into a Drop
+guard, so a panic and an abort both produce exactly one exit event.
+
+The expect_exit flag is gone. A latch only an arriving event can clear is a
+latch a lost event poisons, and it swallowed the next real exit; every task
+now carries an epoch and the supervisor discards anything that is not the
+current one.
+
+Also: ComponentControl::start on a running component spawned a second body
+and leaked the first; a failed OnDemand check went to a terminal Failed and
+could never run again while run_now kept returning success; backoff reset on
+Ready rather than after an uptime past the cap, so a build-then-return loop
+restarted on the base delay forever; apply_plan stopped components in map
+order while claiming reverse topological order; shutdown took one grace per
+component rather than per rank; schedule.period was never refreshed on a
+plan diff; and mw_component_ticks_total was missing its outcome label.
+
+RouteEntry::conflicts_with was asymmetric for two prefixes, so D-51's route
+conflict depended on which component was declared first. Zone::new rejected
+America/Port-au-Prince, America/Blanc-Sablon and Asia/Ust-Nera through a
+digit-and-sign filter that was redundant for everything it was written for.
+find_cycle walked consumer edges and could report a path that neither closed
+nor consisted of real edges; it walks providers now, where the termination
+argument actually holds.
+
+The torn-read sentinel was one-directional. is_fully_applied's `>=` is the
+right production predicate for W5 §2.2 and cannot see a reader that observed
+a stale generation beside fresh rows, which is one of the two ways a split
+publication tears — and it was the direction the reported loom evidence
+actually demonstrated. StateTable::is_coherent is the sentinel now, and a
+split publisher fails the model in both store orders.
+
+The stalled-sink test asserted a property of its test double: the fan-out's
+queue was unbounded and the elapsed-time assertion could not fail under
+paused time. The double's queue is bounded at the depth of the Go channel the
+defect is in, the fan-out offers with try_send, and the assertion is that a
+full queue refuses rather than waits.
+
+Smaller: BuildCx::additive refuses an exclusive capability; Classify on the
+four error enums that lacked it; a plan error for a route manifest on a
+non-route capability, an unmountable pattern, and a component called `spine`;
+RouteConflict names both patterns and the methods they share; the wall-clock
+step detector has a cadence of its own; and the comments that claimed
+behaviour the code did not have are corrected rather than deleted.
+
+Coverage 83.54%, floor unchanged at 75.00.

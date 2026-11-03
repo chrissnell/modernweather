@@ -55,7 +55,18 @@ impl Methods {
         self.0 & other.0 != 0
     }
 
-    /// Whether the set is empty, which a declared route may not be.
+    /// The methods both sets answer, which is what a conflict is actually about: reporting
+    /// one owner's whole set would say `ANY` where the real overlap is `GET`.
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    /// Whether the set is empty.
+    ///
+    /// Not constructible through this type's own API — the field is private and `union`
+    /// of two non-empty sets is non-empty — so this exists for the one caller that can
+    /// produce one: `intersection`, whose empty result means "no overlap". `plan()`
+    /// rejects an empty declared set separately.
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
@@ -159,20 +170,35 @@ impl RouteEntry {
 
     /// Whether two entries would both claim some request.
     ///
-    /// Three cases, and the prefix ones are the interesting half: two exact patterns
-    /// conflict when they are equal; a prefix conflicts with anything it contains,
-    /// including another prefix. Parameter *names* are not compared, because
-    /// `/span/{span}` and `/span/{window}` claim the same paths — a conflict a
-    /// string comparison would miss and an operator would experience as one of their two
-    /// handlers never running.
+    /// **Symmetric**, which is the property that matters and the one that is easy to lose:
+    /// `plan()` compares each new manifest against the ones already seen, in plan order, so
+    /// an asymmetric answer would make a conflict depend on which component happened to be
+    /// declared first. Two nested prefixes are the case that catches it — `/ingest` and
+    /// `/ingest/ambient` conflict whichever way round they are asked.
+    ///
+    /// Parameter *names* are not compared, because `/span/{span}` and `/span/{window}`
+    /// claim the same paths — a conflict a string comparison would miss and an operator
+    /// would experience as one of their two handlers never running.
+    ///
+    /// What this deliberately does **not** treat as a conflict is a parameter against a
+    /// literal in the same position: `/span/{span}` and `/span/24h` both match
+    /// `GET /span/24h`, and the router resolves it to the literal. Overlap here is defined
+    /// as *pattern* identity rather than path-set intersection, because the narrower route
+    /// winning is how a frozen path is pinned beside a general one — `api:legacy` declares
+    /// both — and rejecting that would make the real contract unexpressible. The cost is
+    /// that two *different* components can shadow one another that way; W1's fixtures are
+    /// what pin the frozen paths against it.
     pub fn conflicts_with(&self, other: &Self) -> bool {
         if !self.methods.intersects(other.methods) {
             return false;
         }
         match (self.matching, other.matching) {
             (Match::Exact, Match::Exact) => shape(&self.pattern) == shape(&other.pattern),
-            (Match::Prefix, _) => contains(&self.pattern, &other.pattern),
-            (_, Match::Prefix) => contains(&other.pattern, &self.pattern),
+            (Match::Prefix, Match::Prefix) => {
+                contains(&self.pattern, &other.pattern) || contains(&other.pattern, &self.pattern)
+            }
+            (Match::Prefix, Match::Exact) => contains(&self.pattern, &other.pattern),
+            (Match::Exact, Match::Prefix) => contains(&other.pattern, &self.pattern),
         }
     }
 }
@@ -180,7 +206,10 @@ impl RouteEntry {
 /// A pattern with every `{param}` segment replaced by a positional marker, so that two
 /// patterns claiming the same paths compare equal whatever their parameters are called.
 fn shape(pattern: &str) -> Vec<&str> {
+    // A trailing slash is the same claim: `/assets/` and `/assets` are one mount, and
+    // without this the empty final segment would stop `/assets/` containing anything.
     pattern
+        .trim_end_matches('/')
         .split('/')
         .map(|seg| {
             if seg.starts_with('{') && seg.ends_with('}') {
@@ -241,6 +270,50 @@ mod tests {
         assert!(a.conflicts_with(&b));
         let c = RouteEntry::exact("/span/24h", Methods::GET);
         assert!(!c.conflicts_with(&RouteEntry::exact("/span/240h", Methods::GET)));
+    }
+
+    /// The property `plan()` depends on: a conflict cannot depend on declaration order.
+    #[test]
+    fn two_nested_prefixes_conflict_in_both_directions() {
+        let outer = RouteEntry::prefix("/ingest", Methods::ANY);
+        let inner = RouteEntry::prefix("/ingest/ambient", Methods::ANY);
+        assert!(outer.conflicts_with(&inner));
+        assert!(
+            inner.conflicts_with(&outer),
+            "asymmetry here makes a route conflict depend on which component was \
+             declared first"
+        );
+        let elsewhere = RouteEntry::prefix("/ingest-other", Methods::ANY);
+        assert!(!outer.conflicts_with(&elsewhere));
+        assert!(!elsewhere.conflicts_with(&outer));
+    }
+
+    #[test]
+    fn a_trailing_slash_is_the_same_claim() {
+        let mount = RouteEntry::prefix("/assets/", Methods::READ);
+        assert!(mount.conflicts_with(&RouteEntry::exact("/assets/site.css", Methods::GET)));
+        assert!(mount.conflicts_with(&RouteEntry::prefix("/assets", Methods::READ)));
+        assert!(RouteEntry::exact("/latest/", Methods::GET)
+            .conflicts_with(&RouteEntry::exact("/latest", Methods::GET)));
+    }
+
+    #[test]
+    fn the_overlap_of_two_method_sets_is_what_a_conflict_is_about() {
+        let a = Methods::GET.union(Methods::HEAD);
+        let b = Methods::HEAD.union(Methods::POST);
+        assert_eq!(a.intersection(b), Methods::HEAD);
+        assert!(Methods::GET.intersection(Methods::POST).is_empty());
+        assert_eq!(Methods::ANY.intersection(a), a);
+    }
+
+    /// A parameter does not conflict with a literal, deliberately — see
+    /// `conflicts_with`'s documentation.
+    #[test]
+    fn a_parameter_does_not_conflict_with_a_literal_in_the_same_position() {
+        let param = RouteEntry::exact("/span/{span}", Methods::GET);
+        let literal = RouteEntry::exact("/span/24h", Methods::GET);
+        assert!(!param.conflicts_with(&literal));
+        assert!(!literal.conflicts_with(&param));
     }
 
     #[test]

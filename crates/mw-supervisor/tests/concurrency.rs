@@ -19,10 +19,15 @@
 //! sleeping through a 10-second grace. M3-2 re-points this test at a real spool; what is
 //! assertable here is the half the supervisor owns — a stalled sink blocks neither the
 //! source nor its siblings, and shutdown completes anyway.
+//!
+//! The test double's per-subscriber queue is **bounded** at the same depth as the Go
+//! channel the defect is in, and the fan-out offers with `try_send`. That is what makes
+//! "the source is never blocked" falsifiable here: the stalled sink's queue really does
+//! fill, and the assertion is that the offer is refused and counted rather than waited on.
 
 #![cfg(not(loom))]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,7 +39,7 @@ use mw_component::{
 use mw_supervisor::plan::{validate, PlanContext};
 use mw_supervisor::publish::{Publication, StateTable};
 use mw_supervisor::testing::{
-    id, roots_with_stream, ChannelStream, CountingOnReading, StalledOnReading,
+    id, roots_with_stream, ChannelStream, CountingOnReading, StalledOnReading, SUBSCRIBER_DEPTH,
 };
 use mw_supervisor::Supervisor;
 use mw_types::{Envelope, OriginId, Provenance, Reading, Seq, StationKey};
@@ -65,10 +70,11 @@ fn status(id_text: &str, applied: u64) -> ComponentStatus {
 
 /// One commit: the generation, and rows that have all applied exactly it.
 ///
-/// The invariant every row satisfies is the sentinel this test checks — it is a property
-/// of how the writer builds a table, not a field the production path reads — so a reader
-/// that ever sees a row whose `applied_generation` disagrees with the table's `generation`
-/// has observed a mixture of two commits.
+/// `StateTable::is_coherent` is the sentinel, and the equality is the point: the
+/// production predicate `is_fully_applied` is `>=`, which cannot see a reader that
+/// observed a stale `generation` beside fresh rows — one of the two directions a split
+/// publication tears in. A sentinel that is blind to half the failure is worth less than
+/// the confidence it produces.
 fn commit(generation: u64) -> Arc<StateTable> {
     Arc::new(StateTable {
         generation: Generation::new(generation),
@@ -85,53 +91,60 @@ fn commit(generation: u64) -> Arc<StateTable> {
 fn a_configuration_reload_racing_sixty_four_readers_never_tears() {
     let published = Arc::new(Publication::new(commit(0)));
     let stop = Arc::new(AtomicBool::new(false));
-    let reads = Arc::new(AtomicU64::new(0));
 
     // Scoped threads rather than `std::thread::spawn`: the handles are joined when the
     // scope ends, so the test cannot leak a thread -- which is the same property
     // `TaskTable` gives the daemon, and the reason `clippy.toml` forbids the free
     // function.
-    std::thread::scope(|scope| {
-        for _ in 0..READERS {
-            let published = Arc::clone(&published);
-            let stop = Arc::clone(&stop);
-            let reads = Arc::clone(&reads);
-            scope.spawn(move || {
-                let mut highest = 0u64;
-                while !stop.load(Ordering::Relaxed) {
-                    // One load, and the `Arc` keeps the snapshot alive for as long as this
-                    // reader needs it -- the shape of a request handler holding a
-                    // configuration for the duration of the request.
-                    let table = published.load();
-                    let generation = table.generation.get();
+    let total_reads: u64 = std::thread::scope(|scope| {
+        let readers: Vec<_> = (0..READERS)
+            .map(|_| {
+                let published = Arc::clone(&published);
+                let stop = Arc::clone(&stop);
+                scope.spawn(move || {
+                    // Counted per reader and summed after the join, rather than through one
+                    // shared atomic: 64 threads incrementing one counter in a tight loop is a
+                    // contended cache line that dominates the loop the test is actually
+                    // about, and every one of those operations is instrumented under
+                    // ThreadSanitizer.
+                    let mut reads = 0u64;
+                    let mut highest = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        // One load, and the `Arc` keeps the snapshot alive for as long as this
+                        // reader needs it -- the shape of a request handler holding a
+                        // configuration for the duration of the request.
+                        let table = published.load();
+                        let generation = table.generation.get();
 
-                    assert!(
-                        table.is_fully_applied(),
-                        "a reader observed a mixture of two commits: table generation \
+                        assert!(
+                            table.is_coherent(),
+                            "a reader observed a mixture of two commits: table generation \
                          {generation}, rows {:?}",
-                        table
-                            .components
-                            .iter()
-                            .map(|c| c.applied_generation.get())
-                            .collect::<Vec<_>>()
-                    );
-                    assert_eq!(
-                        table.components.len(),
-                        4,
-                        "a reader observed a table that was never published"
-                    );
-                    // Coherence on one location: a reader's successive loads can never go
-                    // backwards, so "the configuration I am serving from" is monotonic for
-                    // the life of a reader.
-                    assert!(
-                        generation >= highest,
-                        "a reader saw generation {generation} after {highest}"
-                    );
-                    highest = generation;
-                    reads.fetch_add(1, Ordering::Relaxed);
-                }
-            });
-        }
+                            table
+                                .components
+                                .iter()
+                                .map(|c| c.applied_generation.get())
+                                .collect::<Vec<_>>()
+                        );
+                        assert_eq!(
+                            table.components.len(),
+                            4,
+                            "a reader observed a table that was never published"
+                        );
+                        // Coherence on one location: a reader's successive loads can never go
+                        // backwards, so "the configuration I am serving from" is monotonic for
+                        // the life of a reader.
+                        assert!(
+                            generation >= highest,
+                            "a reader saw generation {generation} after {highest}"
+                        );
+                        highest = generation;
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
 
         let writer_published = Arc::clone(&published);
         scope.spawn(move || {
@@ -140,11 +153,16 @@ fn a_configuration_reload_racing_sixty_four_readers_never_tears() {
             }
             stop.store(true, Ordering::Release);
         });
+
+        readers
+            .into_iter()
+            .map(|r| r.join().expect("a reader panicked"))
+            .sum()
     });
 
     assert_eq!(published.load().generation, Generation::new(COMMITS));
     assert!(
-        reads.load(Ordering::Relaxed) > 0,
+        total_reads > 0,
         "the readers must actually have read something for this to mean anything"
     );
 }
@@ -225,20 +243,33 @@ async fn a_stalled_sink_blocks_neither_the_source_nor_shutdown() {
             tokio::task::yield_now().await;
         }
 
-        // Deliver 1,000 envelopes to each sink. The stalled one takes its first batch and
-        // never returns; **the source is not blocked by it**, which is the invariant no
-        // reading policy may break (W2a Decision 61).
-        let before = tokio::time::Instant::now();
+        // Offer 1,000 envelopes to each sink. The stalled one takes its first batch and
+        // never returns, so its 20-deep queue fills and every further offer is **refused
+        // rather than waited on** — which is the invariant no reading policy may break
+        // (W2a Decision 61). The Go defect is the other branch: an unguarded blocking send
+        // into a 20-deep channel, which back-pressures the serial read loops.
+        let mut accepted_by_healthy = 0usize;
         for seq in 1..=1_000u64 {
             let batch = ReadingBatch::new(vec![envelope(seq)]);
-            assert!(stream.deliver(&stalled_id, batch.clone()), "stalled sink");
-            assert!(stream.deliver(&healthy_id, batch), "healthy sink");
+            stream.deliver(&stalled_id, batch.clone());
+            if stream.deliver(&healthy_id, batch) {
+                accepted_by_healthy += 1;
+            }
+            // The healthy sink drains as it goes, so yielding keeps its queue moving
+            // while the stalled one's stays full.
+            tokio::task::yield_now().await;
         }
-        assert_eq!(
-            before.elapsed(),
-            Duration::ZERO,
-            "a source that waited on a sink would show time here"
+        assert!(
+            stream.refused(&stalled_id) > 0,
+            "the stalled sink's queue must actually have filled, or this test is \
+             asserting a property of an unbounded channel"
         );
+        assert_eq!(
+            stream.refused(&healthy_id),
+            0,
+            "a draining sink is never refused"
+        );
+        assert!(accepted_by_healthy > SUBSCRIBER_DEPTH);
 
         for _ in 0..64 {
             tokio::task::yield_now().await;

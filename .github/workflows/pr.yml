@@ -144,9 +144,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: loom
-      # Exhaustive interleaving checks for lock-free code, on stable. There are none yet;
-      # the invocation exists so that writing the first one needs no CI change. loom and
-      # TSan are complementary: loom is exhaustive over a model, TSan observes a real run.
+      # Exhaustive interleaving checks for lock-free code, on stable. loom and TSan are
+      # complementary: loom is exhaustive over a model, TSan observes a real run.
+      #
+      # What this job runs, as of implementation-plan.md M2-3:
+      # crates/mw-supervisor/tests/loom_publish.rs, a model of the published state table's
+      # publish/read protocol. The two D-85 tests themselves -- config reload racing 64
+      # readers, and shutdown with a stalled sink -- are `#![cfg(not(loom))]` and run in
+      # the `race` job above, under ThreadSanitizer, which is where a test of the real
+      # `ArcSwap` and a real multi-threaded runtime belongs.
       #
       # Scoped to two crates rather than --workspace, and it is not a preference. RUSTFLAGS
       # applies `--cfg loom` to EVERY crate in the graph, dependencies included, and
@@ -158,9 +164,9 @@ jobs:
       # against the target spec, not against RUSTFLAGS, so a dependency's own loom support
       # is unreachable this way.
       #
-      # The two named here are where W3 D-85 puts the concurrency tests -- config reload
-      # racing 64 readers, and shutdown with a stalled sink -- and neither depends on axum
-      # or tonic. implementation-plan.md M2-3 writes them.
+      # The two named here are the crates W3 D-85 puts lock-free code in -- the
+      # supervisor's published snapshot and the pipeline's spool -- and neither depends on
+      # axum or tonic. `mw-pipeline`'s model arrives with M3-2.
       - name: cargo test --cfg loom
         env:
           RUSTFLAGS: --cfg loom

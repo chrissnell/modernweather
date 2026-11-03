@@ -126,12 +126,24 @@ impl LogControl for MemoryLogControl {
     }
 }
 
-/// A [`ReadingStream`] fed by hand: one sender per subscriber.
+/// How deep a subscriber's queue is in this double.
+///
+/// Twenty, mirroring the Go reading distributor's `make(chan types.Reading, 20)`, because
+/// the defect D-29 records is an **unguarded blocking send** into exactly that depth: a
+/// stalled TimescaleDB back-pressures the serial read loops and a Davis console that is
+/// not drained loses packets. An unbounded queue here would delete the failure mode rather
+/// than survive it, and the test asserting "a source is never blocked by a sink" would
+/// then be asserting a property of the double.
+pub const SUBSCRIBER_DEPTH: usize = 20;
+
+/// A [`ReadingStream`] fed by hand: one bounded sender per subscriber.
 #[derive(Debug, Default)]
 pub struct ChannelStream {
-    subscribers: Mutex<Vec<(ComponentId, mpsc::UnboundedSender<ReadingBatch>)>>,
+    subscribers: Mutex<Vec<(ComponentId, mpsc::Sender<ReadingBatch>)>>,
     /// How many batches each subscriber has acknowledged.
     acks: Arc<Mutex<BTreeMap<ComponentId, usize>>>,
+    /// How many deliveries each subscriber's full queue refused.
+    refused: Arc<Mutex<BTreeMap<ComponentId, usize>>>,
 }
 
 impl ChannelStream {
@@ -140,14 +152,45 @@ impl ChannelStream {
         Self::default()
     }
 
-    /// Deliver a batch to one subscriber. `false` if it has not subscribed.
+    /// Offer a batch to one subscriber, **without waiting**.
+    ///
+    /// `try_send`, never `send`: a fan-out that awaited a full queue would be the Go
+    /// defect. A refusal is counted and reported, which is what the real fan-out does
+    /// instead — it spools (M3-2) or counts a drop, and in neither case does the source
+    /// wait. Returns whether the batch was accepted.
     pub fn deliver(&self, subscriber: &ComponentId, batch: ReadingBatch) -> bool {
-        self.subscribers
+        let sender = self
+            .subscribers
             .lock()
             .expect("the test stream is not poisoned")
             .iter()
             .find(|(id, _)| id == subscriber)
-            .is_some_and(|(_, tx)| tx.send(batch).is_ok())
+            .map(|(_, tx)| tx.clone());
+        match sender {
+            Some(tx) => match tx.try_send(batch) {
+                Ok(()) => true,
+                Err(_) => {
+                    *self
+                        .refused
+                        .lock()
+                        .expect("the test stream is not poisoned")
+                        .entry(subscriber.clone())
+                        .or_default() += 1;
+                    false
+                }
+            },
+            None => false,
+        }
+    }
+
+    /// How many deliveries a subscriber's full queue refused.
+    pub fn refused(&self, subscriber: &ComponentId) -> usize {
+        self.refused
+            .lock()
+            .expect("the test stream is not poisoned")
+            .get(subscriber)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// How many batches a subscriber has acknowledged — the cursor, in miniature.
@@ -168,7 +211,7 @@ impl ReadingStream for ChannelStream {
         _filter: &ReadingFilter,
         _policy: ReadingPolicy,
     ) -> Result<Box<dyn ReadingSubscription>, StreamError> {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(SUBSCRIBER_DEPTH);
         self.subscribers
             .lock()
             .expect("the test stream is not poisoned")
@@ -188,7 +231,7 @@ impl ReadingStream for ChannelStream {
 #[derive(Debug)]
 struct ChannelSubscription {
     subscriber: ComponentId,
-    rx: mpsc::UnboundedReceiver<ReadingBatch>,
+    rx: mpsc::Receiver<ReadingBatch>,
     acks: Arc<Mutex<BTreeMap<ComponentId, usize>>>,
 }
 

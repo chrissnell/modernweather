@@ -601,6 +601,11 @@ async fn a_plan_diff_restarts_only_what_changed() {
             Generation::new(42),
             "the component whose configuration changed was rebuilt"
         );
+        assert_eq!(
+            changed.schedule.period,
+            Some(Duration::from_secs(60)),
+            "the schedule is state (§1.3), so every field of it has to follow the spec"
+        );
         assert!(
             matches!(changed.state, State::Running { .. }),
             "{:?}",
@@ -615,6 +620,168 @@ async fn a_plan_diff_restarts_only_what_changed() {
         report.stopped >= 1,
         "the changed component was stopped first"
     );
+}
+
+/// A changed spec's **schedule** follows it. The clock fires on the new period either
+/// way; `schedule.period` is what W5 renders, and it used to be set once at construction
+/// and never updated — so after a reconfiguration the UI showed the old interval forever.
+#[tokio::test(start_paused = true)]
+async fn a_changed_period_is_reflected_in_the_published_schedule() {
+    let at = |period_s: u64, digest: &str| {
+        let (spec, _) = tick("pws:backyard", period_s, 30);
+        spec.config_digest(ConfigDigest::of(digest))
+    };
+    let first = planned(vec![at(60, "a")], 1);
+    let second = planned(vec![at(300, "b")], 2);
+
+    let shutdown = CancellationToken::new();
+    let (supervisor, control, plans) = Supervisor::new(roots(), shutdown.clone());
+    let stop = shutdown;
+
+    let driver = async {
+        settle().await;
+        assert_eq!(
+            control
+                .component(&id("pws:backyard"))
+                .unwrap()
+                .schedule
+                .period,
+            Some(Duration::from_secs(60))
+        );
+
+        plans.apply(second).expect("running");
+        settle().await;
+        assert_eq!(
+            control
+                .component(&id("pws:backyard"))
+                .unwrap()
+                .schedule
+                .period,
+            Some(Duration::from_secs(300))
+        );
+        stop.cancel();
+    };
+
+    let (_report, ()) = tokio::join!(supervisor.run(first), driver);
+}
+
+/// A successful occurrence clears the attempt count, so `Backoff { attempt }` means "this
+/// many consecutive failures" rather than "this many failures since the process started".
+/// An intermittently failing uploader used to accumulate it for the life of the process.
+#[tokio::test(start_paused = true)]
+async fn a_successful_occurrence_clears_the_attempt_count() {
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let shared = Arc::clone(&fail);
+    let spec = ComponentSpec::new(
+        id("wu:backyard"),
+        Trigger::every(Duration::from_secs(60), Duration::from_secs(30)),
+        Builder::tick(move |_| {
+            let fail = Arc::clone(&shared);
+            async move { Ok(Flaky { fail }) }
+        }),
+    );
+
+    let shutdown = CancellationToken::new();
+    let (supervisor, control, _plans) = Supervisor::new(roots(), shutdown.clone());
+    let stop = shutdown;
+
+    let driver = async {
+        settle().await;
+        advance(Duration::from_secs(60)).await;
+        advance(Duration::from_secs(60)).await;
+        let attempt = match control.component(&id("wu:backyard")).unwrap().state {
+            State::Backoff { attempt, .. } => attempt,
+            other => panic!("expected Backoff, got {other:?}"),
+        };
+        assert!(attempt >= 2, "two failures in a row: {attempt}");
+
+        // The remote end comes back.
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        advance(Duration::from_secs(60)).await;
+        let status = control.component(&id("wu:backyard")).unwrap();
+        assert!(
+            matches!(status.state, State::Running { .. }),
+            "{:?}",
+            status.state
+        );
+
+        // ...and it fails once more. The attempt count starts again rather than carrying
+        // the earlier failures.
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        advance(Duration::from_secs(60)).await;
+        let attempt = match control.component(&id("wu:backyard")).unwrap().state {
+            State::Backoff { attempt, .. } => attempt,
+            other => panic!("expected Backoff, got {other:?}"),
+        };
+        assert_eq!(attempt, 1, "the count did not reset on the successful run");
+
+        stop.cancel();
+    };
+
+    let (_report, ()) = tokio::join!(supervisor.run(planned(vec![spec], 1)), driver);
+}
+
+/// A `Tick` body that fails while a flag is set.
+struct Flaky {
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl mw_component::Tick for Flaky {
+    fn tick<'a>(&'a mut self, _cx: &'a Cx) -> BoxFuture<'a, Result<(), ComponentError>> {
+        let fail = self.fail.load(std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            if fail {
+                Err(ComponentError::tick(
+                    "upload to Weather Underground",
+                    mw_supervisor::testing::Refused,
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+/// `STATUS=` counts **components**, not distinct providers. Twelve uploaders waiting on
+/// one database is "12 waiting", and reporting "1 waiting (db:postgres)" would say the
+/// daemon is nearly fine when nothing is working.
+#[tokio::test(start_paused = true)]
+async fn the_status_line_counts_waiting_components_not_providers() {
+    let db = ComponentSpec::new(
+        id("db:postgres"),
+        Trigger::Service,
+        // Provides the capability in the plan and never publishes it: a database that is
+        // unreachable at boot.
+        Builder::serve(|_| async { Ok(CooperativeServe) }),
+    )
+    .provides([Provision::of(Capability::ReadingStore)]);
+    let consumers: Vec<ComponentSpec> = (1..=3)
+        .map(|n| consumer(&format!("wu:station{n}")))
+        .collect();
+    let mut specs = vec![db];
+    specs.extend(consumers);
+
+    let shutdown = CancellationToken::new();
+    let (supervisor, _control, _plans) = Supervisor::new(roots(), shutdown.clone());
+    let readiness = supervisor.readiness();
+    let stop = shutdown;
+
+    let driver = async {
+        settle().await;
+        let status = readiness.borrow().status.clone();
+        assert!(
+            status.contains("3 waiting (db:postgres)"),
+            "three components are waiting on one provider: {status}"
+        );
+        assert!(
+            readiness.borrow().converged,
+            "waiting is a settled state: an uploader waiting on a dead database must not \
+             block readiness forever (§3.5)"
+        );
+        stop.cancel();
+    };
+
+    let (_report, ()) = tokio::join!(supervisor.run(planned(specs, 1)), driver);
 }
 
 /// A removed component is stopped and leaves the table.

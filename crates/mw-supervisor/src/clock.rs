@@ -23,9 +23,13 @@ use tokio::time::Instant;
 /// Which occurrence of a component's schedule is due.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Occurrence {
-    /// The `n`th firing of a `Trigger::Every`, counted from the component's phase origin.
+    /// A firing of a `Trigger::Every`.
     Every {
-        /// How many periods since the phase origin.
+        /// A monotonic tag, incremented per firing. **Not** a count of elapsed periods: a
+        /// process stalled past a period advances to the next future slot rather than
+        /// firing the backlog, so this counts firings and the slot it lands on is the
+        /// clock's business. It exists so that two queued firings of one component are
+        /// distinguishable for deduplication.
         seq: u64,
     },
     /// A `Trigger::Calendar` occurrence, keyed on local date and slot — which is what
@@ -216,7 +220,7 @@ impl Clock {
             return;
         };
         self.push(Due {
-            at: self.instant_for(occurrence.at),
+            at: Self::instant_for(occurrence.at),
             id: id.clone(),
             occurrence: Occurrence::Calendar(OccurrenceKey::new(
                 id.clone(),
@@ -309,12 +313,17 @@ impl Clock {
             .retain(|Reverse(due)| !matches!(due.occurrence, Occurrence::Calendar(_)));
     }
 
-    /// Convert a wall-clock instant into a monotonic one, through the current reference.
+    /// Convert a wall-clock instant into a monotonic one.
     ///
     /// A `Calendar` occurrence is computed in a time zone and therefore in wall-clock
     /// terms; the heap is monotonic. This is the one conversion between them, and it is
     /// why a stepped clock invalidates exactly the calendar entries.
-    pub fn instant_for(&self, wall: DateTime<Utc>) -> Instant {
+    ///
+    /// Deliberately **not** through [`Clock::wall_step`]'s stored reference: that pair is
+    /// as old as the last step check, and a conversion wants the offset *now*. Taking a
+    /// fresh pair means a step that happened since the last check is absorbed here rather
+    /// than baked into the instant.
+    pub fn instant_for(wall: DateTime<Utc>) -> Instant {
         let now = Utc::now();
         let delta = wall.signed_duration_since(now);
         match delta.to_std() {

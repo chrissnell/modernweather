@@ -149,7 +149,7 @@ fn two_providers_of_an_additive_capability_are_fine() {
 
 /// A provider that declares the wrong arity for a capability.
 #[test]
-fn an_arity_a_capability_does_not_have_is_rej() {
+fn an_arity_a_capability_does_not_have_is_rejected() {
     let bad = spec("db:postgres", Trigger::Service).provides([Provision {
         capability: Capability::ReadingStore,
         arity: Arity::Additive,
@@ -225,13 +225,119 @@ fn a_cycle_is_reported_with_its_path() {
         .provides([Provision::of(Capability::LatestSnapshot)])
         .requires([Need::hard(Capability::WindowedView)]);
     let err = validate(vec![a, b], &ctx()).expect_err("that is a cycle");
-    let PlanError::Cycle { path } = &err else {
+    assert_cycle(&err, &["window:rollup", "snapshot:latest"]);
+}
+
+/// The path must be **a cycle**, not a path that leads into one.
+///
+/// A forward walk over consumer edges can leave the cycle down an acyclic tail and stop,
+/// and the reported path then neither closes nor consists of real edges — it named a
+/// component that was not part of the problem, which is the one thing `PlanError::Cycle`
+/// exists not to do.
+#[test]
+fn a_cycle_with_an_innocent_consumer_hanging_off_it_reports_only_the_cycle() {
+    let a = spec("window:rollup", every(60, 10))
+        .provides([Provision::of(Capability::WindowedView)])
+        .requires([Need::hard(Capability::LatestSnapshot)]);
+    let b = spec("snapshot:latest", Trigger::Service)
+        .provides([Provision::of(Capability::LatestSnapshot)])
+        .requires([Need::hard(Capability::WindowedView)]);
+    // Consumes the cycle and is consumed by nothing: the acyclic tail.
+    let innocent =
+        spec("wu:backyard", every(60, 30)).requires([Need::hard(Capability::WindowedView)]);
+
+    // Both declaration orders. A diagnostic that depends on which component happened to
+    // be declared first is itself the defect: with the tail declared between the two
+    // cycle members, a forward walk over consumer edges leaves the cycle, dead-ends, and
+    // falls back to reporting the whole unorderable remainder.
+    for (label, specs) in [
+        ("cycle first", vec![a.clone(), b.clone(), innocent.clone()]),
+        (
+            "tail in the middle",
+            vec![a.clone(), innocent.clone(), b.clone()],
+        ),
+        ("tail first", vec![innocent, a, b]),
+    ] {
+        let err = validate(specs, &ctx()).expect_err("that is still a cycle");
+        let path = assert_cycle(&err, &["window:rollup", "snapshot:latest"]);
+        assert!(
+            !path.iter().any(|id| id.as_str() == "wu:backyard"),
+            "`wu:backyard` is not on the cycle ({label}): {path:?}"
+        );
+    }
+}
+
+/// Two interlocking cycles: the reported path still has to be one of them, closed.
+#[test]
+fn two_interlocking_cycles_still_report_a_closed_path() {
+    let one = |n: u8| {
+        let (provides, requires) = if n == 1 {
+            (Capability::WindowedView, Capability::LatestSnapshot)
+        } else {
+            (Capability::LatestSnapshot, Capability::WindowedView)
+        };
+        spec(&format!("c{n}:node"), Trigger::Service)
+            .provides([Provision::of(provides)])
+            .requires([Need::hard(requires)])
+    };
+    let two = |n: u8| {
+        let (provides, requires) = if n == 1 {
+            (Capability::ForecastStore, Capability::AlertStore)
+        } else {
+            (Capability::AlertStore, Capability::ForecastStore)
+        };
+        spec(&format!("d{n}:node"), Trigger::Service)
+            .provides([Provision::of(provides)])
+            .requires([Need::hard(requires)])
+    };
+    let err = validate(vec![one(1), one(2), two(1), two(2)], &ctx())
+        .expect_err("two cycles are two cycles");
+    let path = assert_cycle(&err, &[]);
+    let names: Vec<&str> = path.iter().map(ComponentId::as_str).collect();
+    let in_one_cycle =
+        names.iter().all(|n| n.starts_with('c')) || names.iter().all(|n| n.starts_with('d'));
+    assert!(
+        in_one_cycle,
+        "the path mixes two separate cycles: {names:?}"
+    );
+}
+
+/// Assert that a `Cycle` error's path is a real, closed cycle, and return it.
+fn assert_cycle(err: &PlanError, expected_members: &[&str]) -> Vec<ComponentId> {
+    let PlanError::Cycle { path } = err else {
         panic!("wrong error: {err}");
     };
-    assert!(path.len() >= 2, "the path names the cycle: {path:?}");
+    assert!(
+        path.len() >= 3,
+        "a closed cycle of N components has N+1 entries: {path:?}"
+    );
+    assert_eq!(
+        path.first(),
+        path.last(),
+        "the path does not close: {path:?}"
+    );
+    let members: Vec<&str> = path[..path.len() - 1]
+        .iter()
+        .map(ComponentId::as_str)
+        .collect();
+    for expected in expected_members {
+        assert!(
+            members.contains(expected),
+            "{expected} is missing from {members:?}"
+        );
+    }
+    if !expected_members.is_empty() {
+        assert_eq!(
+            members.len(),
+            expected_members.len(),
+            "the path has members that are not on the cycle: {members:?}"
+        );
+    }
     let rendered = err.to_string();
-    assert!(rendered.contains("window:rollup"), "{rendered}");
-    assert!(rendered.contains("snapshot:latest"), "{rendered}");
+    for member in &members {
+        assert!(rendered.contains(member), "{rendered}");
+    }
+    path.clone()
 }
 
 /// The same relationship through **soft** edges is not a cycle, which is what makes `Soft`
@@ -386,17 +492,139 @@ fn two_components_claiming_one_path_are_rejected() {
     let PlanError::RouteConflict {
         scope,
         pattern,
+        methods,
         a,
         b,
-        ..
     } = &err
     else {
         panic!("wrong error: {err}");
     };
     assert_eq!(*scope, Scope::Any);
-    assert_eq!(pattern, "/span/{window}");
+    // Both patterns, because they differ as strings and reporting one loses half the
+    // problem; and the methods they actually **share**, not one owner's whole set.
+    assert_eq!(pattern, "/span/{span} / /span/{window}");
+    assert_eq!(*methods, Methods::GET);
     assert_eq!(a.as_str(), "api:legacy");
     assert_eq!(b.as_str(), "web:site:1");
+}
+
+/// A frozen path and a per-site path are **not** in disjoint scopes: one `Router` is
+/// served on every socket and hostname routing selects the site, so a website
+/// configuration that claimed `/latest` would make the frozen REST path unreachable on
+/// that host. `Scope::Any` means every host, and that is what makes it overlap.
+#[test]
+fn an_any_scope_route_conflicts_with_a_per_site_one() {
+    let legacy = spec("api:legacy", Trigger::Service).provides([Provision::routes(
+        RouteManifest::new(Scope::Any, vec![RouteEntry::exact("/latest", Methods::ANY)]),
+    )]);
+    let site =
+        spec("web:site:1", Trigger::Service).provides([Provision::routes(RouteManifest::new(
+            Scope::Site(mw_types::WebsiteId::new(1)),
+            vec![RouteEntry::exact("/latest", Methods::GET)],
+        ))]);
+    assert!(matches!(
+        validate(vec![legacy, site], &ctx()),
+        Err(PlanError::RouteConflict { .. })
+    ));
+}
+
+/// A route manifest on a capability no listener consumes would be conflict-checked and
+/// then never mounted, with nothing saying so.
+#[test]
+fn routes_declared_on_another_capability_are_rejected() {
+    let confused = spec("web:site:1", Trigger::Service).provides([mw_component::Provision {
+        capability: Capability::LatestSnapshot,
+        arity: Arity::Exclusive,
+        detail: mw_component::ProvisionDetail::Routes(RouteManifest::new(
+            Scope::Any,
+            vec![RouteEntry::exact("/latest", Methods::GET)],
+        )),
+    }]);
+    assert!(matches!(
+        validate(vec![confused], &ctx()),
+        Err(PlanError::RoutesOnNonRouteCapability {
+            capability: Capability::LatestSnapshot,
+            ..
+        })
+    ));
+}
+
+/// A pattern the router cannot mount is a plan error, not an `axum` panic inside
+/// `http:listener` after its siblings have started.
+#[test]
+fn an_unmountable_route_pattern_is_rejected() {
+    let bad = |pattern: &str| {
+        spec("api:legacy", Trigger::Service).provides([Provision::routes(RouteManifest::new(
+            Scope::Any,
+            vec![RouteEntry::exact(pattern, Methods::GET)],
+        ))])
+    };
+    for pattern in ["", "latest", "/span/{span"] {
+        assert!(
+            matches!(
+                validate(vec![bad(pattern)], &ctx()),
+                Err(PlanError::BadRoute { .. })
+            ),
+            "`{pattern}` should not be mountable"
+        );
+    }
+    assert_eq!(planned(vec![bad("/latest")]).len(), 1);
+}
+
+/// The id the runtime spine publishes the root capabilities under. A component with that
+/// name would, on its first stop, revoke `ComponentControl` and `ReadingStream` for the
+/// whole process.
+#[test]
+fn a_component_may_not_be_called_spine() {
+    assert!(matches!(
+        validate(vec![spec("spine", Trigger::Service)], &ctx()),
+        Err(PlanError::ReservedComponentId { .. })
+    ));
+}
+
+/// **Unknown capability, through an explicitly declared need.** The implied
+/// `OnReading → ReadingStream` path above is one route to this error; the canonical one is
+/// W2a §2.5's `api:management` requiring `ComponentControl` in a process that was not
+/// given it.
+#[test]
+fn a_declared_need_for_an_absent_root_is_an_unknown_capability() {
+    let mgmt = spec("api:management", Trigger::Service)
+        .requires([Need::hard(Capability::ComponentControl)]);
+    let err = validate(vec![mgmt], &ctx().with_roots(RootSet::empty()))
+        .expect_err("a process with no component control cannot satisfy it");
+    assert!(
+        matches!(
+            err,
+            PlanError::UnknownCapability {
+                capability: Capability::ComponentControl,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(err.to_string().contains("does not provide at all"), "{err}");
+
+    // The ordinary root set satisfies it, which is what makes the error about the build
+    // rather than about the configuration.
+    let mgmt = spec("api:management", Trigger::Service)
+        .requires([Need::hard(Capability::ComponentControl)]);
+    assert_eq!(planned(vec![mgmt]).len(), 1);
+}
+
+/// `RootSet` only admits root-class capabilities. Claiming a component-provided one as a
+/// root would make `Unprovided` unreachable for it.
+#[test]
+fn a_root_set_ignores_a_capability_no_root_can_provide() {
+    let pretend = RootSet::new([Capability::ReadingStore, Capability::ComponentControl]);
+    assert!(pretend.contains(Capability::ComponentControl));
+    assert!(!pretend.contains(Capability::ReadingStore));
+
+    let consumer =
+        spec("wu:backyard", every(60, 30)).requires([Need::hard(Capability::ReadingStore)]);
+    assert!(matches!(
+        validate(vec![consumer], &ctx().with_roots(pretend)),
+        Err(PlanError::Unprovided { .. })
+    ));
 }
 
 /// A gRPC mount is a prefix, and a prefix claims what is under it.
@@ -484,7 +712,23 @@ fn a_calendar_without_a_time_zone_is_rejected() {
     );
     let err = validate(vec![rollover], &ctx()).expect_err("no zone");
     assert!(matches!(err, PlanError::MissingTimeZone { .. }));
-    assert!(err.to_string().contains('4'), "{err}");
+    assert!(err.to_string().contains("station 4"), "{err}");
+
+    // The deployment default reads as a sentence rather than as a substitution.
+    let deployment = spec(
+        "aeris:alerts:gc",
+        Trigger::Calendar {
+            spec: CronSpec::daily_at(LocalTime::new(3, 0)),
+            tz: TzSource::Deployment { zone: None },
+            misfire: Misfire::DEFAULT,
+            deadline: Duration::from_secs(60),
+        },
+    );
+    let err = validate(vec![deployment], &ctx()).expect_err("no zone");
+    assert!(
+        err.to_string().contains("deployment's default time zone"),
+        "{err}"
+    );
 
     let with_zone = spec(
         "snow:season",

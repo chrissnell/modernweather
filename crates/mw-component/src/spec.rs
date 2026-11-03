@@ -151,6 +151,10 @@ impl ComponentSpec {
 /// this mechanism exists to prevent. So [`ConfigDigest`] is part of the fingerprint, and
 /// **a registrar is responsible for folding into it every configuration value its builder
 /// closes over**. The diff is exactly as accurate as that digest.
+///
+/// `freshness` is deliberately **not** compared: it is consumed by W5 and the `/test/*`
+/// checks and never by the scheduler (W2a Decision 20), so a change to it cannot change
+/// what a running instance does and restarting the component for one would be churn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecFingerprint {
     trigger: Trigger,
@@ -180,6 +184,12 @@ impl ConfigDigest {
     /// an `applied_generation` that survived a restart would need stability, and a hash
     /// whose stability is documented as "not guaranteed" is the wrong foundation to
     /// discover that on.
+    ///
+    /// One layer is still missing for that, and it is worth knowing before relying on it:
+    /// the digest is a function of the value's `Hash` impl as well as of the hasher, and
+    /// `std`'s `Hash` impls carry no cross-version guarantee either. Within a process —
+    /// which is all the plan diff needs — that does not matter. If the digest is ever
+    /// persisted, it needs a canonical byte encoding rather than `Hash`.
     pub fn of<T: Hash + ?Sized>(value: &T) -> Self {
         let mut hasher = Fnv1a::default();
         value.hash(&mut hasher);

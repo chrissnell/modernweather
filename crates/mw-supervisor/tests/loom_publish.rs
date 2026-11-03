@@ -23,6 +23,13 @@
 //! The deterministic demonstration that this property is **not** free lives beside the
 //! cell, in `publish.rs`'s `a_split_publisher_is_observably_inconsistent`: a two-store
 //! publisher is inconsistent between its stores with no concurrency at all.
+//!
+//! The sentinel is [`mw_supervisor::StateTable::is_coherent`] — rows agreeing *exactly*
+//! with the generation they were published with — and not the production predicate
+//! `is_fully_applied`, whose `>=` is blind to a stale generation beside fresh rows. Which
+//! of the two cells a split publisher writes first decides which direction it tears in,
+//! so a one-directional sentinel catches a split publisher in only one of the two
+//! orderings.
 
 #![cfg(loom)]
 
@@ -76,11 +83,11 @@ fn no_interleaving_of_a_commit_and_a_read_tears() {
                 loom::thread::spawn(move || {
                     let first = published.load();
                     assert!(
-                        first.is_fully_applied(),
+                        first.is_coherent(),
                         "a reader observed a mixture of two commits"
                     );
                     let second = published.load();
-                    assert!(second.is_fully_applied());
+                    assert!(second.is_coherent());
                     assert!(
                         second.generation >= first.generation,
                         "a reader's successive loads went backwards: {} after {}",
@@ -107,6 +114,6 @@ fn no_interleaving_of_a_commit_and_a_read_tears() {
 
         let settled = published.load();
         assert_eq!(settled.generation, Generation::new(COMMITS));
-        assert!(settled.is_fully_applied());
+        assert!(settled.is_coherent());
     });
 }

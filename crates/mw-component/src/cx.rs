@@ -13,6 +13,19 @@
 //! The same applies in the other direction: a provider is handed a [`Publisher`] for each
 //! capability **it declared**, so publishing something undeclared is not a runtime error
 //! to handle but a handle that was never issued.
+//!
+//! **The claim, stated precisely.** For an *exclusive* capability a built component holds
+//! a plain handle and has no way to ask whether it is still published, so unavailability
+//! reaches it as a lifecycle state rather than as an error at a call site. For the one
+//! *additive* capability the opposite is required — the listener must watch route
+//! providers arrive and leave (Decision 19) — so [`BuildCx::additive`] is restricted to
+//! that arity and nothing else can be taken as a watch.
+//!
+//! What is **not** enforced: a body could store its whole [`BuildCx`] and resolve at use
+//! time. Closing that would mean the build closure borrowing the context rather than
+//! owning it, which is an API shape the next six work items would have to be written
+//! against, so it is a reviewable mistake rather than an unrepresentable one — flagged
+//! here so the distinction is not read the other way.
 
 use std::any::Any;
 use std::fmt;
@@ -22,7 +35,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use crate::capability::{Capability, Need, Strength};
+use crate::capability::{Arity, Capability, Need, Strength};
 use crate::control::Generation;
 use crate::error::BuildError;
 use crate::id::ComponentId;
@@ -217,16 +230,26 @@ impl<H: CapabilityHandle> Additive<H> {
     ///
     /// A handle published under the wrong type is skipped rather than failing the whole
     /// load: one misconfigured route provider must not take the listener down with it.
-    /// The supervisor logs the mismatch when it happens.
+    /// It is **logged here**, by the consumer, because only the consumer knows the type it
+    /// expected — the supervisor moves the handle as an `Arc<dyn Any>` and never learns
+    /// what it should have been. Without that line the affected paths would answer 503
+    /// forever with nothing anywhere saying why.
     pub fn load(&self) -> Vec<(ComponentId, H)> {
         self.rx
             .borrow()
             .providers
             .iter()
-            .filter_map(|p| {
-                p.handle
-                    .downcast_ref::<H>()
-                    .map(|h| (p.provider.clone(), h.clone()))
+            .filter_map(|p| match p.handle.downcast_ref::<H>() {
+                Some(h) => Some((p.provider.clone(), h.clone())),
+                None => {
+                    tracing::warn!(
+                        provider = %p.provider,
+                        capability = %H::CAPABILITY,
+                        expected = std::any::type_name::<H>(),
+                        "a published handle is not the type this consumer resolves; skipped"
+                    );
+                    None
+                }
             })
             .collect()
     }
@@ -377,7 +400,18 @@ impl BuildCx {
     }
 
     /// Subscribe to every provider of an additive capability.
+    ///
+    /// Only an additive one. An `Additive<H>` is a live `watch::Receiver` the consumer
+    /// keeps after `build`, so taking an *exclusive* capability this way would be the one
+    /// hole in "after `build` a component cannot observe absence": it could watch its
+    /// database being revoked and decide for itself what that means, which is the error
+    /// branch in business logic that Decision 21 exists to remove.
     pub fn additive<H: CapabilityHandle>(&self) -> Result<Additive<H>, BuildError> {
+        if H::CAPABILITY.arity() != Arity::Additive {
+            return Err(BuildError::NotAdditive {
+                capability: H::CAPABILITY,
+            });
+        }
         self.require_declared(H::CAPABILITY)?;
         let rx = self
             .access
@@ -610,6 +644,28 @@ mod tests {
                 (id("writer:timescale"), Capability::HttpRoutes, false),
             ]
         );
+    }
+
+    /// An exclusive capability taken as a live subscription would be a component watching
+    /// its own database being revoked — the error branch in business logic that resolving
+    /// once exists to remove.
+    #[test]
+    fn an_exclusive_capability_cannot_be_taken_as_an_additive_subscription() {
+        let cx = build_cx(
+            vec![Need::hard(Capability::ReadingStore)],
+            vec![],
+            vec![(
+                Capability::ReadingStore,
+                slot_with("db:postgres", Arc::new(FakeStore("pool"))),
+            )],
+            Arc::new(RecordingBus::default()),
+        );
+        assert!(matches!(
+            cx.additive::<FakeStore>(),
+            Err(BuildError::NotAdditive {
+                capability: Capability::ReadingStore
+            })
+        ));
     }
 
     #[test]

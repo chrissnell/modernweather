@@ -81,6 +81,21 @@ pub enum StreamError {
     },
 }
 
+impl mw_types::Classify for StreamError {
+    /// `Unsupported` is a plan-level mistake that reached run time, so no retry helps.
+    /// `Backend` is transient **here**: whether a failure was the spool — which W2a
+    /// Decision 62 makes fatal for the process rather than a silent drop — is a judgement
+    /// only the stream implementation can make, so a fatal one is reported as such by
+    /// constructing the variant from an error whose own class is `Fatal`. The decision is
+    /// recorded beside the implementation, which is §4.2's whole point.
+    fn class(&self) -> mw_types::Class {
+        match self {
+            StreamError::Unsupported { .. } => mw_types::Class::Fatal,
+            StreamError::Backend { .. } => mw_types::Class::RETRYABLE,
+        }
+    }
+}
+
 impl StreamError {
     /// Wrap a backend failure.
     pub fn backend<E>(source: E) -> Self

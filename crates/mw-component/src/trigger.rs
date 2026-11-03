@@ -204,9 +204,14 @@ impl Zone {
     /// observes no DST, and a station there still has a local midnight that a rollover
     /// must reset on.
     pub fn new(name: &str) -> Result<Self, ZoneError> {
-        let is_area_location = name.contains('/') && !name.starts_with("Etc/");
-        let acceptable = (is_area_location || name == "UTC")
-            && !name.contains(|c: char| c.is_ascii_digit() || c == '+' || c == '-');
+        // An `Area/Location` name, or the one legitimate bare name. That is the whole
+        // test: every offset-denoting alias `chrono_tz` accepts either has no `/`
+        // (`MST`, `EST5EDT`) or lives under `Etc/` (`Etc/GMT+7`), so nothing further is
+        // needed -- and anything further rejects real places. A digit-and-sign filter was
+        // here and it refused `America/Port-au-Prince`, `America/Blanc-Sablon` and
+        // `Asia/Ust-Nera`, which are three populated time zones whose stations could not
+        // then have a `Calendar` component at all.
+        let acceptable = (name.contains('/') && !name.starts_with("Etc/")) || name == "UTC";
         if !acceptable {
             return Err(ZoneError::NotAZone {
                 name: name.to_string(),
@@ -618,6 +623,18 @@ mod tests {
         // Arizona observes no DST and is still a place with a local midnight.
         assert!(Zone::new("America/Phoenix").is_ok());
         assert!(Zone::new("UTC").is_ok());
+        // Real places whose names carry a hyphen. A station in any of the three must be
+        // able to have a `Calendar` component.
+        for hyphenated in [
+            "America/Port-au-Prince",
+            "America/Blanc-Sablon",
+            "Asia/Ust-Nera",
+        ] {
+            assert!(
+                Zone::new(hyphenated).is_ok(),
+                "{hyphenated} is a populated IANA zone"
+            );
+        }
         for rejected in [
             "MST",
             "EST",

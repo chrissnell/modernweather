@@ -120,6 +120,12 @@ pub struct Readiness {
     pub status: String,
 }
 
+// Note for implementation-plan.md M2-4, which owns the `sd-notify` wiring: §3.5 also asks
+// for `RELOADING=1` at the start of a plan diff and `STOPPING=1` on shutdown. Those are
+// two more facts about this loop, and the loop is the only thing that knows them -- so
+// when M2-4 needs them they belong on this watch as another field, rather than as a
+// second channel.
+
 /// What a completed [`Supervisor::run`] reports.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunReport {
@@ -146,14 +152,16 @@ struct Record {
     /// Set when the component should not be started again until asked — a `stop` through
     /// `ComponentControl`, or an `OnStartup` that has finished.
     held: bool,
-    /// Set while a stop this supervisor asked for is in flight.
+    /// When the current task reported `Ready`, for the uptime-based backoff reset.
+    running_since: Option<tokio::time::Instant>,
+    /// Which attempt the component's current task is.
     ///
-    /// A task that is cancelled still reports its exit, and that report arrives *after*
-    /// `stop` has already awaited the handle and set the state. Without this flag the
-    /// stale `Cancelled` would be read as "the body returned on its own" and the component
-    /// would be backed off and restarted — which is what a revoked capability looked like
-    /// before this field existed: `Backoff` where `Waiting` belonged.
-    expect_exit: bool,
+    /// Every event a task reports carries the epoch it was spawned with, and anything
+    /// that does not match is discarded. That is what makes a cancelled task's trailing
+    /// report harmless: it arrives *after* `stop` has already awaited the handle and
+    /// decided the state, and reading it as "the body returned on its own" is what
+    /// produced `Backoff` where a revoked capability should give `Waiting`.
+    epoch: task::Epoch,
 }
 
 impl Record {
@@ -176,7 +184,8 @@ impl Record {
             attempt: 0,
             in_flight: false,
             held: false,
-            expect_exit: false,
+            running_since: None,
+            epoch: 0,
         }
     }
 
@@ -238,6 +247,8 @@ struct Core {
     readiness: watch::Sender<Readiness>,
     occurrences: BTreeMap<ComponentId, OccurrenceRecord>,
     report: RunReport,
+    /// Latched once every component has settled at least once; see `readiness_now`.
+    converged: bool,
 }
 
 /// How a new plan reaches a running supervisor.
@@ -311,6 +322,7 @@ impl Supervisor {
             readiness,
             occurrences: BTreeMap::new(),
             report: RunReport::default(),
+            converged: false,
         };
 
         (
@@ -363,15 +375,16 @@ impl Supervisor {
         self.core.apply_plan(plan).await;
 
         loop {
-            let next_due = self.core.clock.peek();
-            let timer = async move {
-                match next_due {
-                    Some(at) => tokio::time::sleep_until(at).await,
-                    // Nothing is scheduled. A `Service`-only plan is the ordinary case for
-                    // a node that serves and does not upload.
-                    None => std::future::pending().await,
-                }
-            };
+            // Bounded by `CLOCK_CHECK_INTERVAL`, so `on_timer` runs at least that often
+            // even when nothing is due — a `Service`-only plan is the ordinary case for a
+            // node that serves and does not upload. The wall-clock step detector lives in
+            // `on_timer` (§3.3) and its motivating case is a Raspberry Pi booting with no
+            // RTC: a plan of services and one daily rollover has nothing else to tick, so
+            // without a floor the step would be noticed only when the misdated occurrence
+            // fired, which is after it has fired at the wrong instant.
+            let floor = tokio::time::Instant::now() + CLOCK_CHECK_INTERVAL;
+            let wake_at = self.core.clock.peek().map_or(floor, |at| at.min(floor));
+            let timer = tokio::time::sleep_until(wake_at);
 
             tokio::select! {
                 () = self.shutdown.cancelled() => break,
@@ -395,11 +408,6 @@ impl Core {
         self.generation = plan.generation();
         self.generation_tx.send_replace(self.generation);
 
-        let incoming: BTreeMap<ComponentId, ComponentSpec> = plan
-            .specs()
-            .iter()
-            .map(|s| (s.id.clone(), s.clone()))
-            .collect();
         self.order = plan.ranks().to_vec();
         self.providers = Capability::ALL
             .iter()
@@ -407,6 +415,13 @@ impl Core {
                 let providers = plan.providers_of(*c);
                 (!providers.is_empty()).then(|| (*c, providers.to_vec()))
             })
+            .collect();
+        // Taken rather than cloned: the supervisor owns the specs from here, and a spec
+        // carries its builder.
+        let incoming: BTreeMap<ComponentId, ComponentSpec> = plan
+            .into_specs()
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
             .collect();
 
         // Removed, and changed, in reverse order so a provider is stopped after its
@@ -428,8 +443,14 @@ impl Core {
             .map(|(id, _)| id.clone())
             .collect();
 
-        for id in removed.iter().chain(changed.iter()) {
-            self.stop_component(id, "the plan changed").await;
+        // In reverse rank order, so a provider is stopped after its consumers. Taking
+        // them in map order instead would stop `db:postgres` before `wu:backyard`, and
+        // the consumers would observe a revoke, bounce to `Waiting` and restart -- the
+        // churn §3.6 reverses the order to avoid, on every configuration save rather than
+        // only at shutdown.
+        let doomed: Vec<ComponentId> = removed.iter().chain(changed.iter()).cloned().collect();
+        for id in self.in_reverse_rank_order(&doomed) {
+            self.stop_component(&id, "the plan changed").await;
         }
         for id in &removed {
             self.records.remove(id);
@@ -442,6 +463,13 @@ impl Core {
                 // configuration no longer disturbs the APRS schedule".
                 Some(record) if record.spec.fingerprint() == spec.fingerprint() => {}
                 Some(record) => {
+                    // `schedule.period` is part of the schedule, and the schedule is state
+                    // (§1.3): leaving the old period here would have the clock fire on the
+                    // new one while W5 rendered the old one forever.
+                    record.schedule.period = match &spec.trigger {
+                        Trigger::Every { period, .. } => Some(*period),
+                        _ => None,
+                    };
                     record.spec = spec;
                     record.state = State::Planned;
                     record.attempt = 0;
@@ -455,6 +483,22 @@ impl Core {
         }
 
         self.reconcile().await;
+    }
+
+    /// Order a subset of components so that a provider comes after its consumers.
+    ///
+    /// The plan's ranks are the ordering; anything not in them (a component added and not
+    /// yet ranked) goes first, because nothing can depend on it yet.
+    fn in_reverse_rank_order(&self, ids: &[ComponentId]) -> Vec<ComponentId> {
+        let mut out: Vec<ComponentId> = ids
+            .iter()
+            .filter(|id| !self.order.iter().flatten().any(|ranked| ranked == *id))
+            .cloned()
+            .collect();
+        for rank in self.order.iter().rev() {
+            out.extend(rank.iter().filter(|id| ids.contains(id)).cloned());
+        }
+        out
     }
 
     /// Bring every record into the state its requirements allow.
@@ -547,11 +591,22 @@ impl Core {
 
     /// Build and spawn one component.
     async fn start(&mut self, id: &ComponentId) {
+        // One task per component, enforced here rather than hoped for. `TaskTable::spawn`
+        // would otherwise replace the entry -- dropping the previous token (a drop is not
+        // a cancel) and the previous handle (a drop is not an abort) -- and
+        // `ComponentControl::start` on a running component reaches this path from the
+        // management API.
+        if self.tasks.contains(id) {
+            debug!(component = %id, "already running; start ignored");
+            return;
+        }
         let Some(record) = self.records.get_mut(id) else {
             return;
         };
         let attempt = record.attempt.saturating_add(1);
         record.attempt = attempt;
+        record.epoch = record.epoch.wrapping_add(1);
+        let epoch = record.epoch;
         let spec = record.spec.clone();
         self.transition(id, State::Starting { attempt });
 
@@ -594,7 +649,7 @@ impl Core {
                     id.clone(),
                     token,
                     Some(fires_tx),
-                    task::run_tick(builder, bcx, cx, once, fires_rx, events),
+                    task::run_tick(builder, bcx, cx, epoch, once, fires_rx, events),
                 );
             }
             Builder::OnReading(builder) => {
@@ -618,7 +673,15 @@ impl Core {
                         id.clone(),
                         token,
                         None,
-                        task::run_on_reading(builder, bcx, cx, subscription, deadline, events),
+                        task::run_on_reading(
+                            builder,
+                            bcx,
+                            cx,
+                            epoch,
+                            subscription,
+                            deadline,
+                            events,
+                        ),
                     ),
                     Err(e) => {
                         let rendered = mw_types::DisplayChain(&e).to_string();
@@ -631,7 +694,7 @@ impl Core {
                     id.clone(),
                     token,
                     None,
-                    task::run_serve(builder, bcx, cx, events),
+                    task::run_serve(builder, bcx, cx, epoch, events),
                 );
             }
         }
@@ -645,16 +708,14 @@ impl Core {
             .map_or(mw_component::DEFAULT_GRACE, |r| r.spec.grace);
         if self.tasks.contains(id) {
             debug!(component = %id, reason = why, "stopping");
-            if let Some(record) = self.records.get_mut(id) {
-                record.expect_exit = true;
-            }
             self.transition(id, State::Stopping { since: Utc::now() });
             match self.tasks.stop(id, grace).await {
-                StopOutcome::Stopped => self.report.stopped += 1,
+                StopOutcome::Stopped | StopOutcome::Panicked => self.report.stopped += 1,
                 StopOutcome::Aborted => {
                     self.report.aborted += 1;
                     if let Some(record) = self.records.get_mut(id) {
                         record.counters.stop_timeout_total += 1;
+                        count(id, "stop_timeout_total", record.counters.stop_timeout_total);
                     }
                 }
                 StopOutcome::NotRunning => {}
@@ -666,8 +727,14 @@ impl Core {
         let revoked = self.bus.revoke_all(id);
         if let Some(record) = self.records.get_mut(id) {
             record.in_flight = false;
+            record.running_since = None;
             record.state = State::Stopped;
             record.since = Utc::now();
+            // Anything the stopped task still reports is now stale by epoch. The stop has
+            // already awaited the handle and decided the state; the trailing report is
+            // only an acknowledgement, and discarding it by number rather than by flag is
+            // what makes it impossible for a lost one to swallow the next real exit.
+            record.epoch = record.epoch.wrapping_add(1);
         }
         if !revoked.is_empty() {
             debug!(component = %id, capabilities = revoked.len(), "capabilities withdrawn");
@@ -684,10 +751,16 @@ impl Core {
             );
             self.clock.forget_calendar();
             let now = Utc::now();
+            // Only the ones with a live task: arming a `Waiting`, `Stopped` or never-built
+            // component would queue occurrences that fail the fireability check, tick
+            // `skipped_total` for something that will never run, and publish a `next_run`
+            // for it.
             let calendars: Vec<ComponentId> = self
                 .records
                 .iter()
-                .filter(|(_, r)| matches!(r.spec.trigger, Trigger::Calendar { .. }))
+                .filter(|(id, r)| {
+                    matches!(r.spec.trigger, Trigger::Calendar { .. }) && self.tasks.contains(id)
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in calendars {
@@ -760,11 +833,25 @@ impl Core {
     }
 
     async fn on_event(&mut self, event: Event) {
+        // Every report from a task the supervisor has already replaced or stopped is
+        // discarded here, in one place, by number.
+        if let Some(epoch) = event_epoch(&event) {
+            let current = self.records.get(event_id(&event)).map(|r| r.epoch);
+            if current != Some(epoch) {
+                debug!(
+                    component = %event_id(&event),
+                    epoch,
+                    current = ?current,
+                    "a report from a task that has been replaced; discarded"
+                );
+                return;
+            }
+        }
         match event {
-            Event::Ready { id } => {
+            Event::Ready { id, .. } => {
                 if let Some(record) = self.records.get_mut(&id) {
-                    record.attempt = 0;
                     record.applied_generation = self.generation;
+                    record.running_since = Some(tokio::time::Instant::now());
                 }
                 let degraded = self.degraded(&id);
                 self.transition(&id, State::Running { degraded });
@@ -791,6 +878,7 @@ impl Core {
                 outcome,
                 error,
                 at,
+                ..
             } => {
                 let next_run = self.next_run_of(&id);
                 let Some(record) = self.records.get_mut(&id) else {
@@ -802,9 +890,14 @@ impl Core {
                 record.schedule.last_outcome = Some(outcome);
                 record.schedule.next_run = next_run;
                 record.last_error = error.clone();
-                count(&id, "ticks_total", record.counters.runs_total);
+                ticked(&id, outcome);
                 match outcome {
                     Outcome::Ok => {
+                        // A successful occurrence clears the attempt count, so
+                        // `Backoff { attempt }` means "this many consecutive failures"
+                        // rather than "this many failures since the process started" --
+                        // which is a number an operator can act on rather than a tally.
+                        record.attempt = 0;
                         let degraded = self.degraded(&id);
                         self.transition(&id, State::Running { degraded });
                     }
@@ -819,12 +912,12 @@ impl Core {
                             "deadline_exceeded_total",
                             record.counters.deadline_exceeded_total,
                         );
-                        self.fail_scheduled(&id, error);
+                        self.fail_occurrence(&id, error);
                     }
                     Outcome::Failed => {
                         record.counters.failed_total += 1;
                         count(&id, "failed_total", record.counters.failed_total);
-                        self.fail_scheduled(&id, error);
+                        self.fail_occurrence(&id, error);
                     }
                     Outcome::Misfired => {}
                 }
@@ -832,7 +925,7 @@ impl Core {
                 self.publish_state();
             }
 
-            Event::Exited { id, exit } => {
+            Event::Exited { id, exit, .. } => {
                 self.on_exit(&id, exit).await;
                 self.publish_state();
             }
@@ -866,26 +959,25 @@ impl Core {
         }
     }
 
+    /// A task of the **current** epoch ended on its own: a stop this supervisor asked for
+    /// has already bumped the epoch, so anything reaching here is unexpected by
+    /// construction.
     async fn on_exit(&mut self, id: &ComponentId, exit: Exit) {
-        // A stop this supervisor asked for has already decided what the state is -- the
-        // component may be `Stopped`, or `Waiting` on a capability that was revoked under
-        // it, or `Starting` again after a plan diff -- and `stop` has already awaited the
-        // handle and withdrawn what it provided. The exit report is then only an
-        // acknowledgement, and it is checked **first**: by the time it arrives the table
-        // may already hold the component's *next* task, and touching it here would stop
-        // the replacement.
-        if let Some(record) = self.records.get_mut(id) {
-            if record.expect_exit {
-                record.expect_exit = false;
-                debug!(component = %id, ?exit, "expected exit");
-                return;
-            }
-        }
-
-        // An unexpected exit: withdraw what it provided before deciding what to do about
-        // it, so a consumer is not left holding a handle to a dead provider.
+        // Withdraw what it provided before deciding what to do about it, so a consumer is
+        // not left holding a handle to a dead provider.
         let revoked = self.bus.revoke_all(id);
+        // Reap the table entry. The task has already returned -- the report came from its
+        // own `Drop` guard -- so this is a removal rather than a stop, and the epoch is
+        // bumped so nothing else from it is read.
         let _ = self.tasks.stop(id, Duration::ZERO).await;
+        if let Some(record) = self.records.get_mut(id) {
+            // Cleared on every exit path, including a panic and a deadline that took the
+            // task with it: a stuck `in_flight` silently stops a component from ever
+            // firing again and shows up only as a climbing `skipped_total`.
+            record.in_flight = false;
+            record.running_since = None;
+            record.epoch = record.epoch.wrapping_add(1);
+        }
 
         match exit {
             Exit::Finished => {
@@ -918,31 +1010,48 @@ impl Core {
         }
     }
 
-    /// A failed occurrence on a scheduled trigger: the period **is** the backoff (W2a
-    /// Decision 29), so this records the failure and points `Backoff { until }` at the
-    /// next occurrence rather than inventing a second clock.
-    fn fail_scheduled(&mut self, id: &ComponentId, error: Option<String>) {
+    /// A failed occurrence, recorded against the component without ending it.
+    ///
+    /// For `Every` and `Calendar` **the period is the backoff** (W2a Decision 29), so this
+    /// points `Backoff { until }` at the next occurrence rather than inventing a second
+    /// clock. For `OnDemand` the component stays live, because failing is a `/test/*`
+    /// check's *normal* outcome and a terminal `Failed` would disable the button
+    /// permanently: `State::Failed` is not fireable, nothing re-arms an `OnDemand`
+    /// component, and `reconcile` leaves `Failed` alone — so one failed connectivity check
+    /// would have meant no further check for the life of the process, while `run_now` kept
+    /// returning success and dropping the request.
+    ///
+    /// Nothing reaches the terminal `Failed` state from here. §3.4's state machine has no
+    /// `Failed` terminus either: every `Failed` goes on to `Backoff`.
+    fn fail_occurrence(&mut self, id: &ComponentId, error: Option<String>) {
         let next = self.next_run_of(id);
+        let degraded = self.degraded(id);
         let Some(record) = self.records.get_mut(id) else {
             return;
         };
         let attempt = record.attempt.saturating_add(1);
         record.attempt = attempt;
         record.last_error = error.clone();
-        match (next, &record.spec.trigger) {
+        let trigger = record.spec.trigger.clone();
+        match (next, &trigger) {
             (Some(until), Trigger::Every { .. } | Trigger::Calendar { .. }) => {
                 self.transition(id, State::Backoff { until, attempt });
             }
-            _ => {
-                self.transition(
-                    id,
-                    State::Failed {
-                        error: error.unwrap_or_else(|| "the occurrence failed".into()),
-                        at: Utc::now(),
-                        attempt,
-                    },
-                );
+            // A scheduled trigger whose next occurrence could not be computed -- a
+            // `Calendar` past the end of its search window. Backoff restarts it, which
+            // re-arms the clock on `Ready`.
+            (None, Trigger::Every { .. } | Trigger::Calendar { .. }) => {
+                let rendered = error.unwrap_or_else(|| "the occurrence failed".into());
+                self.backoff(id, rendered);
             }
+            // `OnStartup` has one occurrence and it did not succeed, so there is nothing
+            // left in the clock: a rebuild is the only thing that can retry it.
+            (_, Trigger::OnStartup { .. }) => {
+                let rendered = error.unwrap_or_else(|| "the occurrence failed".into());
+                self.backoff(id, rendered);
+            }
+            // `OnDemand`: live, with the failure recorded.
+            _ => self.transition(id, State::Running { degraded }),
         }
     }
 
@@ -961,7 +1070,18 @@ impl Core {
             record.state = State::Stopped;
             return;
         }
+        // §3.4: "reset after an uptime exceeding the cap". Without it a component that
+        // builds successfully and then returns immediately -- a serial port that opens
+        // and EOFs, a TCP uplink that connects and drops -- restarts on the base delay
+        // forever, because every `Ready` would have reset the attempt count.
+        let was_up_longer_than_the_cap = record
+            .running_since
+            .is_some_and(|since| since.elapsed() > BACKOFF_CAP);
+        if was_up_longer_than_the_cap {
+            record.attempt = 1;
+        }
         let attempt = record.attempt.max(1);
+        record.running_since = None;
         record.counters.restart_total += 1;
         record.last_error = Some(error.clone());
         count(id, "restart_total", record.counters.restart_total);
@@ -1068,6 +1188,14 @@ impl Core {
                 }
             }
             Command::Start(id) => {
+                // Checked here rather than only in `start`, because resetting the state to
+                // `Planned` for a component that already has a task would leave it
+                // *reported* as `Planned` with a live body — the start would be refused
+                // further down and nothing would put the state back.
+                if self.tasks.contains(&id) {
+                    debug!(component = %id, "already running; start ignored");
+                    return;
+                }
                 if let Some(record) = self.records.get_mut(&id) {
                     record.held = false;
                     record.attempt = 0;
@@ -1086,31 +1214,78 @@ impl Core {
         }
     }
 
-    /// Cancel everything in reverse topological order and await each inside its grace.
+    /// Cancel everything in reverse topological order, a rank at a time.
+    ///
+    /// Reverse order matters for one specific reason: a consumer must never observe a
+    /// *revoked* capability during shutdown, because that would move it to `Waiting` while
+    /// it is trying to stop and produce a spurious transition in the last thing an
+    /// operator sees in the log.
+    ///
+    /// Within a rank the grace is **shared** rather than per component (§3.6). Twenty
+    /// components stopped one after another is twenty times the grace, which outlives
+    /// `TimeoutStopSec` and gets the daemon `SIGKILL`ed — killing bodies mid-write, which
+    /// is the thing the grace exists to prevent.
     async fn shutdown(&mut self) {
         info!(components = self.tasks.len(), "shutting down");
-        let mut ranks = self.order.clone();
-        ranks.reverse();
-        if ranks.is_empty() {
-            ranks = vec![self.tasks.ids()];
+        let mut ranks: Vec<Vec<ComponentId>> = self.order.iter().rev().cloned().collect();
+        // Anything the plan's ranks do not name — a component added and not yet ranked —
+        // stops first, because nothing can depend on it yet.
+        let unranked: Vec<ComponentId> = self
+            .tasks
+            .ids()
+            .into_iter()
+            .filter(|id| !self.order.iter().flatten().any(|ranked| ranked == id))
+            .collect();
+        if !unranked.is_empty() {
+            ranks.insert(0, unranked);
         }
+
         for rank in ranks {
-            // Reverse order matters for one specific reason: a consumer must never observe
-            // a *revoked* capability during shutdown, because that would move it to
-            // `Waiting` while it is trying to stop and produce a spurious transition in
-            // the last thing an operator sees in the log.
-            for id in rank {
-                if self.tasks.contains(&id) {
-                    if let Some(record) = self.records.get_mut(&id) {
-                        record.held = true;
+            let live: Vec<ComponentId> = rank
+                .into_iter()
+                .filter(|id| self.tasks.contains(id))
+                .collect();
+            if live.is_empty() {
+                continue;
+            }
+            let grace = live
+                .iter()
+                .filter_map(|id| self.records.get(id))
+                .map(|r| r.spec.grace)
+                .max()
+                .unwrap_or(mw_component::DEFAULT_GRACE);
+            for id in &live {
+                if let Some(record) = self.records.get_mut(id) {
+                    record.held = true;
+                }
+                self.transition(id, State::Stopping { since: Utc::now() });
+            }
+            for (id, outcome) in self.tasks.stop_rank(&live, grace).await {
+                match outcome {
+                    StopOutcome::Stopped | StopOutcome::Panicked => self.report.stopped += 1,
+                    StopOutcome::Aborted => {
+                        self.report.aborted += 1;
+                        if let Some(record) = self.records.get_mut(&id) {
+                            record.counters.stop_timeout_total += 1;
+                            count(
+                                &id,
+                                "stop_timeout_total",
+                                record.counters.stop_timeout_total,
+                            );
+                        }
                     }
-                    self.stop_component(&id, "shutdown").await;
+                    StopOutcome::NotRunning => {}
+                }
+                self.bus.revoke_all(&id);
+                self.clock.forget(&id);
+                if let Some(record) = self.records.get_mut(&id) {
+                    record.in_flight = false;
+                    record.running_since = None;
+                    record.epoch = record.epoch.wrapping_add(1);
+                    record.state = State::Stopped;
+                    record.since = Utc::now();
                 }
             }
-        }
-        // Anything the plan's ranks did not name — a component added and not yet ranked.
-        for id in self.tasks.ids() {
-            self.stop_component(&id, "shutdown").await;
         }
         debug_assert!(self.tasks.is_empty(), "the task table outlived shutdown");
         self.publish_state();
@@ -1172,16 +1347,25 @@ impl Core {
         self.readiness.send_replace(readiness);
     }
 
-    fn readiness_now(&self) -> Readiness {
+    fn readiness_now(&mut self) -> Readiness {
         let mut running = 0usize;
-        let mut waiting: Vec<&ComponentId> = Vec::new();
+        let mut waiting = 0usize;
+        let mut waiting_on: Vec<&str> = Vec::new();
         let mut failed = 0usize;
         let mut settled = 0usize;
         for record in self.records.values() {
             match &record.state {
                 State::Running { .. } => running += 1,
                 State::Waiting { on } => {
-                    waiting.extend(on.iter().filter_map(|w| w.provider.as_ref()))
+                    // Components, not distinct providers. Twelve uploaders waiting on one
+                    // database is "12 waiting (db:postgres)", which is what §3.5's
+                    // example counts; reporting "1 waiting" would say the daemon is
+                    // almost fine when nothing is working.
+                    waiting += 1;
+                    waiting_on.extend(
+                        on.iter()
+                            .filter_map(|w| w.provider.as_ref().map(|p| p.as_str())),
+                    );
                 }
                 State::Failed { .. } | State::Backoff { .. } => failed += 1,
                 _ => {}
@@ -1190,25 +1374,51 @@ impl Core {
                 settled += 1;
             }
         }
-        let waiting_names: Vec<&str> = {
-            let mut names: Vec<&str> = waiting.iter().map(|id| id.as_str()).collect();
-            names.sort_unstable();
-            names.dedup();
-            names
-        };
-        let status = if waiting_names.is_empty() {
-            format!("{running} running, 0 waiting, {failed} failed")
+        waiting_on.sort_unstable();
+        waiting_on.dedup();
+        let status = if waiting_on.is_empty() {
+            format!("{running} running, {waiting} waiting, {failed} failed")
         } else {
             format!(
-                "{running} running, {} waiting ({}), {failed} failed",
-                waiting_names.len(),
-                waiting_names.join(", ")
+                "{running} running, {waiting} waiting ({}), {failed} failed",
+                waiting_on.join(", ")
             )
         };
+        // Latched, because `READY=1` cannot be withdrawn: systemd takes the first
+        // notification as the answer, and a single component restarting through
+        // `Starting` would otherwise publish `converged: false` after it was already
+        // true. "The first full reconciliation pass has completed" is a fact about the
+        // past, so the flag is one too.
+        self.converged |= settled == self.records.len();
         Readiness {
-            converged: settled == self.records.len(),
+            converged: self.converged,
             status,
         }
+    }
+}
+
+/// Which component an event is about.
+fn event_id(event: &Event) -> &ComponentId {
+    match event {
+        Event::Ready { id, .. }
+        | Event::Occurred { id, .. }
+        | Event::Exited { id, .. }
+        | Event::Publish { provider: id, .. }
+        | Event::Revoke { provider: id, .. } => id,
+    }
+}
+
+/// The epoch of the task that produced an event, for the two kinds that come from one.
+///
+/// A capability publication has no epoch: it is keyed on the provider rather than on an
+/// attempt, and a stopped provider's handles are withdrawn by `revoke_all` rather than by
+/// discarding its last message.
+fn event_epoch(event: &Event) -> Option<task::Epoch> {
+    match event {
+        Event::Ready { epoch, .. }
+        | Event::Occurred { epoch, .. }
+        | Event::Exited { epoch, .. } => Some(*epoch),
+        Event::Publish { .. } | Event::Revoke { .. } => None,
     }
 }
 
@@ -1227,6 +1437,13 @@ fn backoff_delay(id: &ComponentId, attempt: u32) -> Duration {
     Duration::from_millis(entropy % exponential.max(1))
 }
 
+/// The backoff cap, and the uptime above which the attempt count resets (§3.4).
+const BACKOFF_CAP: Duration = Duration::from_secs(60);
+
+/// How often the loop wakes when nothing is scheduled, so the wall-clock step detector
+/// has a cadence of its own.
+const CLOCK_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
 /// `mw_component_state` — one series per state, so "how long has it been Waiting" is a
 /// query rather than a guess (docs/service-architecture.md §5.10).
 fn gauge_state(id: &ComponentId, state: &State) {
@@ -1237,16 +1454,31 @@ fn gauge_state(id: &ComponentId, state: &State) {
     }
 }
 
+/// `mw_component_ticks_total{component,outcome}` — one series per outcome, so
+/// "how often does this succeed" is a query rather than a subtraction (§5.10).
+///
+/// Incremented rather than set absolutely, because the supervisor keeps one `runs_total`
+/// rather than a counter per outcome; mixing `absolute` and `increment` on one metric name
+/// is the mistake this split avoids.
+fn ticked(id: &ComponentId, outcome: Outcome) {
+    metrics::counter!(
+        "mw_component_ticks_total",
+        "component" => id.as_str().to_string(),
+        "outcome" => outcome.as_str(),
+    )
+    .increment(1);
+}
+
 /// A per-component counter, set absolutely from the record so the metric and the state
 /// cannot drift apart.
 fn count(id: &ComponentId, name: &'static str, value: u64) {
     let metric = match name {
-        "ticks_total" => "mw_component_ticks_total",
         "failed_total" => "mw_component_failed_total",
         "skipped_total" => "mw_component_skipped_total",
         "deadline_exceeded_total" => "mw_component_deadline_exceeded_total",
         "misfired_total" => "mw_component_misfired_total",
         "restart_total" => "mw_component_restart_total",
+        "stop_timeout_total" => "mw_component_stop_timeout_total",
         other => {
             debug_assert!(false, "unknown counter {other}");
             return;

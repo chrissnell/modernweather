@@ -84,6 +84,10 @@ impl Provenance {
 /// `SmallVec<[OriginId; 8]>` rather than a `HashSet`: it is ordered, because "which way
 /// did this reading come" is the question an operator asks, and eight hops is far beyond
 /// any topology this system is for — so the common case is one inline allocation of none.
+///
+/// Eight is the inline capacity, **not** a limit: a ninth hop spills to the heap rather
+/// than being refused. Whether a path length is rejected belongs with forwarding, which is
+/// M3-2's, together with the `Envelope::forward` that is the only thing able to grow one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PathSet(SmallVec<[OriginId; 8]>);
 
