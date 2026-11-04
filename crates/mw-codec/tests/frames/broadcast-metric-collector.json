@@ -1,0 +1,19 @@
+{
+  "did": "001D0A710ABC",
+  "ts": 1762200000,
+  "conditions": [
+    {
+      "lsid": 52001,
+      "data_structure_type": 1,
+      "txid": 1,
+      "wind_speed_last": 0.0,
+      "wind_dir_last": null,
+      "rain_size": 3,
+      "rain_rate_last": 12,
+      "rainfall_daily": 254,
+      "rain_15_min": 3,
+      "rain_60_min": 12,
+      "rain_24_hr": 254
+    }
+  ]
+}

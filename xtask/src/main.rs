@@ -23,6 +23,7 @@
 mod conformance;
 mod coverage;
 mod dist;
+mod emulators;
 mod gates;
 mod gen;
 mod layout;
@@ -69,6 +70,9 @@ fn main() -> ExitCode {
         // The `conformance` gate's command, and the same split as `gate-layout` above:
         // `cargo xtask gate conformance` consults ci/gates.toml and then runs this.
         "conformance" => conformance::main(&owned),
+        // The `driver-emulators` gate's command, and the same split as `gate-layout`:
+        // `cargo xtask gate driver-emulators` consults ci/gates.toml and then runs this.
+        "emulator-tests" => emulators::main(&owned),
         "coverage" => coverage::main(&owned).map(|()| ExitCode::SUCCESS),
         "dist" => dist::main(&owned).map(|()| ExitCode::SUCCESS),
         "targets" => dist::targets(&owned).map(|()| ExitCode::SUCCESS),
@@ -147,6 +151,12 @@ fn usage() {
          \x20     --workdir <d>        logs and replay output (default\n\
          \x20                          target/conformance-rust)\n\
          \x20     --keep-running       leave the daemon up after a green run\n\
+         \x20 emulator-tests     run every emulator declared in\n\
+         \x20                    tests/emulators/manifest.toml against the driver it\n\
+         \x20                    drives, and fail unless the declared number of tests\n\
+         \x20                    passed. The tests are `--ignored` because they need a Go\n\
+         \x20                    toolchain; the count is what makes a gate that ran\n\
+         \x20                    nothing a failure rather than a pass.\n\
          \x20 gate-layout        check the crate boundaries declared in ci/layers.toml:\n\
          \x20                    the layer order, every crate's forbidden list, and the\n\
          \x20                    source rules. Exit 1 on a violation.\n\

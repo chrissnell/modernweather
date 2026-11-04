@@ -609,6 +609,23 @@ jobs:
         with:
           go-version: stable
       - uses: Swatinem/rust-cache@v2
+      # The emulators the reference tree does not have are written here, in Go, and
+      # tests/emulators/manifest.toml records which ones and why. Nothing else in this
+      # workflow lints Go, so an unformatted or suspect emulator would land unseen -- and
+      # an emulator is the oracle, so it is the last thing that should be sloppy.
+      - name: Lint the emulators this repository owns
+        run: |
+          for module in tests/emulators/*/go.mod; do
+            dir="$(dirname "$module")"
+            echo "::group::$dir"
+            unformatted="$(gofmt -l "$dir")"
+            if [ -n "$unformatted" ]; then
+              echo "::error::gofmt would change: $unformatted"
+              exit 1
+            fi
+            (cd "$dir" && go vet ./...)
+            echo "::endgroup::"
+          done
       - run: cargo xtask gate driver-emulators
 
   database:

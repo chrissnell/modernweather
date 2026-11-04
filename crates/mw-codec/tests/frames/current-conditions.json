@@ -1,0 +1,60 @@
+{
+  "data": {
+    "did": "001D0A700002",
+    "ts": 1531754005,
+    "conditions": [
+      {
+        "lsid": 48308,
+        "data_structure_type": 1,
+        "txid": 1,
+        "temp": 62.7,
+        "hum": 56.8,
+        "dew_point": 46.5,
+        "wet_bulb": 52.3,
+        "heat_index": 62.3,
+        "wind_chill": 62.7,
+        "thw_index": 62.3,
+        "thsw_index": 64.5,
+        "wind_speed_last": 2.0,
+        "wind_dir_last": 165,
+        "wind_speed_avg_last_1_min": 1.5,
+        "wind_dir_scalar_avg_last_1_min": 170,
+        "wind_speed_avg_last_2_min": 1.8,
+        "wind_speed_hi_last_2_min": 2.6,
+        "wind_speed_avg_last_10_min": 2.2,
+        "wind_speed_hi_last_10_min": 3.0,
+        "rain_size": 2,
+        "rain_rate_last": 0,
+        "rain_rate_hi": 0,
+        "rainfall_last_15_min": 0,
+        "rainfall_last_60_min": 0,
+        "rainfall_last_24_hr": 0,
+        "rain_storm": 0,
+        "rain_storm_start_at": 1530255720,
+        "solar_rad": 747,
+        "uv_index": 2.7,
+        "rx_state": 0,
+        "trans_battery_flag": 0,
+        "rainfall_daily": 63,
+        "rainfall_monthly": 63,
+        "rainfall_year": 63
+      },
+      {
+        "lsid": 48307,
+        "data_structure_type": 4,
+        "temp_in": 78.0,
+        "hum_in": 41.1,
+        "dew_point_in": 52.5,
+        "heat_index_in": 77.0
+      },
+      {
+        "lsid": 48306,
+        "data_structure_type": 3,
+        "bar_sea_level": 29.897,
+        "bar_trend": 0.0,
+        "bar_absolute": 29.846
+      }
+    ]
+  },
+  "error": null
+}

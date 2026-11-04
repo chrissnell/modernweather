@@ -1196,6 +1196,7 @@ something it does not read. *Behavioural* — a byte a client does read, or coul
 | **DEV-5** | Three additive `X-MW-*` response headers (`X-MW-Snapshot-Age`, `X-MW-Degraded`) during a database outage | W3 D-36 | additive | **No.** Same allowlist property as DEV-1. The frozen *body* is never used to signal degradation — that was the explicit alternative W3 rejected. |
 | **DEV-7** | `/span`'s `solarjoules` becomes the bucket **total** instead of the bucket mean, and is NULL for pre-cutover history | **N-9** (implementation-plan.md M1-6) | behavioural — **corrects a meaningless statistic**, and **needs the owner's acknowledgement** | **Yes, and by orders of magnitude.** `solarjoules` carries the Campbell logger's `slr_mj`: energy per unit area accumulated since its previous output. The Go views stored `avg(solarjoules)`, which is the mean increment per reading and moves when the logger's output interval does; the registry now stores `total`, which is the bucket's insolation. At production's 2-second cadence that multiplies the value `/span` returns by roughly the bucket's reading count — **~30× at the 6 h band, ~150× at 48 h, ~1,800× at 14 d, ~43,200× at 366 d**. Two further consequences. (1) `/latest` serves the last raw reading, so after this change `/latest` and `/span` report different physical quantities under the same key and the same declared unit; the frozen contract has one name for them and `rainincremental`/`period_rain` is the only precedent, where the Go surface gave the bucket total a *second* name. (2) No Go view computed `sum(solarjoules)`, so `solarjoules_total` is NULL for the ~294 pre-cutover rollup days — and `solarjoules` is `"swift_optional": false` in `contract/legacy-v1.json`, the same property that makes `windd` a contract hazard, so the read path must coalesce it rather than emit null. **The conformance suite cannot catch any of this**: it compares shape, type and numeric formatting, not values (`contract/conformance/src/lib.rs`). |
 | **DEV-6** | Wildcard certificates match exactly one label; on an SNI miss the chain is exact → wildcard → designated default → refuse with `unrecognized_name` | W3 D-69, D-70 | behavioural — **closes two defects** | **Only by depending on the bugs.** The Go `strings.HasSuffix` check matches any depth *and* matches `evilexample.com` for `*.example.com`. On a miss, Go returns an arbitrary certificate by iterating a map — non-deterministic between runs, producing a browser interstitial that blames the user. |
+| **DEV-8** | A WeatherLink Live station's readings are stored in the units the registry declares (°F, inHg, inches), its indoor temperature and humidity are stored at all, and its rainfall is converted from tip counts | **implementation-plan.md M3-1**; four defects in the Go driver | behavioural — **closes four defects**, and **needs the owner's acknowledgement** | **Yes, if the owner has ever run a WeatherLink Live.** `internal/weatherstations/weatherlinklive/data_transformer.go` converts every temperature `(F - 32) * 5 / 9` and every pressure `* 33.8639`, writing Celsius into `outtemp` and hPa into `barometer`/`baromrelin`/`baromabsin` — columns `metrics/registry.toml` declares as `degF` and `inHg`, which the Go **Davis** driver on the same schema fills in °F and inHg (`convBigVal10` of the LOOP packet) and which `/latest` emits with no conversion. So the two Go drivers disagree about what the column means and the WeatherLink Live one disagrees with the frozen contract: a 62.7 °F reading is stored as 17.06 and rendered as 17.06 °F. It also copies `rainfall_daily` and `rain_rate_last` — which are **tip counts** — into `dayrain` and `rainrate`, declared `in` and `in_per_hour`, so a 0.2 mm collector reports 20× and a 0.01 in collector 100× the rainfall it measured; `rain_size`, which is the only thing that can convert them, is read into the struct and never used. And its `th_indoor` arm looks for `DataStructureBarometer` (record type 3) while `temp_in`/`hum_in` are in record type 4, so `intemp` and `inhumidity` are never populated from one of these units at all. The Rust codec stores the device's own units, converts rainfall through `rain_size`, leaves rainfall `NULL` when `rain_size` is absent rather than storing a count (**D-26**), and reads the indoor record. **Marked as needing acknowledgement** for DEV-7's reason: it is a correction and not a decision, and whether a stored series changes meaning is the owner's call. **The conformance suite cannot catch any of it** — it compares shape, type and formatting, not values — and nothing in this repository can tell whether any WeatherLink Live data exists in the production database. |
 
 **DEV-4 answers W9's OQ-W9-4 in the affirmative**, which is what W9 asked W6 to decide. It belongs
 here rather than only in `docs/data-migration.md` for the reason W9 gave for rejecting its own option
@@ -1220,6 +1221,26 @@ reason the item was sized as a one-line registry edit needing no record, and tha
 hold. **Marked as needing the owner's acknowledgement**, like DEV-2, DEV-3 and DEV-6: the aggregation
 is an agent's technical judgement, and whether a chart's numbers may change by three orders of
 magnitude is not.
+
+**DEV-8 is a *driver* deviation rather than a read-path one, which is why it reads differently from
+the six above it.** Nothing about the frozen contract changes: the keys, the types and the formatting
+are identical, and a client sees the same JSON shape it always did. What changes is the **number**
+under `otemp`, `bar`, `dayrain` and `rainrate` for a station of one type — and in the direction of the
+unit the registry, the contract and the other driver all already agree on. Three consequences worth
+stating rather than discovering:
+
+1. **Historic rows are not migrated.** M7-4's configuration migration and W9's data migration copy
+   what is there; a `outtemp` column holding Celsius for some past range is not something either can
+   detect, because 17.06 is a plausible Fahrenheit reading for a cold morning. If the owner has
+   WeatherLink Live history, a chart spanning the cutover will step.
+2. **It is invisible to every gate.** The `conformance` suite compares shape and formatting;
+   `db-tests` has no WeatherLink Live in it; the emulator level asserts the Rust decoder against a
+   Rust-adjacent oracle. The only check that could have caught the Go behaviour is the one this entry
+   *is*: reading the registry's declared unit next to the driver's arithmetic.
+3. **The rainfall case is not symmetrical with the others.** A temperature in the wrong unit is
+   recoverable arithmetic. A rain total in counts is only recoverable if `rain_size` is known for the
+   period, and nothing stored it — which is also why the Rust codec stores `NULL` rather than a count
+   when the device omits it.
 
 **What is *not* in this ledger, and why each is more interesting than it looks.**
 

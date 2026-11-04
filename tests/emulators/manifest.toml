@@ -1,0 +1,137 @@
+# The emulator manifest. `cargo xtask emulator-tests` reads this file and nothing else;
+# `ci/gates.toml` declares it as the gate `driver-emulators`, armed by the existence of
+# this file.
+#
+# Level 3 of the three W3 D-82 specifies — "the whole driver against the pinned Go
+# emulator" — and the reason it is a manifest rather than a hard-coded list is D-64: a
+# gate's `arms_when` must name a path some work item's done-criteria require it to create,
+# and implementation-plan.md M3-1 carries this one. A gate that printed `DEFERRED` and
+# exited 0 after this file existed would be docs/reconciliation.md G-1 exactly, so the
+# runner asserts that the declared number of tests **passed** — a filter that matches no
+# tests exits zero, and that is the hole the count closes.
+#
+# ---------------------------------------------------------------------------------------
+# WHAT THIS MANIFEST HAS TO SAY OUT LOUD
+#
+# DESIGN.md D-40 keeps the emulators in Go deliberately, because "a driver tested against a
+# simulator written in the same language from the same understanding tests that
+# understanding against itself", and A-W8-4 adds that they are consumed at a pinned commit
+# of the reference repository.
+#
+# **The reference repository has no WeatherLink Live emulator at that commit.** Its four
+# are `cmd/davis-emulator`, `cmd/campbell-emulator`, `cmd/weather-station-simulator` (Davis
+# on TCP 22222 and Campbell on TCP 7000) and `cmd/live-data-simulator` (Campbell packets
+# from live data); none of them speaks the WeatherLink Live local API or broadcasts its
+# datagrams. The repository is read-only to this programme, so one cannot be added there.
+#
+# M3-1 is the item that arms this gate and the only driver that exists is WeatherLink Live,
+# so the choice was between a gate that runs nothing — G-1 — and an emulator written here.
+# The emulator is written here, in Go, as `tests/emulators/wll`, and `origin =
+# "this-repository"` records exactly which of D-40's properties that costs:
+#
+#   kept      a separate process, a different language, real sockets, the real bind, and a
+#             driver exercised for more than one batch
+#   lost      independent authorship. It was written in the same repository as the driver,
+#             from the same reading of the published API, so it cannot catch a
+#             misunderstanding the two share.
+#
+# **This is a decision for the programme owner, not a settled one.** The honest fix is a
+# `cmd/weatherlink-live-emulator` in the reference tree, written against the vendor
+# documentation by somebody who is not writing the driver, with the pin below bumped to the
+# commit that adds it — at which point this entry's `origin` becomes `"reference"` and the
+# local copy is deleted. Until then the gate runs real tests and says what they do not
+# prove.
+#
+# ---------------------------------------------------------------------------------------
+
+# The pinned commit of the reference repository (A-W8-4). Bumping it is a reviewed change:
+# the reference is read-only to this programme and is NOT frozen, so an unrelated upstream
+# commit could otherwise turn this repository's CI red.
+#
+# Nothing in this manifest is checked out from it yet — the WeatherLink Live emulator is
+# local — so the pin is a commitment the first `origin = "reference"` entry will use rather
+# than a path that is read today. `cargo xtask emulator-tests` still validates that it is a
+# full 40-character object name, because "pinned" and "pinned to a branch name" are
+# different things.
+[reference]
+repo = "git@github.com:chrissnell/remoteweather.git"
+commit = "c3ec9f7d7dec2c5f71a1f48b8af2b9b0921b7bcf"
+committed = "2026-10-27"
+
+# ---------------------------------------------------------------------------------------
+# The emulators that run today.
+
+[[emulator]]
+id = "weatherlink-live"
+emulates = "Davis WeatherLink Live — the local API v1 and its UDP broadcast"
+driver = "mw_station::wll (implementation-plan.md M3-1)"
+origin = "this-repository"
+path = "tests/emulators/wll"
+package = "mw-station"
+test_target = "emulator"
+tests = 4
+note = """
+Four tests, each asserting something the two levels below it cannot:
+
+  the_broadcast_driver_arms_the_unit_and_keeps_receiving
+      nothing arrives before the unit is armed; then twelve datagrams over a real socket,
+      with the values moving, so a driver that admitted the first and stalled fails.
+  the_poll_driver_produces_a_reading_on_every_occurrence
+      four `Tick` occurrences, four readings. This is the Davis "stops polling after one
+      batch" defect's own shape, on the transport it was actually on.
+  a_refusal_carrying_two_hundred_fails_the_re_arm
+      the unit refuses an arming with `200 OK` and a populated `error` body. A client that
+      trusted the status line would listen to a port nothing sends to -- a station that
+      silently stops reporting. The emulator refuses every fifth arming on purpose.
+  a_port_disagreement_is_reported_rather_than_followed
+      the unit broadcasts to a port the configuration does not name. The re-arm reports it
+      and does not move the listener, which is W2a §4a.5's "shares no state with the
+      listener" made observable.
+
+`tests` is load-bearing: the runner fails unless exactly this many passed, so neither a
+renamed test nor a filter that matches nothing can make the gate green."""
+
+# ---------------------------------------------------------------------------------------
+# Declared, not yet runnable. Each needs a driver this build does not have, and the gate
+# prints them so the set is visible on every run rather than remembered — the same reason
+# `cargo xtask gates` prints the deferred set.
+#
+# These are NOT skipped checks. There is nothing to check: `mw_station::plan` refuses a
+# station of any of these types by name, so a configuration that needed one fails at
+# startup rather than quietly collecting nothing.
+
+[[pending]]
+id = "davis"
+emulates = "Davis VantagePro/Vue — LOOP packets, CRC16, the wake handshake"
+reference_path = "cmd/davis-emulator"
+driver = "implementation-plan.md M6-1"
+note = """
+Exists in the reference tree and is the strongest oracle this programme has: 695 lines,
+written years before any of this. W8 assumption 15 expects the emulator tests to connect to
+a TCP port the harness supplies, which `davis-emulator -port` already does; the serial
+variant of the same driver needs a `socat` pty pair, and W2a decides per driver whether that
+is worth it."""
+
+[[pending]]
+id = "campbell"
+emulates = "Campbell Scientific datalogger — command/response over TCP"
+reference_path = "cmd/campbell-emulator"
+driver = "implementation-plan.md M6-1"
+note = "Also in the reference tree, and the owner's production station type."
+
+[[pending]]
+id = "ambient"
+emulates = "Ambient 'customized' — the vendor webhook into our own listener"
+reference_path = ""
+driver = "implementation-plan.md M6-1"
+note = """
+No emulator anywhere, and it needs none of this shape: the station is the client, so the
+test is a request against the route the driver mounts. Listed because leaving it off the
+manifest would be the quiet kind of gap — the one G-5 is about."""
+
+[[pending]]
+id = "snowgauge"
+emulates = "The snow gauge — a gRPC client stream"
+reference_path = ""
+driver = "implementation-plan.md M6-3"
+note = "A gRPC server stub, which arrives with the driver that consumes one."

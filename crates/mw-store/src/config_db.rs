@@ -318,9 +318,15 @@ mod tests {
                 .await
                 .expect_err("a migration body applied twice without error");
             let message = err.to_string();
+            // Two phrasings, because SQLite has two for the same fact and the property
+            // being asserted is "a second application is an error", not which sentence it
+            // is. `CREATE TABLE x` says "table x already exists"; `ALTER TABLE x ADD
+            // COLUMN y` says "duplicate column name: y" -- which is what
+            // `20261104120000_station_presented_key_and_weatherlink_options.sql` produces,
+            // and it is the same refusal.
             assert!(
-                message.contains("already exists"),
-                "{}: expected an 'already exists' error, got: {message}",
+                message.contains("already exists") || message.contains("duplicate column name"),
+                "{}: expected a second application to be refused, got: {message}",
                 migration.description
             );
         }
@@ -477,6 +483,138 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("the schema rejected {what}: {e}"));
         }
+        pool.close().await;
+    }
+
+    /// The three columns M3-1 added, and the round trip the station registrar depends on.
+    #[tokio::test]
+    async fn a_weatherlink_live_row_round_trips_through_the_station_reader() {
+        let scratch = Scratch::new("stations");
+        let pool = open_and_migrate(&scratch.db()).await.expect("migrate");
+
+        // A broadcasting unit this node also arms, and a polled one. Both are the shapes
+        // `mw_station::plan` turns into components.
+        for sql in [
+            "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind,
+                                   presented_key, transport_kind, transport_port,
+                                   transport_host, wll_sensor_mapping)
+             VALUES ('suncrest:roof', x'0193f3c28b207c71ae3f10cc92d4b7aa', 'roof',
+                     'weatherlink-live', 'from_payload', '001D0A700002', 'udp_in', 22222,
+                     '192.168.1.50', 'th:1, wind:1, baro')",
+            "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind,
+                                   transport_kind, transport_url,
+                                   wll_sensor_mapping, wll_poll_interval_seconds)
+             VALUES ('suncrest:field', x'0193f3c28b207c71ae3f10cc92d4b7aa', 'field',
+                     'weatherlink-live', 'fixed', 'http_out', 'http://192.168.1.51',
+                     'th:1, wind:1', 45)",
+        ] {
+            sqlx::query(sql).execute(&pool).await.expect("a valid row");
+        }
+
+        let rows = stations(&pool).await.expect("the station rows read");
+        assert_eq!(rows.len(), 2);
+        // Ordered by key, which is what keeps a listener's ConfigDigest stable.
+        assert_eq!(rows[0].station_key, "suncrest:field");
+        assert_eq!(rows[1].station_key, "suncrest:roof");
+
+        let field = &rows[0];
+        assert_eq!(field.identity_kind, "fixed");
+        assert_eq!(field.presented_key, None);
+        assert_eq!(field.transport_kind.as_deref(), Some("http_out"));
+        assert_eq!(field.wll_poll_interval_seconds, Some(45));
+        assert!(field.enabled, "the column defaults to collecting");
+
+        let roof = &rows[1];
+        assert_eq!(roof.presented_key.as_deref(), Some("001D0A700002"));
+        assert_eq!(roof.transport_port, Some(22222));
+        assert_eq!(roof.transport_host.as_deref(), Some("192.168.1.50"));
+        assert_eq!(
+            roof.wll_sensor_mapping.as_deref(),
+            Some("th:1, wind:1, baro")
+        );
+        assert_eq!(roof.wll_poll_interval_seconds, None);
+        assert!(roof.transport_auth.is_none());
+        pool.close().await;
+    }
+
+    /// The three CHECKs M3-1's migration adds, as the illegal states they name.
+    #[tokio::test]
+    async fn the_identity_claim_is_required_exactly_where_there_is_one() {
+        let scratch = Scratch::new("claims");
+        let pool = open_and_migrate(&scratch.db()).await.expect("migrate");
+        let node = "x'0193f3c28b207c71ae3f10cc92d4b7aa'";
+
+        for (what, sql) in [
+            (
+                "a `from_payload` station with no claim to resolve against",
+                format!(
+                    "INSERT INTO stations (station_key, owning_node_id, name, type,
+                                           identity_kind, transport_kind, transport_port)
+                     VALUES ('a', {node}, 'a', 'weatherlink-live', 'from_payload', 'udp_in',
+                             22222)"
+                ),
+            ),
+            (
+                "a `fixed` station presenting one anyway",
+                format!(
+                    "INSERT INTO stations (station_key, owning_node_id, name, type,
+                                           identity_kind, transport_kind, transport_url,
+                                           presented_key)
+                     VALUES ('b', {node}, 'b', 'weatherlink-live', 'fixed', 'http_out',
+                             'http://h', 'x')"
+                ),
+            ),
+            (
+                "a poll interval below W2a 4a.5's floor",
+                format!(
+                    "INSERT INTO stations (station_key, owning_node_id, name, type,
+                                           identity_kind, transport_kind, transport_url,
+                                           wll_poll_interval_seconds)
+                     VALUES ('c', {node}, 'c', 'weatherlink-live', 'fixed', 'http_out',
+                             'http://h', 5)"
+                ),
+            ),
+            (
+                "an empty sensor mapping, which is not a mapping",
+                format!(
+                    "INSERT INTO stations (station_key, owning_node_id, name, type,
+                                           identity_kind, transport_kind, transport_url,
+                                           wll_sensor_mapping)
+                     VALUES ('d', {node}, 'd', 'weatherlink-live', 'fixed', 'http_out',
+                             'http://h', '')"
+                ),
+            ),
+        ] {
+            let e = sqlx::query(&sql)
+                .execute(&pool)
+                .await
+                .expect_err(&format!("the schema accepted {what}"));
+            assert!(
+                e.to_string().contains("CHECK constraint failed"),
+                "{what}: {e}"
+            );
+        }
+
+        // Two stations cannot present one claim: resolution would not be a function.
+        sqlx::query(&format!(
+            "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind,
+                                   transport_kind, transport_port, presented_key)
+             VALUES ('e', {node}, 'e', 'weatherlink-live', 'from_payload', 'udp_in', 22222,
+                     '001D0A700002')"
+        ))
+        .execute(&pool)
+        .await
+        .expect("the first station with that serial");
+        let e = sqlx::query(&format!(
+            "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind,
+                                   transport_kind, transport_port, presented_key)
+             VALUES ('f', {node}, 'f', 'weatherlink-live', 'from_payload', 'udp_in', 22222,
+                     '001D0A700002')"
+        ))
+        .execute(&pool)
+        .await
+        .expect_err("two stations, one serial");
+        assert!(e.to_string().contains("UNIQUE constraint failed"), "{e}");
         pool.close().await;
     }
 
@@ -746,6 +884,159 @@ pub async fn weather_database(pool: &SqlitePool) -> Result<Option<WeatherDatabas
     Ok(row.map(|r| WeatherDatabase {
         url: SecretString::from(r.get::<String, _>("url")),
     }))
+}
+
+/// One `config.stations` row, as the columns hold it.
+///
+/// Deliberately close to the SQL and deliberately **not** `mw_station::StationRow`. Both
+/// crates are in the `service` layer, so `ci/layers.toml` forbids either naming the other;
+/// the binary copies column into field, and what that buys is that this crate cannot grow a
+/// `Transport` and that crate cannot grow a query (`mw_station::config`'s module
+/// documentation has the other half of this note).
+///
+/// No `PartialEq`: `transport_auth` is a `SecretString`, which deliberately implements
+/// neither comparison nor `Hash` (**D-33**) so that a credential cannot be compared by
+/// accident in non-constant time. What needs comparing is the *plan* this row produces,
+/// and `mw_component::ConfigDigest` is what compares that.
+#[derive(Debug, Clone)]
+pub struct StationRow {
+    /// `station_key` -- the domain identity.
+    pub station_key: String,
+    /// `name`.
+    pub name: String,
+    /// `type` -- the configured device type, in the frozen contract's spelling.
+    pub kind: String,
+    /// `enabled`.
+    pub enabled: bool,
+    /// `identity_kind`.
+    pub identity_kind: String,
+    /// `presented_key` -- the identifier a non-`fixed` station presents.
+    pub presented_key: Option<String>,
+    /// `ingest_secret_hash` -- the protocol secret's hash, where the protocol has one.
+    pub ingest_secret_hash: Option<String>,
+    /// `transport_kind`. `None` for a station received from a peer.
+    pub transport_kind: Option<String>,
+    /// `transport_dev`.
+    pub transport_dev: Option<String>,
+    /// `transport_baud`.
+    pub transport_baud: Option<i64>,
+    /// `transport_host`.
+    pub transport_host: Option<String>,
+    /// `transport_port`.
+    pub transport_port: Option<i64>,
+    /// `transport_url`.
+    pub transport_url: Option<String>,
+    /// `transport_method`.
+    pub transport_method: Option<String>,
+    /// `transport_auth` -- a credential, so a secret from the moment it is read (**D-33**).
+    pub transport_auth: Option<SecretString>,
+    /// `transport_streaming`.
+    pub transport_streaming: Option<bool>,
+    /// `transport_mount`.
+    pub transport_mount: Option<String>,
+    /// `transport_group`.
+    pub transport_group: Option<String>,
+    /// `transport_topic`.
+    pub transport_topic: Option<String>,
+    /// `transport_tls_ca_path`.
+    pub transport_tls_ca_path: Option<String>,
+    /// `transport_tls_cert_path`.
+    pub transport_tls_cert_path: Option<String>,
+    /// `transport_tls_key_path`.
+    pub transport_tls_key_path: Option<String>,
+    /// `wll_sensor_mapping`.
+    pub wll_sensor_mapping: Option<String>,
+    /// `wll_poll_interval_seconds`.
+    pub wll_poll_interval_seconds: Option<i64>,
+}
+
+/// Read every `config.stations` row, ordered by key.
+///
+/// Every row, including the disabled ones and the ones a peer owns: which of them produce
+/// components is `mw_station`'s to decide, and a `WHERE enabled = 1` here would put that
+/// decision in two places.
+///
+/// Ordered, because the order reaches the plan: a listener's `ConfigDigest` is over the
+/// group of rows it serves, and an unordered `SELECT` would make the digest -- and
+/// therefore the plan diff -- depend on SQLite's row order.
+pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbError> {
+    let rows = sqlx::query(
+        "SELECT station_key, name, type, enabled, identity_kind, presented_key, \
+                ingest_secret_hash, transport_kind, transport_dev, transport_baud, \
+                transport_host, transport_port, transport_url, transport_method, \
+                transport_auth, transport_streaming, transport_mount, transport_group, \
+                transport_topic, transport_tls_ca_path, transport_tls_cert_path, \
+                transport_tls_key_path, wll_sensor_mapping, wll_poll_interval_seconds \
+         FROM stations ORDER BY station_key",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|source| ConfigDbError::Query {
+        what: "the station rows",
+        source,
+    })?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(StationRow {
+                station_key: r.get("station_key"),
+                name: r.get("name"),
+                kind: r.get("type"),
+                enabled: flag(&r, "enabled")?,
+                identity_kind: r.get("identity_kind"),
+                presented_key: r.get("presented_key"),
+                ingest_secret_hash: r.get("ingest_secret_hash"),
+                transport_kind: r.get("transport_kind"),
+                transport_dev: r.get("transport_dev"),
+                transport_baud: r.get("transport_baud"),
+                transport_host: r.get("transport_host"),
+                transport_port: r.get("transport_port"),
+                transport_url: r.get("transport_url"),
+                transport_method: r.get("transport_method"),
+                transport_auth: r
+                    .get::<Option<String>, _>("transport_auth")
+                    .map(SecretString::from),
+                transport_streaming: optional_flag(&r, "transport_streaming")?,
+                transport_mount: r.get("transport_mount"),
+                transport_group: r.get("transport_group"),
+                transport_topic: r.get("transport_topic"),
+                transport_tls_ca_path: r.get("transport_tls_ca_path"),
+                transport_tls_cert_path: r.get("transport_tls_cert_path"),
+                transport_tls_key_path: r.get("transport_tls_key_path"),
+                wll_sensor_mapping: r.get("wll_sensor_mapping"),
+                wll_poll_interval_seconds: r.get("wll_poll_interval_seconds"),
+            })
+        })
+        .collect()
+}
+
+/// A `0`/`1` column as a `bool`, refusing anything else.
+///
+/// The column's own `CHECK` permits exactly those two, so a third value means this build
+/// and its schema disagree -- which is what `ConfigDbError::Column` says.
+fn flag(row: &sqlx::sqlite::SqliteRow, column: &'static str) -> Result<bool, ConfigDbError> {
+    match row.get::<i64, _>(column) {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(ConfigDbError::Column {
+            column,
+            value: other.to_string(),
+        }),
+    }
+}
+
+fn optional_flag(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &'static str,
+) -> Result<Option<bool>, ConfigDbError> {
+    match row.get::<Option<i64>, _>(column) {
+        None => Ok(None),
+        Some(0) => Ok(Some(false)),
+        Some(1) => Ok(Some(true)),
+        Some(other) => Err(ConfigDbError::Column {
+            column,
+            value: other.to_string(),
+        }),
+    }
 }
 
 /// The node's own identity and spool settings (W7 §5.2).

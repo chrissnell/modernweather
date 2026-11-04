@@ -1,0 +1,64 @@
+{
+  "data": {
+    "did": "001D0A70BEEF",
+    "ts": 1762200120,
+    "conditions": [
+      {
+        "lsid": 61001,
+        "data_structure_type": 1,
+        "txid": 1,
+        "temp": 44.1,
+        "hum": 91.0,
+        "dew_point": 41.8,
+        "wet_bulb": 42.6,
+        "heat_index": 44.1,
+        "wind_chill": 41.0,
+        "thw_index": 41.0,
+        "thsw_index": 43.9,
+        "wind_speed_last": 6.0,
+        "wind_dir_last": 310,
+        "wind_speed_avg_last_10_min": 5.25,
+        "rain_size": 1,
+        "rain_rate_last": 4,
+        "rainfall_daily": 17,
+        "solar_rad": 88,
+        "uv_index": 0.3,
+        "rx_state": 0,
+        "trans_battery_flag": 1
+      },
+      {
+        "lsid": 61002,
+        "data_structure_type": 2,
+        "txid": 2,
+        "temp_1": 51.2,
+        "temp_2": 52.7,
+        "temp_3": 53.1,
+        "temp_4": null,
+        "moist_soil_1": 12.0,
+        "moist_soil_2": 31.5,
+        "moist_soil_3": 44.0,
+        "moist_soil_4": null,
+        "wet_leaf_1": 8.0,
+        "wet_leaf_2": 0.0,
+        "rx_state": 0,
+        "trans_battery_flag": 0
+      },
+      {
+        "lsid": 61003,
+        "data_structure_type": 3,
+        "bar_sea_level": 30.112,
+        "bar_trend": -0.02,
+        "bar_absolute": 25.008
+      },
+      {
+        "lsid": 61004,
+        "data_structure_type": 4,
+        "temp_in": 66.4,
+        "hum_in": 38.2,
+        "dew_point_in": 40.1,
+        "heat_index_in": 64.9
+      }
+    ]
+  },
+  "error": null
+}

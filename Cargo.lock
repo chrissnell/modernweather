@@ -1450,6 +1450,7 @@ name = "modernweather"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "metrics",
  "mw-api-legacy",
  "mw-api-mgmt",
@@ -1528,6 +1529,7 @@ dependencies = [
 name = "mw-codec"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "mw-types",
  "serde",
  "serde_json",
@@ -1668,11 +1670,14 @@ name = "mw-station"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "metrics",
  "mw-codec",
  "mw-component",
  "mw-types",
+ "secrecy",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -1680,6 +1685,7 @@ dependencies = [
 name = "mw-store"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "chrono",
  "mw-component",
  "mw-types",

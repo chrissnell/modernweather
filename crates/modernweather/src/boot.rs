@@ -45,7 +45,7 @@ use mw_component::Generation;
 use mw_store::config_db;
 use mw_store::version::{self, Observed, VersionError};
 use mw_store::SqliteScheduleStore;
-use mw_supervisor::plan::{plan, PlanContext, Registrar};
+use mw_supervisor::plan::{plan, PlanContext, RegisterError, Registrar};
 use mw_supervisor::{Roots, RunReport, Supervisor};
 use mw_types::Classify;
 use secrecy::ExposeSecret;
@@ -61,13 +61,82 @@ use crate::spool;
 
 /// Which component crates contribute specs.
 ///
-/// Empty, and that is the whole of this milestone: M2-3 built `plan()` and the supervisor,
-/// and the first registrar arrives with the first component crate
-/// (implementation-plan.md M3-1's station driver). The list being a value here rather than
-/// a `match` inside the supervisor is §1.3 rule 2 -- adding a component crate adds a line
-/// to this slice and edits nothing else, which is the shape `managers/controller.go` could
-/// not take.
-const REGISTRARS: &[&dyn Registrar<Config>] = &[];
+/// One line per component crate, which is §1.3 rule 2: adding a component crate adds a line
+/// here and edits nothing else -- the shape `managers/controller.go` could not take, down to
+/// its `if con.Type == "management" { continue }`.
+const REGISTRARS: &[&dyn Registrar<Config>] = &[&Stations];
+
+/// `mw-station`'s registrar.
+///
+/// The adapter exists because `Registrar` is `mw-supervisor`'s and both crates are in the
+/// `service` layer, so `ci/layers.toml` forbids `mw-station` from naming it -- the
+/// supervisor must not know that a station exists. The binary is the one place a consumer
+/// and a provider meet (§1.3 rule 1), so the trait is implemented here over
+/// `mw_station::register`, which is the pure function that does the work.
+#[derive(Debug)]
+struct Stations;
+
+impl Registrar<Config> for Stations {
+    fn name(&self) -> &'static str {
+        "mw-station"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        // The chain, flattened once, at the boundary where `RegisterError` is a string:
+        // `PlanError::Registrar` carries a `reason: String`, so a `#[source]` chain that
+        // was not walked here would lose every level but the first.
+        mw_station::register(cfg, out)
+            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
+    }
+}
+
+/// Build the station registry and the write end of the pipeline, and hand both to the
+/// configuration.
+///
+/// **Two things that are not in W3 §3.1's list, and the reason is the same for both: the
+/// component that should own them does not exist.** W2a §4.1b gives `StationRegistry` to a
+/// `config:sqlite` component and no work item in `docs/implementation-plan.md` creates one,
+/// so the snapshot is built here, once, from the rows step 4 already read -- the same way
+/// the SQLite pool and the spool are root resources `main` owns (**D-41**, **D-30a**). What
+/// that costs is stated at `mw_store::registry`: a station added while the daemon runs is
+/// not resolvable until it restarts, which is true of every configuration change until
+/// `ConfigAdmin` exists (M7-1).
+///
+/// `SpoolIngress` is the other half. It holds the spool and the registry and nothing else,
+/// which is what makes **D-87** -- `admit` does no I/O but the spool append -- structurally
+/// true rather than a rule to remember: there is no database handle in it to reach for.
+///
+/// A function rather than inline code, so that the tests below drive the *same* assembly
+/// the daemon does. A second copy in a test would be a test of the copy.
+fn attach_ingress(cfg: &mut Config, fanout: &spool::Fanout) -> anyhow::Result<()> {
+    // The receivers a `Fixed` frame resolves through, minted by the registrar that minted
+    // the component ids -- so the registry and the plan cannot disagree about what a
+    // component is called.
+    let receivers = mw_station::fixed_receivers(cfg)
+        .map_err(|e| anyhow::anyhow!("{}", mw_types::DisplayChain(&e)))
+        .context("deriving the components identity resolution answers through")?;
+    let snapshot = mw_store::RegistrySnapshot::new(
+        &cfg.stations,
+        receivers.iter().map(|r| (&r.component, &r.station)),
+    );
+    info!(
+        stations = cfg.stations.len(),
+        claims = snapshot.claims(),
+        receivers = snapshot.receivers(),
+        "station registry published"
+    );
+    let registry: Arc<dyn mw_component::StationRegistry> =
+        Arc::new(mw_store::ConfigRegistry::new(snapshot));
+    cfg.set_ingress(Arc::new(mw_pipeline::SpoolIngress::new(
+        Arc::clone(&fanout.spool),
+        registry,
+    )) as Arc<dyn mw_component::Ingress>);
+    Ok(())
+}
 
 /// How long the **D-62** probe may take before the boot sequence gives up on it.
 ///
@@ -127,7 +196,7 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     };
 
     // Step 4.
-    let cfg = Config::load(&pool)
+    let mut cfg = Config::load(&pool)
         .await
         .context("reading the configuration")?;
     match &cfg.node {
@@ -220,6 +289,12 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
             None
         }
     };
+
+    // Step 4c: identity resolution and the write end of the pipeline.
+    mw_station::metrics::register();
+    if let Some(fanout) = &fanout {
+        attach_ingress(&mut cfg, fanout).context("assembling the reading pipeline")?;
+    }
 
     // Step 5. Pure: every structural error in W2a Decision 2's list is caught here,
     // before anything is constructed.
@@ -372,6 +447,9 @@ mod tests {
 
     fn config(with_database: bool) -> Config {
         Config {
+            stations: Vec::new(),
+            declared_stations: Vec::new(),
+            ingress: None,
             listener: Listener {
                 listen_addr: "127.0.0.1".into(),
                 http_port: 8080,
@@ -436,6 +514,419 @@ mod tests {
             "postgres://mw:hunter2@db.internal/weather",
             "the probe gets the secret, which is why nothing else does"
         );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // The done-criterion, end to end: a WeatherLink Live station configured in the
+    // configuration database produces readings.
+    //
+    // Here rather than in `tests/station_ingest.rs` because `modernweather` is a `[[bin]]`
+    // and an integration test cannot import from a binary target -- so a test over there
+    // would have had to restate `declare` and `attach_ingress`, and a test of a copy is not
+    // a test. These run the real conversion, the real registry, the real registrar, the
+    // real `plan()` and the real supervisor, and read the envelope back out of the spool's
+    // files:
+    //
+    //   config.db -> Config::load -> declare -> register -> plan -> Supervisor
+    //        |                                                         | Builder::serve
+    //        +-- RegistrySnapshot -> ConfigRegistry --+                 v
+    //                                                 \-> SpoolIngress <- BroadcastListener
+    //                                                          |              ^
+    //                                                          v              | a datagram
+    //                                                        Spool -> Cursor  | on loopback
+
+    /// A scratch directory per test, removed on drop. Twenty lines rather than a
+    /// dev-dependency, which is the call `mw-store`'s and `mw-pipeline`'s tests make.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "mw-ingest-{}-{tag}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).expect("the scratch directory is creatable");
+            Self(dir)
+        }
+
+        fn db(&self) -> std::path::PathBuf {
+            self.0.join("config.db")
+        }
+
+        fn spool(&self) -> std::path::PathBuf {
+            self.0.join("spool")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The serial a WeatherLink Live puts in every datagram, in the case it reports it.
+    const SERIAL: &str = "001D0A700002";
+
+    /// The sensor mapping these tests configure, which is `vp2_basic` minus the indices.
+    const MAPPING: &str = "th:1, rain:1, wind:1, th_indoor, baro";
+
+    /// A free UDP port, for a station row that must not collide with anything on the host.
+    ///
+    /// 22222 is the port a real WeatherLink Live broadcasts to and is deliberately **not**
+    /// used: a developer running the daemon while the tests run would make this flaky, and
+    /// the port is configuration (`transport_port`) precisely so that it can be.
+    async fn free_port() -> u16 {
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral port is available");
+        probe.local_addr().expect("a bound socket").port()
+    }
+
+    /// A configuration database with a node identity, a spool, and the given station rows.
+    async fn configure(scratch: &Scratch, stations: &[String]) -> sqlx::SqlitePool {
+        let pool = config_db::open_and_migrate(&scratch.db())
+            .await
+            .expect("the configuration schema applies");
+        // The `node` row the spool needs. The migration deliberately seeds none, because
+        // `node_id` is minted once by the node; a test is the one place it is a literal.
+        sqlx::query(
+            "INSERT INTO node (id, node_id, node_name, spool_path)
+             VALUES (1, x'07070707070707070707070707070707', 'test', ?)",
+        )
+        .bind(scratch.spool().to_string_lossy().to_string())
+        .execute(&pool)
+        .await
+        .expect("the node row");
+        for sql in stations {
+            sqlx::query(sql)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("the schema rejected a station row: {e}"));
+        }
+        pool
+    }
+
+    /// A broadcasting WeatherLink Live, as an operator would configure one.
+    fn broadcast_station(key: &str, serial: &str, port: u16) -> String {
+        format!(
+            "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind,
+                                   presented_key, transport_kind, transport_port,
+                                   transport_host, wll_sensor_mapping)
+             VALUES ('{key}', x'07070707070707070707070707070707', '{key}',
+                     'weatherlink-live', 'from_payload', '{serial}', 'udp_in', {port},
+                     '192.168.1.50', '{MAPPING}')"
+        )
+    }
+
+    /// Unix seconds as the instant a transport observed a frame at.
+    fn instant(seconds: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(seconds, 0).expect("a literal instant")
+    }
+
+    /// A datagram in the shape a WeatherLink Live broadcasts.
+    fn datagram(serial: &str, ts: i64, temp: f64) -> Vec<u8> {
+        format!(
+            r#"{{"did":"{serial}","ts":{ts},"conditions":[{{"lsid":48308,
+               "data_structure_type":1,"txid":1,"temp":{temp},"hum":52.0,
+               "wind_speed_last":4.0,"wind_dir_last":280,"rain_size":1,
+               "rain_rate_last":0,"rainfall_daily":12}}]}}"#
+        )
+        .into_bytes()
+    }
+
+    /// Steps 3, 4, 4b and 4c, over a scratch database: the daemon's own code.
+    async fn boot_to_pipeline(
+        scratch: &Scratch,
+        stations: &[String],
+    ) -> (sqlx::SqlitePool, Config, spool::Fanout) {
+        let pool = configure(scratch, stations).await;
+        let mut cfg = Config::load(&pool).await.expect("the configuration reads");
+        let node = cfg.node.clone().expect("the node row was inserted");
+        let fanout = spool::open(&node).expect("the spool opens");
+        attach_ingress(&mut cfg, &fanout).expect("the pipeline assembles");
+        (pool, cfg, fanout)
+    }
+
+    /// **The headline.** The real plan, the real supervisor, a datagram on loopback, and a
+    /// durable envelope carrying the station the operator configured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_configured_weatherlink_live_station_produces_a_durable_reading() {
+        let scratch = Scratch::new("produces");
+        let port = free_port().await;
+        let (pool, cfg, fanout) = boot_to_pipeline(
+            &scratch,
+            &[broadcast_station("suncrest:roof", SERIAL, port)],
+        )
+        .await;
+
+        // Step 5, with the real registrar list.
+        let shutdown = CancellationToken::new();
+        let roots = Roots {
+            schedule: Arc::new(SqliteScheduleStore::new(pool.clone())),
+            stream: Some(Arc::clone(&fanout.stream) as Arc<dyn mw_component::ReadingStream>),
+            // The real one is `ObsLogControl` over the subscriber's reload handle, and
+            // installing a subscriber is a process-global act that only one test per
+            // binary could perform. What the supervisor needs from this root is a handle
+            // that answers, which is what the double is.
+            log: Arc::new(mw_supervisor::testing::MemoryLogControl::new("info")),
+        };
+        let ctx = PlanContext::new(Generation::ZERO).with_roots(roots.capabilities());
+        let planned = plan(&cfg, REGISTRARS, &ctx).expect("the configuration plans");
+        let mut ids: Vec<&str> = planned
+            .ids()
+            .map(mw_component::ComponentId::as_str)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![
+                "station:wll:suncrest:roof:rearm",
+                &format!("station:wll:udp:{port}")[..],
+            ],
+            "one listener for the endpoint, one re-arm for the unit (W2a D-44)"
+        );
+
+        // Step 6: the real supervisor, which is what runs `Builder::serve` and therefore
+        // what binds the socket. Nothing here constructs a component by hand.
+        let (supervisor, _control, _plans) = Supervisor::new(roots, shutdown.clone());
+        // `spawn` is forbidden in the daemon (`clippy.toml`, §3.2) and this test is `main`:
+        // `Supervisor::run` returns only on shutdown, so driving it and sending to it at
+        // the same time is the only way to exercise anything it supervises.
+        #[allow(clippy::disallowed_methods)]
+        let running = tokio::task::spawn(supervisor.run(planned));
+
+        // Send the datagram once the listener has had a chance to bind. Retried rather
+        // than slept on: a fixed sleep is a flake, and a lost UDP datagram before the bind
+        // is indistinguishable from a broken driver.
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a sending socket");
+        let target = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+        // A `Durable` subscription through the root capability, which is what
+        // `writer:timescale` will be (M3-3) and the only way to read the spool back as a
+        // consumer rather than as a file.
+        let mut cursor = mw_component::ReadingStream::subscribe(
+            fanout.stream.as_ref(),
+            &mw_component::ComponentId::new("writer:timescale").expect("a literal id"),
+            &mw_component::ReadingFilter::All,
+            mw_component::ReadingPolicy::Durable,
+        )
+        .expect("a durable subscription");
+        let batch = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                sender
+                    .send_to(&datagram(SERIAL, 1_762_200_000, 62.7), target)
+                    .await
+                    .expect("the datagram is sent");
+                if fanout.spool.tail_seq() > mw_types::Seq::new(0) {
+                    break cursor.next_batch().await.expect("a batch");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the listener bound and admitted a datagram");
+
+        let envelope = &batch.envelopes()[0];
+        // 1. The station the operator configured, resolved from the serial the device sent.
+        //    This is the whole of identity resolution, and the assertion no driver-level
+        //    test can make: a recording ingress resolves nothing.
+        assert_eq!(envelope.station.as_str(), "suncrest:roof");
+        assert_eq!(envelope.reading.station_id, "suncrest:roof");
+        // 2. The payload's own instant, not the arrival time.
+        assert_eq!(envelope.observed_at.timestamp(), 1_762_200_000);
+        // 3. The metrics the configured mapping names, in the registry's units.
+        assert_eq!(envelope.reading.out_temp, Some(62.7), "degF, not Celsius");
+        assert_eq!(envelope.reading.out_humidity, Some(52.0));
+        assert_eq!(envelope.reading.wind_speed, Some(4.0));
+        assert_eq!(envelope.reading.wind_dir, Some(280.0));
+        let day_rain = envelope.reading.day_rain.expect("rainfall is populated");
+        assert!(
+            (day_rain - 0.12).abs() < 1e-5,
+            "12 tips of 0.01 in: {day_rain}"
+        );
+        // 4. And nothing invented: a broadcast datagram carries no barometer.
+        assert_eq!(
+            envelope.reading.barometer, None,
+            "D-26: absent stays absent"
+        );
+        assert_eq!(envelope.reading.snow_depth, None);
+        // 5. Sealed by this node, at the first sequence number.
+        assert_eq!(
+            envelope.provenance.origin(),
+            mw_types::OriginId::new([7; 16])
+        );
+        assert_eq!(envelope.provenance.seq(), mw_types::Seq::FIRST);
+
+        shutdown.cancel();
+        let report = tokio::time::timeout(Duration::from_secs(20), running)
+            .await
+            .expect("the supervisor stops")
+            .expect("the task did not panic");
+        assert_eq!(report.aborted, 0, "the listener stopped inside its grace");
+        pool.close().await;
+    }
+
+    /// A neighbour's unit on the same LAN reaches the spool as nothing at all.
+    ///
+    /// The listener is configured for a serial the registry does not know, which is the
+    /// case that separates the two lookups: the driver decodes the datagram and the gate
+    /// refuses it, so nothing is appended.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_datagram_from_an_unconfigured_unit_is_not_stored() {
+        let scratch = Scratch::new("unknown");
+        let port = free_port().await;
+        let (pool, cfg, fanout) = boot_to_pipeline(
+            &scratch,
+            &[broadcast_station("suncrest:roof", SERIAL, port)],
+        )
+        .await;
+        let ingress = mw_station::StationConfig::ingress(&cfg)
+            .expect("the pipeline is attached")
+            .clone();
+
+        let listener = mw_station::wll::BroadcastListener::new(
+            port,
+            None,
+            [mw_station::wll::BroadcastUnit {
+                serial: "001D0A7FFFFF".to_string(),
+                station: mw_types::StationKey::new("somebody:else"),
+                codec: mw_codec::WllConditions::new(
+                    mw_codec::SensorMapping::parse(MAPPING).expect("a literal mapping"),
+                ),
+            }],
+            ingress,
+        );
+        listener
+            .on_datagram(
+                &mw_component::ComponentId::new("station:wll:udp:1").expect("a literal id"),
+                &datagram("001D0A7FFFFF", 1_762_200_001, 44.0),
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 99)),
+                instant(1_762_200_001),
+            )
+            .await;
+        assert_eq!(
+            fanout.spool.tail_seq(),
+            mw_types::Seq::new(0),
+            "nothing was appended, so there is no reading to store"
+        );
+        pool.close().await;
+    }
+
+    /// Two units on one endpoint, a polled third, and the component set that follows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_three_shapes_of_a_weatherlink_live_station_plan_together() {
+        let scratch = Scratch::new("shapes");
+        let port = free_port().await;
+        let (pool, cfg, fanout) = boot_to_pipeline(
+            &scratch,
+            &[
+                broadcast_station("suncrest:roof", SERIAL, port),
+                broadcast_station("suncrest:barn", "001D0A700003", port),
+                format!(
+                    "INSERT INTO stations (station_key, owning_node_id, name, type,
+                                           identity_kind, transport_kind, transport_url,
+                                           wll_sensor_mapping, wll_poll_interval_seconds)
+                     VALUES ('suncrest:field', x'07070707070707070707070707070707', 'field',
+                             'weatherlink-live', 'fixed', 'http_out', 'http://192.168.1.51',
+                             '{MAPPING}', 30)"
+                ),
+            ],
+        )
+        .await;
+        let roots = Roots {
+            schedule: Arc::new(SqliteScheduleStore::new(pool.clone())),
+            stream: Some(Arc::clone(&fanout.stream) as Arc<dyn mw_component::ReadingStream>),
+            // The real one is `ObsLogControl` over the subscriber's reload handle, and
+            // installing a subscriber is a process-global act that only one test per
+            // binary could perform. What the supervisor needs from this root is a handle
+            // that answers, which is what the double is.
+            log: Arc::new(mw_supervisor::testing::MemoryLogControl::new("info")),
+        };
+        let ctx = PlanContext::new(Generation::ZERO).with_roots(roots.capabilities());
+        let planned = plan(&cfg, REGISTRARS, &ctx).expect("the configuration plans");
+        let mut ids: Vec<&str> = planned
+            .ids()
+            .map(mw_component::ComponentId::as_str)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![
+                "station:wll:suncrest:barn:rearm",
+                "station:wll:suncrest:field",
+                "station:wll:suncrest:roof:rearm",
+                &format!("station:wll:udp:{port}")[..],
+            ],
+            "a second unit on one port is a row, not a second socket (W2a §4a.4)"
+        );
+        // A polled station resolves by its receiver, so the registry has to have an entry
+        // for exactly that component -- which is `fixed_receivers`' whole job.
+        let receivers = mw_station::fixed_receivers(&cfg).expect("the receivers derive");
+        assert_eq!(receivers.len(), 1);
+        assert_eq!(
+            receivers[0].component.as_str(),
+            "station:wll:suncrest:field"
+        );
+        assert_eq!(receivers[0].station.as_str(), "suncrest:field");
+        pool.close().await;
+    }
+
+    /// A node with stations and no spool is refused at plan time, not started.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_station_with_no_reading_stream_refuses_to_plan() {
+        let scratch = Scratch::new("nostream");
+        let pool = config_db::open_and_migrate(&scratch.db())
+            .await
+            .expect("migrate");
+        // No `node` row, so no spool and no fan-out -- W7 §8.2's "serves but does not
+        // ingest" node, with a station configured on it by mistake.
+        sqlx::query(&broadcast_station("suncrest:roof", SERIAL, 22222))
+            .execute(&pool)
+            .await
+            .expect("the row is valid");
+        let cfg = Config::load(&pool).await.expect("the configuration reads");
+        assert!(cfg.node.is_none(), "no identity, so step 4b opens no spool");
+        let ctx =
+            PlanContext::new(Generation::ZERO).with_roots(mw_supervisor::plan::RootSet::empty());
+        let e = plan(&cfg, REGISTRARS, &ctx).expect_err("nowhere to admit readings to");
+        let text = mw_types::DisplayChain(&e).to_string();
+        assert!(
+            text.contains("no reading stream"),
+            "the refusal says what is missing: {text}"
+        );
+        pool.close().await;
+    }
+
+    /// W5 §1.2's toggle, through the daemon's own conversion.
+    #[tokio::test(flavor = "current_thread")]
+    async fn switching_a_station_off_removes_its_components() {
+        let scratch = Scratch::new("disabled");
+        let port = free_port().await;
+        let (pool, cfg, _fanout) = boot_to_pipeline(
+            &scratch,
+            &[broadcast_station("suncrest:roof", SERIAL, port)],
+        )
+        .await;
+        sqlx::query("UPDATE stations SET enabled = 0")
+            .execute(&pool)
+            .await
+            .expect("the toggle is a column");
+        let reloaded = Config::load(&pool)
+            .await
+            .expect("the configuration re-reads");
+        let mut specs = Vec::new();
+        mw_station::register(&reloaded, &mut specs).expect("a disabled station is not an error");
+        assert!(specs.is_empty(), "the toggle is a plan diff, not an error");
+        // ... and the same rows enabled do produce components, so the assertion above is
+        // about the toggle and not about the fixture being wrong.
+        let mut specs = Vec::new();
+        mw_station::register(&cfg, &mut specs).expect("the enabled rows plan");
+        assert_eq!(specs.len(), 2);
+        pool.close().await;
     }
 
     #[tokio::test]
