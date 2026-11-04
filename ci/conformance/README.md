@@ -42,10 +42,17 @@ Same libpq variables as below (the default database is `mw_conformance`), and it
 It fails rather than skipping when it cannot have them, for the reason W3 Decision 84 gives about
 the database tests: "green because it did not run" has to be unreachable.
 
-`cargo xtask conformance --help`-worth of knobs lives in `cargo xtask help`; the two that matter
-when reading a failure are `--no-build` (replay against the binary already at `--target-binary`)
-and `--keep-running` (leave the daemon up after a green run). Replay output and the daemon's log
-land in `target/conformance-rust/`.
+That `DROP DATABASE … WITH (FORCE)` takes its name from the environment, so it is guarded rather
+than only documented: the run **refuses a `$PGDATABASE` whose name does not contain
+`conformance`**. Unset the variable to get the default, or point it at a database whose name says
+what it is for.
+
+`cargo xtask conformance --help` lists the knobs. The two that matter when reading a failure are
+`--no-build` (replay against the binary already at `--target-binary`) and `--keep-running`, which
+leaves the daemon up after any run that reached a verdict — including today's red one, which is
+when you most want to `curl` it. A run that reached *no* verdict cleans up after itself, because its
+processes would only mislead the next one. Replay output and the daemon's log land in
+`target/conformance-rust/`.
 
 Its two failure codes are declared in `ci/gates.toml` and mean different things: **1** is "the
 replay reached a verdict and the binary does not conform", which is today's expected state, and
@@ -163,7 +170,13 @@ The Rust target's equivalents, each watched against a real run rather than reaso
 CONFORMANCE_FIXTURES=/some/subset cargo xtask conformance   # "attempted 3 fixtures, expected 70", exit 2
 CONFORMANCE_FORCE_MANGLE=1        cargo xtask conformance   # the replay goes through the proxy
 PATH=/usr/bin:/bin                cargo xtask conformance   # "missing required tool(s): psql, sqlite3", exit 2
+PGDATABASE=weather                cargo xtask conformance   # "refusing to drop `weather`", exit 2
 ```
+
+A daemon that dies at startup is the other one worth knowing: it ends the wait at once and says
+`the daemon exited during startup`, naming its log. It used to spend the full 60-second deadline and
+report a timeout instead — watched both ways with a `--target-binary` that exits on its second
+invocation.
 
 `CONFORMANCE_FORCE_MANGLE=1` does not change the Rust target's verdict today — the direct replay is
 already red — but it is the one knob that exercises the proxy, the port it listens on and the second

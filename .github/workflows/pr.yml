@@ -392,6 +392,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: conformance
+          # `cache-on-failure` defaults to false, and THIS JOB IS DESIGNED TO FAIL until
+          # M4-2 -- so without this line nothing is ever saved under the key above, nothing
+          # is ever restored, and every PR cold-builds the root workspace, the daemon and
+          # contract/conformance. A gate that is red on purpose for two milestones must not
+          # also be the most expensive job in the file.
+          cache-on-failure: true
           # Two workspaces, for the same reason conformance-fixtures names two: the root one
           # builds xtask and the daemon, and contract/conformance is standalone on purpose
           # (W1 Decision 7).
@@ -438,16 +444,22 @@ jobs:
       - name: Replay the fixtures against the Rust binary
         run: |
           set -o pipefail
-          cargo xtask gate conformance | tee /tmp/conformance.txt
+          # `2>&1` as well as the pipe: the counts are printed on stdout but the verdict and
+          # the gate's on_exit message go to stderr, and the verdict is the one paragraph
+          # that explains why this check is red. Without it the step summary below shows
+          # "0 passed, 70 failed" and nothing that says that is the correct state.
+          cargo xtask gate conformance 2>&1 | tee /tmp/conformance.txt
       - name: Report
         if: always()
         run: |
           {
             echo "## Frozen contract conformance (Rust target)"
             echo
+            echo "### The gate's verdict"
             echo '```'
             cat /tmp/conformance.txt 2>/dev/null || echo "the gate did not run"
             echo '```'
+            echo "### The replay"
             echo '```'
             tail -n 3 target/conformance-rust/direct.txt 2>/dev/null \
               || echo "the replay did not run"

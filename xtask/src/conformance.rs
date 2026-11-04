@@ -30,10 +30,11 @@
 //! * **1 — the replay reached a verdict and the binary does not conform.** Fixtures
 //!   failed. This is the expected state until M4-2.
 //! * **2 — no verdict was reached, so the run proved nothing.** A missing tool, a port
-//!   already in use, a database that would not answer, a daemon that would not start, a
-//!   fixture count that is not 70, failures at the transport layer, or a negative control
-//!   that did not hold. A suite that cannot be made to fail proves nothing, and neither
-//!   does one whose target was not listening — both are this code, never 1.
+//!   already in use, a `$PGDATABASE` this run will not drop, a database that would not
+//!   answer, a daemon that would not start, a fixture count that is not 70, a replay where
+//!   everything skipped, failures at the transport layer, or a negative control that did
+//!   not hold. A suite that cannot be made to fail proves nothing, and neither does one
+//!   whose target was not listening — both are this code, never 1.
 //!
 //! **What this does NOT decide.** M4-2 narrowed the frozen surface to the five endpoints
 //! iOS calls (`docs/reconciliation.md` §6): `/alerts`, `/api/remote-stations` and
@@ -76,9 +77,19 @@ const MIN_MANGLED_FAILURES: usize = 26;
 /// the row it is about to be given is the one that says otherwise.
 const SCHEMA_PORT: u16 = 8080;
 
+/// The message `crates/modernweather/src/boot.rs` logs on the success path of **D-62**, and
+/// the only evidence available that the daemon reached the database this command prepared.
+///
+/// A const rather than a literal at the one use site so that a test can assert the daemon
+/// still logs it: this is the one cross-file coupling here that a reword would break
+/// silently, and it would break it 60 seconds into a CI run rather than in `cargo test`.
+const DB_ASSERTED: &str = "database version asserted";
+
 pub fn main(args: &[String]) -> Result<ExitCode, String> {
     let root = crate::repo_root();
-    let opts = Options::parse(&root, args)?;
+    let Some(opts) = Options::parse(&root, args)? else {
+        return Ok(ExitCode::SUCCESS);
+    };
 
     preflight(&opts)?;
     let fixtures = count_fixtures(&root)?;
@@ -106,8 +117,9 @@ pub fn main(args: &[String]) -> Result<ExitCode, String> {
     // which is how `ci/conformance/README.md` says to watch this gate go red on demand. It
     // changes nothing today — the replay is already red — and it is here so that the knob
     // keeps working when M4-2 turns the direct replay green.
+    let forced = std::env::var_os("CONFORMANCE_FORCE_MANGLE").is_some_and(|v| v == "1");
     let mut direct_url = format!("http://127.0.0.1:{REST_PORT}");
-    if std::env::var_os("CONFORMANCE_FORCE_MANGLE").is_some_and(|v| v == "1") {
+    if forced {
         say("CONFORMANCE_FORCE_MANGLE=1: sending the accepted replay through mangle_proxy.py");
         start_proxy(&opts, &mut procs, "mangle-proxy-forced")?;
         direct_url = format!("http://127.0.0.1:{MANGLE_PORT}");
@@ -119,7 +131,25 @@ pub fn main(args: &[String]) -> Result<ExitCode, String> {
 
     match judge_direct(&direct, EXPECTED_FIXTURES) {
         Direct::Inconclusive(why) => Ok(report(2, &why)),
-        Direct::NotConforming(why) => Ok(report(1, &why)),
+        Direct::NotConforming(why) => {
+            // A verdict, so `--keep-running` applies: a red replay is exactly when somebody
+            // wants the daemon left up to curl it, and until M4-2 every replay is red. A
+            // run that reached NO verdict is the one whose processes are a confusing
+            // inheritance, and that is the branch above.
+            procs.reached_a_verdict();
+            Ok(report(1, &why))
+        }
+        Direct::Conforms if forced => {
+            // The accepted replay went THROUGH the proxy and still conformed, so the proxy
+            // mangled nothing. Caught here rather than by starting a second proxy on the
+            // port the first one already holds, which is what the branch below would do.
+            Ok(report(
+                2,
+                "the replay conformed while going through mangle_proxy.py, so the proxy \
+                 changed nothing and CONFORMANCE_FORCE_MANGLE proved the opposite of what \
+                 it is for (W1 Decision 10).",
+            ))
+        }
         Direct::Conforms => {
             // W1 Decision 10: a green conformance run is only accepted alongside a passing
             // negative control. Unreachable until M4-2, which is exactly why `judge_control`
@@ -134,13 +164,13 @@ pub fn main(args: &[String]) -> Result<ExitCode, String> {
                 "mangled",
             )?;
             println!("    {}", control.summary_line());
-            match judge_control(&control, MIN_MANGLED_FAILURES) {
+            match judge_control(&control, EXPECTED_FIXTURES, MIN_MANGLED_FAILURES) {
                 Control::Held(note) => {
                     say(&format!(
                         "conformance: green. {} against the Rust binary, {note}",
                         direct.summary_line()
                     ));
-                    procs.succeeded();
+                    procs.reached_a_verdict();
                     Ok(ExitCode::SUCCESS)
                 }
                 Control::Broken(why) => Ok(report(2, &why)),
@@ -250,7 +280,8 @@ pub fn judge_direct(s: &Summary, expected: usize) -> Direct {
         return Direct::Inconclusive(format!(
             "the runner attempted {} fixtures, expected {expected}.\n  \
              Something filtered the frozen set, so this run measured a subset and cannot \
-             speak for the contract. Check --fixtures and contract/fixtures/.",
+             speak for the contract. CONFORMANCE_FIXTURES is the one knob that can do this; \
+             otherwise contract/fixtures/ itself changed.",
             s.attempted()
         ));
     }
@@ -262,6 +293,15 @@ pub fn judge_direct(s: &Summary, expected: usize) -> Direct {
              is why this is checked rather than inferred from the count. The daemon's own log \
              is in the run's logs/ directory.",
             s.transport, s.failed
+        ));
+    }
+    if s.passed == 0 && s.failed == 0 {
+        return Direct::Inconclusive(format!(
+            "all {} fixtures were SKIPPED, so nothing was compared.\n  \
+             contract/conformance skips a fixture that stores no body, so a whole set of \
+             them means the fixtures lost their recorded responses rather than that the \
+             binary conforms.",
+            s.skipped
         ));
     }
     if s.failed > 0 {
@@ -294,7 +334,16 @@ pub enum Control {
 /// still pass, and no failure may be a transport failure. Without those two parts, a daemon
 /// that died between the replays fails all 70, clears a bare floor, and reports a control
 /// that held while having mangled nothing.
-pub fn judge_control(s: &Summary, min_failures: usize) -> Control {
+pub fn judge_control(s: &Summary, expected: usize, min_failures: usize) -> Control {
+    // The same precondition the direct replay has. It holds by construction today -- one
+    // runner, one fixture set, two base URLs -- and asserting it here costs nothing and
+    // stops the control from being judged on a subset if that ever stops being true.
+    if s.attempted() != expected {
+        return Control::Broken(format!(
+            "the negative control attempted {} fixtures, expected {expected}.",
+            s.attempted()
+        ));
+    }
     if s.failed == 0 {
         return Control::Broken(
             "the negative control PASSED. The runner is not asserting anything: a conformance \
@@ -350,15 +399,28 @@ struct Options {
     db: Libpq,
 }
 
+/// The flags that take a value, and the ones that do not.
+const VALUE_FLAGS: [&str; 2] = ["--target-binary", "--workdir"];
+const BARE_FLAGS: [&str; 3] = ["--no-build", "--release", "--keep-running"];
+
 impl Options {
-    fn parse(root: &Path, args: &[String]) -> Result<Options, String> {
+    /// `Ok(None)` means "parsed, and the caller asked for help instead of a run".
+    fn parse(root: &Path, args: &[String]) -> Result<Option<Options>, String> {
         for a in args {
-            if a.starts_with('-')
-                && !matches!(
-                    a.split('=').next().unwrap_or(a),
-                    "--target-binary" | "--workdir" | "--no-build" | "--release" | "--keep-running"
-                )
-            {
+            if matches!(a.as_str(), "-h" | "--help") {
+                crate::usage();
+                return Ok(None);
+            }
+            if !a.starts_with('-') {
+                continue;
+            }
+            let head = a.split('=').next().unwrap_or(a);
+            // `--no-build=x` used to pass this check and then match nothing, so the flag was
+            // silently ignored: a bare flag spelled with a value is a typo, not a default.
+            if BARE_FLAGS.contains(&head) && head != a.as_str() {
+                return Err(format!("`{head}` takes no value, so `{a}` is a typo."));
+            }
+            if !VALUE_FLAGS.contains(&head) && !BARE_FLAGS.contains(&head) {
                 return Err(format!(
                     "unknown option `{a}`. Run `cargo xtask help` for the accepted ones."
                 ));
@@ -366,12 +428,17 @@ impl Options {
         }
         let release = args.iter().any(|a| a == "--release");
         let profile_dir = if release { "release" } else { "debug" };
-        let target_binary = crate::flag_value(args, "--target-binary")
+        let target_binary = value_of(args, "--target-binary")?
             .unwrap_or_else(|| format!("target/{profile_dir}/modernweather"));
-        let workdir = crate::flag_value(args, "--workdir")
-            .unwrap_or_else(|| "target/conformance-rust".to_string());
-        let workdir = root.join(workdir);
-        Ok(Options {
+        let workdir =
+            value_of(args, "--workdir")?.unwrap_or_else(|| "target/conformance-rust".to_string());
+        // `Path::join` REPLACES the base when the argument is absolute, and `clear_workdir`
+        // deletes inside whatever comes out -- so `--workdir /var` would have it removing
+        // /var/logs. Confined to the repository rather than sanitised, because every
+        // legitimate value is already relative and there is nothing this command needs to
+        // write outside the tree it was invoked in.
+        let workdir = confine(root, &workdir, "--workdir")?;
+        Ok(Some(Options {
             root: root.to_path_buf(),
             target_binary: root.join(target_binary),
             build: !args.iter().any(|a| a == "--no-build"),
@@ -380,8 +447,43 @@ impl Options {
             workdir,
             keep_running: args.iter().any(|a| a == "--keep-running"),
             db: Libpq::from_env(),
-        })
+        }))
     }
+}
+
+/// A flag's value, distinguishing "absent" from "present with nothing after it".
+///
+/// `crate::flag_value` collapses the two into `None`, which for a flag that decides which
+/// binary gets measured would mean a typo quietly measuring the default one instead.
+fn value_of(args: &[String], name: &str) -> Result<Option<String>, String> {
+    let eq = format!("{name}=");
+    let present = args.iter().any(|a| a == name || a.starts_with(&eq));
+    match crate::flag_value(args, name) {
+        None if present => Err(format!("`{name}` needs a value")),
+        Some(v) if v.trim().is_empty() => Err(format!("`{name}` was given an empty value")),
+        other => Ok(other),
+    }
+}
+
+/// `root/candidate`, rejected unless it really is under `root`.
+fn confine(root: &Path, candidate: &str, flag: &str) -> Result<PathBuf, String> {
+    let joined = root.join(candidate);
+    // Lexical, because the path does not exist yet and `canonicalize` therefore cannot be
+    // asked. `..` is rejected outright rather than resolved: there is no legitimate value
+    // containing one, so refusing is both simpler and impossible to get subtly wrong.
+    if Path::new(candidate).is_absolute() {
+        return Err(format!(
+            "{flag} must be relative to the repository root; `{candidate}` is absolute, and \
+             this command deletes inside the directory it is given."
+        ));
+    }
+    if candidate.split('/').any(|part| part == "..") {
+        return Err(format!(
+            "{flag} must stay inside the repository root; `{candidate}` escapes it, and this \
+             command deletes inside the directory it is given."
+        ));
+    }
+    Ok(joined)
 }
 
 /// The weather database, addressed the way every other script in this repository addresses
@@ -419,24 +521,63 @@ impl Libpq {
         }
     }
 
+    /// The URL **without** the password, which is the one that goes on a command line.
+    ///
+    /// `psql` is handed the password through `PGPASSWORD` in its environment instead
+    /// (see [`psql`]), so it never reaches `argv` and therefore never reaches `/proc` or an
+    /// error message. The user does have to be in the URL: this command's default user is
+    /// `postgres`, while `psql`'s own default is the operating-system user, so leaving it
+    /// out would silently connect as somebody else.
     fn url(&self, database: &str) -> String {
-        let auth = if self.password.is_empty() {
-            self.user.clone()
-        } else {
-            format!("{}:{}", self.user, self.password)
-        };
         format!(
-            "postgresql://{auth}@{}:{}/{database}?sslmode={}",
-            self.host, self.port, self.sslmode
+            "postgresql://{}@{}:{}/{database}?sslmode={}",
+            encode(&self.user),
+            self.host,
+            self.port,
+            self.sslmode
         )
     }
 
-    /// What goes into `weather_database.url`. The column's CHECK pins the scheme to
-    /// `postgres://` or `postgresql://`, which this satisfies, and `mw_store::version`
-    /// hands the whole string to sqlx.
+    /// What goes into `weather_database.url`: the full thing, because sqlx is given no
+    /// environment of its own.
+    ///
+    /// The column's CHECK pins the scheme to `postgres://` or `postgresql://`, which this
+    /// satisfies, and `mw_store::version` hands the whole string to sqlx. The credentials
+    /// are percent-encoded, which is not cosmetic: an unencoded `p@ss/word` turns
+    /// `postgresql://postgres:p@ss/word@127.0.0.1:5432/db` into a URL whose host parses as
+    /// `ss`, and the daemon would then warn and start anyway under **D-27** -- caught by the
+    /// `database version asserted` check in `start_daemon`, but as a confusing failure
+    /// rather than as this one.
     fn target_url(&self) -> String {
-        self.url(&self.database)
+        if self.password.is_empty() {
+            return self.url(&self.database);
+        }
+        format!(
+            "postgresql://{}:{}@{}:{}/{}?sslmode={}",
+            encode(&self.user),
+            encode(&self.password),
+            self.host,
+            self.port,
+            self.database,
+            self.sslmode
+        )
     }
+}
+
+/// Percent-encode a URL userinfo component: unreserved characters through, everything else
+/// escaped. Hand-rolled because `xtask` has three dependencies and this is nine lines
+/// (**D-32**: the crate list is a decision, not a convenience).
+fn encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------------------
@@ -472,11 +613,47 @@ fn preflight(opts: &Options) -> Result<(), String> {
     // an earlier run satisfies the readiness probe below while the freshly started one dies
     // on "address already in use" — so the replay would silently measure the stale process.
     //
+    // Before the build rather than at the statement itself, so a `PGDATABASE` this run will
+    // not touch is refused in a second instead of after three minutes of `cargo build`.
+    droppable(&opts.db.database)?;
+
     // The schema's 8080 is deliberately NOT in this list: the bootstrap start binds it only
     // because the row that says otherwise is the one it is creating, and that start's own
     // fate is not used for anything (see `bootstrap_configuration`).
-    for port in [REST_PORT, MANGLE_PORT] {
-        if port_answers(port) {
+    ports_free(&[REST_PORT, MANGLE_PORT])
+}
+
+/// The one guard on a `DROP DATABASE ... WITH (FORCE)` whose name comes from the
+/// environment.
+///
+/// The default is safe; `PGDATABASE` exported to a development weather database is not, and
+/// "the README says not to point it at anything you care about" is not a mechanism.
+/// `conformance` in the name is the convention both halves of this suite already follow
+/// (`go-target.sh` defaults to `conformance`, this to `mw_conformance`), so the rule costs a
+/// correctly-named database nothing.
+///
+/// Called from `preflight` as well as from the statement itself: a misconfigured
+/// `PGDATABASE` should be refused before a three-minute build, and the invariant should also
+/// hold at the point where it matters.
+fn droppable(database: &str) -> Result<(), String> {
+    if database.contains("conformance") {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to drop `{database}`: this command recreates $PGDATABASE from scratch, so \
+         it only accepts a name containing `conformance`.\n  \
+         Unset PGDATABASE to use the default (`mw_conformance`), or point it at a database \
+         whose name says what it is for."
+    ))
+}
+
+/// Refuse to start if anything is already answering on a port this run must own.
+///
+/// Separate from [`preflight`] so that a test can hand it a port the test itself bound,
+/// rather than one a concurrent run of this command might be using.
+fn ports_free(ports: &[u16]) -> Result<(), String> {
+    for port in ports {
+        if port_answers(*port) {
             return Err(format!(
                 "port {port} is already in use. A daemon or proxy leaked from an earlier run \
                  would be measured instead of the one this command starts. Find it with \
@@ -566,13 +743,24 @@ fn build_target(opts: &Options) -> Result<(), String> {
 /// instead of making the reader work that out from a daemon that exited during step 4a.
 fn prepare_weather_database(opts: &Options) -> Result<(), String> {
     let db = &opts.db;
+    // The one guard on a `DROP DATABASE ... WITH (FORCE)` whose name comes from the
+    // environment. The default is safe; `PGDATABASE` exported to a development weather
+    // database is not, and "the README says not to point it at anything you care about" is
+    // not a mechanism. `conformance` in the name is the convention both halves of this
+    // suite already follow (`go-target.sh` defaults to `conformance`, this to
+    // `mw_conformance`), so the rule costs a correctly-named database nothing.
+    droppable(&db.database)?;
     say(&format!(
         "Recreating the weather database {} on {}:{}",
         db.database, db.host, db.port
     ));
     let admin = db.url("postgres");
     await_for("PostgreSQL", Duration::from_secs(120), || {
-        psql(opts, &admin, &["-c", "select 1"]).is_ok()
+        if psql(opts, &admin, &["-c", "select 1"]).is_ok() {
+            Wait::Ready
+        } else {
+            Wait::Pending
+        }
     })
     .map_err(|e| {
         format!(
@@ -698,27 +886,28 @@ fn bootstrap_configuration(opts: &Options, procs: &mut Processes) -> Result<Path
             == Some(migrations)
     };
     let log = opts.log_dir.join("bootstrap.log");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let outcome = loop {
+    await_for("the configuration schema", Duration::from_secs(60), || {
         if applied() {
-            break Ok(());
+            return Wait::Ready;
         }
         // A process that has exited will not apply anything else, so this stops waiting
-        // rather than waiting out the deadline -- and it is checked AFTER `applied`,
-        // because an exit is only a failure if the schema is not there.
+        // rather than spending the deadline -- and it asks `applied` a second time
+        // before calling the exit a failure. The commit and the exit can land inside one
+        // poll interval, which is exactly what happens in the case the doc comment above
+        // calls harmless: the migrations commit, the bind then fails, and the process is
+        // gone by the time this looks.
         if procs.exited(bootstrap) {
-            break Err(format!(
-                "the bootstrap daemon exited before it had applied {migrations} configuration \
-                 migration(s)"
+            if applied() {
+                return Wait::Ready;
+            }
+            return Wait::GiveUp(format!(
+                "the bootstrap daemon exited before it had applied {migrations} \
+                     configuration migration(s)"
             ));
         }
-        if Instant::now() >= deadline {
-            break Err("timed out after 60s waiting for the configuration schema".to_string());
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    outcome.map_err(|e| format!("{e}. The daemon's log is {}", log.display()))?;
-    println!("    the configuration schema is at {migrations} migration(s)");
+        Wait::Pending
+    })
+    .map_err(|e| format!("{e}. The daemon's log is {}", log.display()))?;
 
     // Stopped before anything writes to the file. `rw`'s equivalent step in `go-target.sh`
     // raced the seed and failed on `database is locked (5)`; SIGKILL and a `wait` is the
@@ -777,22 +966,26 @@ fn start_daemon(opts: &Options, config_db: &Path, procs: &mut Processes) -> Resu
     let log = opts.log_dir.join("modernweather.log");
 
     await_for("the REST server", Duration::from_secs(60), || {
-        !procs.exited(daemon) && http_ok(REST_PORT, "/metrics")
+        // `http_ok` first: a daemon that answered is ready whatever it does next, and
+        // `exited` is the give-up rather than a second condition on readiness. A port
+        // answering is not evidence that THIS daemon is answering it, which is what the
+        // liveness half is for.
+        if http_ok(REST_PORT, "/metrics") {
+            Wait::Ready
+        } else if procs.exited(daemon) {
+            Wait::GiveUp("the daemon exited during startup".to_string())
+        } else {
+            Wait::Pending
+        }
     })
     .map_err(|e| format!("{e}. The daemon's log is {}", log.display()))?;
-    if procs.exited(daemon) {
-        return Err(format!(
-            "the daemon exited during startup. Its log is {}",
-            log.display()
-        ));
-    }
 
     // The message `crates/modernweather/src/boot.rs` logs on the success path of **D-62**.
     // Matched against the JSON rendering (`--log-format json` above) rather than the pretty
     // one, because that is the rendering with a stable field name — and if the message ever
     // changes, this fails loudly rather than quietly stopping to check.
     let text = std::fs::read_to_string(&log).map_err(|e| format!("{}: {e}", log.display()))?;
-    if !text.contains("\"message\":\"database version asserted\"") {
+    if !text.contains(&format!("\"message\":\"{DB_ASSERTED}\"")) {
         return Err(format!(
             "the daemon came up but never logged that it asserted the database version, so it \
              did not reach {}.\n  \
@@ -882,7 +1075,13 @@ fn start_proxy(opts: &Options, procs: &mut Processes, name: &str) -> Result<(), 
     cmd.arg("contract/tools/rig/mangle_proxy.py");
     let proxy = procs.spawn(opts, name, cmd)?;
     await_for("the mangling proxy", Duration::from_secs(30), || {
-        !procs.exited(proxy) && port_answers(MANGLE_PORT)
+        if port_answers(MANGLE_PORT) {
+            Wait::Ready
+        } else if procs.exited(proxy) {
+            Wait::GiveUp("the mangling proxy exited without listening".to_string())
+        } else {
+            Wait::Pending
+        }
     })
     .map_err(|e| {
         format!(
@@ -907,7 +1106,7 @@ fn start_proxy(opts: &Options, procs: &mut Processes, name: &str) -> Result<(), 
 struct Processes {
     started: Vec<Option<Child>>,
     keep_running: bool,
-    succeeded: bool,
+    verdict: bool,
 }
 
 /// An index into [`Processes`], so that a caller can ask about one process it started
@@ -920,7 +1119,7 @@ impl Processes {
         Processes {
             started: Vec::new(),
             keep_running,
-            succeeded: false,
+            verdict: false,
         }
     }
 
@@ -973,10 +1172,11 @@ impl Processes {
         Ok(())
     }
 
-    /// `--keep-running` leaves everything up, and only on a green run: a failed run's
-    /// processes are a confusing inheritance for the next one.
-    fn succeeded(&mut self) {
-        self.succeeded = true;
+    /// `--keep-running` leaves everything up, and only once the replay reached a verdict:
+    /// the processes of a run that measured nothing are a confusing inheritance for the next
+    /// one, and the port preflight would reject them anyway.
+    fn reached_a_verdict(&mut self) {
+        self.verdict = true;
     }
 }
 
@@ -984,7 +1184,7 @@ impl Drop for Processes {
     fn drop(&mut self) {
         // Dropping a `Child` neither kills nor waits, so leaving them is simply not
         // touching them: they are reparented when this process exits and keep running.
-        if self.keep_running && self.succeeded {
+        if self.keep_running && self.verdict {
             let live = self.started.iter().filter(|c| c.is_some()).count();
             println!("\n==> --keep-running: leaving {live} process(es) up");
             return;
@@ -1015,13 +1215,23 @@ fn run(mut cmd: Command, what: &str) -> Result<(), String> {
 /// Returns what the server said on stderr, which is where `RAISE NOTICE` and `RAISE
 /// WARNING` land — the version assertion below says everything it has to say through those,
 /// so a caller that swallowed them would run the check and discard its answer.
+///
+/// `-X` so that a developer's `~/.psqlrc` is not part of a measuring instrument; the
+/// password through `PGPASSWORD` rather than the URL so it stays out of `argv`; and
+/// `PGCONNECT_TIMEOUT` because without it a blackholed `PGHOST` blocks inside one call and
+/// the caller's own deadline is never reached.
 fn psql(opts: &Options, url: &str, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("psql")
-        .args(["-v", "ON_ERROR_STOP=1", "-q", url])
+    let mut cmd = Command::new("psql");
+    cmd.args(["-X", "-v", "ON_ERROR_STOP=1", "-q", url])
         .args(args)
-        .current_dir(&opts.root)
-        .output()
-        .map_err(|e| format!("running psql: {e}"))?;
+        .env("PGCONNECT_TIMEOUT", "5")
+        .current_dir(&opts.root);
+    if opts.db.password.is_empty() {
+        cmd.env_remove("PGPASSWORD");
+    } else {
+        cmd.env("PGPASSWORD", &opts.db.password);
+    }
+    let out = cmd.output().map_err(|e| format!("running psql: {e}"))?;
     let stderr = String::from_utf8_lossy(&out.stderr).trim_end().to_string();
     if out.status.success() {
         return Ok(stderr);
@@ -1046,12 +1256,25 @@ fn sqlite_query(db: &Path, sql: &str) -> Result<String, String> {
 }
 
 fn sqlite3(db: &Path, sql: &str) -> Result<String, String> {
-    let out = Command::new("sqlite3")
+    // The SQL arrives on stdin rather than in `argv`, because one of these statements
+    // carries the weather database's URL and a command line is world-readable in /proc.
+    let mut child = Command::new("sqlite3")
         .args(["-bail", "-cmd", ".timeout 5000"])
         .arg(db)
-        .arg(sql)
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("running sqlite3: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "sqlite3's stdin was not piped".to_string())?
+        .write_all(sql.as_bytes())
+        .map_err(|e| format!("writing to sqlite3: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("waiting for sqlite3: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "sqlite3 exited with {}: {}",
@@ -1062,21 +1285,40 @@ fn sqlite3(db: &Path, sql: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Poll until `ready`. Used instead of a fixed sleep so that a slow machine is slow rather
-/// than broken, and a genuinely stuck step fails with the thing it was waiting for named.
-fn await_for(
-    what: &str,
-    deadline: Duration,
-    mut ready: impl FnMut() -> bool,
-) -> Result<(), String> {
+/// What one poll of [`await_for`] found.
+#[derive(Debug)]
+enum Wait {
+    /// Stop waiting; the thing is there.
+    Ready,
+    /// Not yet. Try again until the deadline.
+    Pending,
+    /// Stop waiting; it is never going to be there, and here is why.
+    GiveUp(String),
+}
+
+/// Poll until `poll` is `Ready`. Used instead of a fixed sleep so that a slow machine is
+/// slow rather than broken, and a genuinely stuck step fails with the thing it was waiting
+/// for named.
+///
+/// `GiveUp` is the half that is easy to leave out and expensive to leave out. Every caller
+/// here is waiting on a child process, and a child that has exited will not become ready --
+/// so without it the most likely failure (a daemon that died at startup) spends the whole
+/// deadline and then reports "timed out", while the accurate message sits unreachable after
+/// the call. Watched before it was fixed: a daemon that exited immediately took 72s to
+/// produce `timed out after 60s waiting for the REST server`.
+fn await_for(what: &str, deadline: Duration, mut poll: impl FnMut() -> Wait) -> Result<(), String> {
     let start = Instant::now();
     loop {
-        if ready() {
-            println!(
-                "    {what} ready after {:.1}s",
-                start.elapsed().as_secs_f32()
-            );
-            return Ok(());
+        match poll() {
+            Wait::Ready => {
+                println!(
+                    "    {what} ready after {:.1}s",
+                    start.elapsed().as_secs_f32()
+                );
+                return Ok(());
+            }
+            Wait::GiveUp(why) => return Err(why),
+            Wait::Pending => {}
         }
         if start.elapsed() >= deadline {
             return Err(format!(
@@ -1112,11 +1354,13 @@ fn http_ok(port: u16, path: &str) -> bool {
     if sock.write_all(request.as_bytes()).is_err() {
         return false;
     }
-    let mut head = [0u8; 15];
+    // Twelve bytes, not fifteen with the trailing space: `HTTP/1.1 200\r\n` with no reason
+    // phrase is a legal status line, and asserting the space would read it as not-ready.
+    let mut head = [0u8; 12];
     if sock.read_exact(&mut head).is_err() {
         return false;
     }
-    head.starts_with(b"HTTP/1.1 200 ")
+    &head == b"HTTP/1.1 200"
 }
 
 fn which(tool: &str) -> Option<PathBuf> {
@@ -1255,14 +1499,18 @@ SKIP alerts-empty (fixture stores no body to compare against)
 
     #[test]
     fn a_negative_control_that_holds_is_what_makes_a_green_run_green() {
-        match judge_control(&summary(44, 26, 0, 0), MIN_MANGLED_FAILURES) {
+        match judge_control(
+            &summary(44, 26, 0, 0),
+            EXPECTED_FIXTURES,
+            MIN_MANGLED_FAILURES,
+        ) {
             Control::Held(note) => assert!(note.contains("26 fixtures failed"), "{note}"),
             other => panic!("got {other:?}"),
         }
     }
 
     #[test]
-    fn each_of_w1_decision_10s_three_parts_can_break_the_control() {
+    fn every_way_the_negative_control_can_fail_to_bite_is_rejected() {
         // Every one of these is a run that would print "the control held" under a bare
         // "at least 26 failed" floor, which is the defect the three-part assertion exists
         // to close. None of them may be reachable from a green gate.
@@ -1274,9 +1522,10 @@ SKIP alerts-empty (fixture stores no body to compare against)
                 "including the ones it does not mangle",
             ),
             (summary(68, 2, 0, 0), "failed only 2 fixtures"),
+            (summary(10, 26, 0, 0), "attempted 36 fixtures"),
         ];
         for (s, expected) in cases {
-            match judge_control(&s, MIN_MANGLED_FAILURES) {
+            match judge_control(&s, EXPECTED_FIXTURES, MIN_MANGLED_FAILURES) {
                 Control::Broken(why) => assert!(why.contains(expected), "{s:?}: {why}"),
                 Control::Held(note) => panic!("{s:?} must not hold: {note}"),
             }
@@ -1316,7 +1565,9 @@ SKIP alerts-empty (fixture stores no body to compare against)
         );
         // The default has to agree with the gate, or `cargo xtask conformance` with no
         // arguments would measure a different binary than CI does.
-        let opts = Options::parse(&crate::repo_root(), &[]).expect("no arguments is valid");
+        let opts = Options::parse(&crate::repo_root(), &[])
+            .expect("no arguments is valid")
+            .expect("no arguments is a run, not a help request");
         assert_eq!(
             opts.target_binary,
             crate::repo_root().join("target/debug/modernweather")
@@ -1335,7 +1586,8 @@ SKIP alerts-empty (fixture stores no body to compare against)
                 "scratch/c".into(),
             ],
         )
-        .expect("a valid command line");
+        .expect("a valid command line")
+        .expect("a command line that runs");
         assert!(opts.release);
         assert!(!opts.build);
         assert_eq!(opts.workdir, root.join("scratch/c"));
@@ -1348,6 +1600,42 @@ SKIP alerts-empty (fixture stores no body to compare against)
 
         let err = Options::parse(&root, &["--target-bin".into(), "x".into()]).unwrap_err();
         assert!(err.contains("unknown option `--target-bin`"), "{err}");
+    }
+
+    /// Every way a command line can be wrong that would otherwise measure something other
+    /// than what the caller asked for, or delete something they did not ask about.
+    #[test]
+    fn a_command_line_that_would_measure_the_wrong_thing_is_refused() {
+        let root = crate::repo_root();
+        let cases: [(&[&str], &str); 6] = [
+            // `flag_value` returns None for both "absent" and "present with nothing after
+            // it", so without this the typo silently measured target/debug/modernweather.
+            (&["--target-binary"], "`--target-binary` needs a value"),
+            (&["--workdir"], "`--workdir` needs a value"),
+            (&["--workdir="], "empty value"),
+            // Passed the unknown-option check and then matched nothing, so it was ignored.
+            (&["--no-build=yes"], "takes no value"),
+            // `Path::join` replaces the base when the argument is absolute, which pointed
+            // clear_workdir's remove_dir_all at /var/logs.
+            (&["--workdir", "/var"], "is absolute"),
+            (&["--workdir", "../../etc"], "escapes it"),
+        ];
+        for (args, expected) in cases {
+            let owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            let err = Options::parse(&root, &owned)
+                .err()
+                .unwrap_or_else(|| panic!("{args:?} should be refused"));
+            assert!(err.contains(expected), "{args:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn help_prints_and_does_not_run() {
+        for flag in ["-h", "--help"] {
+            let parsed = Options::parse(&crate::repo_root(), &[flag.to_string()])
+                .expect("help is not an error");
+            assert!(parsed.is_none(), "{flag} should print and stop");
+        }
     }
 
     #[test]
@@ -1364,10 +1652,27 @@ SKIP alerts-empty (fixture stores no body to compare against)
             db.target_url(),
             "postgresql://mw:hunter2@db.internal:5433/mw_conformance?sslmode=require"
         );
-        // migrations/config's `url TEXT NOT NULL CHECK (url GLOB 'postgres://?*' OR url GLOB
-        // 'postgresql://?*')` is what this has to satisfy; a URL the CHECK rejects would
-        // fail the seed rather than the start.
-        assert!(db.target_url().starts_with("postgresql://"));
+        // The CHECK this has to satisfy is read out of the schema rather than restated
+        // here, the same way the rig test reads mangle_proxy.py: a constraint quoted into a
+        // comment stops being an assertion the moment the schema changes.
+        let schema = std::fs::read_to_string(
+            crate::repo_root().join("migrations/config/20261102230000_config_schema_initial.sql"),
+        )
+        .expect("the configuration schema is in the tree");
+        let check = schema
+            .lines()
+            .find(|l| l.contains("url") && l.contains("GLOB"))
+            .expect("weather_database.url still has a GLOB check on its scheme");
+        let scheme = db
+            .target_url()
+            .split("://")
+            .next()
+            .expect("a URL has a scheme")
+            .to_string();
+        assert!(
+            check.contains(&format!("'{scheme}://?*'")),
+            "the seeded URL's scheme `{scheme}` is not one the schema accepts: {check}"
+        );
 
         let anonymous = Libpq {
             password: String::new(),
@@ -1397,6 +1702,200 @@ SKIP alerts-empty (fixture stores no body to compare against)
             proxy.contains(&format!("(\"127.0.0.1\", {MANGLE_PORT})")),
             "mangle_proxy.py no longer listens on {MANGLE_PORT}"
         );
+    }
+
+    /// The literal `start_daemon` greps the daemon's log for. A reworded `info!` would
+    /// otherwise turn this gate's one piece of evidence that the daemon reached the database
+    /// into a 60-second wait and a confusing exit 2 — the same class of coupling as the rig
+    /// ports, and the only one that had no guard.
+    #[test]
+    fn the_daemon_still_logs_the_message_this_gate_waits_for() {
+        let boot =
+            std::fs::read_to_string(crate::repo_root().join("crates/modernweather/src/boot.rs"))
+                .expect("the boot sequence is in the tree");
+        assert!(
+            boot.contains(&format!("\"{DB_ASSERTED}\"")),
+            "crates/modernweather/src/boot.rs no longer logs `{DB_ASSERTED}`, so \
+             start_daemon's check can never pass"
+        );
+    }
+
+    /// A canned server, so that the hand-written request and the status-line comparison are
+    /// pinned rather than reasoned about. The 404 case is the one that matters: the daemon
+    /// answers 404 on every route this gate replays, and a probe that accepted one would
+    /// report a daemon with no route table as ready.
+    #[test]
+    fn the_readiness_probe_accepts_only_a_200() {
+        use std::io::{BufRead as _, BufReader};
+        use std::net::TcpListener;
+
+        for (status, expected) in [
+            ("HTTP/1.1 200 OK", true),
+            // A legal status line with no reason phrase. The probe used to require the
+            // trailing space after the code and would have read this as not-ready.
+            ("HTTP/1.1 200", true),
+            ("HTTP/1.1 404 Not Found", false),
+            ("HTTP/1.1 503 Service Unavailable", false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port");
+            let port = listener.local_addr().expect("a bound address").port();
+            // `clippy.toml` forbids `std::thread::spawn` so that §3.2's task table owns
+            // every task in the DAEMON; an allow with a comment at the call site is the
+            // mechanism that file prescribes for a permitted one. This is an xtask test
+            // serving one canned response to the probe under test — there is no task table
+            // here, and `accept()` has to block somewhere other than where `http_ok` calls
+            // `connect()`.
+            #[allow(clippy::disallowed_methods)]
+            let server = std::thread::spawn(move || {
+                let (sock, _) = listener.accept().expect("the probe connects");
+                // The request has to be read, or the probe's write can fail with EPIPE
+                // before it ever looks at the response.
+                let mut reader = BufReader::new(sock);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+                let body = format!("{status}\r\nContent-Length: 0\r\n\r\n");
+                let _ = reader.into_inner().write_all(body.as_bytes());
+            });
+            assert_eq!(
+                http_ok(port, "/metrics"),
+                expected,
+                "`{status}` should read as ready={expected}"
+            );
+            server.join().expect("the canned server finishes");
+        }
+    }
+
+    /// A port already answering is the one thing that makes this gate measure the wrong
+    /// process, which is why the preflight exists and why `go-target.sh` records the same
+    /// lesson. Checked against a port the test itself owns rather than 18080, so a
+    /// conformance run in another terminal cannot fail this.
+    #[test]
+    fn a_port_already_answering_stops_the_run() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port");
+        let port = listener.local_addr().expect("a bound address").port();
+        let err = ports_free(&[port]).expect_err("a bound port must be refused");
+        assert!(
+            err.contains(&format!("port {port} is already in use")),
+            "{err}"
+        );
+        drop(listener);
+        ports_free(&[port]).expect("a released port is free again");
+    }
+
+    /// The restored-cache defence. `Swatinem/rust-cache` restores `target/` wholesale, so
+    /// the default work directory arrives holding the previous run's replay output — and an
+    /// artefact from a run that did not happen is exactly the kind of small lie this gate
+    /// exists to prevent.
+    #[test]
+    fn a_previous_runs_output_does_not_survive_into_this_one() {
+        let workdir = check_tmp_workdir();
+        let logs = workdir.join("logs");
+        std::fs::create_dir_all(&logs).expect("a scratch work directory");
+        for stale in ["config.db", "config.db-wal", "direct.txt", "mangled.txt"] {
+            std::fs::write(workdir.join(stale), "from an earlier run").expect("a stale file");
+        }
+        std::fs::write(logs.join("modernweather.log"), "an earlier run's log").expect("a log");
+
+        let opts = Options {
+            root: crate::repo_root(),
+            target_binary: PathBuf::new(),
+            build: false,
+            release: false,
+            log_dir: logs.clone(),
+            workdir: workdir.clone(),
+            keep_running: false,
+            db: Libpq::from_env(),
+        };
+        clear_workdir(&opts).expect("the work directory is cleared");
+
+        for gone in ["config.db", "config.db-wal", "direct.txt", "mangled.txt"] {
+            assert!(
+                !workdir.join(gone).exists(),
+                "{gone} survived into this run"
+            );
+        }
+        assert!(
+            !logs.join("modernweather.log").exists(),
+            "a previous run's log survived into this one"
+        );
+        assert!(
+            logs.is_dir(),
+            "the log directory is left ready to write into"
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    /// Unique per call: `cargo test` runs these concurrently in one process.
+    fn check_tmp_workdir() -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        std::env::temp_dir().join(format!(
+            "mw-conformance-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn credentials_are_percent_encoded_into_the_url() {
+        // Unencoded, `postgresql://postgres:p@ss/word@host:5432/db` has a host of `ss`:
+        // sqlx would connect somewhere else entirely and D-27 would turn that into a
+        // warning rather than a failure.
+        let db = Libpq {
+            host: "db.internal".into(),
+            port: "5432".into(),
+            user: "mw admin".into(),
+            password: "p@ss/word".into(),
+            database: "mw_conformance".into(),
+            sslmode: "disable".into(),
+        };
+        assert_eq!(
+            db.target_url(),
+            "postgresql://mw%20admin:p%40ss%2Fword@db.internal:5432/mw_conformance?sslmode=disable"
+        );
+        // The password never goes on a command line; `psql` is handed it in its environment.
+        assert!(
+            !db.url("postgres").contains("p%40ss"),
+            "{}",
+            db.url("postgres")
+        );
+    }
+
+    #[test]
+    fn a_database_that_is_not_named_for_this_run_is_not_dropped() {
+        // The guard is on the name because the statement is DROP DATABASE ... WITH (FORCE)
+        // and the name comes from the environment.
+        for refused in ["weather", "postgres", "remoteweather", ""] {
+            let err = droppable(refused).expect_err("this name must be refused");
+            assert!(
+                err.contains(&format!("refusing to drop `{refused}`")),
+                "{err}"
+            );
+            assert!(
+                err.contains("mw_conformance"),
+                "the default is named: {err}"
+            );
+        }
+        // Both halves of the suite already name their database this way.
+        for accepted in ["mw_conformance", "conformance", "chris_conformance_scratch"] {
+            droppable(accepted).unwrap_or_else(|e| panic!("`{accepted}`: {e}"));
+        }
+        // The name this command uses when PGDATABASE is unset has to be one of them, or the
+        // guard would refuse every ordinary run.
+        droppable(&Libpq::from_env().database).expect("the configured database is acceptable");
+    }
+
+    #[test]
+    fn a_replay_where_everything_skipped_is_not_a_pass() {
+        // A SKIP means "the fixture stores no body". All 70 skipping means the fixtures
+        // lost their recorded responses, which is not the binary conforming.
+        match judge_direct(&summary(0, 0, 70, 0), EXPECTED_FIXTURES) {
+            Direct::Inconclusive(why) => assert!(why.contains("were SKIPPED"), "{why}"),
+            other => panic!("70 skips is not a verdict; got {other:?}"),
+        }
     }
 
     /// `migrations/` and `migrations/config/` are two databases on two engines (**D-8** as
