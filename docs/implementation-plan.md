@@ -556,7 +556,10 @@ ship as one binary (D-69). O-5's `/stationinfo` fix lands here as a signed devia
 fixture.
 **Done when:** `cargo xtask gate conformance` is **green against the Rust binary** for every
 frozen-class and coupled-class fixture, and the negative control still fails. This is the milestone's
-headline.
+headline. **And the `conformance` job goes back into the `gate` job's `needs` in
+`.github/workflows/pr.yml` in the same PR** — M2-5 took it out because a gate that is red by design
+for two milestones must not be the single required check, and the line goes back the moment it is
+green.
 **Test strategy:** the conformance suite is the specification. Plus a regression test for W1-BUG-1 —
 `/span` for a station with no non-NULL `winddir` must return 200 with `windd: 0`, which W4 D-8's
 finaliser makes true and which was a 500 in Go.

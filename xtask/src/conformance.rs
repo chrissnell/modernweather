@@ -1898,6 +1898,61 @@ SKIP alerts-empty (fixture stores no body to compare against)
         }
     }
 
+    /// The jobs the single required `gate` check depends on, read out of the workflow.
+    ///
+    /// Hand-parsed because `xtask` has three dependencies and none of them is a YAML
+    /// reader (**D-32**). Narrow on purpose: the `needs:` list of one named job, and
+    /// nothing else in the file.
+    fn gate_job_needs() -> Vec<String> {
+        let workflow = std::fs::read_to_string(crate::repo_root().join(".github/workflows/pr.yml"))
+            .expect("the PR workflow is in the tree");
+        let job = workflow
+            .split_once("\n  gate:\n")
+            .expect("pr.yml declares a `gate` job")
+            .1;
+        let list = job
+            .split_once("\n    needs:\n")
+            .expect("the gate job declares `needs`")
+            .1;
+        list.lines()
+            .take_while(|l| l.starts_with("      - "))
+            .map(|l| l.trim_start_matches("      - ").to_string())
+            .collect()
+    }
+
+    /// The `conformance` gate is red by design until M4-2, so M2-5 took it out of the one
+    /// required check — a check nobody may merge past for two milestones is one everybody
+    /// learns to override, which is `docs/reconciliation.md` G-1 by a different route.
+    ///
+    /// The risk with that is the obvious one: an exception nobody removes. This is the
+    /// mechanism rather than a third comment about it (G-5 again) — the exception and the
+    /// plan's instruction to undo it are asserted to be *the same decision*, so the two
+    /// halves cannot drift apart. Re-adding the job without striking the plan's sentence
+    /// fails here, and so does striking the sentence while the job is still out.
+    #[test]
+    fn the_required_check_excludes_this_gate_exactly_while_the_plan_says_to() {
+        let needs = gate_job_needs();
+        assert!(
+            needs.contains(&"conformance-fixtures".to_string()),
+            "the Go-target half is not red by design and must stay required: {needs:?}"
+        );
+        let excluded = !needs.contains(&"conformance".to_string());
+
+        let plan = std::fs::read_to_string(crate::repo_root().join("docs/implementation-plan.md"))
+            .expect("the implementation plan is in the tree");
+        // The sentence M4-2's done-criteria carry, which is what puts the line back.
+        let plan_says_restore = plan.contains("goes back into the `gate` job's `needs`");
+
+        assert_eq!(
+            excluded, plan_says_restore,
+            "the workflow and the plan disagree about the one required-check exception.\n  \
+             `conformance` excluded from the gate job's needs: {excluded}\n  \
+             M4-2's done-criteria require it to be restored: {plan_says_restore}\n  \
+             Both or neither: if the gate is green now, re-add the job AND strike that \
+             sentence from the plan in the same change."
+        );
+    }
+
     /// `migrations/` and `migrations/config/` are two databases on two engines (**D-8** as
     /// amended by A-W6-2), so the weather half must not pick up the SQLite half's DDL.
     #[test]

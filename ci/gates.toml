@@ -114,7 +114,12 @@ require it to create. This one is created by implementation-plan.md M2-1; the xt
 subcommand is M2-5; a green run is M4-2's headline done-criterion.
 
 M2-5 implemented that subcommand, so this gate now fails for the honest reason rather than
-for having no runner. A run needs a TimescaleDB through the standard libpq variables and
+for having no runner. Because it is red BY DESIGN until M4-2, M2-5 also took it out of the
+`gate` job's `needs` in .github/workflows/pr.yml: a check nobody may merge past for two
+milestones is one everybody learns to override, which is G-1 by a different route. The job
+still runs and is still visible. **M4-2 puts that line back in the same PR that turns this
+gate green**, and that is recorded in M4-2's done-criteria as well as here -- a comment in a
+workflow file is not a work item (G-5). A run needs a TimescaleDB through the standard libpq variables and
 `psql`, `sqlite3` and `python3` on PATH; it fails rather than skipping when it cannot have
 them, because a conformance check that reports green without running is the defect this
 gate exists downstream of. See xtask/src/conformance.rs and ci/conformance/README.md."""

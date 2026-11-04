@@ -740,8 +740,29 @@ jobs:
 
   gate:
     name: gate
-    # The single required check. Everything above is a dependency, so branch protection
+    # The single required check. Everything below is a dependency, so branch protection
     # needs exactly one entry and never changes.
+    #
+    # `conformance` is DELIBERATELY NOT in this list, and this is the only exception.
+    # ---------------------------------------------------------------------------------
+    # That job replays the frozen contract against the Rust binary, and until
+    # implementation-plan.md M4-2 implements mw-api-legacy it is RED BY DESIGN: all 70
+    # fixtures fail on the status line because no legacy endpoint exists yet. M2-5 armed it
+    # for exactly that reason -- a conformance gate reporting green while running nothing is
+    # what docs/reconciliation.md G-1 cost this programme.
+    #
+    # A check that is red by design cannot be a required check. Inside this list it would
+    # block every merge from M2 through M4 while saying nothing new on any of them, and a
+    # required check that everybody overrides for two milestones stops being read at all --
+    # which lands in the same place G-1 did, by a different route. So the job stays, stays
+    # red, and stays visible in the PR's check list and in the run summary; it just does not
+    # gate the merge.
+    #
+    # THE EXPIRY IS NOT A COMMENT. implementation-plan.md M4-2's done-criteria carry
+    # "`conformance` is back in pr.yml's `gate` needs", and ci/gates.toml says the same at
+    # the gate itself, because a comment in a workflow file is not a work item
+    # (docs/reconciliation.md G-5). Put the line back in the same PR that turns the gate
+    # green; `cargo xtask gates` is what proves it is still armed in the meantime.
     needs:
       - fmt
       - clippy
@@ -754,7 +775,6 @@ jobs:
       - layout
       - codegen-drift
       - legacy-import-drift
-      - conformance
       - conformance-fixtures
       - driver-emulators
       - database
