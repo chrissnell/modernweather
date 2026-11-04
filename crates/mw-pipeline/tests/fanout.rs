@@ -7,6 +7,15 @@
 //! - **The group commit coalesces append *calls*, not records** (W7 **D-13**) — 64
 //!   concurrent callers cost one disk sync, which is the difference between 64 and 1 for a
 //!   reconnecting satellite's replay burst.
+//!
+//! Not run under `--cfg loom`. Every test here drives a real `tokio` runtime, and under
+//! that flag tokio's time/IO driver refuses to be enabled (`assertion failed: !enabled`),
+//! so the whole file panics rather than modelling anything. The `loom` job builds
+//! `mw-pipeline` for the scope guard's sake; what it has to run is
+//! `mw-supervisor`'s `loom_publish.rs`, and `crates/mw-supervisor/tests/` carries this
+//! same `cfg` for this same reason.
+
+#![cfg(not(loom))]
 
 use std::sync::Arc;
 use std::time::Duration;
