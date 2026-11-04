@@ -38,13 +38,15 @@
 //! # Which capability handle traits exist yet
 //!
 //! `ComponentControl` and `LogControl` (this crate's own surface), `ReadingStream` and
-//! `ScheduleStore` (the two the supervisor itself consumes). The store handles --
-//! `ReadingStore`, `ForecastStore`, `AlertStore`, `SnowCache`, `ConfigStore`,
-//! `ConfigAdmin`, `StationRegistry`, `WindowedView`, `LatestSnapshot`, `HttpRoutes` --
-//! arrive with the work items that consume them, because a handle trait is a *query set*
-//! and the item that writes the queries is the item that knows them. What is fixed here is
-//! the mechanism every one of them uses: [`CapabilityHandle`] associates a handle type
-//! with its capability, and [`BuildCx`] resolves it **once**, in `build`.
+//! `ScheduleStore` (the two the supervisor itself consumes), `Ingress` -- the write end of
+//! `ReadingStream` -- and the one method of `StationRegistry` that admission needs. The
+//! rest of the store handles -- `ReadingStore`, `ForecastStore`, `AlertStore`, `SnowCache`,
+//! `ConfigStore`, `ConfigAdmin`, `WindowedView`, `LatestSnapshot`, `HttpRoutes` -- arrive
+//! with the work items that consume them, because a handle trait is a *query set* and the
+//! item that writes the queries is the item that knows them. `StationRegistry` is here
+//! with one method for the same reason and will grow the rest the same way. What is fixed
+//! here is the mechanism every one of them uses: [`CapabilityHandle`] associates a handle
+//! type with its capability, and [`BuildCx`] resolves it **once**, in `build`.
 
 mod body;
 mod capability;
@@ -53,6 +55,7 @@ mod cx;
 mod error;
 mod id;
 mod identity;
+mod ingress;
 mod routes;
 mod schedule;
 mod spec;
@@ -73,6 +76,9 @@ pub use error::{BuildError, ComponentError, Outcome, PlanError};
 pub use id::{stable_hash, ComponentId, ComponentIdError, Fnv1a};
 pub use identity::{
     Cardinality, Continuity, IdentityProblem, IdentityShape, IdentitySource, Initiation,
+};
+pub use ingress::{
+    AcceptError, Accepted, AdmitError, Admitted, FrameMeta, Ingress, Reject, StationRegistry,
 };
 pub use routes::{Match, Methods, RouteEntry, RouteManifest, Scope};
 pub use schedule::{OccurrenceKey, OccurrenceRecord, ScheduleStore, ScheduleStoreError};

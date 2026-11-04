@@ -54,6 +54,14 @@ metrics.workspace = true
 # the one place that hands it to a connection has to be able to expose it.
 secrecy.workspace = true
 
+[dev-dependencies]
+# `test-util` for `tokio::time::pause()`. The stalled-sink test of W3 D-85 is re-pointed at
+# a real spool in `tests/spool_fanout.rs`, and it has to live here: `mw-supervisor` and
+# `mw-pipeline` are the same layer, so `ci/layers.toml` forbids either naming the other and
+# the binary is the only place they meet. Under `resolver = "2"` a dev-dependency feature is
+# not unified into `cargo build`, so the shipped artefact does not carry the mock clock.
+tokio = { workspace = true, features = ["test-util"] }
+
 # Packaging, verbatim from docs/release.md §6, which asks for exactly this block when
 # `crates/modernweather` lands. `cargo xtask dist` reads ci/release.toml for the target
 # matrix and `cargo deb` / `cargo generate-rpm` read these.

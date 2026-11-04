@@ -1,0 +1,229 @@
+//! The numbers W7 §7 and docs/service-architecture.md §5.10 say this crate owns.
+//!
+//! One function per fact, so that every call site names a metric that exists and the
+//! label set is decided here rather than at twelve call sites. All names carry the `mw_`
+//! prefix `mw-obs` establishes — §5.10's table writes it and W7 §7's does not, and one
+//! namespace for one process's metrics is worth more than two sections' literal text.
+//!
+//! **Cardinality is bounded by construction** (§5.10): every label here is a component id
+//! or a closed enum. There is no label whose values come from a request, a peer's claim or
+//! a file name, and the review rule is that a new one must be justifiable as "there are N
+//! of these and N is in the configuration".
+
+use mw_component::{ComponentId, Reject};
+
+use crate::spool::CursorState;
+
+/// Describe and zero everything this crate owns.
+///
+/// Called once from the boot sequence. A Prometheus counter does not exist in the
+/// exposition until something touches it, so a daemon that has rejected no readings and a
+/// daemon whose metrics are broken look identical to a scraper — and an alert on
+/// `rate(...)` over a series that appears halfway through a window reads as a step change
+/// rather than as the first increment.
+pub fn register() {
+    metrics::describe_counter!(
+        "mw_readings_ingested_total",
+        "Readings sealed into an envelope and durably appended"
+    );
+    metrics::describe_counter!(
+        "mw_readings_rejected_total",
+        "Frames and envelopes refused before anything was stored, by reason"
+    );
+    metrics::describe_counter!(
+        "mw_readings_dropped_total",
+        "Readings lost rather than refused, by reason"
+    );
+    metrics::describe_gauge!("mw_spool_depth_bytes", "How much the spool holds on disk");
+    metrics::describe_gauge!(
+        "mw_spool_depth_envelopes",
+        "The spool's tail, as a count of appended records"
+    );
+    metrics::describe_gauge!(
+        "mw_spool_lag_envelopes",
+        "How far behind each cursor is, in records"
+    );
+    metrics::describe_gauge!(
+        "mw_spool_oldest_unacked_age_seconds",
+        "How long each cursor has been behind"
+    );
+    metrics::describe_gauge!(
+        "mw_spool_time_remaining_seconds",
+        "When the ceiling arrives at the trailing-hour admit rate"
+    );
+    metrics::describe_gauge!(
+        "mw_spool_origins",
+        "Rows in the spool manifest's origin table"
+    );
+    metrics::describe_gauge!("mw_spool_cursor_state", "1 for the state each cursor is in");
+    metrics::describe_counter!("mw_spool_appends_total", "Append calls committed");
+    metrics::describe_counter!("mw_spool_fsyncs_total", "Group commits -- fsyncs performed");
+    metrics::describe_counter!(
+        "mw_spool_truncated_total",
+        "Segments whose torn tail was discarded at start-up"
+    );
+    metrics::describe_counter!(
+        "mw_spool_segments_reclaimed_total",
+        "Segments deleted after every active cursor acked past them"
+    );
+    metrics::describe_counter!(
+        "mw_spool_cursor_abandoned_total",
+        "Cursors given up on because they were behind longer than max_lag"
+    );
+    metrics::describe_counter!(
+        "mw_spool_cursor_skipped_envelopes_total",
+        "Records reclaimed before a re-activated cursor read them"
+    );
+    metrics::describe_counter!(
+        "mw_ingest_duplicates_total",
+        "Envelopes the dedup gate already had"
+    );
+    metrics::describe_counter!(
+        "mw_ingest_window_overrun_total",
+        "Sequence numbers that fell out of an origin's dedup window"
+    );
+    metrics::describe_counter!(
+        "mw_sink_partial_ack_total",
+        "Deliveries where a sink handled a strict prefix of the batch"
+    );
+    metrics::describe_counter!(
+        "mw_stream_lagged_total",
+        "Envelopes a Lossy subscriber fell too far behind to receive"
+    );
+
+    // Zeroed, so "nothing has gone wrong yet" is an assertion rather than an absence.
+    metrics::counter!("mw_spool_appends_total").absolute(0);
+    metrics::counter!("mw_spool_fsyncs_total").absolute(0);
+    metrics::counter!("mw_spool_truncated_total").absolute(0);
+    metrics::counter!("mw_spool_segments_reclaimed_total").absolute(0);
+    metrics::counter!("mw_spool_cursor_skipped_envelopes_total").absolute(0);
+    metrics::counter!("mw_ingest_duplicates_total").absolute(0);
+    metrics::counter!("mw_ingest_window_overrun_total").absolute(0);
+    for reason in Reject::ALL {
+        metrics::counter!("mw_readings_rejected_total", "reason" => reason.as_str()).absolute(0);
+    }
+    for reason in DROPPED_REASONS {
+        metrics::counter!("mw_readings_dropped_total", "reason" => *reason).absolute(0);
+    }
+}
+
+/// §5.10's named list for `mw_readings_dropped_total`.
+///
+/// `rejected` is deliberately **not** here even though §5.10 lists it: a rejection is
+/// counted once, by reason, on `mw_readings_rejected_total`, and a second series that
+/// double-counts the same event under a coarser label is how two dashboards come to
+/// disagree. The three that remain are losses rather than refusals.
+const DROPPED_REASONS: &[&str] = &["spool_full", "lagged", "out_of_range"];
+
+/// A frame or an envelope refused before anything was stored.
+pub fn rejected(reason: Reject, n: u64) {
+    metrics::counter!("mw_readings_rejected_total", "reason" => reason.as_str()).increment(n);
+}
+
+/// Readings lost at the spool's ceiling (W3 §2.7).
+pub fn dropped_spool_full(n: u64) {
+    metrics::counter!("mw_readings_dropped_total", "reason" => "spool_full").increment(n);
+}
+
+/// Readings sealed and committed, per station.
+///
+/// `station` is a station key, which is in the configuration — §5.10's cardinality rule
+/// satisfied by the label's source rather than by its current size.
+pub fn ingested(station: &str, n: u64) {
+    metrics::counter!("mw_readings_ingested_total", "station" => station.to_string()).increment(n);
+}
+
+/// Envelopes the dedup gate already had (W7 §4.4). Expected and non-zero in a diamond.
+pub fn duplicates(n: u64) {
+    metrics::counter!("mw_ingest_duplicates_total").increment(n);
+}
+
+/// Sequence numbers that fell out of an origin's window, so the database backstop is the
+/// only remaining dedup for them.
+pub fn window_overrun(n: u64) {
+    metrics::counter!("mw_ingest_window_overrun_total").increment(n);
+}
+
+/// One committed append call.
+pub fn spool_appended(records: usize) {
+    metrics::counter!("mw_spool_appends_total").increment(1);
+    let _ = records;
+}
+
+/// One `fsync`. The ratio against `mw_spool_appends_total` is the group-commit
+/// coalescing, which is the one thing that makes a replay burst cheap (W7 **D-13**).
+pub fn spool_fsynced() {
+    metrics::counter!("mw_spool_fsyncs_total").increment(1);
+}
+
+/// A segment's torn tail was discarded (W7 **D-12**).
+pub fn spool_truncated() {
+    metrics::counter!("mw_spool_truncated_total").increment(1);
+}
+
+/// Segments deleted because every active cursor had acked past them.
+pub fn spool_reclaimed(n: usize) {
+    metrics::counter!("mw_spool_segments_reclaimed_total").increment(n as u64);
+}
+
+/// `max_lag` fired on a cursor.
+pub fn spool_cursor_abandoned(cursor: &ComponentId) {
+    metrics::counter!("mw_spool_cursor_abandoned_total", "cursor" => cursor.as_str().to_string())
+        .increment(1);
+}
+
+/// Records reclaimed before a re-activated cursor read them (§3.6 step 6).
+pub fn spool_cursor_skipped(n: u64) {
+    metrics::counter!("mw_spool_cursor_skipped_envelopes_total").increment(n);
+}
+
+/// How much is on disk, and how many records deep the log is.
+pub fn spool_depth(bytes: u64, envelopes: u64) {
+    metrics::gauge!("mw_spool_depth_bytes").set(bytes as f64);
+    metrics::gauge!("mw_spool_depth_envelopes").set(envelopes as f64);
+}
+
+/// Rows in the origin table, against [`crate::spool::MAX_ORIGINS`].
+pub fn spool_origins(n: usize) {
+    metrics::gauge!("mw_spool_origins").set(n as f64);
+}
+
+/// One cursor's lag, age and state.
+///
+/// One series per state rather than a state *value*, so "how long has this cursor been
+/// abandoned" is a query rather than an arithmetic convention (§5.10's
+/// `mw_component_state` does the same).
+pub fn spool_cursor(cursor: &ComponentId, lag: u64, age_seconds: i64, state: CursorState) {
+    let label = cursor.as_str().to_string();
+    metrics::gauge!("mw_spool_lag_envelopes", "cursor" => label.clone()).set(lag as f64);
+    metrics::gauge!("mw_spool_oldest_unacked_age_seconds", "cursor" => label.clone())
+        .set(age_seconds as f64);
+    for possible in [CursorState::Active, CursorState::Abandoned] {
+        metrics::gauge!(
+            "mw_spool_cursor_state",
+            "cursor" => label.clone(),
+            "state" => possible.as_str(),
+        )
+        .set(f64::from(u8::from(possible == state)));
+    }
+}
+
+/// When the ceiling arrives at the trailing-hour rate — the number an operator watches,
+/// and the one W5 renders as "about 94 days" (W7 §3.5).
+pub fn spool_time_remaining(seconds: f64) {
+    metrics::gauge!("mw_spool_time_remaining_seconds").set(seconds);
+}
+
+/// A sink handled a strict prefix of a batch.
+pub fn sink_partial_ack(sink: &ComponentId, handled: usize, of: usize) {
+    metrics::counter!("mw_sink_partial_ack_total", "sink" => sink.as_str().to_string())
+        .increment(1);
+    let _ = (handled, of);
+}
+
+/// A `Lossy` subscriber fell more than 1024 envelopes behind.
+pub fn stream_lagged(subscriber: &ComponentId, n: u64) {
+    metrics::counter!("mw_stream_lagged_total", "component" => subscriber.as_str().to_string())
+        .increment(n);
+    metrics::counter!("mw_readings_dropped_total", "reason" => "lagged").increment(n);
+}

@@ -1,0 +1,72 @@
+// The node-to-node schema: what one envelope looks like on the wire and in the spool.
+//
+// Hand-written and therefore NOT under `generated/`. docs/collector.md §4.1 writes the
+// path as `generated/proto/collector.proto`, and that path is not available: `generated/`
+// is owned end to end by `cargo xtask codegen` -- `ci/layers.toml`'s `[generated]` rule
+// requires a DO-NOT-EDIT header on everything in it, and implementation-plan.md M1-3's
+// prune DELETES anything there the generator does not write. A hand-written file there
+// would survive exactly until the next `cargo xtask codegen`. Nothing about this schema
+// derives from `metrics/registry.toml` except the `Reading` it imports, so the honest
+// placement is beside the crate that compiles it. The substance of W7 D-11 is unchanged:
+// the spool record's payload is byte-for-byte this message.
+//
+// `Reading` is the generated one (`generated/proto/reading.proto`, W2's emitter), which is
+// what makes W3 D-89's field presence reach the spool: without `optional` on every metric
+// field an unreported humidity decodes as 0% across a restart as well as across a hop.
+// docs/collector.md §4.1 names the package `weather.v1`; the generator emits
+// `modernweather.v1`, and the generator is the artefact.
+//
+// SCOPE. This file carries `Envelope` and nothing else. `service Collector`, `IngestBatch`,
+// `IngestAck`, `OriginHigh`, `AckStatus`, `NodeIdentity`, `HelloAck`, `EnrolRequest` and
+// `EnrolGrant` are implementation-plan.md M6-4's, together with the tonic build they need;
+// `Envelope` is here because implementation-plan.md M3-2 owns the spool record format and
+// that format IS this message. `WeatherV1` is not touched (W7 D-19).
+
+syntax = "proto3";
+
+package collector.v1;
+
+import "reading.proto";
+
+// One sealed observation: the identity its origin gave it, and the reading.
+//
+// Immutable except for `path`, which grows by exactly one element per hop. In memory the
+// equivalent is `mw_types::Envelope`, whose `Provenance` has no public field and no
+// setter, so the only transitions that exist are the three `mw_types::envelope` documents.
+message Envelope {
+    // The NodeId of the node that first admitted this reading, 16 bytes. Never rewritten.
+    //
+    // NodeId rather than the spool's local `origin_id`: a dense per-node index is
+    // meaningless to a peer (docs/collector.md §1.3), so the wire carries NodeIds and the
+    // translation happens at encode and decode and nowhere else.
+    bytes origin = 1;
+
+    // The origin's spool append position for this envelope (W7 D-4). Per origin NODE, not
+    // per (origin, station): `(origin, seq)` is an envelope's globally unique immutable
+    // identity, and a cumulative ack needs one sequence per log.
+    uint64 seq = 2;
+
+    // Every node this envelope has traversed, oldest first, with `path[0] == origin` and
+    // `path.back()` the hop it is addressed to (W7 D-6). At most 8 elements (W7 D-8).
+    //
+    // Ordered, not a set: three of W7 D-7's six receive-check clauses are positional, and
+    // a bare set cannot distinguish "you were added by my sender's forward" from "you were
+    // here two hops ago".
+    repeated bytes path = 3;
+
+    // The station, as resolved AT THE ORIGIN (W2a §4a.6). There is no envelope without
+    // one, which is what makes an unauthenticated reading unstorable rather than merely
+    // unstored.
+    string station_key = 4;
+
+    // Unix milliseconds. When the station says it measured.
+    int64 observed_at = 5;
+
+    // Unix milliseconds. When the ORIGIN admitted it -- not when this node received it.
+    // A relay does not restamp, because the pair `(observed_at, received_at)` is what
+    // distinguishes "the sensor is slow" from "the link was down".
+    int64 received_at = 6;
+
+    // The reading itself, every metric field `optional` (D-89).
+    modernweather.v1.Reading reading = 7;
+}

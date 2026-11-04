@@ -272,10 +272,27 @@ discover: `mw-proto` may name the proto SCHEMA, and the rule above still gives `
 sole access to the generated RUST. The distinction is the one the decision is actually
 about -- a hand-written module must not be able to reach a generated TYPE.
 
-The `mw-proto` half of this exemption is currently unused: that build script does not exist
-yet (its `[build-dependencies]` arrive with it). It is declared now because the alternative is
-whoever writes it discovering that two sections of one design document disagree. When it
-lands, this `only` entry should narrow to `mw-proto`'s `build.rs` alone."""
+The `mw-proto` half of this exemption has landed: implementation-plan.md M3-2 wrote that
+build script, because the spool record's payload is the wire `collector.v1.Envelope`
+(W7 D-11) and that message imports the generated `reading.proto`.
+
+The previous note here said the `only` entry should then narrow to `build.rs` alone. **It
+does not, and the reason is the scan rather than the decision.** This check is a
+whitespace-squeezed substring match over whole files and does not know what a comment is, so
+narrowing it to one path makes every doc comment in the crate that NAMES the schema a gate
+failure -- including the module doc that exists to tell a reader where the types come from.
+The choice would be between worse documentation and a weaker gate, and it is a false choice:
+the rule that actually enforces the decision is `only-mw-types-adopts-generated-rust` above,
+whose needle is `generated/rust/` and whose `only` list does NOT include `mw-proto`. A
+hand-written module still cannot reach a generated TYPE. What is left here is the schema
+PATH, and naming a path in prose is not reaching it.
+
+`collector.proto` itself is hand-written and lives at `crates/mw-proto/proto/`, NOT under
+`generated/`, even though docs/collector.md §4.1 writes the latter path. It has to: the
+`[generated]` check below requires a DO-NOT-EDIT header on everything in that directory, and
+implementation-plan.md M1-3's prune deletes anything there the generator does not write — so a
+hand-written file there would survive until the next `cargo xtask codegen`. Nothing in that
+schema derives from `metrics/registry.toml` except the `Reading` it imports."""
 
 [[source_rule]]
 id = "one-seam"
@@ -353,6 +370,7 @@ only = []
 only_paths = [
   "crates/modernweather/src/args.rs",
   "crates/mw-obs/src/stderr.rs",
+  "crates/mw-proto/build.rs",
 ]
 reason = """
 docs/service-architecture.md §5.1 allows these only on the binary's argument-parsing path,
@@ -380,11 +398,19 @@ exemption that outlives the file it names cannot quietly widen the rule back out
 exact set is also asserted by a test, because widening it one file at a time is the gradual
 version of the hole this narrowing closed.
 
+The third path is a **build script**, and it is exempt for a reason that is not about
+logging at all: `cargo::rerun-if-changed` and every other build-script directive is
+delivered to cargo on **stdout**, and `println!` is the only way to write one. There is no
+alternative API to point at. `crates/mw-proto/build.rs` emits one directive per schema it
+parses so that an edit to `generated/proto/reading.proto` rebuilds the crate; without them
+the prost output would go stale against a gated input, which is the one thing
+docs/service-architecture.md §1.6 relies on when it declines to commit that output.
+
 One property of the narrowing worth knowing before it surprises somebody: the scan is a
 whitespace-squeezed substring match over the whole file, so it does not know what a comment
 is. A doc comment in the binary that NAMES `println!` -- while explaining this rule, say --
 is a violation now that the crate is no longer exempt. `crates/modernweather/src/args.rs`
-contains exactly that, and passes only because it is one of the two exempt paths."""
+contains exactly that, and passes only because it is one of the exempt paths."""
 
 [[source_rule]]
 id = "no-template-escape-opt-out"

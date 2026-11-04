@@ -25,3 +25,7 @@ tracing.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
+# `FrameMeta::presented_secret` is a `SecretString` rather than a `String` (**D-33**): a
+# station's `?PASSWORD=` crosses this boundary on its way to a constant-time comparison,
+# and the redaction belongs to the type rather than to every log site that might touch it.
+secrecy.workspace = true

@@ -26,6 +26,7 @@ mod config;
 mod logctl;
 mod notify;
 mod signals;
+mod spool;
 
 use std::process::ExitCode;
 

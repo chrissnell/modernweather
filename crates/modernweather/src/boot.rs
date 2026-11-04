@@ -6,6 +6,7 @@
 //! 3. open the SQLite pool and run its migrations  <- the root resource (D-41)
 //! 4. cfg = Config::load(&pool)
 //! 4a. assert the database version                 <- D-62, after the pool, before plan()
+//! 4b. open the spool                              <- the fan-out, the second root (D-30a)
 //! 5. specs = plan(&cfg, registrars)               pure; every structural error caught here
 //! 6. supervisor = Supervisor::new(pool.schedule_store(), log_control, ...)
 //! 6a. bind the listener                           <- NOT in §3.1; see below
@@ -56,6 +57,7 @@ use crate::config::Config;
 use crate::logctl::ObsLogControl;
 use crate::notify;
 use crate::signals::Signals;
+use crate::spool;
 
 /// Which component crates contribute specs.
 ///
@@ -129,7 +131,12 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
         .await
         .context("reading the configuration")?;
     match &cfg.node {
-        Some(node) => info!(node = %node.node_name, timezone = %node.timezone, "node identity"),
+        Some(node) => info!(
+            node = %node.node_name,
+            timezone = %node.timezone,
+            spool = %node.spool_path,
+            "node identity"
+        ),
         // The migration deliberately seeds no `node` row: `node_id` is a UUIDv7 the node
         // mints once and never edits, so a migration that invented one would make every
         // fresh install claim the same identity. An empty table means "not yet started",
@@ -189,16 +196,41 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
         ),
     }
 
+    // Step 4b: the spool, which is the reading fan-out and therefore the second root
+    // resource `main` owns (W3 §3.1, **D-30a**).
+    //
+    // Opened before `plan()`, because `Roots::capabilities()` is what `plan()` validates an
+    // `OnReading` component against -- so whether this process has a `ReadingStream` has to
+    // be known before the plan is built, not after.
+    //
+    // `None` when there is no `node` row, which is a legitimate configuration and not a
+    // degraded one: `node.spool_path` has no default in the schema, a node that has never
+    // enrolled has no identity to put in `MANIFEST`, and a spool whose `node_id` was
+    // invented here would be adopted by the real identity later and refused. A node that
+    // serves but does not ingest is W7 §8.2's shape.
+    mw_pipeline::metrics::register();
+    notify::starting("opening the spool");
+    let fanout = match &cfg.node {
+        Some(node) => Some(
+            spool::open(node)
+                .with_context(|| format!("opening the spool at {}", node.spool_path))?,
+        ),
+        None => {
+            info!("no node identity, so no spool and no reading fan-out yet");
+            None
+        }
+    };
+
     // Step 5. Pure: every structural error in W2a Decision 2's list is caught here,
     // before anything is constructed.
     let log: Arc<dyn mw_component::LogControl> = Arc::new(ObsLogControl::new(obs.log()));
     let roots = Roots {
         schedule: Arc::new(SqliteScheduleStore::new(pool.clone())),
-        // No reading fan-out in this process yet: the spool and `Ingress` are M3-2, and
-        // `None` is a legitimate configuration -- a node that serves but does not ingest.
-        // `plan()` rejects an `OnReading` component against this root set rather than
-        // letting one start and never be delivered to.
-        stream: None,
+        // `plan()` rejects an `OnReading` component against a root set without this rather
+        // than letting one start and never be delivered to.
+        stream: fanout
+            .as_ref()
+            .map(|f| Arc::clone(&f.stream) as Arc<dyn mw_component::ReadingStream>),
         log,
     };
     notify::starting("planning the configuration");
@@ -257,6 +289,25 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
         notify::run(readiness, &obs, &shutdown),
         signals.wait(&shutdown),
     );
+    // The spool is `main`'s too, and closing it is just dropping it: every cursor is
+    // released with the component that held it, and every append was `fsync`ed before its
+    // caller was told it committed -- so there is no flush to forget.
+    //
+    // What is worth saying out loud on the way out is how much it still holds. A spool
+    // that is deep at shutdown is a spool whose consumers were behind, and the next start
+    // will replay from exactly here; the append/fsync ratio is the group-commit
+    // coalescing (W7 D-13), which is the one number that says whether a replay burst cost
+    // one disk sync or hundreds.
+    if let Some(fanout) = fanout {
+        let stats = fanout.spool.stats();
+        info!(
+            depth_bytes = fanout.spool.depth_bytes(),
+            tail_seq = fanout.spool.tail_seq().get(),
+            appends = stats.appends,
+            fsyncs = stats.fsyncs,
+            "spool closed"
+        );
+    }
     // The pool is `main`'s to close (D-41) and nothing can hold it by here: every
     // component is stopped. WAL mode means the final checkpoint happens on the last
     // connection closing, so skipping this leaves `-wal`/`-shm` beside the database and a
