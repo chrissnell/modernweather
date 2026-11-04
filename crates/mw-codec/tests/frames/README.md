@@ -22,6 +22,7 @@ better and needs no code change.
 | `broadcast.json` | A UDP broadcast datagram: one ISS record carrying only the high-rate wind and rain fields. Note that it is **not** wrapped in `data`. |
 | `current-conditions.json` | `GET /v1/current_conditions` on a Vantage Pro2 Plus: ISS, the unit's own temp/humidity, and the unit's barometer. |
 | `current-conditions-agricultural.json` | The same, with a leaf/soil station on transmitter 2. |
+| `current-conditions-two-transmitters.json` | Three temperature/humidity transmitters, the middle one **present with null fields** (`rx_state: 2`) — a configured transmitter the unit has not heard from. This is the fixture for the `th` ordering rule, because a dropout must not renumber the columns after it. |
 | `real-time.json` | `GET /v1/real_time?duration=3600`'s answer. |
 | `device-error.json` | The unit refusing, with `200` on the status line and the refusal in the body. |
 | `broadcast-metric-collector.json` | A broadcast datagram from a unit with a 0.1 mm collector, which is the case the Go driver's raw tip counts get wrong by a factor of 254. |

@@ -52,9 +52,25 @@ struct Emulator {
     path: String,
     package: String,
     test_target: String,
-    tests: usize,
+    /// Every test this emulator's target must run, by name.
+    ///
+    /// **The count alone was not enough, and the manifest used to claim it was.** A count
+    /// catches a removed test and a filter that matched nothing; it does not catch a
+    /// *rename*, and it does not catch four tests whose bodies were emptied — which is the
+    /// realistic path, because the way a flaky emulator test gets "fixed" is by gutting it.
+    /// Demonstrated rather than reasoned about: four empty `#[ignore]`d functions produced
+    /// `ok: 4 test(s) passed` and exit 0 with no emulator process ever started. Names bind
+    /// identity, so now they have to be the same tests.
+    test_names: Vec<String>,
     #[serde(default)]
     note: String,
+}
+
+impl Emulator {
+    /// How many tests this emulator declares.
+    fn tests(&self) -> usize {
+        self.test_names.len()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,7 +139,7 @@ pub fn main(args: &[String]) -> Result<ExitCode, String> {
             println!("           {}", first_line(&emulator.note));
         }
         match run(&root, emulator) {
-            Ok(()) => println!("           ok: {} test(s) passed", emulator.tests),
+            Ok(()) => println!("           ok: {} test(s) passed", emulator.tests()),
             Err(why) => {
                 println!("           FAILED: {why}");
                 failures.push(format!("{}: {why}", emulator.id));
@@ -135,7 +151,11 @@ pub fn main(args: &[String]) -> Result<ExitCode, String> {
         println!(
             "emulator-tests: {} emulator(s), {} test(s), {} pending",
             manifest.emulators.len(),
-            manifest.emulators.iter().map(|e| e.tests).sum::<usize>(),
+            manifest
+                .emulators
+                .iter()
+                .map(Emulator::tests)
+                .sum::<usize>(),
             manifest.pending.len()
         );
         Ok(ExitCode::SUCCESS)
@@ -188,10 +208,21 @@ fn check(root: &Path, manifest: &Manifest) -> Result<(), String> {
         if seen.insert(emulator.id.as_str(), ()).is_some() {
             return Err(format!("two emulators share the id `{}`", emulator.id));
         }
-        if emulator.tests == 0 {
+        if emulator.test_names.is_empty() {
             return Err(format!(
-                "emulator `{}` declares 0 tests. The count is what makes \"the gate ran \
-                 nothing\" a failure, so zero is the one value it may not be.",
+                "emulator `{}` declares no tests. The declared set is what makes \"the gate \
+                 ran nothing\" a failure, so empty is the one value it may not be.",
+                emulator.id
+            ));
+        }
+        let mut names: Vec<&str> = emulator.test_names.iter().map(String::as_str).collect();
+        let before = names.len();
+        names.sort_unstable();
+        names.dedup();
+        if names.len() != before {
+            return Err(format!(
+                "emulator `{}` declares the same test twice, so the count and the set \
+                 disagree about how many there are",
                 emulator.id
             ));
         }
@@ -276,15 +307,50 @@ fn run(root: &Path, emulator: &Emulator) -> Result<(), String> {
     if failed != 0 {
         return Err(report(format!("{failed} test(s) failed")));
     }
-    if passed != emulator.tests {
+    if passed != emulator.tests() {
         return Err(report(format!(
             "{passed} test(s) passed and the manifest declares {}. Either a test was \
-             renamed or removed, or the filter matched nothing -- and a filter that \
-             matches nothing exits zero, which is why this count exists.",
-            emulator.tests
+             removed, or the filter matched nothing -- and a filter that matches nothing \
+             exits zero, which is why the declared set exists.",
+            emulator.tests()
+        )));
+    }
+    // The count says how many ran; the names say WHICH. Without this a rename passes, and
+    // so do four tests whose bodies were emptied -- verified, which is why this is here.
+    let ran = passed_names(&stdout);
+    let missing: Vec<&str> = emulator
+        .test_names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !ran.iter().any(|r| r == name))
+        .collect();
+    if !missing.is_empty() {
+        return Err(report(format!(
+            "the manifest declares {} test(s) that did not pass: {}. A test that was \
+             renamed or replaced is a test this gate no longer knows it is running, which \
+             is what the declared set is for -- rename it in {MANIFEST} in the same change.",
+            missing.len(),
+            missing.join(", ")
         )));
     }
     Ok(())
+}
+
+/// Every test libtest reported as passing.
+///
+/// `test the_broadcast_driver_arms_the_unit_and_keeps_receiving ... ok`
+///
+/// The same trade as [`summary`]: this command chose the invocation, and the alternative --
+/// trusting a number -- cannot tell four known tests from four unknown ones.
+fn passed_names(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("test ")?;
+            let (name, verdict) = rest.rsplit_once(" ... ")?;
+            (verdict.trim() == "ok").then_some(name.trim())
+        })
+        .collect()
 }
 
 /// The `passed` and `failed` counts from libtest's summary line.
@@ -345,7 +411,7 @@ mod tests {
                 emulator.id,
                 target.display()
             );
-            assert!(emulator.tests > 0);
+            assert!(emulator.tests() > 0);
             assert!(!emulator.emulates.is_empty());
             assert!(!emulator.driver.is_empty());
         }
@@ -382,7 +448,7 @@ mod tests {
                 path = "tests/emulators/wll"
                 package = "mw-station"
                 test_target = "emulator"
-                tests = 1
+                test_names = ["x"]
                 "#
             ))
             .expect("parses");
@@ -392,8 +458,8 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_test_count_and_a_missing_path_are_both_refused() {
-        let with = |tests: usize, path: &str| -> Manifest {
+    fn an_empty_test_set_a_duplicate_name_and_a_missing_path_are_all_refused() {
+        let with = |names: &str, path: &str| -> Manifest {
             toml::from_str(&format!(
                 r#"
                 [reference]
@@ -407,18 +473,69 @@ mod tests {
                 path = "{path}"
                 package = "mw-station"
                 test_target = "emulator"
-                tests = {tests}
+                test_names = {names}
                 "#
             ))
             .expect("parses")
         };
         let root = crate::repo_root();
-        assert!(check(&root, &with(0, "tests/emulators/wll"))
+        assert!(check(&root, &with("[]", "tests/emulators/wll"))
             .expect_err("refused")
-            .contains("declares 0 tests"));
-        assert!(check(&root, &with(1, "tests/emulators/nowhere"))
+            .contains("declares no tests"));
+        assert!(check(&root, &with(r#"["a", "a"]"#, "tests/emulators/wll"))
+            .expect_err("refused")
+            .contains("the same test twice"));
+        assert!(check(&root, &with(r#"["a"]"#, "tests/emulators/nowhere"))
             .expect_err("refused")
             .contains("does not exist"));
+    }
+
+    /// The hole the declared set exists to close: four tests with the right *shape* and the
+    /// wrong *identity*. The count cannot see this, which is why it is not the only check.
+    #[test]
+    fn the_names_libtest_reports_are_read_the_way_libtest_writes_them() {
+        let stdout = "running 2 tests\n\
+                      test the_broadcast_driver_arms_the_unit_and_keeps_receiving ... ok\n\
+                      test a_refusal_carrying_two_hundred_fails_the_re_arm ... ok\n\
+                      test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; \
+                      0 filtered out; finished in 3.85s\n";
+        assert_eq!(
+            passed_names(stdout),
+            vec![
+                "the_broadcast_driver_arms_the_unit_and_keeps_receiving",
+                "a_refusal_carrying_two_hundred_fails_the_re_arm",
+            ]
+        );
+        // An ignored test is not a passing one, and neither is a failing one.
+        let mixed = "test a ... ok\n\
+                     test b ... ignored, needs a Go toolchain\n\
+                     test c ... FAILED\n";
+        assert_eq!(passed_names(mixed), vec!["a"]);
+        assert!(passed_names("the test binary did not start").is_empty());
+    }
+
+    /// Every test the committed manifest declares exists in the file it names.
+    ///
+    /// The runner checks the other direction at gate time — that each declared name
+    /// actually passed — and this checks it at `cargo test` time, where nobody needs a Go
+    /// toolchain to find out that a rename was only half done.
+    #[test]
+    fn every_declared_test_name_exists_in_its_target() {
+        for emulator in &manifest().emulators {
+            let path = crate::repo_root()
+                .join("crates")
+                .join(&emulator.package)
+                .join("tests")
+                .join(format!("{}.rs", emulator.test_target));
+            let source = std::fs::read_to_string(&path).expect("the target is readable");
+            for name in &emulator.test_names {
+                assert!(
+                    source.contains(&format!("fn {name}(")),
+                    "`{name}` is declared in {MANIFEST} and is not in {}",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[test]

@@ -36,18 +36,44 @@
 -- `fixed` is excluded because configuration already says which station -- a `fixed`
 -- transport that presented a key would be presenting a second answer to a question that
 -- already has one.
+--
+-- **It constrains where the column must be ABSENT and not where it must be present**, and
+-- that asymmetry is forced rather than chosen. `ADD COLUMN` sets every existing row to
+-- NULL, and SQLite validates a new CHECK against the rows already in the table -- so an
+-- `ELSE presented_key IS NOT NULL` arm aborts the ALTER on any database that already holds
+-- one non-`fixed` station. `ci/db/config-seed.sql` seeds exactly that (an Ambient station,
+-- `from_query`, no claim), so it is not a hypothetical: the strict form fails
+-- `cargo xtask gate db-migrate-twice` in two places, and on an operator's own database it
+-- fails `sqlx::migrate` at startup with no value to backfill from.
+--
+-- Nothing is lost. The required half is enforced at plan time with a better message than a
+-- constraint can produce -- `mw_station::plan` raises
+-- `StationPlanError::Missing { column: "presented_key" }`, which names the station and says
+-- what the column is for -- and a `CHECK` that duplicated it would only be able to say
+-- "constraint failed". The half that *is* here is the half plan time cannot reach: a
+-- `fixed` row carrying a claim is a row the registry would never consult, so nothing would
+-- ever notice it.
 ALTER TABLE stations ADD COLUMN presented_key TEXT CHECK (
     CASE identity_kind
         WHEN 'fixed'             THEN presented_key IS NULL
         WHEN 'from_registration' THEN presented_key IS NULL
-        ELSE presented_key IS NOT NULL AND presented_key <> ''
+        ELSE presented_key IS NULL OR presented_key <> ''
     END
 );
 
 -- Two claims cannot resolve to two stations, or resolution is not a function. Partial, so
 -- that the NULL every `fixed` station carries is not a collision -- SQLite permits
 -- repeated NULLs in a UNIQUE index, but saying so with a WHERE clause states the intent.
-CREATE UNIQUE INDEX stations_presented_key ON stations (presented_key)
+--
+-- Over `lower(presented_key)`, because that is the comparison that actually happens.
+-- `mw_store::registry` folds ASCII case on both sides -- a WeatherLink Live reports
+-- `001D0A700002` and an operator types `001d0a700002`, and a case-sensitive lookup there is
+-- a station whose datagrams silently never resolve. A byte-exact index would therefore
+-- admit two rows the registry considers one, and the second one read would win: the first
+-- station's readings would be stored under the second station's key. Silently wrong data is
+-- worse than the flat line the case folding exists to prevent, so the index agrees with the
+-- lookup.
+CREATE UNIQUE INDEX stations_presented_key ON stations (lower(presented_key))
     WHERE presented_key IS NOT NULL;
 
 -- "Which sensor is which" (W5 §1.6), as the mapping string the Go driver parses:

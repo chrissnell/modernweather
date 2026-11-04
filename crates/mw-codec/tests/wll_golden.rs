@@ -31,6 +31,7 @@ const BROADCAST: &str = include_str!("frames/broadcast.json");
 const BROADCAST_METRIC: &str = include_str!("frames/broadcast-metric-collector.json");
 const CURRENT: &str = include_str!("frames/current-conditions.json");
 const AGRI_FRAME: &str = include_str!("frames/current-conditions-agricultural.json");
+const TWO_TRANSMITTERS: &str = include_str!("frames/current-conditions-two-transmitters.json");
 const REAL_TIME: &str = include_str!("frames/real-time.json");
 const DEVICE_ERROR: &str = include_str!("frames/device-error.json");
 
@@ -177,6 +178,42 @@ fn the_agricultural_station_lands_on_its_four_soil_and_two_leaf_channels() {
     near(r.day_rain, 0.17); // 17 tips of 0.01 in
     near(r.in_temp, 66.4);
     near(r.barometer, 30.112);
+}
+
+/// **The ordering rule, end to end through `Codec::decode`.** Three configured T/H
+/// transmitters; the middle one is present in the payload with null fields, which is what a
+/// WeatherLink Live reports for a configured transmitter it has not heard from
+/// (`rx_state: 2`).
+///
+/// The assertion that matters is the third one: a dropout must NOT promote a later sensor
+/// into `outtemp`, and must NOT renumber the ones after it. Go's counter increments on a
+/// matched *record* rather than on a populated *value*, so the slots are stable across a
+/// dropout — and this is the test that pins it, because every other assertion about
+/// `extratemp*` in this file is a `None`.
+#[test]
+fn a_dropped_transmitter_does_not_renumber_the_temperature_columns() {
+    let r = one("th:1, th:2, th:3", TWO_TRANSMITTERS).values;
+    // Index 0: the outdoor sensor, with the three values only index 0 carries.
+    near(r.out_temp, 58.4);
+    near(r.out_humidity, 71.0);
+    near(r.extra_float1, 49.3); // dew point
+    near(r.extra_float2, 52.8); // wet bulb
+    near(r.heat_index, 58.4);
+    // Index 1: present, silent. A gap, not a value borrowed from somewhere else.
+    assert_eq!(r.extra_temp1, None, "a silent transmitter stores nothing");
+    assert_eq!(r.extra_humidity1, None);
+    // Index 2: the third transmitter, still in ITS slot.
+    near(r.extra_temp2, 39.9);
+    near(r.extra_humidity2, 88.0);
+    assert_eq!(r.extra_temp3, None, "there is no fourth sensor");
+
+    // And the converse case, which is the one that does not consume an index: a `th` entry
+    // that matches NO record at all. `th:4` is configured and absent, so `th:3` is still
+    // index 1 rather than index 2.
+    let r = one("th:1, th:4, th:3", TWO_TRANSMITTERS).values;
+    near(r.out_temp, 58.4);
+    near(r.extra_temp1, 39.9);
+    assert_eq!(r.extra_temp2, None);
 }
 
 #[test]

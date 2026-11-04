@@ -1676,6 +1676,7 @@ The handful of numbers that matter:
 | `mw_component_state` | gauge | `component`, `state` | one series per state, so "how long has it been Waiting" is a query |
 | `mw_component_ticks_total` | counter | `component`, `outcome` | with `skipped_total`, `deadline_exceeded_total`, `misfired_total`, `failed_total`, `restart_total`, `lagged_total` — exactly W2a Decision 20's list |
 | `mw_http_requests_total`, `mw_http_request_seconds` | counter, histogram | `route`, `status` | `route` is the **matched pattern**, never the URI |
+| `mw_station_frames_total` | counter | `component`, `outcome` | **a frame that never became a reading** — a datagram from a device nobody configured, a body that is not the API's, an empty record set. `mw_readings_*` is emitted from `admit` and cannot see these, and `mw_component_ticks_total` counts occurrences rather than frames. `outcome` is a closed enum (`mw_station::metrics::FrameOutcome`) and `component` is a component id, so §5.10's cardinality rule holds. Added by implementation-plan.md M3-1 |
 
 **Cardinality is bounded by construction and that is a rule, not an observation**: every label is a
 station id, a component id, a route pattern or a closed enum. A label whose values come from a

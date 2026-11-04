@@ -404,6 +404,15 @@ fn dechunk(body: &[u8]) -> Result<Option<Vec<u8>>, &'static str> {
         let size_text = std::str::from_utf8(size_text).map_err(|_| "a chunk size is not text")?;
         let size = usize::from_str_radix(size_text.trim(), 16)
             .map_err(|_| "a chunk size is not hexadecimal")?;
+        // `ffffffffffffffff` parses, and `at + size + 2` below then overflows -- which
+        // panics in a debug build and, in a release build, wraps past the length check and
+        // panics on the slice instead. A peer that can answer on the device's address would
+        // therefore turn a classified, retryable `Malformed` into "the component body
+        // panicked", with no device and no rule named. Refused against the body cap, which
+        // is the bound the rest of this module already works to.
+        if size > MAX_BODY_BYTES {
+            return Err("a chunk is larger than this client will read");
+        }
         at += eol + 2;
         if size == 0 {
             // The trailer section, then the final blank line. Trailers are not read: no
@@ -555,6 +564,17 @@ mod tests {
             b"hi".to_vec()
         );
         assert!(dechunk(b"zz\r\n").is_err(), "a non-hexadecimal chunk size");
+        // The arithmetic a hostile chunk header reaches. Both of these used to panic --
+        // `attempt to add with overflow` in debug, and a slice-index panic in release,
+        // where the wrapped sum slips past the length check.
+        for hostile in [
+            &b"ffffffffffffffff\r\nxx\r\n0\r\n\r\n"[..],
+            &b"ffffffff\r\nxx\r\n"[..],
+            &b"7fffffffffffffff\r\n"[..],
+        ] {
+            let e = dechunk(hostile).expect_err("a chunk larger than the cap");
+            assert_eq!(e, "a chunk is larger than this client will read");
+        }
     }
 
     #[tokio::test]

@@ -42,9 +42,19 @@
 //! cannot hand it a port. The Go driver takes the port from the API response and restarts
 //! its receiver when it changes, which is a component reconfiguring another component at
 //! run time. Here the listener binds `transport_port` and the re-arm *checks* that the unit
-//! agrees, logging and counting a disagreement with the column to change. A unit that
-//! reports a different port is then a configuration error an operator can see, rather than
-//! a socket that moved without anybody asking.
+//! agrees, **logging** a disagreement and naming the column to change. A unit that reports
+//! a different port is then a configuration error an operator can see, rather than a socket
+//! that moved without anybody asking.
+//!
+//! It is logged and **not counted**, and that is a gap rather than a decision. §5.10's rule
+//! is that an operator alerts on a number, and a silently-wrong broadcast port is exactly
+//! the "station that reports nothing" this driver exists to make visible — so a counter is
+//! the better surface. What stopped it being added here is that the one series this crate
+//! owns is `mw_station_frames_total{component, outcome}` and the re-arm handles no frames,
+//! so it would be a second series for an event that fires at most once per occurrence
+//! period. The right home is a per-occurrence outcome on `ComponentControl`'s surface,
+//! which is W5's to render; recorded here so the next reader does not take the absence for
+//! a judgement.
 
 use std::collections::BTreeMap;
 use std::fmt;

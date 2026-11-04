@@ -7,6 +7,7 @@
 //! 4. cfg = Config::load(&pool)
 //! 4a. assert the database version                 <- D-62, after the pool, before plan()
 //! 4b. open the spool                              <- the fan-out, the second root (D-30a)
+//! 4c. registry + ingress                          <- `config:sqlite` has no work item
 //! 5. specs = plan(&cfg, registrars)               pure; every structural error caught here
 //! 6. supervisor = Supervisor::new(pool.schedule_store(), log_control, ...)
 //! 6a. bind the listener                           <- NOT in §3.1; see below
@@ -116,9 +117,12 @@ fn attach_ingress(cfg: &mut Config, fanout: &spool::Fanout) -> anyhow::Result<()
     // The receivers a `Fixed` frame resolves through, minted by the registrar that minted
     // the component ids -- so the registry and the plan cannot disagree about what a
     // component is called.
+    // A `StationPlanError`, so this reads as the configuration rejection it is rather than
+    // as a failure to assemble a pipeline: `fixed_receivers` can refuse a station key that
+    // cannot name a component, which is a structural error step 5 would otherwise report.
     let receivers = mw_station::fixed_receivers(cfg)
         .map_err(|e| anyhow::anyhow!("{}", mw_types::DisplayChain(&e)))
-        .context("deriving the components identity resolution answers through")?;
+        .context("the station configuration is not usable")?;
     let snapshot = mw_store::RegistrySnapshot::new(
         &cfg.stations,
         receivers.iter().map(|r| (&r.component, &r.station)),
@@ -129,6 +133,21 @@ fn attach_ingress(cfg: &mut Config, fanout: &spool::Fanout) -> anyhow::Result<()
         receivers = snapshot.receivers(),
         "station registry published"
     );
+    // A station carrying `ingest_secret_hash` resolves to `Reject::BadSecret` on every
+    // frame until M6-1 brings the driver that verifies one (`mw_store::registry`). That is
+    // the correct answer and an invisible one: the counter only moves when the station
+    // sends something, so a hash pasted onto the wrong row is a station that reports
+    // nothing with nothing anywhere naming it. Said once, at startup, where an operator
+    // reading the boot log can act on it.
+    for station in snapshot.unverifiable_secrets() {
+        warn!(
+            %station,
+            "this station has an ingest secret configured and no driver in this build can \
+             verify one, so every reading from it will be refused. \
+             implementation-plan.md M6-1 adds the driver that presents one; until then, \
+             clear `ingest_secret_hash` for a station that does not need it."
+        );
+    }
     let registry: Arc<dyn mw_component::StationRegistry> =
         Arc::new(mw_store::ConfigRegistry::new(snapshot));
     cfg.set_ingress(Arc::new(mw_pipeline::SpoolIngress::new(

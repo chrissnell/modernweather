@@ -51,27 +51,25 @@ impl StationIdentity {
     /// The spellings are the schema's `CHECK` list, so a value this rejects is a value that
     /// `CHECK` would have rejected on the way in.
     pub fn parse(kind: &str) -> Result<Self, IdentityError> {
-        match kind {
-            "fixed" => Ok(StationIdentity::Fixed),
-            "from_path" => Ok(StationIdentity::FromPath),
-            "from_query" => Ok(StationIdentity::FromQuery),
-            "from_payload" => Ok(StationIdentity::FromPayload),
-            "from_registration" => Ok(StationIdentity::FromRegistration),
-            other => Err(IdentityError {
-                kind: other.to_string(),
+        // Through `mw_component::IdentitySource`'s mapping, which is where the column's
+        // spellings live: `mw-store`'s registry needs the same mapping and may not name
+        // this crate, so a second copy here is a copy that can disagree about which
+        // strategy authenticated a reading.
+        match IdentitySource::from_schema_name(kind) {
+            Some(IdentitySource::Fixed) => Ok(StationIdentity::Fixed),
+            Some(IdentitySource::FromPath) => Ok(StationIdentity::FromPath),
+            Some(IdentitySource::FromQuery) => Ok(StationIdentity::FromQuery),
+            Some(IdentitySource::FromPayload) => Ok(StationIdentity::FromPayload),
+            Some(IdentitySource::FromRegistration) => Ok(StationIdentity::FromRegistration),
+            None => Err(IdentityError {
+                kind: kind.to_string(),
             }),
         }
     }
 
     /// The `identity_kind` value this is.
     pub const fn as_str(self) -> &'static str {
-        match self {
-            StationIdentity::Fixed => "fixed",
-            StationIdentity::FromPath => "from_path",
-            StationIdentity::FromQuery => "from_query",
-            StationIdentity::FromPayload => "from_payload",
-            StationIdentity::FromRegistration => "from_registration",
-        }
+        self.source().schema_name()
     }
 
     /// The declarative half, for the shape `plan()` checks

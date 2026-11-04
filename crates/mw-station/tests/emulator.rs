@@ -317,7 +317,10 @@ async fn the_poll_driver_produces_a_reading_on_every_occurrence() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs a Go toolchain; run through `cargo xtask emulator-tests`"]
 async fn a_refusal_carrying_two_hundred_fails_the_re_arm() {
-    let emulator = Emulator::start(&[]).await;
+    // The cadence is this test's to declare, not the emulator's to assume: a number hidden
+    // in the emulator would shift the moment anything retried inside `Rearm::arm`, and
+    // would then break the other tests for a reason their output would not show.
+    let emulator = Emulator::start(&["-refuse-arming-every", "5"]).await;
     let rearm = Rearm::new(
         emulator.endpoint(),
         emulator.udp,
@@ -345,6 +348,52 @@ async fn a_refusal_carrying_two_hundred_fails_the_re_arm() {
     );
     // The sixth succeeds, which is what makes the refusal a transient rather than a wall.
     rearm.arm().await.expect("the sixth arming succeeds");
+}
+
+/// **DEV-8's corrective, against a device that triggers it.** A unit with no `rain_size`
+/// in its records: a tip count cannot become a depth without one, so rainfall must be
+/// absent rather than stored as a count.
+///
+/// This is the one assertion in the file that the codec's own golden tests could not make
+/// about a *device* — they pin the decoder against a fixture, and this pins it against a
+/// unit that really omits the field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a Go toolchain; run through `cargo xtask emulator-tests`"]
+async fn a_unit_that_reports_no_collector_size_stores_no_rainfall() {
+    let emulator = Emulator::start(&["-always-broadcast", "-rain-size", "0"]).await;
+    let ingress = RecordingIngress::accepting();
+    let component = ComponentId::new(format!("station:wll:udp:{}", emulator.udp))
+        .expect("a port makes a valid id");
+    let listener = Box::new(BroadcastListener::new(
+        emulator.udp,
+        None,
+        [BroadcastUnit {
+            serial: SERIAL.to_string(),
+            station: StationKey::new("suncrest:roof"),
+            codec: codec(),
+        }],
+        Arc::clone(&ingress) as Arc<dyn Ingress>,
+    ));
+    let (context, token) = cx(&component);
+    #[allow(clippy::disallowed_methods)]
+    let serving = tokio::task::spawn(listener.serve(context));
+
+    until("three datagrams", || ingress.readings() >= 3).await;
+    for admission in ingress.admissions() {
+        let reading = &admission.batch[0].values;
+        // The datagram still carries the tip counts, and the reading still carries wind --
+        // so this is a reading that was admitted, with the rain deliberately absent from
+        // it rather than a reading that failed to decode.
+        assert!(reading.wind_speed.is_some(), "the datagram decoded");
+        assert_eq!(
+            reading.day_rain, None,
+            "a tip count with no collector size is not a depth (D-26)"
+        );
+        assert_eq!(reading.rain_rate, None);
+    }
+
+    token.cancel();
+    let _ = tokio::time::timeout(DEADLINE, serving).await;
 }
 
 /// A unit broadcasting on a port this node is not listening on, and a node listening for a

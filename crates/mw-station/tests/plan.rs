@@ -384,6 +384,49 @@ async fn an_identity_strategy_this_driver_cannot_use_is_refused() {
     assert!(e.to_string().contains("from_payload"), "{e}");
 }
 
+/// `transport_host` is a free-text column, and the one thing a misused host column holds
+/// is a URL — which is where a credential hides.
+#[tokio::test]
+async fn a_host_column_holding_more_than_a_host_is_refused_without_quoting_it() {
+    for (what, host) in [
+        ("a scheme", "http://192.168.1.50"),
+        ("a path", "192.168.1.50/v1/real_time"),
+        ("a port", "192.168.1.50:8080"),
+    ] {
+        let mut row = broadcast("roof", "001D0A700002", 22222, None);
+        row.transport.as_mut().expect("a transport").host = Some(host.to_string());
+        let e = register(&Cfg::new(vec![row])).expect_err(what);
+        assert!(matches!(e, StationPlanError::Host { .. }), "{what}: {e}");
+        assert!(e.to_string().contains("transport_host"), "{what}: {e}");
+    }
+    // The one that matters: a credential is refused and never quoted back.
+    let mut row = broadcast("roof", "001D0A700002", 22222, None);
+    row.transport.as_mut().expect("a transport").host = Some("admin:hunter2@1.2.3.4".into());
+    let e = register(&Cfg::new(vec![row])).expect_err("a credential in a host column");
+    let text = mw_types::DisplayChain(&e).to_string();
+    assert!(!text.contains("hunter2"), "{text}");
+}
+
+/// `fixed_receivers` must not name a component `register` would refuse to emit.
+#[tokio::test]
+async fn fixed_receivers_applies_the_same_station_type_guard_as_register() {
+    let mut row = polled("backyard", "http://192.168.1.9");
+    row.kind = "davis".into();
+    let cfg = Cfg::new(vec![row]);
+    // `register` refuses the row outright...
+    assert!(matches!(
+        register(&cfg).expect_err("no Davis driver yet"),
+        StationPlanError::NoDriver { .. }
+    ));
+    // ... so nothing may claim a `station:wll:backyard` receiver for it. Without the guard
+    // this returned one, and was safe only because `boot.rs` happens to call `register`
+    // first.
+    assert!(
+        plan::fixed_receivers(&cfg).expect("no error").is_empty(),
+        "a station with no driver has no receiver"
+    );
+}
+
 #[tokio::test]
 async fn a_tls_address_for_a_unit_with_no_tls_listener_is_refused_at_plan_time() {
     let e = register(&Cfg::new(vec![polled("roof", "https://192.168.1.50")]))

@@ -80,20 +80,25 @@ pub(crate) fn apply(reading: &mut Reading, entry: &SensorEntry, c: &Condition, t
     }
 }
 
-/// Whether applying `entry` to `c` would populate anything at all.
+/// Apply a `th` entry at its occurrence index: 0 is outdoor, 1-7 are `extratemp1..7`.
 ///
-/// What makes a `th` entry "match a record" for the ordering rule: the Go transformer
-/// increments its counter only after `applyTempHumidity` ran, and `applyTempHumidity` runs
-/// only when `findCondition` returned a record — so a configured outdoor sensor whose
-/// transmitter is silent does not push the next one into its slot. Reproduced exactly,
-/// because the alternative would renumber every extra temperature on a dropped
-/// transmitter.
-pub(crate) fn populates(entry: &SensorEntry, c: &Condition) -> bool {
-    let mut probe = Reading::default();
-    apply(&mut probe, entry, c, 0);
-    probe != Reading::default()
-}
-
+/// **The index is consumed when the entry matched a record, not when the record carried a
+/// value**, and the distinction is load-bearing. The Go transformer increments its counter
+/// immediately after `applyTempHumidity` returns (`data_transformer.go:30`), and
+/// `applyTempHumidity`'s `if tempC != nil` guards are *inside* it -- so a configured
+/// transmitter that is present in the payload with null fields still consumes its slot.
+///
+/// That is the behaviour to reproduce, and reproducing it is not merely fidelity. A
+/// WeatherLink Live reports a configured-but-unheard transmitter as a **present record with
+/// null fields** (`rx_state: 2`), which is what an ordinary dropout looks like. An
+/// implementation that skipped the index in that case would move the *next* `th` sensor's
+/// temperature into `outtemp` -- the most-read column on the frozen contract -- for as long
+/// as the outdoor transmitter was out of sync, and move it back when it returned. A gap is
+/// the right answer there; a plausible wrong number is not.
+///
+/// A `th` entry that matches **no** record is a different case and does not consume an
+/// index: `findCondition` returning nil makes the Go loop `continue` before the increment,
+/// and `Codec::decode` does the same.
 fn temp_humidity(reading: &mut Reading, c: &Condition, index: usize) {
     let temp = f32s(c.temp);
     let hum = f32s(c.hum);
@@ -233,8 +238,16 @@ fn battery(reading: &mut Reading, c: &Condition, txid: Option<u8>) {
 ///
 /// `f32` is the registry's `float4`, which is the column width; narrowing here rather than
 /// at the writer keeps the one lossy step in the one place that knows the column type.
+///
+/// **A non-finite value becomes `None`.** A device on a LAN is untrusted input, and
+/// `{"temp": -1e39}` narrows to `-inf`, which is a perfectly valid `float4`: it reaches the
+/// store and then poisons `mean`, `min` and `max` over every window that contains it
+/// (M3-4). Dropping it is the same choice already made for rainfall with no `rain_size` --
+/// a gap is recoverable and a poisoned aggregate is not -- and it is **D-26**'s rule read in
+/// the only direction that makes sense here: a value the instrument cannot have produced is
+/// not a reading.
 fn f32s(value: Option<f64>) -> Option<f32> {
-    value.map(|n| n as f32)
+    value.map(|n| n as f32).filter(|n| n.is_finite())
 }
 
 /// The payload's `i64` as the domain type's `i32`, saturating.
@@ -339,16 +352,68 @@ mod tests {
         assert_eq!(r, Reading::default());
     }
 
+    /// The index accounting the Go transformer has, stated as the case that distinguishes
+    /// it from the obvious wrong answer: a present record with null fields.
     #[test]
-    fn populates_is_false_for_a_record_the_entry_cannot_read() {
-        let empty = Condition::default();
-        assert!(!populates(&entry("th:1"), &empty));
-        let wind = Condition {
-            wind_speed_last: Some(0.0),
+    fn a_present_record_with_null_fields_still_consumes_its_th_index() {
+        let silent = Condition {
+            data_structure_type: Some(1),
+            txid: Some(1),
+            // `rx_state: 2` -- configured, not heard from. The record is there; the values
+            // are not.
             ..Condition::default()
         };
-        // Zero is a reading, not an absence: `Some(0.0)` differs from `Reading::default()`.
-        assert!(populates(&entry("wind:1"), &wind));
+        let mut r = Reading::default();
+        apply(&mut r, &entry("th:1"), &silent, 0);
+        assert_eq!(
+            r,
+            Reading::default(),
+            "nothing to store from a silent sensor"
+        );
+        // ... and the next entry is therefore index 1, not index 0.
+        let reporting = Condition {
+            data_structure_type: Some(1),
+            txid: Some(2),
+            temp: Some(44.0),
+            hum: Some(80.0),
+            ..Condition::default()
+        };
+        apply(&mut r, &entry("th:2"), &reporting, 1);
+        assert_eq!(r.extra_temp1, Some(44.0));
+        assert_eq!(
+            r.out_temp, None,
+            "the outdoor column stays empty rather than taking the extra sensor's value"
+        );
+    }
+
+    /// A device on a LAN is untrusted input, and `float4` has room for an infinity.
+    #[test]
+    fn a_value_the_instrument_cannot_have_produced_is_not_a_reading() {
+        let hostile = Condition {
+            temp: Some(-1e39),
+            hum: Some(f64::NAN),
+            rain_size: Some(1),
+            rainfall_daily: Some(1e308),
+            ..Condition::default()
+        };
+        let mut r = Reading::default();
+        apply(&mut r, &entry("th:1"), &hostile, 0);
+        apply(&mut r, &entry("rain:1"), &hostile, 0);
+        assert_eq!(
+            r.out_temp, None,
+            "-1e39 narrows to -inf, which is not a reading"
+        );
+        assert_eq!(r.out_humidity, None, "nor is NaN");
+        assert_eq!(r.day_rain, None, "nor is an overflowing rain total");
+        // A finite value at the edge of `f32` still gets through: the filter is about
+        // representability, not about plausibility, which is the enrich stage's question.
+        let edge = Condition {
+            temp: Some(-40.0),
+            ..Condition::default()
+        };
+        let mut r = Reading::default();
+        apply(&mut r, &entry("th:1"), &edge, 0);
+        assert_eq!(r.out_temp, Some(-40.0));
     }
 
     #[test]

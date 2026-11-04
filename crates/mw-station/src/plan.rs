@@ -174,6 +174,16 @@ pub enum StationPlanError {
         identity: &'static str,
     },
 
+    /// `transport_host` is not a bare host.
+    #[error("station `{station}`: `transport_host` {source}")]
+    Host {
+        /// Which station.
+        station: String,
+        /// Why.
+        #[source]
+        source: crate::endpoint::EndpointError,
+    },
+
     /// A WeatherLink Live over TLS, which does not exist.
     #[error(
         "station `{station}` is configured as `https`: a WeatherLink Live's local API is \
@@ -321,7 +331,16 @@ where
                 // A unit this node arms as well as listens to. `transport_host` absent is a
                 // unit something else arms, which is a configuration and not a mistake.
                 if let Some(host) = columns.host.as_deref().filter(|h| !h.is_empty()) {
-                    out.push(rearm_spec(row, Endpoint::http(host), *port, &station)?);
+                    // Through `bare_host` and not `Endpoint::http`: `transport_host` is a
+                    // free-text column, and a value with a scheme, a port or -- the one
+                    // that matters -- a credential in it would otherwise become the host
+                    // verbatim and be printed back in every request error.
+                    let endpoint =
+                        Endpoint::bare_host(host).map_err(|source| StationPlanError::Host {
+                            station: row.key.clone(),
+                            source,
+                        })?;
+                    out.push(rearm_spec(row, endpoint, *port, &station)?);
                 }
             }
             Transport::HttpOut { url, method, auth } => {
@@ -376,6 +395,14 @@ where
             }
         })?;
         if identity != StationIdentity::Fixed {
+            continue;
+        }
+        // The same guard `register` applies, and for the same reason: without it a `davis`
+        // row with `fixed`/`http_out` yields a receiver whose component is
+        // `station:wll:<key>` -- an id `register` refuses to emit. It is safe today only
+        // because `boot.rs` calls `register` first and aborts on its error, and a
+        // correctness that depends on call order is one a later edit breaks silently.
+        if row.kind != wll::STATION_TYPE {
             continue;
         }
         let columns = row.transport.as_ref().expect("a collected station");

@@ -443,11 +443,19 @@ and HTTP) feeding one codec family plus an outbound re-arm that is its own `Ever
 at 360 test lines.
 **Done when:** a WLL station configured in the config database produces readings; the codec is pure
 (no `tokio`, no clock, no socket — enforced by the layout gate) and passes golden tests against
-captured frames.
+captured frames; and **DEV-8 is recorded in `docs/reconciliation.md` §3 and acknowledged by the
+owner** — the Go driver stores Celsius in a `degF` column, hPa in an `inHg` column and rain tip
+counts in inch columns, so correcting it changes what an existing WeatherLink Live series means and
+no gate can see it (the same carrier M1-6 has for DEV-7).
 **Test strategy:** the three levels W3 D-82 specifies — pure codec against captured frames, `Session`
-against a recorded transcript, and the whole driver against the pinned Go emulator. **The transcript
-level is the one that matters**: it is what would have caught the Davis "stops polling after one
-batch" defect. `tests/emulators/manifest.toml` is created here, which arms `driver-emulators` — an
+against a recorded transcript, and the whole driver against a Go emulator. **The transcript level is
+the one that matters**: it is what would have caught the Davis "stops polling after one batch" defect.
+For a driver with no `Session` — which WeatherLink Live is, and every inbound driver is (W2a §4a.2) —
+that level is *a recorded sequence of transport output*, and the assertion is the same one: every
+frame in the sequence produces a reading, not only the first.
+**The emulator is not necessarily the pinned reference tree's**: it has none for WeatherLink Live, so
+M3-1's lives in this repository and `tests/emulators/manifest.toml` records what that costs against
+D-40. See **O-13**. `tests/emulators/manifest.toml` is created here, which arms `driver-emulators` — an
 explicit deliverable per **D-64**, so that gate does not become a second G-1.
 **Constraint from another document:** discovery uses an **in-process mDNS client**, not `getaddrinfo`
 of a `.local` name. This follows from D-43's static-musl linkage — musl's resolver supports neither

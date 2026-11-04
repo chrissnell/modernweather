@@ -38,4 +38,5 @@ mod wll;
 pub use frame::{Codec, CodecError, Frame};
 pub use wll::{
     real_time, Broadcast, MappingError, SensorEntry, SensorMapping, SensorRole, WllConditions,
+    MAX_DSN_BYTES,
 };

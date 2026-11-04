@@ -55,6 +55,15 @@ type emulator struct {
 	udpPort  int
 	conn     *net.UDPConn
 	requests map[string]int
+	// Refuse every Nth arming, or never when zero. A flag rather than a constant: the test
+	// that drives the refusal depends on WHICH attempt is refused, so a number nothing
+	// declares is hidden coupling -- any future retry inside `Rearm::arm` would shift it
+	// and break the other tests for a reason their output would not show.
+	refuseEvery int
+	// The rain collector code to report, or zero to omit `rain_size` entirely. Omitting it
+	// is the case DEV-8's corrective turns on: with no collector size a tip count cannot
+	// become a depth, and the driver must store NULL rather than the count.
+	rainSize int
 }
 
 // condition is one `conditions` record. Every field is a pointer so that an absent sensor
@@ -119,12 +128,24 @@ type realTimeData struct {
 }
 
 type realTimeResponse struct {
-	Data  realTimeData `json:"data"`
-	Error *apiError    `json:"error"`
+	// A pointer, so a refusal serialises `"data":null` the way a real unit does rather than
+	// a zero-valued object. The emulator level is the level that is supposed to show what
+	// the device sends, not what the decoder tolerates.
+	Data  *realTimeData `json:"data,omitempty"`
+	Error *apiError     `json:"error"`
 }
 
 func f(v float64) *float64 { return &v }
 func i(v int) *int         { return &v }
+
+// rainSizeOrNil omits `rain_size` when the flag is zero, so the field is absent from the
+// JSON rather than present and zero.
+func rainSizeOrNil(size int) *int {
+	if size == 0 {
+		return nil
+	}
+	return &size
+}
 
 // iss builds the Integrated Sensor Suite record. The values move, so a driver that
 // admitted one reading and then stopped is visibly different from one that keeps up.
@@ -147,7 +168,7 @@ func (e *emulator) iss(now time.Time) condition {
 		WindSpeedLast:         f(round(wind)),
 		WindDirLast:           i(int(280 + 20*math.Sin(phase/5))),
 		WindSpeedAvgLast10Min: f(round(wind - 0.5)),
-		RainSize:              i(rainSize),
+		RainSize:              rainSizeOrNil(e.rainSize),
 		RainRateLast:          f(0),
 		RainfallDaily:         f(12),
 		SolarRad:              i(int(700 + 40*math.Sin(phase/11))),
@@ -232,17 +253,19 @@ func (e *emulator) handleRealTime(w http.ResponseWriter, r *http.Request) {
 	if duration > 3600 {
 		duration = 3600
 	}
-	// Every fifth arming is refused with a 200 and a populated `error`, which is what a
-	// unit does when another client already holds the broadcast. A client that read the
-	// status line and not the body would treat it as success and listen to silence.
-	if n%5 == 0 {
+	// Refused with a 200 and a populated `error`, which is what a unit does when another
+	// client already holds the broadcast. A client that read the status line and not the
+	// body would treat it as success and listen to silence.
+	if e.refuseEvery > 0 && n%e.refuseEvery == 0 {
 		writeJSON(w, realTimeResponse{Error: &apiError{Code: 409, Message: "Request Rejected"}})
 		return
 	}
 	e.mu.Lock()
 	e.armedTo = time.Now().Add(time.Duration(duration) * time.Second)
 	e.mu.Unlock()
-	writeJSON(w, realTimeResponse{Data: realTimeData{BroadcastPort: e.udpPort, Duration: duration}})
+	writeJSON(w, realTimeResponse{
+		Data: &realTimeData{BroadcastPort: e.udpPort, Duration: duration},
+	})
 }
 
 func (e *emulator) armed() bool {
@@ -271,6 +294,10 @@ func main() {
 	serial := flag.String("serial", defaultSerial, "the device serial to report")
 	alwaysBroadcast := flag.Bool("always-broadcast", false,
 		"broadcast without waiting to be armed, for a listener-only test")
+	refuseEvery := flag.Int("refuse-arming-every", 0,
+		"refuse every Nth arming with a 200 carrying an error body; 0 never refuses")
+	rainSizeFlag := flag.Int("rain-size", rainSize,
+		"the rain collector code to report (1=0.01in 2=0.2mm 3=0.1mm 4=0.001in); 0 omits it")
 	flag.Parse()
 
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", *httpPort))
@@ -300,12 +327,14 @@ func main() {
 	}
 
 	e := &emulator{
-		serial:   *serial,
-		started:  time.Now(),
-		udpPort:  target,
-		udpAddr:  &net.UDPAddr{IP: net.ParseIP(*udpHost), Port: target},
-		conn:     conn,
-		requests: map[string]int{},
+		serial:      *serial,
+		started:     time.Now(),
+		udpPort:     target,
+		udpAddr:     &net.UDPAddr{IP: net.ParseIP(*udpHost), Port: target},
+		conn:        conn,
+		requests:    map[string]int{},
+		refuseEvery: *refuseEvery,
+		rainSize:    *rainSizeFlag,
 	}
 	if *alwaysBroadcast {
 		e.armedTo = time.Now().Add(24 * time.Hour)
@@ -316,15 +345,28 @@ func main() {
 	mux.HandleFunc("/v1/real_time", e.handleRealTime)
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
+	// One channel for the signal, and a SECOND that is CLOSED when it arrives.
+	//
+	// `stop` alone was a bug: a signal is one send, and two goroutines received from it --
+	// the broadcast loop below and the shutdown goroutine further down. Whichever won took
+	// the signal, so about a third of the time the broadcast loop consumed it, returned,
+	// and the shutdown goroutine never ran: `server.Serve` blocked forever and the process
+	// stayed up on Ctrl-C. A closed channel wakes every receiver, which is what "shut down"
+	// has to mean when more than one goroutine is listening.
 	stop := make(chan os.Signal, 1)
+	done := make(chan struct{})
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-stop
+		close(done)
+	}()
 
 	go func() {
 		ticker := time.NewTicker(*interval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-stop:
+			case <-done:
 				return
 			case now := <-ticker.C:
 				if !e.armed() {
@@ -345,7 +387,7 @@ func main() {
 	os.Stdout.Sync()
 
 	go func() {
-		<-stop
+		<-done
 		_ = server.Close()
 		_ = e.conn.Close()
 	}()

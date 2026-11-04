@@ -51,6 +51,18 @@ pub struct StationEntry {
     pub station: StationKey,
     /// Whether the operator has switched collection on.
     pub enabled: bool,
+    /// How this station is configured to be identified.
+    ///
+    /// Checked against the strategy the frame arrived under. W2a §4a.6 writes the gate as
+    /// `resolve(meta, id: &StationIdentity, reg)` — the configured strategy is a *separate
+    /// argument* — and describes a **per-transport** allow-list: "the station set is an
+    /// allow-list from the registry" for `UdpIn`, "topic → station from the registry
+    /// allow-list" for `MqttSub`. A single map keyed on the claim alone collapses those
+    /// into one namespace, so an `?ID=` could resolve a WeatherLink Live's DSN and a topic
+    /// segment could resolve an Ambient id. Nothing exploits that today — WeatherLink Live
+    /// is the only driver — but this is the authentication gate, and one field now is
+    /// cheaper than auditing three drivers later.
+    pub identity: IdentitySource,
     /// Whether the protocol presents a secret that has to be verified.
     pub has_secret: bool,
 }
@@ -82,9 +94,15 @@ impl RegistrySnapshot {
         let mut entries: BTreeMap<&str, StationEntry> = BTreeMap::new();
         let mut by_claim = BTreeMap::new();
         for row in rows {
+            // A column value its own `CHECK` would reject means this build and its schema
+            // disagree. `Fixed` is the safe reading: it is the strategy that resolves by
+            // receiver, so the row simply never matches a presented claim.
+            let identity = IdentitySource::from_schema_name(&row.identity_kind)
+                .unwrap_or(IdentitySource::Fixed);
             let entry = StationEntry {
                 station: StationKey::new(row.station_key.as_str()),
                 enabled: row.enabled,
+                identity,
                 has_secret: row
                     .ingest_secret_hash
                     .as_deref()
@@ -123,6 +141,18 @@ impl RegistrySnapshot {
     pub fn receivers(&self) -> usize {
         self.by_receiver.len()
     }
+
+    /// The stations carrying a secret nothing can verify yet, for the startup warning.
+    ///
+    /// See [`ConfigRegistry::admit`]: such a station resolves to `BadSecret` on every
+    /// frame, which is the right answer and an invisible one until traffic arrives.
+    pub fn unverifiable_secrets(&self) -> Vec<&StationKey> {
+        self.by_claim
+            .values()
+            .filter(|e| e.has_secret)
+            .map(|e| &e.station)
+            .collect()
+    }
 }
 
 /// The `StationRegistry` the daemon runs on.
@@ -152,7 +182,15 @@ impl ConfigRegistry {
         self.snapshot.load_full()
     }
 
-    fn admit(entry: &StationEntry) -> Result<StationKey, Reject> {
+    fn admit(entry: &StationEntry, source: IdentitySource) -> Result<StationKey, Reject> {
+        // The configured strategy has to be the one the frame arrived under. Without this,
+        // `by_claim` is one global namespace across every non-`Fixed` strategy and a frame
+        // from one transport can resolve another transport's station (see
+        // `StationEntry::identity`). `UnknownStation` rather than a new reason: from the
+        // gate's point of view there is no station with that claim on that transport.
+        if entry.identity != source {
+            return Err(Reject::UnknownStation);
+        }
         if !entry.enabled {
             return Err(Reject::Disabled);
         }
@@ -162,10 +200,16 @@ impl ConfigRegistry {
             // hash (W2a §4a.6, **D-33**) -- and that verification is Argon2, which costs
             // ~100 ms by design and therefore has to be reconciled with **D-87**'s "no I/O
             // and nothing slow on the admit path" before it goes here. That is M6-1's, with
-            // the driver that presents a secret. Until then no plannable component can
-            // present one (`mw_station::plan` refuses every type but WeatherLink Live), so
-            // this branch is unreachable in a running daemon -- and refusing is still the
-            // right answer, because the alternative is a configured secret that is ignored.
+            // the driver that presents a secret.
+            //
+            // **Reachable, not unreachable.** Nothing ties `ingest_secret_hash` to
+            // `identity_kind`, so a hash pasted onto a WeatherLink Live row is a row the
+            // schema accepts and `plan()` does not look at: the listener binds, the daemon
+            // reports ready, and every datagram is counted `bad_secret` with nothing naming
+            // the station. The counter alone only moves when traffic arrives, so
+            // `crates/modernweather/src/boot.rs` warns once per such row at startup
+            // instead. Refusing is still the right answer -- the alternative is a
+            // configured secret that is silently ignored.
             return Err(Reject::BadSecret);
         }
         Ok(entry.station.clone())
@@ -180,8 +224,8 @@ impl StationRegistry for ConfigRegistry {
                 .by_receiver
                 .get(&meta.receiver)
                 .ok_or(Reject::UnknownStation)
-                .and_then(Self::admit),
-            _ => {
+                .and_then(|entry| Self::admit(entry, IdentitySource::Fixed)),
+            source => {
                 let claim = meta
                     .presented_key
                     .as_deref()
@@ -191,7 +235,7 @@ impl StationRegistry for ConfigRegistry {
                     .by_claim
                     .get(&claim)
                     .ok_or(Reject::UnknownStation)
-                    .and_then(Self::admit)
+                    .and_then(|entry| Self::admit(entry, source))
             }
         }
     }
@@ -316,6 +360,45 @@ mod tests {
         assert_eq!(registry.resolve(&other), Err(Reject::UnknownStation));
     }
 
+    /// A frame must not resolve a station configured for a different identity strategy.
+    ///
+    /// `by_claim` is one map, so without the strategy check an Ambient `?ID=` could resolve
+    /// a WeatherLink Live's DSN — one namespace across every transport, which is not the
+    /// per-transport allow-list §4a.6 specifies.
+    #[test]
+    fn a_claim_does_not_resolve_a_station_configured_for_another_strategy() {
+        let registry = registry();
+        for source in [
+            IdentitySource::FromQuery,
+            IdentitySource::FromPath,
+            IdentitySource::FromRegistration,
+        ] {
+            let meta = FrameMeta::presenting(
+                id("station:ambient"),
+                source,
+                // The broadcasting station's serial, presented on the wrong transport.
+                "001D0A700002",
+                at(),
+            );
+            assert_eq!(
+                registry.resolve(&meta),
+                Err(Reject::UnknownStation),
+                "{source} resolved a from_payload station"
+            );
+        }
+        // ... and the strategy it IS configured for still resolves.
+        let meta = FrameMeta::presenting(
+            id("station:wll:udp:22222"),
+            IdentitySource::FromPayload,
+            "001D0A700002",
+            at(),
+        );
+        assert_eq!(
+            registry.resolve(&meta).expect("resolves").as_str(),
+            "suncrest:roof"
+        );
+    }
+
     /// The claim and the receiver are separate lookups: a `Fixed` frame must not resolve by
     /// accidentally matching a serial, and a presented claim must not resolve by matching a
     /// component id.
@@ -354,6 +437,11 @@ mod tests {
     #[test]
     fn a_station_with_a_configured_secret_is_refused_until_something_verifies_it() {
         let mut rows = vec![row("ambient:backyard", Some("KAMBIENT1"))];
+        // An Ambient station: `from_query`, because the strategy check runs first and a
+        // `from_payload` row presented on a query transport is `UnknownStation` before the
+        // secret is ever reached.
+        rows[0].identity_kind = "from_query".into();
+        rows[0].kind = "ambient-customized".into();
         rows[0].ingest_secret_hash = Some("$argon2id$v=19$...".into());
         let registry = ConfigRegistry::new(RegistrySnapshot::new(&rows, []));
         let meta = FrameMeta::presenting(

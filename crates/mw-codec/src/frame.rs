@@ -100,6 +100,20 @@ pub enum CodecError {
         message: String,
     },
 
+    /// The device answered the right shape with the wrong contents — a field the caller
+    /// needs is absent or unusable.
+    ///
+    /// Distinct from [`CodecError::NoRecords`] because the two are different sentences to an
+    /// operator. An arming response with no broadcast port used to report "the frame carries
+    /// no sensor records", which the driver then wrapped as "reading a WeatherLink Live
+    /// arming response" — so somebody debugging a broadcast that never starts got a sentence
+    /// about sensors.
+    #[error("the device's answer carries no {what}")]
+    Incomplete {
+        /// What was missing, named as the operator would name it.
+        what: &'static str,
+    },
+
     /// The frame is structurally valid and carries nothing this codec can map.
     ///
     /// Not an empty *reading* — that is admission's [`mw_component::Reject::EmptyReading`]
@@ -109,7 +123,7 @@ pub enum CodecError {
 }
 
 impl mw_types::Classify for CodecError {
-    /// All four are [`mw_types::Class::Ignorable`], and that is the whole of this impl's
+    /// All five are [`mw_types::Class::Ignorable`], and that is the whole of this impl's
     /// content: retrying a decode of the same bytes against the same codec cannot change
     /// the answer, and a frame the device sent wrong is not a failure of the component that
     /// received it (§4.4's canonical example).
@@ -139,8 +153,8 @@ pub trait Codec: fmt::Debug + Send + Sync + 'static {
     /// vendor-cloud poll both carry several observations in one frame (W2a §4a.2).
     fn decode(&self, frame: &Frame) -> Result<Vec<PartialReading>, CodecError>;
 
-    /// The station identity the payload claims, for
-    /// [`StationIdentity::FromPayload`](../../mw_station/enum.StationIdentity.html).
+    /// The station identity the payload claims, for `mw_station`'s
+    /// `StationIdentity::FromPayload`.
     ///
     /// W2a §4a.4 writes this strategy as `FromPayload(fn(&Frame) -> Option<StationKey>)`. A
     /// method on the codec rather than a function pointer beside it, because the codec is
@@ -181,6 +195,13 @@ mod tests {
     fn every_decode_failure_is_ignorable() {
         assert_eq!(CodecError::NotText.class(), Class::Ignorable);
         assert_eq!(CodecError::NoRecords.class(), Class::Ignorable);
+        assert_eq!(
+            CodecError::Incomplete {
+                what: "broadcast port"
+            }
+            .class(),
+            Class::Ignorable
+        );
         assert_eq!(
             CodecError::Device {
                 code: 409,

@@ -10,7 +10,12 @@
 //! WeatherLink Live has **no session** — both its transports deliver one frame per read
 //! (W2a §4a.2 lists the inbound drivers as exactly the ones that need none) — so what this
 //! file proves is the harness and the contract rather than a particular protocol's
-//! conversation. The fixture below is a deliberately minimal request/response session in
+//! conversation. **The level-2 artefact for the driver this item actually ships is
+//! `tests/wll_driver.rs`**, whose `every_datagram_is_admitted_and_not_only_the_first` and
+//! `every_poll_response_is_admitted_and_not_only_the_first` are the same assertion over a
+//! recorded sequence of transport output. Said here because "the transcript level" and "the
+//! level for this driver" are two files, and a reader who found only this one could
+//! reasonably conclude the delivered driver had no level-2 coverage. The fixture below is a deliberately minimal request/response session in
 //! the shape Davis needs: wake, issue a command, read a run of `n` frames, re-issue. It is
 //! a **test fixture and not the Davis driver**, which is M6-1's; what it is here for is to
 //! demonstrate that `Transcript` fails a session that stops re-issuing, so that when that
@@ -177,6 +182,12 @@ async fn a_session_that_stops_re_issuing_fails_the_transcript_and_not_the_first_
 }
 
 /// A session that writes the wrong bytes is an error from the stream, not a silent pass.
+///
+/// A *missing* write is a weaker property of this harness and worth naming: it is caught
+/// only because the test above asserts `io.exhausted()`, not because `read` refuses to hand
+/// back a chunk while a scripted write is outstanding. Making the harness enforce the
+/// ordering would turn the Davis defect from assertable into unmissable, and is the first
+/// thing to do here when M6-1 brings a driver that needs it.
 #[tokio::test]
 async fn the_transcript_refuses_a_session_that_says_the_wrong_thing() {
     let mut io = Transcript::scripted([AWAKE.to_vec()], [b"WAKE\r\n".to_vec()]);

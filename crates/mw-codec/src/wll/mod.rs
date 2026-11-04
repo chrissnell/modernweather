@@ -41,6 +41,13 @@ pub struct Broadcast {
     pub duration_seconds: i64,
 }
 
+/// The longest device serial this codec will carry as a claim.
+///
+/// A WeatherLink Live reports twelve hex characters (`001D0A700002`). The bound is on the
+/// claim and not on the frame because a claim outlives the frame: it reaches a log field
+/// through `FrameMeta`, and a resolved one reaches a metric label.
+pub const MAX_DSN_BYTES: usize = 64;
+
 /// Decode `GET /v1/real_time`'s body.
 ///
 /// The unit answers `200` with a populated `error` object rather than a status code, so a
@@ -72,7 +79,9 @@ pub fn real_time(frame: &Frame) -> Result<Broadcast, CodecError> {
     };
     // A response with no port is not a successful arming, whatever its status line said.
     let Some(port) = port.filter(|p| *p != 0) else {
-        return Err(CodecError::NoRecords);
+        return Err(CodecError::Incomplete {
+            what: "broadcast port",
+        });
     };
     Ok(Broadcast {
         port,
@@ -196,13 +205,9 @@ impl Codec for WllConditions {
             let Some(condition) = self.find(&doc.conditions, entry) else {
                 continue;
             };
-            // The ordering rule, and the reason it is a question rather than a counter:
-            // an entry that reads nothing out of the record it matched does not consume a
-            // `th` index. See `map::populates`.
+            // The ordering rule: a `th` entry consumes an index when it MATCHED A RECORD,
+            // whether or not that record populated anything. See `map::temp_humidity`.
             if entry.role == SensorRole::Th {
-                if !map::populates(entry, condition) {
-                    continue;
-                }
                 map::apply(&mut values, entry, condition, th_index);
                 th_index += 1;
             } else {
@@ -224,10 +229,21 @@ impl Codec for WllConditions {
         // Verbatim, because it is a claim: `StationRegistry::resolve` is what turns it into
         // a station, and the comparison it makes -- against `config.stations.presented_key`
         // -- is where the unit's upper-case hex and an operator's typing are reconciled.
+        //
+        // Bounded, because the input is a datagram from a LAN. A claim that does not
+        // resolve reaches a log field, and a claim that does becomes a metric label, so
+        // "verbatim" has to stop somewhere: a WeatherLink Live serial is twelve hex
+        // characters, and `MAX_DSN_BYTES` is generous against that rather than against the
+        // frame. A claim this rejects is one no `presented_key` could have matched anyway,
+        // so nothing resolvable is lost.
         self.document(frame)
             .ok()?
             .did
-            .filter(|did| !did.is_empty())
+            .filter(|did| {
+                !did.is_empty()
+                    && did.len() <= MAX_DSN_BYTES
+                    && did.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
             .map(StationKey::new)
     }
 }
@@ -399,7 +415,40 @@ mod tests {
             Err(CodecError::Device { code: 403, .. })
         ));
         let portless = Frame::new(br#"{"data":{"duration":3600}}"#.to_vec());
-        assert!(matches!(real_time(&portless), Err(CodecError::NoRecords)));
+        let e = real_time(&portless).expect_err("no port is not an arming");
+        assert_eq!(
+            e.to_string(),
+            "the device's answer carries no broadcast port",
+            "an operator debugging a broadcast that never starts reads this sentence"
+        );
+    }
+
+    /// A datagram from a LAN is untrusted input, and a claim outlives the frame it came in.
+    #[test]
+    fn a_claim_that_no_configured_station_could_match_is_not_carried() {
+        let c = codec();
+        let with_did = |did: &str| {
+            Frame::new(
+                format!(
+                    r#"{{"did":"{did}","ts":1,"conditions":[{{"data_structure_type":1,
+                       "txid":1,"temp":1.0}}]}}"#
+                )
+                .into_bytes(),
+            )
+        };
+        // A kilobyte of serial, and one with a newline in it: both would otherwise reach a
+        // log field verbatim.
+        assert!(c.claimed_station(&with_did(&"a".repeat(1024))).is_none());
+        assert!(c.claimed_station(&with_did("001D0A70\\n0002")).is_none());
+        assert!(c.claimed_station(&with_did("001D0A70 0002")).is_none());
+        // The real thing still resolves, in either case, and a hyphen is permitted because
+        // a vendor may yet use one.
+        assert_eq!(
+            c.claimed_station(&with_did("001D0A700002"))
+                .map(|k| k.as_str().to_string()),
+            Some("001D0A700002".to_string())
+        );
+        assert!(c.claimed_station(&with_did("001d-0a70-0002")).is_some());
     }
 
     #[test]

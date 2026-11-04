@@ -84,9 +84,14 @@ pub async fn socket_addr(
 /// a resolver that will certainly fail, with a message about the name rather than about the
 /// linkage.
 pub fn is_local(host: &str) -> bool {
-    let host = host.trim_end_matches('.');
+    let host = host.trim_end_matches('.').as_bytes();
+    // Over bytes, not over `&str`. `transport_host` and `transport_url` are free-text
+    // columns, so a pasted IDN name or one stray non-ASCII character puts `len() - 6`
+    // inside a multi-byte character -- and slicing a `&str` there panics. The first poll
+    // occurrence would then be a panicking component instead of the
+    // `ResolveError::System` message this module exists to produce.
     host.len() > LOCAL_SUFFIX.len()
-        && host[host.len() - LOCAL_SUFFIX.len()..].eq_ignore_ascii_case(LOCAL_SUFFIX)
+        && host[host.len() - LOCAL_SUFFIX.len()..].eq_ignore_ascii_case(LOCAL_SUFFIX.as_bytes())
 }
 
 #[cfg(test)]
@@ -102,6 +107,14 @@ mod tests {
         assert!(!is_local("local"), "the suffix is not a name");
         assert!(!is_local(".local"), "nor is a bare suffix");
         assert!(!is_local("192.168.1.50"));
+        // A non-ASCII host used to panic here: the suffix boundary lands inside a
+        // multi-byte character. `transport_host` is free text, so this is one paste away.
+        assert!(!is_local("ab\u{20AC}cdef"));
+        assert!(!is_local("\u{1F600}"));
+        assert!(
+            is_local("caf\u{e9}.local"),
+            "a non-ASCII label is still .local"
+        );
     }
 
     #[tokio::test]

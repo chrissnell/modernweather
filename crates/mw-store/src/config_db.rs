@@ -477,6 +477,22 @@ mod tests {
                 "an Aeris pairing, which has no uploader because Aeris is not an egress",
                 "INSERT INTO station_service (station_key, service) VALUES ('c', 'aeris')",
             ),
+            // The shape `ci/db/config-seed.sql` seeds, and the one that is load-bearing for
+            // every FUTURE column added to this table: an inbound endpoint with a secret
+            // and NO claim. A migration that added a constraint requiring a claim could not
+            // apply to a database holding this row, because `ADD COLUMN` validates a new
+            // CHECK against the rows already there -- and the Rust suite would stay green
+            // while `cargo xtask gate db-migrate-twice` went red, because this was the one
+            // identity strategy no test here used.
+            (
+                "§4a.4's from_query endpoint: a secret, and no claim configured yet",
+                "INSERT INTO stations (station_key, owning_node_id, name, type,
+                                       identity_kind, ingest_secret_hash, transport_kind,
+                                       transport_mount)
+                 VALUES ('ambient', x'0193f3c28b207c71ae3f10cc92d4b7aa', 'ambient',
+                         'ambient-customized', 'from_query', 'sha256:0f1e2d3c', 'http_in',
+                         '/ingest/ambient')",
+            ),
         ] {
             sqlx::query(sql)
                 .execute(&pool)
@@ -546,15 +562,6 @@ mod tests {
 
         for (what, sql) in [
             (
-                "a `from_payload` station with no claim to resolve against",
-                format!(
-                    "INSERT INTO stations (station_key, owning_node_id, name, type,
-                                           identity_kind, transport_kind, transport_port)
-                     VALUES ('a', {node}, 'a', 'weatherlink-live', 'from_payload', 'udp_in',
-                             22222)"
-                ),
-            ),
-            (
                 "a `fixed` station presenting one anyway",
                 format!(
                     "INSERT INTO stations (station_key, owning_node_id, name, type,
@@ -595,7 +602,25 @@ mod tests {
             );
         }
 
-        // Two stations cannot present one claim: resolution would not be a function.
+        // A `from_payload` station with no claim is NOT rejected here, and that is the
+        // decision the migration's own comment carries: `ADD COLUMN` validates a new CHECK
+        // against existing rows, so an arm requiring the column to be present cannot be
+        // added to a table that already holds an Ambient station. `mw_station::plan`
+        // enforces it instead, with a message that names the station and the column.
+        sqlx::query(&format!(
+            "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind,
+                                   transport_kind, transport_port)
+             VALUES ('a', {node}, 'a', 'weatherlink-live', 'from_payload', 'udp_in', 22222)"
+        ))
+        .execute(&pool)
+        .await
+        .expect("the schema leaves the required half to plan time");
+
+        // Two stations cannot present one claim: resolution would not be a function. The
+        // index is over `lower(presented_key)`, because that is the comparison
+        // `mw_store::registry` makes -- so the case-variant pair below has to be refused
+        // too. A byte-exact index would admit it and the registry would then collapse the
+        // two, storing one station's readings under the other's key.
         sqlx::query(&format!(
             "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind,
                                    transport_kind, transport_port, presented_key)
@@ -605,16 +630,28 @@ mod tests {
         .execute(&pool)
         .await
         .expect("the first station with that serial");
-        let e = sqlx::query(&format!(
-            "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind,
-                                   transport_kind, transport_port, presented_key)
-             VALUES ('f', {node}, 'f', 'weatherlink-live', 'from_payload', 'udp_in', 22222,
-                     '001D0A700002')"
-        ))
-        .execute(&pool)
-        .await
-        .expect_err("two stations, one serial");
-        assert!(e.to_string().contains("UNIQUE constraint failed"), "{e}");
+        for (what, key, port) in [
+            ("the same serial, byte for byte", "001D0A700002", 22222),
+            // Two broadcast stations on DIFFERENT ports are two listener groups of one unit
+            // each, so `StationPlanError::DuplicateClaim` -- which is checked per group --
+            // does not see this pair. The index is the only thing that can.
+            ("the same serial in the other case", "001d0a700002", 22223),
+        ] {
+            let e = sqlx::query(&format!(
+                "INSERT INTO stations (station_key, owning_node_id, name, type,
+                                       identity_kind, transport_kind, transport_port,
+                                       presented_key)
+                 VALUES ('f{port}', {node}, 'f', 'weatherlink-live', 'from_payload',
+                         'udp_in', {port}, '{key}')"
+            ))
+            .execute(&pool)
+            .await
+            .expect_err(&format!("the schema accepted {what}"));
+            assert!(
+                e.to_string().contains("UNIQUE constraint failed"),
+                "{what}: {e}"
+            );
+        }
         pool.close().await;
     }
 

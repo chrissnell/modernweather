@@ -120,6 +120,42 @@ pub enum IdentitySource {
     FromRegistration,
 }
 
+impl IdentitySource {
+    /// The spelling `config.stations.identity_kind` holds.
+    ///
+    /// Here rather than in the two crates that need it, because both of them do:
+    /// `mw-station` parses the column into its own `StationIdentity` and `mw-store`'s
+    /// registry has to compare a row's configured strategy against the one a frame
+    /// arrived under. They are in the same layer and may not name each other, so a mapping
+    /// in each is a mapping that can disagree — and the thing it would disagree about is
+    /// which strategy authenticated a reading.
+    ///
+    /// Distinct from [`IdentitySource`]'s `Display`, which is the internal vocabulary
+    /// `IdentityProblem` renders (**D-36**) and is deliberately not a column value.
+    pub const fn schema_name(self) -> &'static str {
+        match self {
+            IdentitySource::Fixed => "fixed",
+            IdentitySource::FromPath => "from_path",
+            IdentitySource::FromQuery => "from_query",
+            IdentitySource::FromPayload => "from_payload",
+            IdentitySource::FromRegistration => "from_registration",
+        }
+    }
+
+    /// Read the `identity_kind` column. `None` for a value its own `CHECK` would reject.
+    pub fn from_schema_name(name: &str) -> Option<Self> {
+        [
+            IdentitySource::Fixed,
+            IdentitySource::FromPath,
+            IdentitySource::FromQuery,
+            IdentitySource::FromPayload,
+            IdentitySource::FromRegistration,
+        ]
+        .into_iter()
+        .find(|s| s.schema_name() == name)
+    }
+}
+
 impl fmt::Display for IdentitySource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -231,6 +267,31 @@ mod tests {
 
     fn every() -> Trigger {
         Trigger::every(Duration::from_secs(30), Duration::from_secs(10))
+    }
+
+    /// The column's `CHECK` list and this mapping are one vocabulary, so they round-trip.
+    #[test]
+    fn every_schema_spelling_round_trips() {
+        for source in [
+            IdentitySource::Fixed,
+            IdentitySource::FromPath,
+            IdentitySource::FromQuery,
+            IdentitySource::FromPayload,
+            IdentitySource::FromRegistration,
+        ] {
+            let name = source.schema_name();
+            assert_eq!(IdentitySource::from_schema_name(name), Some(source));
+            assert!(
+                name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "`{name}` is not a column spelling"
+            );
+            assert_ne!(
+                name,
+                source.to_string(),
+                "the column value and the internal name are two vocabularies (D-36)"
+            );
+        }
+        assert_eq!(IdentitySource::from_schema_name("whoever"), None);
     }
 
     #[test]

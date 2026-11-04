@@ -603,8 +603,14 @@ jobs:
           toolchain: ${{ env.RUST_STABLE }}
       # The emulators stay in Go deliberately (DESIGN.md D-40): an independently written
       # emulator is a stronger oracle than one written alongside the driver. So this job
-      # needs a Go toolchain too. `cargo xtask emulator-tests` — W2a §4a's to implement —
-      # checks the reference repository out at a pinned commit and runs them.
+      # needs a Go toolchain. `cargo xtask emulator-tests` runs every emulator
+      # tests/emulators/manifest.toml declares and fails unless every test it names passed.
+      #
+      # It checks nothing out of the reference repository YET. The manifest pins the commit
+      # the first `origin = "reference"` entry will use, and the one emulator that runs
+      # today lives in this repository because the reference tree has none for WeatherLink
+      # Live — which the manifest records in full, and which is docs/reconciliation.md's
+      # O-13 for the owner.
       - uses: actions/setup-go@v5
         with:
           go-version: stable
@@ -620,7 +626,8 @@ jobs:
             echo "::group::$dir"
             unformatted="$(gofmt -l "$dir")"
             if [ -n "$unformatted" ]; then
-              echo "::error::gofmt would change: $unformatted"
+              echo "::error file=$dir/main.go::gofmt would change: $unformatted"
+              echo "::endgroup::"
               exit 1
             fi
             (cd "$dir" && go vet ./...)

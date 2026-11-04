@@ -69,9 +69,20 @@ origin = "this-repository"
 path = "tests/emulators/wll"
 package = "mw-station"
 test_target = "emulator"
-tests = 4
+# BY NAME, not by count. A count catches a removed test and a filter that matched nothing;
+# it does not catch a rename, and it does not catch tests whose bodies were emptied -- which
+# is the realistic path, because that is how a flaky emulator test gets "fixed". Four empty
+# `#[ignore]`d functions were shown to produce `ok: 4 test(s) passed` and exit 0 with no
+# emulator process ever started, which is why this is a list.
+test_names = [
+    "the_broadcast_driver_arms_the_unit_and_keeps_receiving",
+    "the_poll_driver_produces_a_reading_on_every_occurrence",
+    "a_refusal_carrying_two_hundred_fails_the_re_arm",
+    "a_unit_that_reports_no_collector_size_stores_no_rainfall",
+    "a_port_disagreement_is_reported_rather_than_followed",
+]
 note = """
-Four tests, each asserting something the two levels below it cannot:
+Five tests, each asserting something the two levels below it cannot:
 
   the_broadcast_driver_arms_the_unit_and_keeps_receiving
       nothing arrives before the unit is armed; then twelve datagrams over a real socket,
@@ -83,13 +94,20 @@ Four tests, each asserting something the two levels below it cannot:
       the unit refuses an arming with `200 OK` and a populated `error` body. A client that
       trusted the status line would listen to a port nothing sends to -- a station that
       silently stops reporting. The emulator refuses every fifth arming on purpose.
+  a_unit_that_reports_no_collector_size_stores_no_rainfall
+      a unit whose records omit `rain_size`. A tip count cannot become a depth without one,
+      so rainfall must be absent rather than stored as a count -- which is DEV-8's
+      corrective, asserted here against a device that actually omits the field rather than
+      against a fixture that was written to.
   a_port_disagreement_is_reported_rather_than_followed
       the unit broadcasts to a port the configuration does not name. The re-arm reports it
       and does not move the listener, which is W2a §4a.5's "shares no state with the
       listener" made observable.
 
-`tests` is load-bearing: the runner fails unless exactly this many passed, so neither a
-renamed test nor a filter that matches nothing can make the gate green."""
+`test_names` is load-bearing in two directions: `cargo xtask emulator-tests` fails unless
+every name in it passed, and `cargo test -p xtask` fails unless every name in it exists in
+the target. So a removed test, a renamed one, and a filter that matches nothing are each a
+red gate, and a half-finished rename is caught without a Go toolchain."""
 
 # ---------------------------------------------------------------------------------------
 # Declared, not yet runnable. Each needs a driver this build does not have, and the gate

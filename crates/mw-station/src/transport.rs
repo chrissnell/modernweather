@@ -292,19 +292,7 @@ impl Transport {
             }),
             "udp_in" => Ok(Transport::UdpIn {
                 port: port(c.port, kind, "transport_port")?,
-                group: match c.group.as_deref().filter(|g| !g.is_empty()) {
-                    None => None,
-                    Some(g) => {
-                        Some(
-                            g.parse::<IpAddr>()
-                                .map_err(|_| TransportError::OutOfRange {
-                                    column: "transport_group",
-                                    value: g.to_string(),
-                                    expected: "a multicast address",
-                                })?,
-                        )
-                    }
-                },
+                group: group(c.group.as_deref())?,
             }),
             other => Err(TransportError::UnknownKind {
                 kind: other.to_string(),
@@ -416,6 +404,41 @@ fn address(
 ) -> Result<Endpoint, TransportError> {
     Endpoint::parse(text(value, kind, column)?)
         .map_err(|source| TransportError::Address { column, source })
+}
+
+/// A multicast group to join, validated as one.
+///
+/// The error said "a multicast address" and the code only parsed *an* address, so a unicast
+/// group or an IPv6 one passed plan time and then failed forever at `bind`:
+/// `join_multicast_v4` refuses a non-multicast address with `EINVAL`, and a V6 group cannot
+/// be joined on the IPv4 socket `crate::wll` binds. The result was a component in permanent
+/// `Backoff` over a configuration typo -- "accepted at plan time, fails forever at runtime"
+/// is the failure shape `plan()` is pure in order to catch.
+fn group(value: Option<&str>) -> Result<Option<IpAddr>, TransportError> {
+    let Some(text) = value.filter(|g| !g.is_empty()) else {
+        return Ok(None);
+    };
+    let out_of_range = |expected: &'static str| TransportError::OutOfRange {
+        column: "transport_group",
+        value: text.to_string(),
+        expected,
+    };
+    let addr = text
+        .parse::<IpAddr>()
+        .map_err(|_| out_of_range("an address"))?;
+    if !addr.is_multicast() {
+        return Err(out_of_range("a multicast address (224.0.0.0/4)"));
+    }
+    // A device that multicasts rather than broadcasts is the §4a.3 case this column exists
+    // for, and no such driver is IPv6 yet. Refusing here is better than joining a group on
+    // a socket that cannot carry it: `crate::wll` binds `0.0.0.0`, so a V6 join fails at
+    // every start attempt with an error about the socket rather than about the column.
+    if addr.is_ipv6() {
+        return Err(out_of_range(
+            "an IPv4 multicast address; the receive socket is IPv4",
+        ));
+    }
+    Ok(Some(addr))
 }
 
 fn tls(c: &TransportColumns) -> Option<TlsFiles> {
@@ -643,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn a_multicast_group_is_parsed_and_a_non_address_is_refused() {
+    fn a_multicast_group_is_parsed_and_everything_else_is_refused() {
         let t = Transport::from_columns(&TransportColumns {
             port: Some(5353),
             group: Some("239.1.2.3".into()),
@@ -651,16 +674,44 @@ mod tests {
         })
         .expect("valid");
         assert!(matches!(t, Transport::UdpIn { group: Some(_), .. }));
+
+        // Each of these used to pass plan time and then fail at every `bind`, which is a
+        // component in permanent Backoff over a configuration typo.
+        for (what, group) in [
+            ("not an address at all", "not-an-address"),
+            ("a unicast address", "192.168.1.1"),
+            (
+                "the broadcast address, which is not a group",
+                "255.255.255.255",
+            ),
+            ("an IPv6 group, on an IPv4 receive socket", "ff02::1"),
+        ] {
+            let e = Transport::from_columns(&TransportColumns {
+                port: Some(5353),
+                group: Some(group.to_string()),
+                ..columns("udp_in")
+            })
+            .expect_err(what);
+            assert!(
+                matches!(
+                    e,
+                    TransportError::OutOfRange {
+                        column: "transport_group",
+                        ..
+                    }
+                ),
+                "{what}: {e}"
+            );
+            assert!(e.to_string().contains(group), "{what}: {e}");
+        }
+        // An empty column is no group, not a bad one.
         assert!(matches!(
             Transport::from_columns(&TransportColumns {
                 port: Some(5353),
-                group: Some("not-an-address".into()),
+                group: Some(String::new()),
                 ..columns("udp_in")
             }),
-            Err(TransportError::OutOfRange {
-                column: "transport_group",
-                ..
-            })
+            Ok(Transport::UdpIn { group: None, .. })
         ));
     }
 

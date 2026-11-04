@@ -1,6 +1,8 @@
 //! The WeatherLink Live driver against recorded transport output.
 //!
-//! Level 2 of W3 **D-82**'s three, for a driver that has no `Session`: WeatherLink Live's
+//! **Level 2 of W3 D-82's three for the driver this item ships**, which has no `Session`.
+//! `tests/transcript.rs` holds the harness and the contract (and a session seen failing);
+//! this file is the level applied to WeatherLink Live. For a driver that has no `Session`:
 //! transports deliver one frame per read, so what a transcript means here is *a recorded
 //! sequence of datagrams and of response bodies*, and the assertion that matters is the
 //! same one — **every** frame in the sequence produces an admission, not only the first.
