@@ -556,13 +556,36 @@ ship as one binary (D-69). O-5's `/stationinfo` fix lands here as a signed devia
 fixture.
 **Done when:** `cargo xtask gate conformance` is **green against the Rust binary** for every
 frozen-class and coupled-class fixture, and the negative control still fails. This is the milestone's
-headline.
+headline. **And the `conformance` job goes back into the `gate` job's `needs` in
+`.github/workflows/pr.yml` in the same PR** — M2-5 took it out because a gate that is red by design
+for two milestones must not be the single required check, and the line goes back the moment it is
+green.
 **Test strategy:** the conformance suite is the specification. Plus a regression test for W1-BUG-1 —
 `/span` for a station with no non-NULL `winddir` must return 200 with `windd: 0`, which W4 D-8's
 finaliser makes true and which was a 500 in Go.
 **Deviations that land here:** DEV-1 (`ETag` on `/latest` and `/snow`) and DEV-5 (the `X-MW-*`
 headers). Both are additive and invisible to the suite by a verified property of the runner
 (`contract/conformance/src/lib.rs:320`).
+**Constraints from M2-5**, which built the runner this item's headline done-criterion is measured by
+(`xtask/src/conformance.rs`). Recorded here rather than in that file, because a comment in a source
+file is not a work item (`docs/reconciliation.md` G-5):
+1. **The done-criterion above is not satisfiable as written, and closing that is part of this item.**
+   `cargo xtask conformance` replays all 70 fixtures and is green only when **none** fail; the scope
+   narrowing three paragraphs up means `/alerts`, `/api/remote-stations` and the msgpack fixtures
+   will still fail when every implemented endpoint is right. So this item has to introduce the
+   frozen / coupled / **not-implemented** classification as *data the runner reads* — not as a
+   narrower replay. The runner asserts that 70 fixtures were **attempted** precisely so that the
+   classification cannot arrive as a silent filter; a change that replays fewer fails that assertion
+   on purpose.
+2. **The weather database has to be seeded.** M2-5 brings the daemon up against a freshly migrated
+   but **empty** database, which is all a replay against 404s needs. Every frozen endpoint reads, so
+   the rig that makes a *green* run mean something belongs here — and W1's rig
+   (`contract/tools/rig/`) targets the **Go** schema, so it is a translation and not a copy.
+3. **`MIN_MANGLED_FAILURES = 26` has to be re-derived.** `contract/README.md`'s 26 is the count
+   against the Go daemon serving all 70 endpoints. Against a binary that does not implement three of
+   them, the floor the negative control must clear is a different number, and it must be measured
+   rather than assumed — a control whose floor is too low is the failure mode W1 Decision 10 exists
+   to prevent.
 
 ### M4-3 — `mw-http` and `mw-web`
 **Depends on:** M4-2. **Blocks:** M5, M7.
