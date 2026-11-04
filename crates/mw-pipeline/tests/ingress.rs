@@ -1,6 +1,15 @@
 //! `Ingress::admit` and `Ingress::accept`, including **D-60**'s whole point: that running
 //! `admit` on a forwarded envelope would destroy the identity the ack and the dedup both
 //! depend on, so there are two entry points and the second one never re-seals.
+//!
+//! Not run under `--cfg loom`. Every test here drives a real `tokio` runtime, and under
+//! that flag tokio's time/IO driver refuses to be enabled (`assertion failed: !enabled`),
+//! so the whole file panics rather than modelling anything. The `loom` job builds
+//! `mw-pipeline` for the scope guard's sake; what it has to run is
+//! `mw-supervisor`'s `loom_publish.rs`, and `crates/mw-supervisor/tests/` carries this
+//! same `cfg` for this same reason.
+
+#![cfg(not(loom))]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
