@@ -522,6 +522,16 @@ pub enum ManifestProblem {
 /// cursor that will never catch up must not pin segments forever, and the alternative to
 /// abandoning it is the ceiling — a node-wide failure attributed to whichever station
 /// happened to admit last rather than to the peer that caused it.
+///
+/// **`Abandoned` is terminal, and that is the intent.** The flag is persisted and restored,
+/// so the state survives a restart and the component stays `Failed { CursorAbandoned }`
+/// until an operator acts — which is what W3 §2.7 asks for ("the operator gets a named
+/// failure attached to the cursor that caused it"), and is why it is a state rather than a
+/// counter. It does mean §3.6 step 6's second clamp describes a path nothing currently
+/// reaches by re-activation: the clamp-forward branch exists for the other way a cursor
+/// ends up behind the oldest segment, which is both slots torn. Re-activation is an
+/// operator action W5's management API owns, not something this code does on its own;
+/// recorded here because the step-6 comment otherwise reads as a live path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorState {
     /// A live consumer. Its position holds segments.
