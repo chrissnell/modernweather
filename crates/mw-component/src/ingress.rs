@@ -38,9 +38,13 @@ use crate::identity::IdentitySource;
 /// peer-identity field among these, and [`FrameMeta::peer`] is it.
 #[derive(Debug, Clone)]
 pub struct FrameMeta {
-    /// Which component received the frame. The label on
-    /// `mw_readings_rejected_total{component, reason}`, so "somebody is pointing a station
-    /// at us" names the endpoint they are pointing it at.
+    /// Which component received the frame, for the log line on a rejection — so "somebody
+    /// is pointing a station at us" names the endpoint they are pointing it at.
+    ///
+    /// **Not** a metric label today: `mw_readings_rejected_total` carries `reason` alone.
+    /// §2.6 and §5.10 specify `{component, reason}` and the component id is bounded by
+    /// configuration, so adding it is cardinality-safe; it is simply not done yet, and
+    /// saying so here is better than documenting a label set that is not emitted.
     pub receiver: ComponentId,
 
     /// How this transport says which station a frame is from (W2a §4a.5).
@@ -126,9 +130,10 @@ impl FrameMeta {
 /// Why a frame or an envelope was refused *before* anything was stored.
 ///
 /// W2a §4a.6 names the first four and W7 §4.4 and §5.4 add the rest. Every variant is a
-/// counted rejection — `mw_readings_rejected_total{component, reason}` — and not a log
-/// line: an unknown sender is a number an operator can alert on, where the Go gRPC
-/// receiver stores the reading and then emits a `Debugf` about it.
+/// counted rejection — `mw_readings_rejected_total{reason}` — and not a log line: an
+/// unknown sender is a number an operator can alert on, where the Go gRPC receiver stores
+/// the reading and then emits a `Debugf` about it. (§5.10 also specifies a `component`
+/// label; see [`FrameMeta::receiver`] for where that stands.)
 ///
 /// [`Reject::as_str`] is the metric label, so the set of label values is this closed enum
 /// and §5.10's cardinality rule holds by construction.

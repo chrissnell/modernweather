@@ -54,6 +54,13 @@ impl TestClock {
 
     /// A clock stopped at a fixed, arbitrary instant with no significance beyond being a
     /// real one: 2026-11-03T12:00:00Z.
+    ///
+    /// On a **whole second**, which is convenient and was once a blind spot: the envelope's
+    /// wire instants are milliseconds and `reading.time` is nanoseconds, so a mismatch
+    /// between them is invisible to every test on this clock. `Ingress::admit` now
+    /// truncates all three together, and
+    /// `the_envelopes_instants_survive_the_spool_on_a_nanosecond_clock` in
+    /// `tests/ingress.rs` holds that down with a clock that has sub-millisecond nanos.
     pub fn fixed() -> Self {
         Self::new(
             DateTime::from_timestamp(1_762_171_200, 0).expect("a constant that is an instant"),

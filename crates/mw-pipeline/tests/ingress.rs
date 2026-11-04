@@ -9,7 +9,7 @@ use mw_component::{
     AcceptError, AdmitError, FrameMeta, IdentitySource, Ingress, Reject, StationRegistry,
 };
 use mw_pipeline::testing::{forwarded, frame, id, node, partial, reading, spool, Scratch};
-use mw_pipeline::{Clock, SpoolIngress, TestClock, MAX_BATCH_ENVELOPES};
+use mw_pipeline::{Clock, Spool, SpoolIngress, TestClock, MAX_BATCH_ENVELOPES};
 use mw_types::{Envelope, PartialReading, Seq, StationKey};
 
 /// A registry that answers `Fixed` frames and counts how often it was asked.
@@ -83,7 +83,10 @@ async fn admit_seals_every_reading_in_a_frame_against_one_identity_resolution() 
     // append, and the append was one group commit.
     let stats = s.stats();
     assert_eq!(stats.appends, 1, "one admit is one append call");
-    assert_eq!(stats.fsyncs, 1, "and one fsync, for all four readings");
+    assert_eq!(
+        stats.commits, 1,
+        "and one group commit, for all four readings"
+    );
 }
 
 /// W2a §4a.6: there is no `Envelope` without a `StationKey`, and the only producer of one
@@ -140,14 +143,170 @@ async fn an_empty_reading_is_rejected_per_reading_and_the_batch_still_commits() 
         partial(clock.now(), 29.92),
         PartialReading::new(mw_types::Reading::default()),
         partial(clock.now(), 29.93),
+        // A reading whose only content is a text metric. This used to be dropped as
+        // "empty": `Reading::get` is `None` for the eleven text metrics, and the
+        // hand-written list of exceptions named `tz` and four timestamps but none of
+        // `extratext1..10`.
+        PartialReading::new(mw_types::Reading {
+            extra_text1: Some("a note from the station".into()),
+            ..mw_types::Reading::default()
+        }),
     ];
     let admitted = ingress
         .admit(&batch, &frame("station:davis", clock.now()))
         .await
         .expect("the frame resolved");
-    assert_eq!(admitted.accepted, 2);
-    assert_eq!(admitted.rejected, 1);
-    assert_eq!(s.tail_seq(), Seq::new(2));
+    assert_eq!(
+        admitted.accepted, 3,
+        "two numeric readings and the text-only one"
+    );
+    assert_eq!(admitted.rejected, 1, "only the genuinely empty one");
+    assert_eq!(s.tail_seq(), Seq::new(3));
+    assert_eq!(
+        ingress.stats().empty_readings,
+        1,
+        "and the rejection is counted by reason"
+    );
+}
+
+/// **The ceiling policy, counted** — the half of the plan's "counted and alarmed" that is
+/// assertable without a process-global metrics recorder.
+///
+/// `mw_readings_dropped_total` is defined by §5.10 as a **reading** count, so a refused
+/// 256-envelope batch must move it by 256 and not by 1.
+#[tokio::test]
+async fn at_the_ceiling_every_lost_reading_is_counted() {
+    let scratch = Scratch::new("ceiling-counted");
+    let clock = TestClock::fixed();
+    let s = Spool::open(
+        mw_pipeline::SpoolConfig {
+            ceiling_bytes: 4 * 1024,
+            segment_bytes: 4 * 1024,
+            ..mw_pipeline::testing::config(scratch.spool())
+        },
+        node(1),
+        Arc::new(clock.clone()) as Arc<dyn Clock>,
+    )
+    .expect("a fresh spool");
+    let ingress = SpoolIngress::new(
+        Arc::clone(&s),
+        CountingRegistry::resolving("backyard") as Arc<_>,
+    );
+
+    // Fill it, then offer a batch of four and have it refused whole.
+    let four: Vec<PartialReading> = (0..4)
+        .map(|i| partial(clock.now(), 29.0 + i as f32))
+        .collect();
+    loop {
+        match ingress
+            .admit(&four, &frame("station:davis", clock.now()))
+            .await
+        {
+            Ok(_) => assert!(s.tail_seq().get() < 10_000, "the ceiling is reachable"),
+            Err(AdmitError::SpoolFull { depth_bytes }) => {
+                assert!(depth_bytes > 0, "the error names what is on disk");
+                break;
+            }
+            Err(other) => panic!("unexpected: {other}"),
+        }
+    }
+
+    assert_eq!(
+        ingress.stats().dropped_spool_full,
+        4,
+        "four readings were in the refused batch, so four were lost -- not one 'batch'"
+    );
+    let before = s.tail_seq();
+    ingress
+        .admit(&four, &frame("station:davis", clock.now()))
+        .await
+        .expect_err("still full");
+    assert_eq!(
+        ingress.stats().dropped_spool_full,
+        8,
+        "and the second refusal adds its four"
+    );
+    assert_eq!(s.tail_seq(), before, "with nothing written either time");
+}
+
+/// §4.1 and §4.5 bound a batch by encoded size as well as by count, and §4.5 owes a `413`
+/// on it. `MAX_BATCH_BYTES` was defined and exported and never read, which reads as a
+/// discharged requirement.
+#[tokio::test]
+async fn a_batch_over_the_encoded_size_limit_is_refused_whole() {
+    let scratch = Scratch::new("accept-bytes");
+    let clock = TestClock::fixed();
+    let s = spool(scratch.spool(), node(1), &clock);
+    let ingress = SpoolIngress::new(
+        Arc::clone(&s),
+        CountingRegistry::resolving("backyard") as Arc<_>,
+    );
+
+    // Well inside the 256-envelope limit, well outside the 1 MiB one: a long station key
+    // is the cheapest way for a peer to make a big envelope.
+    let fat = "s".repeat(8_000);
+    let batch: Vec<Envelope> = (1..=200)
+        .map(|seq| forwarded(node(7), seq, &fat, clock.now(), &[node(1)]))
+        .collect();
+    assert!(batch.len() <= mw_pipeline::MAX_BATCH_ENVELOPES);
+
+    let err = ingress
+        .accept(&batch, node(7))
+        .await
+        .expect_err("over the encoded-size limit");
+    assert!(
+        matches!(err, AcceptError::Rejected(Reject::BatchTooLarge)),
+        "{err}"
+    );
+    assert_eq!(
+        s.tail_seq(),
+        Seq::new(0),
+        "trimming it would make the ack a claim about envelopes never seen"
+    );
+}
+
+/// **Regression: the envelope's instants and the reading's timestamp must agree after a
+/// spool round trip.**
+///
+/// `observed_at`/`received_at` are `int64` milliseconds on the wire while `reading.time` is
+/// a nanosecond `Timestamp`, so a reading sealed from a nanosecond clock came back with the
+/// three disagreeing — on every envelope in production, because **D-11** makes the spool
+/// record that same message. The whole suite was blind to it because the test clock sat on
+/// a whole second.
+#[tokio::test]
+async fn the_envelopes_instants_survive_the_spool_on_a_nanosecond_clock() {
+    let scratch = Scratch::new("nanos");
+    let clock = TestClock::new(
+        chrono::DateTime::from_timestamp(1_762_171_200, 123_456_789).expect("a real instant"),
+    );
+    assert_ne!(clock.now().timestamp_subsec_nanos() % 1_000_000, 0);
+
+    let s = spool(scratch.spool(), node(1), &clock);
+    let ingress = SpoolIngress::new(
+        Arc::clone(&s),
+        CountingRegistry::resolving("backyard") as Arc<_>,
+    );
+    ingress
+        .admit(
+            &[PartialReading::new(reading(29.92))],
+            &frame("station:davis", clock.now()),
+        )
+        .await
+        .expect("resolved");
+
+    let stored = s.read_after(Seq::new(0), 10).expect("readable");
+    let e = &stored.envelopes[0].1;
+    assert_eq!(
+        e.observed_at, e.reading.time,
+        "the envelope and the stored column agree about when it was measured"
+    );
+    assert_eq!(e.received_at, e.observed_at);
+    assert_eq!(
+        e.observed_at.timestamp_subsec_nanos() % 1_000_000,
+        0,
+        "truncated to the millisecond the wire can carry, rather than silently rounded \
+         in one of the three places"
+    );
 }
 
 /// A frame with no station-reported timestamp takes the frame's arrival time, in exactly
@@ -401,8 +560,8 @@ async fn a_full_batch_is_one_append_call_and_one_fsync() {
         s.stats(),
         mw_pipeline::SpoolStats {
             appends: 1,
-            fsyncs: 1
+            commits: 1
         },
-        "256 records, one append call, one disk sync"
+        "256 records, one append call, one group commit"
     );
 }

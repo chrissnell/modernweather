@@ -14,8 +14,10 @@
 //! them. `StationId`, `StationKey`, `WebsiteId`, `OriginId`, `Seq`, `Envelope`,
 //! `Provenance` and `PathSet` are here, because implementation-plan.md M2-3 needs a name
 //! for the thing a `Trigger::OnReading` component is handed and for the station a
-//! `Calendar` component takes its time zone from; `Envelope::forward`, `PartialReading`
-//! and `FrameMeta` arrive with M3-2, which owns admission. `Window`, `Agg` and the
+//! `Calendar` component takes its time zone from; `Envelope::forward`, `Provenance::sealed`
+//! and `PartialReading` arrive with M3-2, which owns admission. (`FrameMeta` is M3-2's too
+//! and lives in `mw-component`, because the `Ingress` trait that takes it does.) `Window`,
+//! `Agg` and the
 //! `ext.rs` additions to `Reading` are still absent: they belong to the window rollup (M6)
 //! and to the enrich stage (M3-3).
 

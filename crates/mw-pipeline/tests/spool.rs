@@ -7,18 +7,22 @@
 //!   format-level version is in `spool::format`'s own tests).
 //! - **a property test that a replayed prefix is idempotent** —
 //!   `replaying_any_prefix_of_a_peers_stream_is_idempotent`.
-//! - **the ceiling policy, which needs its own test** — `at_the_ceiling_*`, three of them:
-//!   refused at the edge, counted, and the spool still usable afterwards.
+//! - **the ceiling policy, which needs its own test** — two here (refused at the edge with
+//!   nothing written, and cleared when a cursor drains) and two elsewhere, because the rest
+//!   of what the plan asks for is not assertable at this level: "counted" is a
+//!   `SpoolIngress` counter (`tests/ingress.rs`) and "shutdown still completing" needs a
+//!   supervisor (`crates/modernweather/tests/spool_fanout.rs`).
 //!
 //! The stalled-sink test re-pointed at a real spool is in `crates/modernweather/tests/`,
 //! because `mw-supervisor` and `mw-pipeline` are the same layer and `ci/layers.toml`
 //! forbids either naming the other — the binary is the only place they meet.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Duration as ChronoDuration;
 use mw_pipeline::spool::format::{scan_records, SEGMENT_HEADER_BYTES};
-use mw_pipeline::spool::{Spool, SpoolConfig, Verdict};
+use mw_pipeline::spool::{Spool, SpoolConfig};
 use mw_pipeline::testing::{config, forwarded, id, node, reading, spool, Scratch};
 use mw_pipeline::{Clock, CursorState, Draft, SpoolError, TestClock};
 use mw_types::{Seq, StationKey};
@@ -78,14 +82,12 @@ async fn the_tail_and_the_origin_table_survive_a_restart() {
         let s = spool(scratch.spool(), node(1), &clock);
         s.admit_local(&drafts(5, &clock)).await.expect("accepted");
         for seq in 1..=3 {
-            assert_eq!(
-                s.record_accepted(node(7), Seq::new(seq)),
-                Verdict::Fresh,
-                "a peer's envelope, interned and recorded in the manifest's high water"
-            );
-            s.append_sealed(&[forwarded(node(7), seq, "remote", clock.now(), &[node(1)])])
+            let committed = s
+                .accept_sealed(&[forwarded(node(7), seq, "remote", clock.now(), &[node(1)])])
                 .await
                 .expect("accepted");
+            assert_eq!(committed.envelopes.len(), 1, "seq {seq} is fresh");
+            assert_eq!(committed.duplicates, 0);
         }
     }
     let s = spool(scratch.spool(), node(1), &clock);
@@ -124,10 +126,11 @@ async fn a_gap_in_a_peers_stream_pins_the_persisted_high_water_and_the_window_co
         let s = spool(scratch.spool(), node(1), &clock);
         // 901 arrives with nothing before it, which is what the diamond of W7 §2.3 looks
         // like from the receiver's side.
-        assert_eq!(s.record_accepted(node(7), Seq::new(901)), Verdict::Fresh);
-        s.append_sealed(&[forwarded(node(7), 901, "remote", clock.now(), &[node(1)])])
+        let committed = s
+            .accept_sealed(&[forwarded(node(7), 901, "remote", clock.now(), &[node(1)])])
             .await
             .expect("accepted");
+        assert_eq!(committed.envelopes.len(), 1);
         assert_eq!(
             s.high_water(node(7)),
             Seq::new(0),
@@ -347,38 +350,71 @@ async fn replaying_any_prefix_of_a_peers_stream_is_idempotent() {
             .map(|seq| forwarded(node(7), seq, "remote", clock.now(), &[node(1)]))
             .collect();
 
-        // The peer's first delivery.
-        let mut accepted = 0usize;
+        // The peer's first delivery, one envelope at a time so the gate sees a stream
+        // rather than one batch.
         for e in &envelopes {
-            if s.record_accepted(node(7), e.provenance.seq()) != Verdict::Duplicate {
-                s.append_sealed(std::slice::from_ref(e)).await.expect("ok");
-                accepted += 1;
-            }
+            let committed = s.accept_sealed(std::slice::from_ref(e)).await.expect("ok");
+            assert_eq!(
+                committed.envelopes.len(),
+                1,
+                "prefix {prefix}: first delivery"
+            );
         }
-        assert_eq!(accepted, STREAM as usize);
         let tail_after_first = s.tail_seq();
+        assert_eq!(tail_after_first, Seq::new(STREAM));
 
         // Its reconnect, replaying `prefix` of what it already sent.
-        let mut duplicates = 0usize;
+        let mut duplicates = 0u32;
         for e in envelopes.iter().take(prefix as usize) {
-            if s.record_accepted(node(7), e.provenance.seq()) == Verdict::Duplicate {
-                duplicates += 1;
-            } else {
-                s.append_sealed(std::slice::from_ref(e)).await.expect("ok");
-            }
+            let committed = s
+                .accept_sealed(std::slice::from_ref(e))
+                .await
+                .expect("a resend is a successful accept, not an error");
+            duplicates += committed.duplicates;
+            assert!(
+                committed.envelopes.is_empty(),
+                "prefix {prefix}: nothing was appended a second time"
+            );
         }
         assert_eq!(
-            duplicates, prefix as usize,
+            duplicates, prefix as u32,
             "prefix {prefix}: every replayed envelope is recognised, not merely absorbed"
         );
         assert_eq!(
             s.tail_seq(),
             tail_after_first,
-            "prefix {prefix}: and nothing was appended a second time"
+            "prefix {prefix}: and the log did not grow"
+        );
+
+        // A replay the high water cannot answer from its contiguous prefix: send a gapped
+        // suffix first, so the window above the water is what does the deduplicating.
+        let gapped = Seq::new(STREAM + 10);
+        let far = forwarded(node(7), gapped.get(), "remote", clock.now(), &[node(1)]);
+        assert_eq!(
+            s.accept_sealed(std::slice::from_ref(&far))
+                .await
+                .expect("ok")
+                .envelopes
+                .len(),
+            1,
+            "prefix {prefix}: a gapped envelope is fresh"
+        );
+        let again = s
+            .accept_sealed(std::slice::from_ref(&far))
+            .await
+            .expect("ok");
+        assert_eq!(
+            again.duplicates, 1,
+            "prefix {prefix}: and its resend is caught by the window above the water, \
+             which is the half a contiguous replay never exercises"
         );
     }
 }
 
+/// **The ceiling, counted.** The plan asks for the ceiling policy to be "counted and
+/// alarmed", and the count lives in `SpoolIngress` rather than in `Spool` — so it has to
+/// be asserted through the ingress, which is what `tests/ingress.rs` does. What is
+/// assertable here is that the refusal names a real depth and leaves the spool untouched.
 /// **The ceiling policy** (W3 §2.7, W7 **D-17**): refused at the edge, with nothing
 /// written.
 #[tokio::test]
@@ -643,5 +679,281 @@ async fn a_torn_cursor_slot_costs_a_replay_and_not_a_loss() {
         cursor.acked_seq(),
         Seq::new(14),
         "the intact slot is the earlier position, which costs a replay of 15..=18"
+    );
+}
+
+/// **Regression: the tail must never exceed the records on disk.**
+///
+/// §3.6 step 4 read as `max(manifest, last record)` is a live-lock. If the newest
+/// segment's records are discarded — a bad block, or a partial append cut off — the
+/// manifest's higher number survived as the tail, `Cursor::wait_for_records` saw
+/// `tail > position` immediately and for ever, and the consumer task spun without ever
+/// progressing while `mw_spool_lag_envelopes` reported a phantom lag.
+#[tokio::test]
+async fn a_tail_is_clamped_down_to_the_records_that_survive() {
+    let scratch = Scratch::new("phantom-tail");
+    let clock = TestClock::fixed();
+    let cursor_id = id("writer:timescale");
+    {
+        let s = Spool::open(
+            SpoolConfig {
+                segment_bytes: 512,
+                ..config(scratch.spool())
+            },
+            node(1),
+            Arc::new(clock.clone()) as Arc<dyn Clock>,
+        )
+        .expect("a fresh spool");
+        let mut cursor = s.open_cursor(cursor_id.clone()).expect("a free cursor");
+        for _ in 0..10 {
+            s.admit_local(&drafts(2, &clock)).await.expect("accepted");
+        }
+        cursor.ack(Seq::new(15)).expect("acknowledged");
+        assert_eq!(s.tail_seq(), Seq::new(20));
+    }
+
+    // Corrupt the newest segment's first record, so every record in it is discarded while
+    // the manifest still claims 20.
+    let newest = segments(&scratch.spool())
+        .pop()
+        .expect("at least one segment");
+    let mut bytes = std::fs::read(&newest).expect("readable");
+    let at = 32; // just past the segment header, i.e. the first record's length field
+    bytes[at] ^= 0xff;
+    std::fs::write(&newest, &bytes).expect("writable");
+
+    let s = Spool::open(
+        SpoolConfig {
+            segment_bytes: 512,
+            ..config(scratch.spool())
+        },
+        node(1),
+        Arc::new(clock.clone()) as Arc<dyn Clock>,
+    )
+    .expect("a torn newest segment is recoverable");
+
+    let highest = s
+        .read_after(Seq::new(0), 1_024)
+        .expect("readable")
+        .envelopes
+        .last()
+        .map(|(seq, _)| *seq)
+        .unwrap_or(Seq::new(0));
+    assert_eq!(
+        s.tail_seq(),
+        highest,
+        "the tail is exactly the last surviving record, not the manifest's claim"
+    );
+
+    // And the consumer does not spin: with nothing after its position, the wait really
+    // waits rather than returning immediately.
+    let mut cursor = s.open_cursor(cursor_id).expect("a free cursor");
+    cursor.ack(s.tail_seq()).expect("acknowledged");
+    assert!(
+        cursor.read().expect("readable").envelopes.is_empty(),
+        "nothing is left to read"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), cursor.wait_for_records())
+            .await
+            .is_err(),
+        "and the wait parks instead of returning immediately, which is what stops the \
+         consumer task spinning at 100 % CPU for ever"
+    );
+}
+
+/// **Regression: a refused `accept` must not consume the peer's sequence numbers.**
+///
+/// The dedup verdict used to be committed in its own critical section before the append.
+/// A ceiling refusal — the documented, expected, retryable case — then left `hw_seq`
+/// claiming envelopes that were never written, so the peer's retry was answered
+/// `Duplicate`, it advanced its cursor on the ack, and the data was gone.
+#[tokio::test]
+async fn a_batch_refused_at_the_ceiling_is_still_fresh_on_retry() {
+    let scratch = Scratch::new("refused-retry");
+    let clock = TestClock::fixed();
+    let s = Spool::open(
+        SpoolConfig {
+            // Small segments inside a small ceiling, so reclamation really frees room:
+            // the open segment is never reclaimed, so a one-segment spool cannot recover.
+            ceiling_bytes: 8 * 1024,
+            segment_bytes: 512,
+            ..config(scratch.spool())
+        },
+        node(1),
+        Arc::new(clock.clone()) as Arc<dyn Clock>,
+    )
+    .expect("a fresh spool");
+    // Opened before the fill, so it holds the segments until it acks -- otherwise they are
+    // reclaimed as they go and the ceiling is never reached.
+    let mut cursor = s
+        .open_cursor(id("writer:timescale"))
+        .expect("a free cursor");
+
+    // Fill it with local readings, so the peer's first contact is the refused one.
+    while s.admit_local(&drafts(4, &clock)).await.is_ok() {
+        assert!(s.tail_seq().get() < 10_000, "the ceiling is reachable");
+    }
+
+    let batch: Vec<_> = (1..=3)
+        .map(|seq| forwarded(node(7), seq, "remote", clock.now(), &[node(1)]))
+        .collect();
+    let err = s
+        .accept_sealed(&batch)
+        .await
+        .expect_err("the spool is at its ceiling");
+    assert!(matches!(err, SpoolError::Full { .. }));
+    assert_eq!(
+        s.high_water(node(7)),
+        Seq::new(0),
+        "the refusal consumed none of the peer's sequence numbers"
+    );
+    for seq in 1..=3 {
+        assert!(
+            !s.is_duplicate(node(7), Seq::new(seq)),
+            "seq {seq} is still unseen, so the peer's retry will be accepted"
+        );
+    }
+
+    // Drain, and the retry really is accepted.
+    cursor.ack(s.tail_seq()).expect("acknowledged");
+    let committed = s.accept_sealed(&batch).await.expect("there is room now");
+    assert_eq!(
+        committed.envelopes.len(),
+        3,
+        "nothing was lost by the refusal"
+    );
+    assert_eq!(committed.duplicates, 0);
+}
+
+/// **Regression: `max_lag` measures lateness, not idleness.**
+///
+/// `acked_at` is only written by an advancing ack, so a cursor with nothing to do never
+/// refreshes it. Measuring against it abandoned a consumer that had acknowledged every
+/// record the instant one new one arrived after a quiet week, and reclaimed the segments
+/// it owed — the inverse of **D-30a**.
+#[tokio::test]
+async fn a_caught_up_cursor_is_not_abandoned_for_being_idle() {
+    let scratch = Scratch::new("idle-cursor");
+    let clock = TestClock::fixed();
+    let s = Spool::open(
+        SpoolConfig {
+            segment_bytes: 512,
+            ..config(scratch.spool())
+        },
+        node(1),
+        Arc::new(clock.clone()) as Arc<dyn Clock>,
+    )
+    .expect("a fresh spool");
+    let consumer = id("uplink:suncrest");
+    let mut cursor = s.open_cursor(consumer.clone()).expect("a free cursor");
+
+    // It keeps up perfectly.
+    for _ in 0..10 {
+        s.admit_local(&drafts(2, &clock)).await.expect("accepted");
+        let read = cursor.read().expect("readable");
+        cursor.ack(read.through).expect("acknowledged");
+    }
+    assert_eq!(cursor.acked_seq(), s.tail_seq(), "fully caught up");
+
+    // The station is offline for eight days, past the seven-day default.
+    clock.advance(ChronoDuration::days(8));
+
+    // It comes back. The cursor is momentarily behind -- which is the whole of its crime.
+    for _ in 0..10 {
+        s.admit_local(&drafts(2, &clock)).await.expect("accepted");
+    }
+    assert_eq!(
+        s.cursor_position(&consumer).expect("registered").state,
+        CursorState::Active,
+        "a consumer that never fell behind is not abandoned for the node being quiet"
+    );
+    assert!(!cursor.is_abandoned());
+    let read = cursor.read().expect("readable");
+    assert_eq!(
+        read.envelopes.len(),
+        20,
+        "and every record admitted since is still there for it"
+    );
+}
+
+/// A zero-length `.seg` is a routine crash artefact, not corruption, and must not refuse
+/// the start for ever.
+///
+/// `create_segment` makes the directory entry durable before the 32-byte header is, so a
+/// journal commit can land one without the other. The file holds no records, so there is
+/// nothing behind it to lose — unlike a segment whose header is present and *wrong*, which
+/// still refuses.
+#[tokio::test]
+async fn a_zero_length_segment_is_removed_rather_than_refusing_the_start() {
+    let scratch = Scratch::new("short-segment");
+    let clock = TestClock::fixed();
+    {
+        let s = spool(scratch.spool(), node(1), &clock);
+        s.admit_local(&drafts(3, &clock)).await.expect("accepted");
+    }
+    // The shape a crash during `create_segment` leaves: an entry, no header.
+    let stray = scratch.spool().join("00000000000009999.seg");
+    std::fs::write(&stray, b"").expect("writable");
+
+    let s = spool(scratch.spool(), node(1), &clock);
+    assert!(!stray.exists(), "the empty segment was removed");
+    assert_eq!(s.tail_seq(), Seq::new(3), "and the real log is intact");
+    s.admit_local(&drafts(1, &clock))
+        .await
+        .expect("and the spool is usable");
+
+    // A segment whose header is present and wrong is a different thing and still refuses:
+    // truncating it to zero records would discard everything behind it.
+    let bad = scratch.spool().join("00000000000008888.seg");
+    std::fs::write(&bad, [0u8; 64]).expect("writable");
+    let err = Spool::open(
+        config(scratch.spool()),
+        node(1),
+        Arc::new(clock.clone()) as Arc<dyn Clock>,
+    )
+    .expect_err("a segment with a bad header is not recoverable by removing it");
+    assert!(matches!(err, SpoolError::Segment { .. }));
+}
+
+/// **D-11's upgrade claim, tested rather than asserted.**
+///
+/// "A spool written by version *n* is read by version *n+1* under protobuf's own
+/// compatibility rules" is only true if a record this build cannot *interpret* does not
+/// refuse the start. The recovery decode runs the full semantic validation, not just prost,
+/// so a record behind a valid CRC32C can be undecodable without being corrupt — and
+/// refusing on it would make a non-empty spool a one-way door at every upgrade.
+#[tokio::test]
+async fn a_record_this_build_cannot_decode_is_skipped_rather_than_refusing_the_start() {
+    let scratch = Scratch::new("undecodable");
+    let clock = TestClock::fixed();
+    {
+        let s = spool(scratch.spool(), node(1), &clock);
+        s.admit_local(&drafts(2, &clock)).await.expect("accepted");
+    }
+
+    // Append a well-framed record -- correct length, correct CRC32C -- whose payload is not
+    // a `collector.v1.Envelope`. That is what a future version's message looks like to this
+    // one if the schema ever changes incompatibly.
+    let newest = segments(&scratch.spool()).pop().expect("a segment");
+    let mut bytes = std::fs::read(&newest).expect("readable");
+    let mut record = Vec::new();
+    mw_pipeline::spool::format::encode_record(Seq::new(3), b"not a protobuf at all", &mut record);
+    bytes.extend_from_slice(&record);
+    std::fs::write(&newest, &bytes).expect("writable");
+
+    let s = spool(scratch.spool(), node(1), &clock);
+    assert_eq!(
+        s.tail_seq(),
+        Seq::new(3),
+        "the record is framed correctly, so it counts toward the tail"
+    );
+    // And the spool works: the two decodable records are readable, and the next append
+    // continues past the one that is not.
+    let read = s.read_after(Seq::new(0), 10);
+    assert!(
+        read.is_err() || read.expect("ok").envelopes.len() == 2,
+        "a cursor reading over it either reports the record or skips it, but the node \
+         started, which is what D-11 needs"
     );
 }

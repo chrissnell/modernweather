@@ -447,3 +447,111 @@ async fn a_rejected_command_line_exits_2_and_prints_the_usage() {
         "the usage is on stdout"
     );
 }
+
+/// Seed a `node` row, which is what makes step 4b open a spool at all.
+///
+/// The migration deliberately seeds none: `node_id` is a UUIDv7 the node mints once, and
+/// `spool_path` has no default. So "this node has started before" is a state only a test or
+/// W7's enrolment can create.
+async fn configure_node(config: &Path, spool_path: &Path) {
+    let pool = mw_store::config_db::open_and_migrate(config)
+        .await
+        .expect("migrated");
+    sqlx::query(
+        "INSERT INTO node (id, node_id, node_name, timezone, spool_path) \
+         VALUES (1, ?1, 'under-test', 'UTC', ?2)",
+    )
+    .bind(vec![7u8; 16])
+    .bind(spool_path.to_str().expect("a UTF-8 scratch path"))
+    .execute(&pool)
+    .await
+    .expect("the row is insertable");
+    pool.close().await;
+}
+
+/// Step 4b against the real binary: a configured node opens its spool, converges, and
+/// stops cleanly — and the spool is on disk afterwards with the files recovery needs.
+///
+/// Nothing covered this path before: `tests/spool_fanout.rs` is in-process and never calls
+/// `spool::open` or `boot::run`, so the 16-byte `node_id` check, both negative-value
+/// guards, the `MANIFEST` creation and the shutdown-time `stats()` log were all untested.
+#[tokio::test]
+async fn a_configured_node_opens_its_spool_and_stops_cleanly() {
+    let scratch = Scratch::new("spool-boot");
+    let config = scratch.path("config.db");
+    let notify = scratch.path("notify.sock");
+    let spool = scratch.path("spool");
+    let port = free_port().await;
+    configure(&config, port).await;
+    configure_node(&config, &spool).await;
+
+    let socket = notify_socket(&notify);
+    let mut child = spawn(&config, &notify);
+    notified_with(&socket, "READY=1").await;
+
+    terminate(&child);
+    let status = tokio::time::timeout(GRACE, child.wait())
+        .await
+        .expect("exits inside the grace")
+        .expect("the exit status is readable");
+    assert!(status.success(), "{status:?}");
+
+    // The spool is a root resource `main` owns, so it exists by readiness and survives the
+    // stop. `MANIFEST` is the file whose absence refuses the next start.
+    assert!(spool.join("MANIFEST").is_file(), "the manifest was written");
+    assert!(
+        spool.join("cursors").is_dir(),
+        "and the cursor directory exists for the first component that asks for one"
+    );
+    let segments = std::fs::read_dir(&spool)
+        .expect("readable")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("seg"))
+        .count();
+    assert_eq!(segments, 1, "one open segment, created with its header");
+
+    // And it reopens: the second start adopts the same spool rather than refusing it,
+    // which is the `WrongNode` check passing rather than being untested.
+    let notify = scratch.path("notify2.sock");
+    let socket = notify_socket(&notify);
+    let mut again = spawn(&config, &notify);
+    notified_with(&socket, "READY=1").await;
+    terminate(&again);
+    let status = tokio::time::timeout(GRACE, again.wait())
+        .await
+        .expect("exits inside the grace")
+        .expect("the exit status is readable");
+    assert!(status.success(), "{status:?}");
+}
+
+/// A spool that cannot be opened is **fatal**, and that is the design's answer rather than
+/// a convenience: §2.7 — "A daemon that cannot durably accept readings is not degraded, it
+/// is wrong." D-27's start-anyway carve-out is about a *remote* server that is slow or
+/// unreachable, not about a local root resource.
+///
+/// The one case where "fatal" was a line of code and not a tested claim.
+#[tokio::test]
+async fn a_spool_path_that_cannot_be_created_fails_the_start() {
+    let scratch = Scratch::new("spool-unwritable");
+    let config = scratch.path("config.db");
+    let notify = scratch.path("notify.sock");
+    // A path whose parent is a *file*, so `create_dir_all` cannot succeed. Chosen over a
+    // permission bit because the test suite may run as root, where a mode-000 directory is
+    // still writable.
+    let blocker = scratch.path("not-a-directory");
+    std::fs::write(&blocker, b"this is a file").expect("writable");
+    let spool = blocker.join("spool");
+    let port = free_port().await;
+    configure(&config, port).await;
+    configure_node(&config, &spool).await;
+
+    let mut child = spawn(&config, &notify);
+    let status = tokio::time::timeout(PATIENCE, child.wait())
+        .await
+        .expect("a fatal spool failure exits promptly rather than hanging the start")
+        .expect("the exit status is readable");
+    assert!(
+        !status.success(),
+        "a spool that cannot be opened must exit non-zero, not start degraded: {status:?}"
+    );
+}

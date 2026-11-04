@@ -295,16 +295,16 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     //
     // What is worth saying out loud on the way out is how much it still holds. A spool
     // that is deep at shutdown is a spool whose consumers were behind, and the next start
-    // will replay from exactly here; the append/fsync ratio is the group-commit
+    // will replay from exactly here; the appends-per-commit ratio is the group-commit
     // coalescing (W7 D-13), which is the one number that says whether a replay burst cost
-    // one disk sync or hundreds.
+    // one group commit or hundreds.
     if let Some(fanout) = fanout {
         let stats = fanout.spool.stats();
         info!(
             depth_bytes = fanout.spool.depth_bytes(),
             tail_seq = fanout.spool.tail_seq().get(),
             appends = stats.appends,
-            fsyncs = stats.fsyncs,
+            commits = stats.commits,
             "spool closed"
         );
     }

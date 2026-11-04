@@ -82,7 +82,7 @@ pub use format::{CursorState, MAX_ORIGINS};
 use dedup::Dedup;
 use format::{
     encode_record, live_slot, scan_records, CursorSlot, Manifest, ManifestProblem, SegmentHeader,
-    CURSOR_FILE_BYTES, CURSOR_SLOT_BYTES, SEGMENT_HEADER_BYTES,
+    CURSOR_FILE_BYTES, SEGMENT_HEADER_BYTES,
 };
 
 /// 8 MiB per segment (W3 §2.4).
@@ -118,6 +118,14 @@ pub const GROUP_COMMIT_WINDOW: Duration = Duration::from_millis(50);
 
 /// How many concurrent append **calls** one `fsync` may cover (W7 **D-13**).
 pub const GROUP_COMMIT_APPENDS: usize = 64;
+
+/// The admit byte rate §2.4 and §3.5 do their arithmetic with: a worst-case ~1 KiB encoded
+/// envelope at the measured ~2/s.
+///
+/// Used only as the fallback for §3.5's configuration advisory, which has to be able to
+/// fire at **startup** — when the trailing-hour rate is necessarily zero, because it is in
+/// memory. Once there is a measurement the measurement is used.
+pub const WORST_CASE_BYTES_PER_SECOND: f64 = 2.0 * 1024.0;
 
 /// How many envelopes a durable cursor reads at once (W3 §2.4).
 ///
@@ -316,11 +324,19 @@ pub struct Draft {
 pub struct SpoolStats {
     /// Append calls committed.
     pub appends: u64,
-    /// `fsync`s performed.
-    pub fsyncs: u64,
+    /// **Group commits** performed — not `fsync` syscalls.
+    ///
+    /// One commit is `sync_data` on the open segment plus, whenever the manifest changed,
+    /// the manifest's own write-fsync-rename-fsyncdir — so three syscalls, not one. What
+    /// the ratio against `appends` measures is the *coalescing*, which is W7 **D-13**'s
+    /// claim, and that is what this counts.
+    pub commits: u64,
 }
 
 /// What one committed append did.
+///
+/// The three counts are zero on the `admit` path — a reading this node measured cannot be
+/// a duplicate of itself — and carry the dedup gate's verdicts on the `accept` path.
 #[derive(Debug, Clone)]
 pub struct Committed {
     /// The highest local position the append consumed. For an empty append, the unchanged
@@ -328,6 +344,26 @@ pub struct Committed {
     pub seq_high: Seq,
     /// The envelopes as they were written, provenance included.
     pub envelopes: Vec<Envelope>,
+    /// Envelopes this node already had (W7 §4.4). Expected and non-zero in a diamond.
+    pub duplicates: u32,
+    /// Envelopes dropped because the origin table is at [`MAX_ORIGINS`].
+    pub origin_table_full: u32,
+    /// How many dedup positions slid out of a window's reach, summed over the batch.
+    pub overrun_positions: u64,
+}
+
+impl Committed {
+    /// Nothing written, at `tail`. `Seq` has no `Default` on purpose — position zero means
+    /// "nothing appended yet" and is not a value a caller should get by omission.
+    fn nothing(tail: Seq) -> Self {
+        Self {
+            seq_high: tail,
+            envelopes: Vec::new(),
+            duplicates: 0,
+            origin_table_full: 0,
+            overrun_positions: 0,
+        }
+    }
 }
 
 /// The durable fan-out point.
@@ -372,10 +408,10 @@ struct State {
     tail_seq: Seq,
     /// Appends assigned, ever.
     write_no: u64,
-    /// Appends committed, ever — the same number, counted after the `fsync`.
+    /// Appends committed, ever — the same number, counted after the commit.
     appends: u64,
-    /// `fsync`s performed, ever.
-    fsyncs: u64,
+    /// Group commits performed, ever.
+    commits: u64,
     /// Appends committed.
     synced_write_no: u64,
     /// When the oldest uncommitted append was written.
@@ -411,6 +447,20 @@ struct CursorFile {
     acked_seq: Seq,
     acked_at: i64,
     state: CursorState,
+    /// When this cursor was first observed *behind the tail*, or `None` while it is caught
+    /// up. In memory only.
+    ///
+    /// **`max_lag` measures lateness, not idleness, and this is the difference.** The
+    /// obvious predicate — `now - acked_at > max_lag` — is wrong, because `acked_at` is
+    /// only written by an *advancing* ack, so a cursor with nothing to do never refreshes
+    /// it. A node that is quiet for eight days would then abandon a consumer that had
+    /// acknowledged every record, the instant the next one arrived, and reclaim the
+    /// segments it owed — silent permanent loss of a durable sink's data after any quiet
+    /// week, which is the exact inverse of **D-30a**.
+    ///
+    /// Seeded from the persisted `acked_at` at open when the cursor is already behind, so
+    /// a restart does not reset the clock on a peer that has been gone six days.
+    behind_since: Option<i64>,
 }
 
 impl Spool {
@@ -480,8 +530,35 @@ impl Spool {
                 .metadata()
                 .map_err(io("reading the metadata of", &path))?
                 .len();
-            let header = std::fs::read(&path).map_err(io("reading", &path))?;
-            let header = SegmentHeader::decode(&header).map_err(|source| SpoolError::Segment {
+            // A 32-byte `read_exact`, not a whole-file read. Slurping each segment just to
+            // parse its header made start-up O(spool depth) -- ~2 GiB of reads at the
+            // ceiling -- which is the opposite of what W7 **D-18** promises ("recovery is
+            // bounded by 8 MiB regardless of spool depth"). Only the newest segment is
+            // read in full, below.
+            let mut head = [0u8; SEGMENT_HEADER_BYTES];
+            let short = {
+                use std::io::Read as _;
+                let mut f = std::fs::File::open(&path).map_err(io("opening", &path))?;
+                f.read_exact(&mut head).is_err()
+            };
+            if short {
+                // A segment shorter than its own header is a routine crash artefact, not
+                // corruption: `create_segment` makes the directory entry durable before
+                // the 32 bytes are, so a journal commit can land one without the other. It
+                // holds no records, so there is nothing behind it to lose -- unlike a
+                // segment whose header is *present and wrong*, which still refuses the
+                // start below.
+                error!(
+                    segment = %path.display(),
+                    bytes,
+                    "a spool segment is shorter than its own header, which is what a crash \
+                     during segment creation leaves. Removing it; it held no records."
+                );
+                std::fs::remove_file(&path).map_err(io("removing", &path))?;
+                m::spool_truncated();
+                continue;
+            }
+            let header = SegmentHeader::decode(&head).map_err(|source| SpoolError::Segment {
                 path: path.clone(),
                 source,
             })?;
@@ -499,7 +576,20 @@ impl Spool {
         for o in &manifest.origins {
             dedup.seed(o.node_id, o.hw_seq);
         }
-        let mut tail_seq = manifest.tail_seq();
+        // §3.6 step 4: "the seq of the last valid record (or MANIFEST's node seq if the
+        // spool is empty)". Taken literally as `max(manifest, last record)` this is a
+        // **live-lock**: if the newest segment's records are discarded (a bad block, or a
+        // truncated partial append), the manifest's higher number survives as the tail,
+        // `Cursor::wait_for_records` waits for `tail > position` — already true — and the
+        // consumer task spins at 100 % CPU for ever without progressing, with
+        // `mw_spool_lag_envelopes` reporting a phantom lag.
+        //
+        // So the tail is clamped **down** to what the records justify. The positions above
+        // it are re-used, which is sound precisely because their records are gone: no
+        // cursor can be ahead of the tail either (the clamp below pulls them back), so
+        // nothing has acknowledged them.
+        let tail_seq;
+        let mut recovered_from_records = false;
         let open = match found.pop() {
             Some(newest) => {
                 let bytes = std::fs::read(&newest.path).map_err(io("reading", &newest.path))?;
@@ -526,13 +616,37 @@ impl Spool {
                     f.sync_all().map_err(io("syncing", &newest.path))?;
                     m::spool_truncated();
                 }
-                if let Some(last) = scan.records.last() {
-                    tail_seq = tail_seq.max(last.seq);
-                }
+                tail_seq = match scan.records.last() {
+                    Some(last) => last.seq,
+                    // An empty newest segment is the ordinary state just after a rotation:
+                    // everything up to the position before its `first_seq` is in the
+                    // closed segments behind it.
+                    None => Seq::new(newest.first_seq.get().saturating_sub(1)),
+                };
+                recovered_from_records = true;
                 // 5. the seen-window, from the newest segment only.
                 for record in &scan.records {
-                    let env = decode_record(record.seq, record.payload)?;
-                    dedup.accept(env.provenance.origin(), env.provenance.seq().get());
+                    match decode_record(record.seq, record.payload) {
+                        Ok(env) => {
+                            dedup.accept(env.provenance.origin(), env.provenance.seq().get());
+                        }
+                        // A record behind a valid CRC32C that this build cannot *interpret*
+                        // is not corruption — it is a schema or validation difference, and
+                        // D-11's whole claim is that version n+1 reads version n's spool.
+                        // Refusing to start on it would make that false, so it is counted
+                        // and skipped: the only cost is that this `(origin, seq)` is no
+                        // longer in the rebuilt window, which is a deduplicated replay.
+                        Err(e) => {
+                            warn!(
+                                seq = record.seq.get(),
+                                segment = %newest.path.display(),
+                                err = %mw_types::DisplayChain(&e),
+                                "a spool record could not be decoded by this build; it is \
+                                 skipped for the dedup window rebuild and left on disk"
+                            );
+                            m::spool_record_undecodable();
+                        }
+                    }
                 }
                 OpenSegment {
                     first_seq: newest.first_seq,
@@ -541,9 +655,25 @@ impl Spool {
                     bytes: scan.valid_bytes as u64,
                 }
             }
-            None => create_segment(&cfg.path, tail_seq.next(), now)?,
+            None => {
+                // No segments at all, so the manifest is the only record of how far this
+                // node's log ever got — which is the other half of §3.6 step 4.
+                tail_seq = manifest.tail_seq();
+                create_segment(&cfg.path, tail_seq.next(), now)?
+            }
         };
-        if manifest.tail_seq() < tail_seq {
+        if recovered_from_records && manifest.tail_seq() > tail_seq {
+            error!(
+                manifest_tail = manifest.tail_seq().get(),
+                records_tail = tail_seq.get(),
+                spool = %cfg.path.display(),
+                "the manifest claims a tail the segments do not hold, which means records \
+                 it had committed are gone. Clamping the tail down to the last surviving \
+                 record; the positions between are re-used, because nothing can have \
+                 acknowledged them."
+            );
+        }
+        if manifest.tail_seq() != tail_seq {
             manifest.set_tail_seq(tail_seq);
             write_manifest(&cfg.path, &manifest)?;
         }
@@ -569,6 +699,12 @@ impl Spool {
             };
             let mut record = read_cursor(&path, &id, now)?;
             clamp(&mut record, tail_seq, oldest_seq, &cfg.path)?;
+            if record.acked_seq < tail_seq {
+                // Already behind when the process came up, so the lateness clock does not
+                // restart: it runs from the last ack, which is a lower bound on when this
+                // cursor fell behind.
+                record.behind_since = Some(record.acked_at);
+            }
             cursors.insert(id, record);
         }
 
@@ -591,7 +727,7 @@ impl Spool {
                 tail_seq,
                 write_no: 0,
                 appends: 0,
-                fsyncs: 0,
+                commits: 0,
                 synced_write_no: 0,
                 group_started: None,
                 dedup,
@@ -635,7 +771,7 @@ impl Spool {
         let st = self.locked();
         SpoolStats {
             appends: st.appends,
-            fsyncs: st.fsyncs,
+            commits: st.commits,
         }
     }
 
@@ -679,10 +815,17 @@ impl Spool {
         self.append_batch(Batch::Local(drafts)).await
     }
 
-    /// Append envelopes a peer already sealed, preserving their provenance (**D-60**).
+    /// Accept envelopes a peer already sealed, preserving their provenance (**D-60**).
     ///
-    /// This is `Ingress::accept`'s step 9.
-    pub async fn append_sealed(&self, envelopes: &[Envelope]) -> Result<Committed, SpoolError> {
+    /// This is W7 §4.4's steps 6, 7 and 9 **in one critical section**, which is what the
+    /// document asks for ("`hw[origin]` updated in the same commit") and what an earlier
+    /// split got wrong. Interning the origin and taking the dedup verdict used to happen in
+    /// their own lock acquisition *before* the append; a ceiling refusal — the documented,
+    /// expected, retryable case — then left `hw_seq` claiming envelopes that were never
+    /// written, so the peer's retry was answered `Duplicate` and its data was gone. The
+    /// mutation now happens only after the records are in the file, so a refusal or a
+    /// cancellation leaves the gate exactly as it was and the retry is answered `Fresh`.
+    pub async fn accept_sealed(&self, envelopes: &[Envelope]) -> Result<Committed, SpoolError> {
         self.append_batch(Batch::Sealed(envelopes)).await
     }
 
@@ -694,21 +837,33 @@ impl Spool {
     /// database will not have.
     async fn append_batch(&self, batch: Batch<'_>) -> Result<Committed, SpoolError> {
         if batch.is_empty() {
-            return Ok(Committed {
-                seq_high: self.tail_seq(),
-                envelopes: Vec::new(),
-            });
+            return Ok(Committed::nothing(self.tail_seq()));
         }
-        let (write_no, committed, pending) = {
+        let (write_no, committed) = {
             let mut st = self.locked();
-            let (write_no, committed) = self.write_batch(&mut st, batch)?;
-            (write_no, committed, st.write_no - st.synced_write_no)
+            let out = self.write_batch(&mut st, batch)?;
+            // Both watch publications happen with `state` held, so the mutex that orders
+            // `State` also orders them. Done outside, they race: two callers released by
+            // one leader can publish `seq_high` out of order and leave `tail` *behind* a
+            // record that is already durable, which parks a cursor on data it could read;
+            // and a `pending` computed under the lock but sent after it can land after the
+            // leader's reset and stick at or above the cap, which silently turns the group
+            // commit into one `fsync` per append for the life of the process. Neither send
+            // can block and neither takes `state`, so holding it costs nothing.
+            self.tail.send_if_modified(|t| {
+                if st.tail_seq > *t {
+                    *t = st.tail_seq;
+                    true
+                } else {
+                    false
+                }
+            });
+            self.pending.send_replace(st.write_no - st.synced_write_no);
+            out
         };
-        self.pending.send_replace(pending);
         self.commit(write_no).await?;
 
         // After the commit, never before.
-        self.tail.send_replace(committed.seq_high);
         for e in &committed.envelopes {
             let shared = Arc::new(e.clone());
             // `send_replace` on a watch and `send` on a broadcast both return without
@@ -723,11 +878,17 @@ impl Spool {
         Ok(committed)
     }
 
-    /// The whole of the critical section: the ceiling check, rotation, the `seq`
-    /// assignment, one `write_all`, and the manifest's new tail.
+    /// The whole of the critical section: the dedup gate, the ceiling check, rotation, the
+    /// `seq` assignment, one `write_all`, and then — and only then — every mutation.
     ///
     /// Synchronous and `&mut State`, so the compiler enforces what the atom needs: there is
     /// no `.await` in here to be cancelled at.
+    ///
+    /// **The order of the two halves is the correctness argument.** Everything above the
+    /// `write_all` only *reads* `State`; everything that mutates it — the dedup verdicts,
+    /// the origin table, the tail, the depth, the manifest — is below. So a ceiling
+    /// refusal, a rotation failure or a write error leaves the spool bit-for-bit as it
+    /// was, and a retry of the same batch gets the same answers.
     fn write_batch(
         &self,
         st: &mut State,
@@ -739,30 +900,56 @@ impl Spool {
             });
         }
 
-        // Seal and encode first, because the ceiling is a byte count and the bytes are not
-        // known until the envelopes are encoded. Nothing is written if the ceiling refuses.
+        // --- read-only: the gate, the sealing, the encoding, the bounds ------------------
+        let now = self.clock.now().timestamp_millis();
+        let mut gate = Gate::new(st);
         let mut seq = st.tail_seq;
-        let mut envelopes = Vec::with_capacity(batch.len());
+        let mut committed = Committed::nothing(st.tail_seq);
+        let mut fresh: Vec<(usize, Seq)> = Vec::with_capacity(batch.len());
         let mut buf = Vec::new();
         for i in 0..batch.len() {
+            if let Batch::Sealed(envelopes) = batch {
+                let provenance = &envelopes[i].provenance;
+                match gate.verdict(&st.dedup, provenance.origin(), provenance.seq().get()) {
+                    Verdict::OriginTableFull => {
+                        committed.origin_table_full += 1;
+                        continue;
+                    }
+                    Verdict::Duplicate => {
+                        committed.duplicates += 1;
+                        continue;
+                    }
+                    Verdict::FreshAfterOverrun { skipped } => {
+                        committed.overrun_positions += skipped;
+                    }
+                    Verdict::Fresh => {}
+                }
+            }
             seq = seq.next();
             let envelope = batch.seal(i, self.node_id, seq);
             let payload = mw_proto::wire::Envelope::from(&envelope).encode_to_vec();
             encode_record(seq, &payload, &mut buf);
-            envelopes.push(envelope);
+            committed.envelopes.push(envelope);
+            fresh.push((i, seq));
+        }
+        if fresh.is_empty() {
+            // Every envelope was a duplicate or refused. Nothing to write, so nothing to
+            // commit -- and `accept` still succeeds, which is what lets the sender advance
+            // its cursor instead of resending for ever (W7 D-8).
+            return Ok((st.write_no, committed));
         }
         let bytes = buf.len() as u64;
         if st.depth_bytes + bytes > self.cfg.ceiling_bytes {
-            // Drop at the edge, loudly (W3 §2.7). Nothing is written, so the batch is lost
-            // and the spool is unchanged -- which is what keeps shutdown working, and is
-            // the half the "stall ingest" alternative gets wrong.
+            // Drop at the edge, loudly (W3 §2.7). Nothing has been mutated, so the batch
+            // is refused and the spool is unchanged -- which is what keeps shutdown working
+            // and what makes a retry sound.
             return Err(SpoolError::Full {
                 depth_bytes: st.depth_bytes,
                 ceiling_bytes: self.cfg.ceiling_bytes,
             });
         }
 
-        let now = self.clock.now().timestamp_millis();
+        // --- the write ------------------------------------------------------------------
         if st.open.bytes > SEGMENT_HEADER_BYTES as u64
             && st.open.bytes + bytes > self.cfg.segment_bytes
         {
@@ -781,15 +968,43 @@ impl Spool {
                 bytes: closed.bytes,
             });
         }
+        // One `write_all` of the whole batch: the atom (W7 D-14) -- but `write_all` is a
+        // loop, not a syscall, so an error can leave a partial record behind. The file is
+        // `O_APPEND`, so the next append would land after the fragment, commit, be
+        // acknowledged, and then be discarded by the next recovery's truncation. Both
+        // halves of the recovery are therefore done here: the fragment is cut off, and the
+        // spool is poisoned so no later append can report success after a partial one.
+        if let Err(e) = st.open.file.write_all(&buf) {
+            let partial = io("appending to", &st.open.path)(e);
+            let repair = st
+                .open
+                .file
+                .set_len(st.open.bytes)
+                .and_then(|()| st.open.file.sync_all());
+            error!(
+                segment = %st.open.path.display(),
+                valid_bytes = st.open.bytes,
+                err = %mw_types::DisplayChain(&partial),
+                repaired = repair.is_ok(),
+                "an append failed part-way through; the partial record has been cut off \
+                 and the spool is poisoned. A daemon that cannot durably accept readings \
+                 is wrong rather than degraded (W2a Decision 62)."
+            );
+            self.poison(&partial);
+            return Err(partial);
+        }
 
-        // One `write_all` of the whole batch: the atom (W7 D-14).
-        st.open
-            .file
-            .write_all(&buf)
-            .map_err(io("appending to", &st.open.path))?;
+        // --- mutation: nothing above this line has changed `State` ----------------------
+        if let Batch::Sealed(envelopes) = batch {
+            for (i, _) in &fresh {
+                let provenance = &envelopes[*i].provenance;
+                commit_verdict(st, provenance.origin(), provenance.seq().get(), now);
+            }
+        }
         st.open.bytes += bytes;
         st.depth_bytes += bytes;
         st.tail_seq = seq;
+        committed.seq_high = seq;
         st.manifest.set_tail_seq(seq);
         st.manifest_dirty = true;
         st.rate.record(now, bytes);
@@ -797,13 +1012,18 @@ impl Spool {
         if st.group_started.is_none() {
             st.group_started = Some(tokio::time::Instant::now());
         }
-        Ok((
-            st.write_no,
-            Committed {
-                seq_high: seq,
-                envelopes,
-            },
-        ))
+        Ok((st.write_no, committed))
+    }
+
+    /// Make the sticky commit failure visible to everyone, including the followers of a
+    /// group commit that is about to be abandoned.
+    fn poison(&self, e: &SpoolError) {
+        let reason: Arc<str> = Arc::from(mw_types::DisplayChain(e).to_string().as_str());
+        self.synced.send_modify(|s| {
+            if s.1.is_none() {
+                s.1 = Some(reason);
+            }
+        });
     }
 
     /// Make append `write_no` durable, coalescing with whatever else is waiting.
@@ -819,37 +1039,60 @@ impl Spool {
         loop {
             {
                 let (through, failed) = &*rx.borrow_and_update();
+                if *through >= write_no {
+                    return Ok(());
+                }
                 if let Some(reason) = failed {
                     return Err(SpoolError::Poisoned {
                         reason: Arc::clone(reason),
                     });
                 }
-                if *through >= write_no {
-                    return Ok(());
-                }
             }
             if let Ok(_leading) = self.syncing.try_lock() {
+                // Declared **before** `_leading` so it drops **after** it (locals drop in
+                // reverse declaration order). If this future is cancelled inside
+                // `wait_out_window` or `flush`, the guard's `Drop` wakes every follower
+                // *after* the leader slot is free, so exactly one of them re-contends and
+                // becomes the new leader. Without it, abdicating released `syncing` and
+                // published nothing: the followers were parked on a notification only a
+                // leader can send, so their `admit`/`accept` calls never returned until
+                // some unrelated later append happened to take the slot -- never, on an
+                // idle node or at shutdown.
+                let _abdicate = Abdicate(&self.synced);
                 self.wait_out_window().await;
                 match self.flush() {
                     Ok(through) => {
                         self.synced.send_replace((through, None));
-                        self.pending.send_replace(0);
                     }
                     Err(e) => {
-                        let reason: Arc<str> =
-                            Arc::from(mw_types::DisplayChain(&e).to_string().as_str());
                         // Published before returning, so a follower is told rather than
                         // left waiting on a commit that will never happen.
-                        self.synced.send_modify(|s| s.1 = Some(Arc::clone(&reason)));
+                        self.poison(&e);
                         return Err(e);
                     }
                 }
             } else {
                 // Somebody else is in the window. Their `fsync` covers this append,
                 // because it syncs the file and this append's bytes are already in it.
-                let _ = rx.changed().await;
+                //
+                // Bounded, and the bound is belt to the abdication guard's braces: the loop
+                // above re-checks `through` and re-attempts leadership, so a wakeup that is
+                // somehow missed costs one window of latency rather than the call never
+                // returning.
+                let _ = tokio::time::timeout(self.follower_patience(), rx.changed()).await;
             }
         }
+    }
+
+    /// How long a follower waits for the leader's publication before re-contending.
+    ///
+    /// One window plus a little, so a healthy leader always wins the race and a follower
+    /// only re-contends when something really has gone wrong.
+    fn follower_patience(&self) -> Duration {
+        self.cfg
+            .group_commit_window
+            .saturating_mul(2)
+            .max(Duration::from_millis(10))
     }
 
     /// Wait out the group-commit window, or leave early when the append cap is reached.
@@ -882,6 +1125,11 @@ impl Spool {
         let mut st = self.locked();
         let through = st.write_no;
         if through == st.synced_write_no {
+            // Nothing to commit. Clearing the window marker anyway, because leaving it set
+            // here is a trap for the next change: a later caller would compute its
+            // remaining window from a start time that belongs to an already-committed
+            // group.
+            st.group_started = None;
             return Ok(through);
         }
         st.open
@@ -893,44 +1141,14 @@ impl Spool {
             st.manifest_dirty = false;
         }
         st.appends += through - st.synced_write_no;
-        st.fsyncs += 1;
+        st.commits += 1;
         st.synced_write_no = through;
         st.group_started = None;
+        // Reset with `state` held, beside the field it mirrors -- see the note in
+        // `append_batch` on why these two must not be published outside the lock.
+        self.pending.send_replace(0);
         m::spool_fsynced();
         Ok(through)
-    }
-
-    /// Intern the origin, take the dedup verdict, and record the high water — in one
-    /// critical section (W7 §4.4 steps 6 and 7).
-    ///
-    /// Called from `Ingress::accept` *before* the append, so the `hw_seq` the manifest
-    /// writes in the commit is the one the segment's records justify. The three steps are
-    /// one call rather than three because they share an invariant: a high water recorded
-    /// against an origin row that does not exist is silently lost at the next restart, and
-    /// every envelope that peer ever sent then looks new.
-    pub fn record_accepted(&self, origin: OriginId, seq: Seq) -> Verdict {
-        let now = self.clock.now().timestamp_millis();
-        let mut st = self.locked();
-        let before = st.manifest.origins.len();
-        if st.manifest.intern(origin, now).is_none() {
-            return Verdict::OriginTableFull;
-        }
-        if st.manifest.origins.len() != before {
-            st.manifest_dirty = true;
-            st.dedup.seed(origin, 0);
-            m::spool_origins(st.manifest.origins.len());
-        }
-        let verdict = st.dedup.accept(origin, seq.get());
-        if verdict != Verdict::Duplicate {
-            let hw = st.dedup.high_water(origin);
-            let row = st
-                .manifest
-                .find_mut(origin)
-                .expect("the origin was interned two statements ago");
-            row.hw_seq = hw;
-            st.manifest_dirty = true;
-        }
-        verdict
     }
 
     /// Hand out the cursor named `id`, owned by exactly one task (W3 Decision 20).
@@ -1003,28 +1221,58 @@ impl Spool {
 
     /// Read up to `limit` records after `after`, oldest first.
     ///
-    /// Reads whole segment files and scans them. There is no index, and at ~2 envelopes/s
-    /// against a 256-envelope read-ahead that is one 8 MiB read per two minutes of
-    /// history — so an index would be apparatus with no measurement behind it. If one is
-    /// ever wanted, the segment's name already is one.
+    /// Segments are skipped by range and read with the state lock released; a cursor that
+    /// is caught up does no I/O at all. Within a segment the scan is still linear and
+    /// materialises every record before filtering, which is one 8 MiB read per
+    /// 256-envelope batch while draining a backlog — acceptable, and the obvious next
+    /// improvement if a measurement ever asks for it is for `scan_records` to take a
+    /// `from`/`limit`. The segment's name is already an index into the first `seq`.
     pub fn read_after(&self, after: Seq, limit: usize) -> Result<Read, SpoolError> {
-        let st = self.locked();
+        // Which files could hold a record after `after`, decided under the lock; the files
+        // themselves are read with the lock **released**.
+        //
+        // Both halves of that matter and the first version got both wrong. It pushed the
+        // open segment unconditionally, so a caught-up cursor re-read and re-CRC'd the
+        // whole thing on every wakeup -- twice per append, per cursor -- and it did so
+        // holding the same `std::sync::Mutex` that `write_batch` and `flush` need, so a
+        // segment approaching 8 MiB put measured milliseconds of CPU in front of every
+        // `admit`. Draining a backlog was quadratic in the segment's fill.
+        let (candidates, tail) = {
+            let st = self.locked();
+            if st.tail_seq <= after {
+                // Nothing newer exists. The common case by far, and now it costs one
+                // comparison instead of a segment scan.
+                return Ok(Read {
+                    envelopes: Vec::new(),
+                    through: after,
+                });
+            }
+            let mut candidates: Vec<(PathBuf, Seq)> = st
+                .closed
+                .iter()
+                // A closed segment is worth reading only if the segment *after* it starts
+                // past `after` -- i.e. it still holds positions we have not read.
+                .filter(|s| next_first(&st, s.first_seq) > after)
+                .map(|s| (s.path.clone(), s.first_seq))
+                .collect();
+            candidates.push((st.open.path.clone(), st.open.first_seq));
+            (candidates, st.tail_seq)
+        };
+
         let mut out = Vec::new();
         let mut through = after;
-        let mut paths: Vec<&PathBuf> = st
-            .closed
-            .iter()
-            .filter(|s| {
-                s.first_seq.get() > after.get() || next_first(&st, s.first_seq).get() > after.get()
-            })
-            .map(|s| &s.path)
-            .collect();
-        paths.push(&st.open.path);
-        for path in paths {
+        for (path, _first) in candidates {
             if out.len() >= limit {
                 break;
             }
-            let bytes = std::fs::read(path).map_err(io("reading", path))?;
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                // A segment reclaimed between the listing and the read. Not an error: the
+                // cursor was behind the oldest retained record, which `clamp` handles at
+                // open and `maintain` counts.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io("reading", &path)(e)),
+            };
             let scan = scan_records(&bytes).map_err(|source| SpoolError::Segment {
                 path: path.clone(),
                 source,
@@ -1040,6 +1288,10 @@ impl Spool {
                 through = record.seq;
             }
         }
+        debug_assert!(
+            through <= tail,
+            "a read cannot pass the tail it was bounded by"
+        );
         Ok(Read {
             envelopes: out,
             through,
@@ -1057,18 +1309,31 @@ impl Spool {
         // catches is a peer that is gone rather than slow.
         let lag_ms = i64::try_from(self.cfg.max_lag.as_millis()).unwrap_or(i64::MAX);
         let tail = st.tail_seq;
+        // First, keep `behind_since` honest: set it when a cursor falls behind, clear it
+        // when it catches up. A caught-up cursor has no lateness to measure however long
+        // the node is quiet.
+        for cursor in st.cursors.values_mut() {
+            if cursor.acked_seq >= tail {
+                cursor.behind_since = None;
+            } else if cursor.behind_since.is_none() {
+                cursor.behind_since = Some(now_ms);
+            }
+        }
         let abandoned: Vec<ComponentId> = st
             .cursors
             .iter()
             .filter(|(_, c)| c.state == CursorState::Active && c.acked_seq < tail)
-            .filter(|(_, c)| now_ms.saturating_sub(c.acked_at) > lag_ms)
+            .filter(|(_, c)| {
+                c.behind_since
+                    .is_some_and(|since| now_ms.saturating_sub(since) > lag_ms)
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in abandoned {
             let Some(record) = st.cursors.get_mut(&id) else {
                 continue;
             };
-            let at = record.acked_at;
+            let at = record.behind_since.unwrap_or(record.acked_at);
             let seq = record.acked_seq;
             if let Err(e) = write_cursor(record, seq, now_ms, CursorState::Abandoned) {
                 // Not fatal: the in-memory state is what reclamation reads, and the worst
@@ -1147,18 +1412,28 @@ impl Spool {
         // spool on an SD card and leaves `max_lag` at seven days has inverted it, and the
         // ceiling then fires before the thing that was supposed to fire first. It cannot be
         // a `plan()` check, because `plan()` is pure and the admit rate is a runtime fact.
-        if rate > 0.0 {
-            let needed = rate * self.cfg.max_lag.as_secs_f64();
-            if (self.cfg.ceiling_bytes as f64) < needed {
-                warn!(
-                    ceiling_bytes = self.cfg.ceiling_bytes,
-                    max_lag_s = self.cfg.max_lag.as_secs(),
-                    trailing_bytes_per_s = rate,
-                    needed_bytes = needed as u64,
-                    "the spool will fill before a stuck peer is abandoned; raise \
-                     [spool].ceiling or lower [spool].max_lag"
-                );
-            }
+        //
+        // §3.5 asks for "a **startup** and config-change warning", and the trailing rate is
+        // in memory and therefore zero at every startup -- which is the one moment this was
+        // guaranteed to stay silent, so the operator with a 256 MiB spool was never told.
+        // `expected_rate` is the fallback: the measured ~1 KiB worst-case envelope at the
+        // measured ~2/s, which is the figure §2.4 and §3.5 do their own arithmetic with.
+        let assumed = if rate > 0.0 {
+            rate
+        } else {
+            WORST_CASE_BYTES_PER_SECOND
+        };
+        let needed = assumed * self.cfg.max_lag.as_secs_f64();
+        if (self.cfg.ceiling_bytes as f64) < needed {
+            warn!(
+                ceiling_bytes = self.cfg.ceiling_bytes,
+                max_lag_s = self.cfg.max_lag.as_secs(),
+                bytes_per_s = assumed,
+                measured = rate > 0.0,
+                needed_bytes = needed as u64,
+                "the spool will fill before a stuck peer is abandoned; raise \
+                 [spool].ceiling or lower [spool].max_lag"
+            );
         }
     }
 
@@ -1169,6 +1444,93 @@ impl Spool {
         self.state
             .lock()
             .expect("the spool state is not poisoned; a panic under it is a bug")
+    }
+}
+
+/// Wakes a group commit's followers when a leader abandons the slot.
+///
+/// A bare `send_modify` with an empty closure is the whole mechanism: it notifies every
+/// `watch::Receiver` without changing the value, so a follower's `rx.changed()` resolves,
+/// the loop in `Spool::commit` re-reads `through`, finds it unchanged, and re-attempts
+/// leadership. One of them wins.
+struct Abdicate<'a>(&'a watch::Sender<(u64, Option<Arc<str>>)>);
+
+impl Drop for Abdicate<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|_| {});
+    }
+}
+
+/// The dedup gate, as a **read-only** view over `State` for the first half of
+/// `write_batch`.
+///
+/// It answers exactly what `Dedup::accept` would answer without mutating anything, which
+/// is what lets the ceiling check and the `write_all` happen before any state changes. Two
+/// things it has to model that a bare `Dedup::is_duplicate` cannot:
+///
+/// - **within-batch duplicates.** Nothing is committed yet, so the same `(origin, seq)`
+///   twice in one `IngestBatch` would both read as fresh. The second is a duplicate.
+/// - **the origin-table bound.** Two *different* unseen origins in one batch with one slot
+///   left must not both be admitted, so the slots this batch would consume are counted.
+struct Gate {
+    seen: std::collections::BTreeSet<(OriginId, u64)>,
+    known: std::collections::BTreeSet<OriginId>,
+    free_slots: usize,
+}
+
+impl Gate {
+    fn new(st: &State) -> Self {
+        Self {
+            seen: std::collections::BTreeSet::new(),
+            known: st.manifest.origins.iter().map(|o| o.node_id).collect(),
+            free_slots: MAX_ORIGINS.saturating_sub(st.manifest.origins.len()),
+        }
+    }
+
+    /// The verdict, consulting the committed `dedup` and this batch's own history.
+    ///
+    /// `dedup` is passed per call rather than borrowed for the `Gate`'s lifetime so that
+    /// `write_batch` can keep reading the rest of `State` between calls.
+    fn verdict(&mut self, dedup: &Dedup, origin: OriginId, seq: u64) -> Verdict {
+        if !self.known.contains(&origin) {
+            if self.free_slots == 0 {
+                return Verdict::OriginTableFull;
+            }
+            self.free_slots -= 1;
+            self.known.insert(origin);
+        }
+        if !self.seen.insert((origin, seq)) {
+            return Verdict::Duplicate;
+        }
+        dedup.would_accept(origin, seq)
+    }
+}
+
+/// Commit one accepted `(origin, seq)`: intern the origin if it is new, advance the dedup
+/// state, and record the high water the manifest will persist in this same commit.
+///
+/// Called only from `write_batch`, only after the records are in the file.
+fn commit_verdict(st: &mut State, origin: OriginId, seq: u64, now: i64) {
+    let before = st.manifest.origins.len();
+    if st.manifest.intern(origin, now).is_none() {
+        // Unreachable: `Gate` refused this envelope if there was no slot for its origin.
+        // Not a panic, because the cost of being wrong is one un-deduplicated origin and
+        // the records are already on disk.
+        warn!(
+            origin = %origin,
+            "the origin table filled between the gate and the commit; this origin's \
+             envelopes are spooled but will not be deduplicated"
+        );
+        return;
+    }
+    if st.manifest.origins.len() != before {
+        st.dedup.seed(origin, 0);
+        m::spool_origins(st.manifest.origins.len());
+    }
+    st.dedup.accept(origin, seq);
+    let hw = st.dedup.high_water(origin);
+    if let Some(row) = st.manifest.find_mut(origin) {
+        row.hw_seq = hw;
     }
 }
 
@@ -1335,6 +1697,7 @@ fn create_cursor(path: &Path, tail: Seq, now: i64) -> Result<CursorFile, SpoolEr
         acked_seq: Seq::new(0),
         acked_at: now,
         state: CursorState::Active,
+        behind_since: None,
     };
     write_cursor(&mut record, tail, now, CursorState::Active)?;
     Ok(record)
@@ -1356,6 +1719,9 @@ fn read_cursor(path: &Path, id: &ComponentId, now: i64) -> Result<CursorFile, Sp
             acked_seq: Seq::new(live.acked_seq),
             acked_at: live.acked_at,
             state: live.state,
+            // Filled in by `Spool::open` once the tail is known: a cursor that comes back
+            // already behind has been behind since at least its last ack.
+            behind_since: None,
         }),
         None => {
             // Both slots torn, or the file was never written. The position is lost, so the
@@ -1376,6 +1742,7 @@ fn read_cursor(path: &Path, id: &ComponentId, now: i64) -> Result<CursorFile, Sp
                 acked_seq: Seq::new(0),
                 acked_at: now,
                 state: CursorState::Active,
+                behind_since: None,
             })
         }
     }
@@ -1404,7 +1771,7 @@ fn write_cursor(
     .encode();
     record
         .file
-        .write_all_at(&encoded, (slot * CURSOR_SLOT_BYTES) as u64)
+        .write_all_at(&encoded, format::cursor_slot_offset(slot) as u64)
         .map_err(io("writing a slot of", &record.path))?;
     record
         .file

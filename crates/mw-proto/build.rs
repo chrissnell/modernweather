@@ -12,8 +12,15 @@
 //! is already gated and a second check would gate the same fact twice.
 //!
 //! This file is the `only-mw-types-and-the-proto-build-script-mention-generated` exemption
-//! in `ci/layers.toml` being used for the first time; that rule is narrowed to this path
-//! in the same change, because the rest of `mw-proto` has no business naming the directory.
+//! in `ci/layers.toml` being used for the first time. That rule stays **crate-wide** for
+//! `mw-proto` rather than narrowing to this path, and the reason is written out beside the
+//! rule: the gate's scan cannot see comments, so narrowing it would fail on the four doc
+//! comments in this crate that name the schema in prose. The rule that enforces the
+//! decision — a hand-written module may not reach a generated *type* — is
+//! `only-mw-types-adopts-generated-rust`, which matches on the generated **Rust**
+//! directory and whose `only` list does not include this crate. (Spelling that path here
+//! would itself trip that rule, which is the same blindness-to-comments the note beside it
+//! describes.)
 
 use std::path::{Path, PathBuf};
 

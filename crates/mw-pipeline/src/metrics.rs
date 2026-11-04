@@ -5,10 +5,33 @@
 //! prefix `mw-obs` establishes — §5.10's table writes it and W7 §7's does not, and one
 //! namespace for one process's metrics is worth more than two sections' literal text.
 //!
-//! **Cardinality is bounded by construction** (§5.10): every label here is a component id
-//! or a closed enum. There is no label whose values come from a request, a peer's claim or
-//! a file name, and the review rule is that a new one must be justifiable as "there are N
-//! of these and N is in the configuration".
+//! **Cardinality is bounded by construction** (§5.10). Every label here is a component id,
+//! a station key that identity resolution has already bounded, or a closed enum — and the
+//! review rule is that a new one must be justifiable as "there are N of these and N is in
+//! the configuration". The one place that was false is recorded on [`accepted`]: on the
+//! `accept` path the station key is a peer's claim until M6-4's registry check lands, so
+//! that path does not label with it.
+//!
+//! # Which named metrics are deliberately not here
+//!
+//! Stated rather than left to a grep, because an operator writing an alert from W7 §7 or
+//! §5.10 needs to know:
+//!
+//! - **`origin` on `mw_readings_ingested_total` and `mw_ingest_duplicates_total`** (§5.10,
+//!   §7). Omitted for now: `origin` is bounded by `MAX_ORIGINS`, a *constant*, not by the
+//!   configuration — so it passes the letter of the cardinality rule and fails its test
+//!   ("there are N of these and N is in the configuration"). The per-origin breakdown
+//!   belongs with the peer registry that makes N configured, which is M6-4's.
+//! - **W7 §7's spellings `admit_rejected_total` and `ingest_rejected_total`** are both
+//!   [`rejected`], i.e. `mw_readings_rejected_total{reason}` — §5.10's name, with §5.10's
+//!   `mw_` prefix. One series for one event; an alert written against either §7 spelling
+//!   will not match, and that is a documentation gap in §7 rather than a second counter.
+//! - **`mw_readings_dropped_total{reason="rejected"}`** (§5.10). A rejection is already
+//!   counted once, by reason, on `mw_readings_rejected_total`; a second series under a
+//!   coarser label is how two dashboards come to disagree.
+//! - **Everything per-peer in W7 §7's uplink and collector tables** — `uplink_*`,
+//!   `ingest_envelopes_total`, `peer_last_seen_seconds` and the rest. Those belong to the
+//!   uplink and the gRPC receiver, which are M6-4's.
 
 use mw_component::{ComponentId, Reject};
 
@@ -67,6 +90,10 @@ pub fn register() {
         "Segments deleted after every active cursor acked past them"
     );
     metrics::describe_counter!(
+        "mw_spool_record_undecodable_total",
+        "Records behind a valid CRC that this build could not decode"
+    );
+    metrics::describe_counter!(
         "mw_spool_cursor_abandoned_total",
         "Cursors given up on because they were behind longer than max_lag"
     );
@@ -86,6 +113,10 @@ pub fn register() {
         "mw_sink_partial_ack_total",
         "Deliveries where a sink handled a strict prefix of the batch"
     );
+    metrics::describe_histogram!(
+        "mw_sink_delivery_seconds",
+        "How long one delivery to a durable sink took, end to end"
+    );
     metrics::describe_counter!(
         "mw_stream_lagged_total",
         "Envelopes a Lossy subscriber fell too far behind to receive"
@@ -95,6 +126,7 @@ pub fn register() {
     metrics::counter!("mw_spool_appends_total").absolute(0);
     metrics::counter!("mw_spool_fsyncs_total").absolute(0);
     metrics::counter!("mw_spool_truncated_total").absolute(0);
+    metrics::counter!("mw_spool_record_undecodable_total").absolute(0);
     metrics::counter!("mw_spool_segments_reclaimed_total").absolute(0);
     metrics::counter!("mw_spool_cursor_skipped_envelopes_total").absolute(0);
     metrics::counter!("mw_ingest_duplicates_total").absolute(0);
@@ -121,16 +153,35 @@ pub fn rejected(reason: Reject, n: u64) {
 }
 
 /// Readings lost at the spool's ceiling (W3 §2.7).
+///
+/// `n` is the number of **readings**, not of batches: §5.10 defines this series as a
+/// "dropped-reading count by reason", and a refused 256-envelope batch counted as 1 would
+/// under-report by 256×.
 pub fn dropped_spool_full(n: u64) {
     metrics::counter!("mw_readings_dropped_total", "reason" => "spool_full").increment(n);
 }
 
-/// Readings sealed and committed, per station.
+/// Readings sealed and committed on the `admit` path, per station.
 ///
-/// `station` is a station key, which is in the configuration — §5.10's cardinality rule
-/// satisfied by the label's source rather than by its current size.
+/// `station` is safe to label with **here and only here**: `admit` has already passed the
+/// key through `StationRegistry::resolve`, so its values come from the configuration, which
+/// is what §5.10's cardinality rule asks ("there are N of these and N is in the
+/// configuration"). The `accept` path uses [`accepted`] instead, because there the key is
+/// still a peer's claim.
 pub fn ingested(station: &str, n: u64) {
     metrics::counter!("mw_readings_ingested_total", "station" => station.to_string()).increment(n);
+}
+
+/// Readings accepted from a peer — **unlabelled**.
+///
+/// §5.10: "A label whose values come from a request … is forbidden". On the `accept` path
+/// the `station_key` is whatever the peer put in the envelope: the check that would bound
+/// it is `station_key` resolving in `StationRegistry`, which is W7 §4.4 step 5 and M6-4's
+/// seam. Labelling with it would let one peer mint unbounded series. When M6-4 lands that
+/// check, this can become [`ingested`] and the two paths merge again.
+pub fn accepted(station: &str) {
+    let _ = station;
+    metrics::counter!("mw_readings_ingested_total", "station" => "peer").increment(1);
 }
 
 /// Envelopes the dedup gate already had (W7 §4.4). Expected and non-zero in a diamond.
@@ -144,16 +195,31 @@ pub fn window_overrun(n: u64) {
     metrics::counter!("mw_ingest_window_overrun_total").increment(n);
 }
 
-/// One committed append call.
+/// One committed append call, carrying how many records it coalesced.
 pub fn spool_appended(records: usize) {
     metrics::counter!("mw_spool_appends_total").increment(1);
-    let _ = records;
+    metrics::histogram!("mw_spool_append_records").record(records as f64);
 }
 
-/// One `fsync`. The ratio against `mw_spool_appends_total` is the group-commit
-/// coalescing, which is the one thing that makes a replay burst cheap (W7 **D-13**).
+/// One **group commit**. The ratio against `mw_spool_appends_total` is the coalescing,
+/// which is the one thing that makes a replay burst cheap (W7 **D-13**).
+///
+/// Named `fsyncs` for W7 §7's spelling, and it is not a syscall count: one commit is
+/// `sync_data` on the segment plus, whenever the manifest changed, that file's own
+/// write-fsync-rename-fsyncdir. The ratio is what the metric is for.
 pub fn spool_fsynced() {
     metrics::counter!("mw_spool_fsyncs_total").increment(1);
+}
+
+/// A record behind a valid CRC32C that this build could not decode (§3.6 step 5).
+///
+/// Separate from `mw_spool_truncated_total` because it is not corruption: it is a schema
+/// or validation difference between the build that wrote the record and the build reading
+/// it, which is exactly the case **D-11** says protobuf's compatibility rules cover. A
+/// non-zero value means an in-place upgrade met a record it cannot interpret — worth
+/// knowing, and not a reason to refuse the start.
+pub fn spool_record_undecodable() {
+    metrics::counter!("mw_spool_record_undecodable_total").increment(1);
 }
 
 /// A segment's torn tail was discarded (W7 **D-12**).
@@ -214,11 +280,33 @@ pub fn spool_time_remaining(seconds: f64) {
     metrics::gauge!("mw_spool_time_remaining_seconds").set(seconds);
 }
 
-/// A sink handled a strict prefix of a batch.
+/// A sink handled a strict prefix of a batch — counted **once per delivery**, not once per
+/// retry.
+///
+/// The distinction matters because `SpooledSink` re-offers the suffix every 50 ms while a
+/// sink is in backpressure: incrementing there turned this into a 20 Hz rate that measured
+/// stall *duration* in 50 ms units, under a name and a description that say it counts
+/// deliveries. Duration is `mw_sink_delivery_seconds`' job.
 pub fn sink_partial_ack(sink: &ComponentId, handled: usize, of: usize) {
     metrics::counter!("mw_sink_partial_ack_total", "sink" => sink.as_str().to_string())
         .increment(1);
-    let _ = (handled, of);
+    // §2.3's `cx.metrics().partial_ack(n, batch.len())` wants the shape of the shortfall
+    // too, and the honest place for it is the delivery histogram's sibling rather than two
+    // discarded arguments. Recorded as a gauge-shaped observation on the counter's own
+    // labels so it is one series per sink and not one per prefix length.
+    metrics::histogram!("mw_sink_partial_ack_fraction", "sink" => sink.as_str().to_string())
+        .record(if of == 0 {
+            0.0
+        } else {
+            handled as f64 / of as f64
+        });
+}
+
+/// How long one delivery to a durable sink took (§5.10: "distinguishes 'slow' from
+/// 'stalled'").
+pub fn sink_delivery(sink: &ComponentId, seconds: f64) {
+    metrics::histogram!("mw_sink_delivery_seconds", "sink" => sink.as_str().to_string())
+        .record(seconds);
 }
 
 /// A `Lossy` subscriber fell more than 1024 envelopes behind.

@@ -55,7 +55,9 @@ mod sink;
 mod stream;
 
 pub use clock::{Clock, SystemClock, TestClock};
-pub use ingress::{receive_check, SpoolIngress, MAX_BATCH_BYTES, MAX_BATCH_ENVELOPES};
+pub use ingress::{
+    receive_check, IngressStats, SpoolIngress, MAX_BATCH_BYTES, MAX_BATCH_ENVELOPES,
+};
 pub use sink::{Acked, Never, OverAck, RecordingSink, Sink, SpooledSink};
 pub use spool::{
     Committed, Cursor, CursorPosition, CursorState, Draft, Spool, SpoolConfig, SpoolError,

@@ -21,7 +21,10 @@
 //!    lost.
 //! 3. A healthy sibling on the same spool keeps draining, at its own position.
 //! 4. Shutdown still completes inside the grace, with the stalled one aborted.
-//! 5. After the restart the records the stalled sink never handled are **still readable**.
+//! 5. After a **restart** — the spool handle dropped and reopened from the files — the
+//!    records the stalled sink never handled are still readable at its position. That is
+//!    the assertion that distinguishes "fell behind on disk" from "fell behind in memory",
+//!    and it is the one the in-memory double cannot make at all.
 //!
 //! Not run under ThreadSanitizer for the same reason `boot.rs` is not: the `race` job sets
 //! `--cfg mw_sanitizer`, and the in-process concurrency it exists for is covered where TSan
@@ -223,29 +226,47 @@ async fn a_stalled_sink_blocks_neither_the_source_nor_shutdown_and_loses_nothing
         "the abort is counted against the component that caused it"
     );
 
-    // **5. Nothing was lost.** The records the stalled sink never handled are still in the
-    // spool, at its position, and the healthy sibling's position is independent of them.
-    // That is **D-30a**: a slow sink falls behind on disk, never upstream.
+    // **5. Nothing was lost, across a restart.** Everything above was in one process, so
+    // it could in principle have been true of an in-memory queue. Dropping the spool and
+    // reopening it from the files is what makes the claim about *disk*: the stalled sink's
+    // position, the healthy sibling's position, and every record neither had handled all
+    // come back. That is **D-30a**: a slow sink falls behind on disk, never upstream.
+    let path = scratch.spool();
+    drop(stream);
+    drop(spool);
+    let reopened = Spool::open(
+        config(&path),
+        node(1),
+        Arc::new(clock.clone()) as Arc<dyn Clock>,
+    )
+    .expect("the spool reopens from its files");
+
     assert_eq!(
-        spool
-            .cursor_position(&stalled_id)
-            .expect("registered")
-            .acked_seq,
-        Seq::new(0)
+        reopened.tail_seq(),
+        Seq::new(ADMITTED),
+        "the log came back whole"
     );
-    let unhandled = spool.read_after(Seq::new(0), 1_024).expect("readable");
+    assert_eq!(
+        reopened
+            .cursor_position(&stalled_id)
+            .expect("the cursor file survived")
+            .acked_seq,
+        Seq::new(0),
+        "the stalled sink resumes from nothing, so nothing it was owed is skipped"
+    );
+    let unhandled = reopened.read_after(Seq::new(0), 1_024).expect("readable");
     assert_eq!(
         unhandled.envelopes.len() as u64,
         ADMITTED,
-        "every admitted reading is still there to be replayed"
+        "and every admitted reading is still there to be replayed to it"
     );
     assert_eq!(
-        spool
+        reopened
             .cursor_position(&healthy_id)
-            .expect("registered")
+            .expect("the cursor file survived")
             .acked_seq,
         healthy_at,
-        "and the healthy sink's position is its own"
+        "while the healthy sink's own position came back where it left it"
     );
 }
 
@@ -334,4 +355,95 @@ async fn a_sink_that_misses_its_deadline_replays_the_same_records_from_the_spool
     };
 
     let (_report, ()) = tokio::join!(supervisor.run(plan), driver);
+}
+
+/// **The ceiling policy's last clause: shutdown still completes** (W3 **D-94**, §2.7).
+///
+/// This is the half the plan singles out and the one that is not assertable in
+/// `mw-pipeline` alone, because it needs a supervisor. §2.7's whole argument for "drop at
+/// the edge" rather than "stall ingest" is that a stalled `admit` back-pressures the serial
+/// read loop *and* leaves the process unable to shut down cleanly — "loss is certain either
+/// way at that point; the only choice is whether shutdown still works and whether the
+/// operator is told". So: fill the spool to its ceiling with a sink that is not draining,
+/// keep admitting into the refusal, and assert the supervisor still stops every component
+/// inside the grace.
+#[tokio::test(start_paused = true)]
+async fn shutdown_completes_with_the_spool_at_its_ceiling() {
+    let scratch = Scratch::new("ceiling-shutdown");
+    let clock = TestClock::fixed();
+    let spool = Spool::open(
+        mw_pipeline::SpoolConfig {
+            // Small enough to reach in a test, with small segments so the fill is not one
+            // enormous write.
+            ceiling_bytes: 8 * 1024,
+            segment_bytes: 512,
+            ..config(scratch.spool())
+        },
+        node(1),
+        Arc::new(clock.clone()) as Arc<dyn Clock>,
+    )
+    .expect("a fresh spool");
+    let shutdown = CancellationToken::new();
+    let stream = Arc::new(SpoolStream::new(Arc::clone(&spool)));
+
+    let stalled_id = id("writer:timescale");
+    let plan = validate(
+        vec![stalled_sink(stalled_id.as_str(), Duration::from_secs(3_600)).grace(GRACE)],
+        &PlanContext::new(Generation::new(1)),
+    )
+    .expect("a valid plan");
+    let (supervisor, control, _plans) =
+        Supervisor::new(roots(Arc::clone(&stream)), shutdown.clone());
+    let stop = shutdown.clone();
+
+    let driver = {
+        let spool = Arc::clone(&spool);
+        let clock = clock.clone();
+        async move {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            // Fill it. The sink holds its first batch and never acks, so nothing is
+            // reclaimed and the ceiling really arrives.
+            let mut refusals = 0usize;
+            for _ in 0..10_000 {
+                match spool.admit_local(&[draft(&clock)]).await {
+                    Ok(_) => {}
+                    Err(mw_pipeline::SpoolError::Full { .. }) => refusals += 1,
+                    Err(other) => panic!("unexpected: {other}"),
+                }
+                if refusals > 16 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                refusals > 16,
+                "the ceiling must actually have been reached and held, or this test \
+                 asserts shutdown from an ordinary state"
+            );
+
+            let at_shutdown = tokio::time::Instant::now();
+            stop.cancel();
+            at_shutdown
+        }
+    };
+
+    let (report, at_shutdown) = tokio::join!(supervisor.run(plan), driver);
+    let took = at_shutdown.elapsed();
+
+    assert!(
+        took <= GRACE + Duration::from_millis(500),
+        "shutdown took {took:?} with the spool at its ceiling, which is past the grace \
+         plus a margin -- the failure §2.7 rejects `stall ingest` for"
+    );
+    assert_eq!(
+        report.stopped + report.aborted,
+        1,
+        "the component was accounted for either way: {report:?}"
+    );
+    assert!(
+        control.component(&stalled_id).is_some(),
+        "and it is still in the table to be reported on"
+    );
 }

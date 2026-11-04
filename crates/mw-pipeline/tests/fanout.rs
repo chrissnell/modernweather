@@ -202,6 +202,11 @@ async fn a_window_that_is_entirely_filtered_still_advances_the_cursor() {
 /// `ReadingFilter::NotFrom(peer)` is `!prov.has_visited(peer)` and nothing else — which is
 /// also why the uplink's filter is `NotFrom(peer)` and not `NotFrom(self)` (**D-47**):
 /// `admit` sets `path = [self]`, so `NotFrom(self)` would match nothing at all.
+///
+/// **Both subscriptions are opened before anything is admitted**, which is what makes the
+/// D-47 half mean something. Subscribed afterwards, a new cursor starts at the current tail
+/// (§3.4) and sees nothing whatever its filter is — so the assertion passed with `NotFrom`
+/// inverted, no-op'd or deleted, while its own comment claimed it was holding D-47 down.
 #[tokio::test]
 async fn not_from_filters_what_the_peer_has_already_seen_and_not_what_we_admitted() {
     let scratch = Scratch::new("not-from");
@@ -210,10 +215,19 @@ async fn not_from_filters_what_the_peer_has_already_seen_and_not_what_we_admitte
     let stream = SpoolStream::new(Arc::clone(&s));
 
     let peer = node(7);
-    let mut sub = stream
+    let mut from_peer = stream
         .subscribe(
             &id("uplink:suncrest"),
             &ReadingFilter::NotFrom(peer),
+            ReadingPolicy::Durable,
+        )
+        .expect("subscribed");
+    // The filter D-47 says is wrong, subscribed at the same point so the comparison is
+    // between the filters and not between two start positions.
+    let mut from_self = stream
+        .subscribe(
+            &id("uplink:wrong"),
+            &ReadingFilter::NotFrom(node(1)),
             ReadingPolicy::Durable,
         )
         .expect("subscribed");
@@ -222,32 +236,26 @@ async fn not_from_filters_what_the_peer_has_already_seen_and_not_what_we_admitte
     s.admit_local(&[draft("backyard", &clock)])
         .await
         .expect("accepted");
-    s.append_sealed(&[forwarded(peer, 1, "remote", clock.now(), &[node(1)])])
+    s.accept_sealed(&[forwarded(peer, 1, "remote", clock.now(), &[node(1)])])
         .await
         .expect("accepted");
 
-    let batch = sub.next_batch().await.expect("our own reading");
+    let batch = from_peer.next_batch().await.expect("our own reading");
     assert_eq!(batch.len(), 1);
     assert_eq!(
         batch.envelopes()[0].provenance.origin(),
         node(1),
-        "our own, which `NotFrom(self)` would have excluded"
+        "our own, and not the one the peer sent us"
     );
 
-    // What the self-filter would have done instead, asserted so D-47 is not folk wisdom.
-    let mut wrong = stream
-        .subscribe(
-            &id("uplink:wrong"),
-            &ReadingFilter::NotFrom(node(1)),
-            ReadingPolicy::Durable,
-        )
-        .expect("subscribed");
-    wrong.ack().await.expect("nothing in flight");
-    let got = tokio::time::timeout(Duration::from_millis(50), wrong.next_batch()).await;
+    // `NotFrom(self)` matches every envelope in this node's own spool -- including the one
+    // we just admitted -- so an uplink configured that way sends nothing. That is D-47,
+    // and it is now a comparison against a subscription that *did* receive something.
     assert!(
-        got.is_err(),
-        "NotFrom(self) matches every envelope in this node's own spool, so an uplink \
-         configured that way sends nothing -- which is exactly D-47"
+        tokio::time::timeout(Duration::from_millis(100), from_self.next_batch())
+            .await
+            .is_err(),
+        "NotFrom(self) excluded the very envelope NotFrom(peer) delivered"
     );
 }
 
@@ -322,6 +330,9 @@ async fn a_lossy_subscriber_receives_every_envelope_while_it_keeps_up() {
 
 /// A subscriber that has not subscribed yet does not get history: `Latest` and `Lossy` are
 /// taps on the append path, not logs. The durable cursor is the only thing that remembers.
+///
+/// Both policies, because the previous version of this test named both and constructed only
+/// the `Lossy` one.
 #[tokio::test]
 async fn latest_and_lossy_subscribers_do_not_replay_history() {
     let scratch = Scratch::new("no-history");
@@ -333,15 +344,48 @@ async fn latest_and_lossy_subscribers_do_not_replay_history() {
         .await
         .expect("accepted");
 
-    let mut lossy = stream
+    for (name, policy) in [
+        ("live:stream", ReadingPolicy::Lossy),
+        ("snapshot:latest", ReadingPolicy::Latest),
+    ] {
+        let mut sub = stream
+            .subscribe(&id(name), &ReadingFilter::All, policy)
+            .expect("subscribed");
+        let got = tokio::time::timeout(Duration::from_millis(50), sub.next_batch()).await;
+        assert!(got.is_err(), "{name} starts at the present, not at the log");
+    }
+
+    // The contrast that makes those two assertions about the *policy* rather than about
+    // the timing: a `Durable` cursor opened at the same point also starts at the tail, so
+    // it is the mechanism and not the position that differs -- and once something new
+    // arrives, only the durable one carries a position forward.
+    let mut durable = stream
         .subscribe(
-            &id("live:stream"),
+            &id("writer:timescale"),
             &ReadingFilter::All,
-            ReadingPolicy::Lossy,
+            ReadingPolicy::Durable,
         )
         .expect("subscribed");
-    let got = tokio::time::timeout(Duration::from_millis(50), lossy.next_batch()).await;
-    assert!(got.is_err(), "a Lossy tap starts at the present");
+    assert_eq!(
+        s.cursor_position(&id("writer:timescale"))
+            .expect("registered")
+            .acked_seq,
+        s.tail_seq(),
+        "a fresh durable cursor starts at the tail too (§3.4)"
+    );
+    s.admit_local(&[draft("backyard", &clock)])
+        .await
+        .expect("accepted");
+    let batch = durable.next_batch().await.expect("the new one");
+    assert_eq!(batch.len(), 1);
+    durable.ack().await.expect("acknowledged");
+    assert_eq!(
+        s.cursor_position(&id("writer:timescale"))
+            .expect("registered")
+            .acked_seq,
+        s.tail_seq(),
+        "and only the durable one has a position to carry forward"
+    );
 }
 
 /// Every subscription parks rather than ending, and dropping the parked future loses
@@ -486,9 +530,10 @@ async fn sixty_four_concurrent_appends_cost_one_fsync() {
         stats.appends, GROUP_COMMIT_APPENDS as u64,
         "sixty-four append calls"
     );
-    assert!(
-        stats.fsyncs < GROUP_COMMIT_APPENDS as u64,
-        "and fewer disk syncs than that: {stats:?}"
+    assert_eq!(
+        stats.commits, 1,
+        "and exactly one group commit: `< 64` would pass at 63 and would not catch the \
+         degenerate mode where the window stops coalescing at all ({stats:?})"
     );
     assert_eq!(
         s.tail_seq(),
@@ -528,4 +573,152 @@ async fn futures_unordered<F: std::future::Future<Output = ()>>(futures: Vec<F>)
         }
     })
     .await;
+}
+
+/// **The only multi-thread test in the workspace, and the reason it has to exist.**
+///
+/// Every other `#[tokio::test]` is `current_thread`, while `#[tokio::main]` in the binary
+/// is multi-thread with one worker per core. Three of the group commit's arguments are "no
+/// await point between X and Y", which buys atomicity only on a single-threaded executor —
+/// so the races that live in the gap between those two facts are structurally unreachable
+/// by the rest of the suite. This is the test that can see them: N real threads appending
+/// concurrently, asserting that every record landed, exactly once, in order, and that the
+/// `pending` counter the window's early exit reads did not end up stuck.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_appends_on_several_threads_lose_nothing_and_leave_the_counters_sane() {
+    const APPENDS: usize = 200;
+
+    let scratch = Scratch::new("multi-thread");
+    let clock = TestClock::fixed();
+    let s = spool_with(
+        SpoolConfig {
+            // The production window, so the leader/follower path really runs.
+            group_commit_window: mw_pipeline::GROUP_COMMIT_WINDOW,
+            // One segment for the whole run: with no cursor registered, nothing holds the
+            // closed segments and reclamation would delete the very records this test
+            // reads back. That is correct behaviour (a spool with no consumer owes nobody
+            // history) and it is not what is under test here.
+            segment_bytes: 1024 * 1024,
+            ..config(scratch.spool())
+        },
+        &clock,
+    );
+
+    let mut handles = Vec::with_capacity(APPENDS);
+    for _ in 0..APPENDS {
+        let s = Arc::clone(&s);
+        let clock = clock.clone();
+        // `spawn` is forbidden in the daemon (`clippy.toml`: everything goes through
+        // `mw_supervisor::task`, §3.2). A test is not the daemon, and spawning is the only
+        // way to get work onto more than one worker thread -- which is the whole point.
+        #[allow(clippy::disallowed_methods)]
+        handles.push(tokio::task::spawn(async move {
+            s.admit_local(&[draft("backyard", &clock)])
+                .await
+                .expect("every concurrent append commits")
+        }));
+    }
+    let mut highest = Vec::with_capacity(APPENDS);
+    for h in handles {
+        highest.push(h.await.expect("no task panicked").seq_high);
+    }
+
+    assert_eq!(
+        s.tail_seq(),
+        Seq::new(APPENDS as u64),
+        "every append consumed exactly one position, with none lost or doubled"
+    );
+    let stats = s.stats();
+    assert_eq!(stats.appends, APPENDS as u64);
+    assert!(
+        stats.commits >= 1 && stats.commits <= APPENDS as u64,
+        "{stats:?}"
+    );
+
+    // Every position 1..=APPENDS is present exactly once, read back off the disk.
+    let read = s.read_after(Seq::new(0), APPENDS * 2).expect("readable");
+    assert_eq!(read.envelopes.len(), APPENDS);
+    let seqs: Vec<u64> = read.envelopes.iter().map(|(seq, _)| seq.get()).collect();
+    assert_eq!(
+        seqs,
+        (1..=APPENDS as u64).collect::<Vec<_>>(),
+        "the log is dense and in order"
+    );
+
+    // Each caller's reported `seq_high` is a real position, and they are all distinct --
+    // which is what fails if two callers are handed the same one.
+    highest.sort_unstable();
+    highest.dedup();
+    assert_eq!(
+        highest.len(),
+        APPENDS,
+        "no two appends got the same position"
+    );
+
+    // And the window still works: a further append must not find `pending` stuck at or
+    // above the cap, which would have turned the group commit into one commit per append
+    // for the life of the process.
+    let before = s.stats();
+    s.admit_local(&[draft("backyard", &clock)])
+        .await
+        .expect("accepted");
+    assert_eq!(s.stats().appends, before.appends + 1);
+}
+
+/// **Regression: a leader that abandons the group commit must not strand its followers.**
+///
+/// Leadership is `syncing.try_lock()` and the losers park on a notification only a leader
+/// can send. A leader cancelled inside the window released the slot and published nothing,
+/// so every follower's `admit`/`accept` call never returned — self-healing at 2 appends/s,
+/// permanent on an idle node or at shutdown. The `Abdicate` guard in `Spool::commit` is
+/// what fixes it; this is the test that fails without it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_group_commit_leader_does_not_strand_its_followers() {
+    let scratch = Scratch::new("abdication");
+    let clock = TestClock::fixed();
+    let s = spool_with(
+        SpoolConfig {
+            // Long enough that the leader is reliably still inside the window when it is
+            // dropped, and short enough that the test is quick if the fix regresses into a
+            // timeout rather than a hang.
+            group_commit_window: Duration::from_secs(2),
+            ..config(scratch.spool())
+        },
+        &clock,
+    );
+
+    // The leader: the first caller to reach `commit`.
+    let leader = {
+        let s = Arc::clone(&s);
+        let clock = clock.clone();
+        #[allow(clippy::disallowed_methods)]
+        tokio::task::spawn(async move { s.admit_local(&[draft("backyard", &clock)]).await })
+    };
+    // Give it time to take the slot and park in the window.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The follower, which will lose `try_lock` and park.
+    let follower = {
+        let s = Arc::clone(&s);
+        let clock = clock.clone();
+        #[allow(clippy::disallowed_methods)]
+        tokio::task::spawn(async move { s.admit_local(&[draft("backyard", &clock)]).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The leader is cancelled mid-window -- a deadline, or its component being stopped.
+    leader.abort();
+
+    // The follower must still return. Nothing else appends, which is the case that used to
+    // hang for ever.
+    let committed = tokio::time::timeout(Duration::from_secs(20), follower)
+        .await
+        .expect("the follower must not be stranded by an abdicating leader")
+        .expect("no panic")
+        .expect("and its own batch commits");
+    assert!(committed.seq_high.get() >= 1);
+    assert!(
+        s.stats().commits >= 1,
+        "somebody promoted themselves and did the commit"
+    );
 }

@@ -13,14 +13,25 @@
 //! returned `Ok` for (`mw_supervisor::task::run_on_reading`). Both readings are in the
 //! design and only one can be built, because the supervisor is already written.
 //!
-//! The cursor therefore lives in [`crate::stream::SpoolSubscription`] and `SpooledSink`
-//! holds no cursor. `Acked(n)` with `n < len` is handled **inside one delivery** rather
-//! than by not acknowledging: the adapter calls `deliver` again with the remaining suffix
-//! until the whole batch is handled, the sink's own declared deadline is the bound, and a
-//! sink that never progresses is a deadline miss rather than a silent stall. That is what
-//! W3 §2.3 means by "`Acked(0)` with `Ok` is legal and means *try again later* — it is how
-//! a sink expresses soft backpressure without failing": the component stays `Running`,
-//! nothing is lost, and nothing is delivered twice.
+//! The cursor therefore lives in the subscription and `SpooledSink` holds none. `Acked(n)`
+//! with `n < len` is handled **inside one delivery**: the adapter calls `deliver` again with
+//! the remaining suffix until the whole batch is handled, so nothing is lost and nothing is
+//! delivered twice.
+//!
+//! **What this does not preserve, stated plainly.** §2.3 says `Acked(0)` with `Ok` "is how
+//! a sink expresses soft backpressure **without failing**". Here it fails: the adapter
+//! retries inside the occurrence, and a sink that keeps saying "not yet" runs into the
+//! trigger's deadline, which `mw_supervisor::task::run_on_reading` turns into
+//! `Outcome::DeadlineExceeded` and then `Failed` + `Backoff`. Nothing is lost — the cursor
+//! did not advance, so the batch replays — but the component does **not** stay `Running`,
+//! and a brief database stall therefore reads as a sink failure rather than as
+//! backpressure.
+//!
+//! That is not fixable here. Expressing it properly needs `ReadingSubscription` to be able
+//! to acknowledge a *prefix* (`ack_through(n)`), which is `mw-component`'s trait and
+//! `mw-supervisor`'s driver — M2-3's crate, not this item's. Recorded as a known gap rather
+//! than papered over, because the alternative on offer was returning `Ok(())` with nothing
+//! handled, and that advances the cursor past undelivered records.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -82,8 +93,18 @@ impl<S: Sink> SpooledSink<S> {
     }
 
     async fn run(&mut self, batch: ReadingBatch, cx: &Cx) -> Result<(), ComponentError> {
+        let started = tokio::time::Instant::now();
+        let outcome = self.deliver_all(&batch, cx).await;
+        // §5.10's `mw_sink_delivery_seconds`, which is what "distinguishes 'slow' from
+        // 'stalled'". Recorded on both outcomes: the interesting samples are the slow ones.
+        m::sink_delivery(&self.id, started.elapsed().as_secs_f64());
+        outcome
+    }
+
+    async fn deliver_all(&mut self, batch: &ReadingBatch, cx: &Cx) -> Result<(), ComponentError> {
         let envelopes = batch.envelopes();
         let mut handled = 0usize;
+        let mut partial = false;
         while handled < envelopes.len() {
             let Acked(n) = self
                 .sink
@@ -103,7 +124,8 @@ impl<S: Sink> SpooledSink<S> {
                 ));
             }
             if n == 0 {
-                m::sink_partial_ack(&self.id, handled, envelopes.len());
+                // Counted once per delivery, below, rather than once per 50 ms retry.
+                partial = true;
                 // Soft backpressure. The trigger's deadline is the bound: the supervisor
                 // cancels this occurrence through a child token when it expires, and the
                 // batch replays because the cursor has not advanced.
@@ -114,9 +136,12 @@ impl<S: Sink> SpooledSink<S> {
                 continue;
             }
             if handled + n < envelopes.len() {
-                m::sink_partial_ack(&self.id, handled + n, envelopes.len());
+                partial = true;
             }
             handled += n;
+        }
+        if partial {
+            m::sink_partial_ack(&self.id, handled, envelopes.len());
         }
         Ok(())
     }

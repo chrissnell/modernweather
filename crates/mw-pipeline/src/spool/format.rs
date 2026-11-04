@@ -32,8 +32,23 @@ pub const CURSOR_SLOT_BYTES: usize = 64;
 /// The bytes of a slot the CRC covers — everything but the CRC itself.
 pub const CURSOR_SLOT_BODY_BYTES: usize = CURSOR_SLOT_BYTES - 4;
 
-/// A whole cursor file: two slots and nothing else.
-pub const CURSOR_FILE_BYTES: usize = CURSOR_SLOT_BYTES * 2;
+/// How far apart the two slots sit.
+///
+/// 4096, not 64. §3.4's reasoning is "a crash can leave one slot torn; the CRC finds it and
+/// the other slot is a valid earlier position" — and that is only true if a single torn
+/// sector cannot damage both. Adjacent 64-byte slots share sector 0 of the file, so the
+/// stated mechanism did not hold: the consequence was bounded (a cursor with both slots
+/// torn restarts from nothing and replays, which the dedup gate and the writer's upsert
+/// absorb) but the claim was wrong. One constant buys it.
+pub const CURSOR_SLOT_STRIDE: usize = 4096;
+
+/// A whole cursor file: two slots, one per 4 KiB sector.
+pub const CURSOR_FILE_BYTES: usize = CURSOR_SLOT_STRIDE + CURSOR_SLOT_BYTES;
+
+/// Where slot `i` begins.
+pub const fn cursor_slot_offset(slot: usize) -> usize {
+    slot * CURSOR_SLOT_STRIDE
+}
 
 /// This node's own row in the origin table. Always present, always index 0.
 pub const SELF_ORIGIN_ID: u16 = 0;
@@ -426,6 +441,12 @@ impl Manifest {
         let count = usize::from(u16::from_le_bytes(
             bytes[26..28].try_into().expect("two bytes"),
         ));
+        if count > MAX_ORIGINS {
+            // `intern` can never produce this, so a manifest claiming it is corrupt or
+            // hand-edited. Refusing is the same answer as a CRC failure and for the same
+            // reason (§3.6 step 1): a wrong origin table mis-dedups.
+            return Err(ManifestProblem::TooManyOrigins { origins: count });
+        }
         let expected = MANIFEST_HEADER_BYTES + count * ORIGIN_ROW_BYTES + 4;
         if bytes.len() != expected {
             return Err(ManifestProblem::Truncated {
@@ -472,6 +493,12 @@ pub enum ManifestProblem {
     Version {
         /// The version in the file.
         found: u16,
+    },
+    /// More origins than [`MAX_ORIGINS`], which `intern` cannot produce.
+    #[error("the manifest claims {origins} origins, more than the {MAX_ORIGINS} allowed")]
+    TooManyOrigins {
+        /// The count it claimed.
+        origins: usize,
     },
     /// The origin count and the file length disagree.
     #[error(
@@ -605,14 +632,14 @@ impl CursorSlot {
 ///
 /// Returns which slot index it was, so the next write goes to the other one.
 pub fn live_slot(file: &[u8]) -> Option<(usize, CursorSlot)> {
-    let a = file
-        .get(0..CURSOR_SLOT_BYTES)
-        .and_then(CursorSlot::decode)
-        .map(|s| (0usize, s));
-    let b = file
-        .get(CURSOR_SLOT_BYTES..CURSOR_FILE_BYTES)
-        .and_then(CursorSlot::decode)
-        .map(|s| (1usize, s));
+    let slot = |i: usize| {
+        let at = cursor_slot_offset(i);
+        file.get(at..at + CURSOR_SLOT_BYTES)
+            .and_then(CursorSlot::decode)
+            .map(|s| (i, s))
+    };
+    let a = slot(0);
+    let b = slot(1);
     match (a, b) {
         (Some(a), Some(b)) if b.1.generation > a.1.generation => Some(b),
         (Some(a), Some(_)) => Some(a),
@@ -804,6 +831,27 @@ mod tests {
         assert_eq!(Manifest::decode(&bytes), Err(ManifestProblem::BadCrc));
     }
 
+    /// `intern` cannot produce more than `MAX_ORIGINS` rows, so a manifest claiming more
+    /// is corrupt or hand-edited — and a wrong origin table mis-dedups, which is why §3.6
+    /// step 1 refuses rather than repairs.
+    #[test]
+    fn a_manifest_claiming_more_origins_than_the_bound_is_refused() {
+        let mut bytes = Manifest::new(node(7), 0).encode();
+        // Claim 2000 origins. The length check would catch it too; this asserts the bound
+        // is checked first, so the error names the real problem.
+        let count = u16::try_from(MAX_ORIGINS + 976).expect("fits a u16");
+        bytes[26..28].copy_from_slice(&count.to_le_bytes());
+        let body = bytes.len() - 4;
+        let crc = crc32c(&bytes[..body]);
+        bytes[body..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            Manifest::decode(&bytes),
+            Err(ManifestProblem::TooManyOrigins {
+                origins: MAX_ORIGINS + 976
+            })
+        );
+    }
+
     #[test]
     fn a_cursor_slot_round_trips_and_is_sixty_four_bytes() {
         let s = CursorSlot {
@@ -835,24 +883,29 @@ mod tests {
         };
 
         let mut file = [0u8; CURSOR_FILE_BYTES];
-        file[..CURSOR_SLOT_BYTES].copy_from_slice(&older.encode());
-        file[CURSOR_SLOT_BYTES..].copy_from_slice(&newer.encode());
+        let (at0, at1) = (cursor_slot_offset(0), cursor_slot_offset(1));
+        assert!(
+            at1 >= 4096,
+            "the two slots must not share a sector, or a single torn write can damage both"
+        );
+        file[at0..at0 + CURSOR_SLOT_BYTES].copy_from_slice(&older.encode());
+        file[at1..at1 + CURSOR_SLOT_BYTES].copy_from_slice(&newer.encode());
         assert_eq!(live_slot(&file), Some((1, newer)), "the higher generation");
 
         // Tear the newer one: the older position is still valid, which costs a replay.
         let mut torn = file;
-        torn[CURSOR_SLOT_BYTES + 9] ^= 0xff;
+        torn[at1 + 9] ^= 0xff;
         assert_eq!(live_slot(&torn), Some((0, older)));
 
         // Tear the older one instead.
         let mut torn = file;
-        torn[9] ^= 0xff;
+        torn[at0 + 9] ^= 0xff;
         assert_eq!(live_slot(&torn), Some((1, newer)));
 
         // Both torn: there is no position, so the cursor starts over from the manifest.
         let mut torn = file;
-        torn[9] ^= 0xff;
-        torn[CURSOR_SLOT_BYTES + 9] ^= 0xff;
+        torn[at0 + 9] ^= 0xff;
+        torn[at1 + 9] ^= 0xff;
         assert_eq!(live_slot(&torn), None);
     }
 
