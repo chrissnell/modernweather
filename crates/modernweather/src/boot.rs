@@ -671,7 +671,24 @@ mod tests {
 
     /// **The headline.** The real plan, the real supervisor, a datagram on loopback, and a
     /// durable envelope carrying the station the operator configured.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    ///
+    /// `current_thread`, like every other test here, and that is **required** rather than
+    /// incidental. `.github/workflows/pr.yml`'s `race` job documents a standing
+    /// ThreadSanitizer false positive in `tokio`'s I/O driver: a `ScheduledIo` is published
+    /// to the driver as an `epoll_ctl` token and read back from `epoll_wait`, TSan does not
+    /// model those syscalls as synchronisation, so it reports the *allocating* write
+    /// against the driver thread's atomic load. It needs the registration and the driver to
+    /// be two threads, which is exactly what a multi-threaded runtime makes them.
+    ///
+    /// This test was written `multi_thread` and was the first target in the workspace to
+    /// combine a multi-threaded runtime with a socket registration — `mw-pipeline`'s
+    /// four-worker fan-out test does file I/O and never calls `Handle::add_source` — so it
+    /// turned the `race` job red on `tokio::runtime::io::driver::Handle::add_source::<mio::
+    /// net::udp::UdpSocket>`, frame for frame as that comment predicts. Nothing in this
+    /// crate was racing; the runtime flavour was a free choice and this is the one that
+    /// keeps the job able to speak. A `Serve` body and a test body interleave at every
+    /// await on one thread, which is all this test needs.
+    #[tokio::test(flavor = "current_thread")]
     async fn a_configured_weatherlink_live_station_produces_a_durable_reading() {
         let scratch = Scratch::new("produces");
         let port = free_port().await;

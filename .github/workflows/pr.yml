@@ -120,12 +120,30 @@ jobs:
       # `tokio` publishes a `ScheduledIo` to its I/O driver as an `epoll_ctl` token and
       # reads it back from `epoll_wait`, and TSan does not model those syscalls as
       # synchronisation, so it reports the allocating write against the driver thread's
-      # atomic load. It needs a MULTI-THREADED runtime for those to be two threads, which
-      # is why no `#[tokio::test]` target (all `current_thread`) trips it. No `tokio`
-      # release fixes that: it needs `__tsan_acquire`/`release` annotations wherever the
-      # pointer crosses the kernel. If a suppression file is ever wanted instead,
-      # `race:tokio::runtime::io::` is the frame, and the reproduction is
-      # `cargo test -p modernweather --test boot` with `--cfg mw_sanitizer` removed.
+      # atomic load. No `tokio` release fixes that: it needs
+      # `__tsan_acquire`/`release` annotations wherever the pointer crosses the kernel. If a
+      # suppression file is ever wanted instead, `race:tokio::runtime::io::` is the frame,
+      # and the reproduction is `cargo test -p modernweather --test boot` with
+      # `--cfg mw_sanitizer` removed.
+      #
+      # IT TAKES TWO THINGS TOGETHER, AND THAT IS A RULE FOR NEW TESTS RATHER THAN A NOTE.
+      # The registration and the driver have to be two threads -- a **multi-threaded
+      # runtime** -- and the thing registered has to be a **socket**, so that
+      # `Handle::add_source` allocates the `ScheduledIo` on the registering thread. Either
+      # alone is fine: `crates/mw-pipeline/tests/fanout.rs` runs four worker threads over
+      # file I/O and is green, and every `current_thread` socket test is green.
+      #
+      # implementation-plan.md M3-1 hit it: its station-ingest test in
+      # `crates/modernweather/src/boot.rs` was written
+      # `#[tokio::test(flavor = "multi_thread")]` and binds a UDP socket, which made it the
+      # first target in the workspace to combine the two -- and this job went red on
+      # `Handle::add_source::<mio::net::udp::UdpSocket>`, exactly as described above. It is
+      # `current_thread` now. **A test that needs a socket does not need worker threads**: a
+      # `Serve` body and a test body interleave at every await on one thread. If a future
+      # test genuinely needs both, the suppression frame above is the answer, not a narrowed
+      # command -- and `crates/mw-station/tests/emulator.rs` is multi-threaded and binds
+      # sockets but is `#[ignore]`d, so this job does not run it; un-ignoring it here would
+      # need the same treatment.
       - name: cargo test under ThreadSanitizer
         env:
           RUSTFLAGS: -Zsanitizer=thread --cfg mw_sanitizer
