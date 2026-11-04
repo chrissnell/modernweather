@@ -26,10 +26,13 @@
 //!    the assertion that distinguishes "fell behind on disk" from "fell behind in memory",
 //!    and it is the one the in-memory double cannot make at all.
 //!
-//! Not run under ThreadSanitizer for the same reason `boot.rs` is not: the `race` job sets
-//! `--cfg mw_sanitizer`, and the in-process concurrency it exists for is covered where TSan
-//! can see it.
-#![cfg(not(mw_sanitizer))]
+//! Run under ThreadSanitizer, unlike `boot.rs`. `boot.rs` is excluded because it drives the
+//! daemon as a *child* process, which TSan has nothing to say about; this one is entirely
+//! in-process, so it is exactly what the `race` job exists to observe. The standing tokio
+//! false positive the job documents needs a multi-threaded runtime to make the `epoll_ctl`
+//! token two threads, and all three tests here are `current_thread` with no thread of their
+//! own — the spool's I/O is synchronous on the runtime thread by design (`spool/mod.rs`
+//! §"Blocking I/O"), not behind `spawn_blocking`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
