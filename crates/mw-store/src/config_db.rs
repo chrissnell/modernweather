@@ -759,6 +759,19 @@ pub struct Node {
     pub timezone: String,
     /// Where the spool lives.
     pub spool_path: String,
+    /// `[spool].ceiling` in bytes — W3 §2.4's 2 GiB default, as the schema's `DEFAULT`.
+    ///
+    /// Read here rather than defaulted in `mw-pipeline` because the column exists and a
+    /// second copy of the default is a second place for it to drift (**D-8**: the schema is
+    /// the schema).
+    pub spool_ceiling_bytes: i64,
+    /// `[spool].max_lag` in seconds — W3 §2.7's seven days.
+    ///
+    /// W7 **D-16** requires this to fire before the ceiling does at the node's observed
+    /// rate. That is not a `CHECK` and not a `plan()` check either, because it depends on
+    /// the admit rate; it is the `mw_spool_time_remaining_seconds` gauge and a startup
+    /// warning the spool itself emits.
+    pub spool_max_lag_seconds: i64,
 }
 
 /// Read the node row, if this node has one.
@@ -772,18 +785,24 @@ pub struct Node {
 /// value in any design document -- so inventing one here would be this work item deciding
 /// something implementation-plan.md M6-4 owns.
 pub async fn node(pool: &SqlitePool) -> Result<Option<Node>, ConfigDbError> {
-    let row = sqlx::query("SELECT node_id, node_name, timezone, spool_path FROM node WHERE id = 1")
-        .fetch_optional(pool)
-        .await
-        .map_err(|source| ConfigDbError::Query {
-            what: "the node row",
-            source,
-        })?;
+    let row = sqlx::query(
+        "SELECT node_id, node_name, timezone, spool_path, \
+                spool_ceiling_bytes, spool_max_lag_seconds \
+         FROM node WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|source| ConfigDbError::Query {
+        what: "the node row",
+        source,
+    })?;
     Ok(row.map(|r| Node {
         node_id: r.get("node_id"),
         node_name: r.get("node_name"),
         timezone: r.get("timezone"),
         spool_path: r.get("spool_path"),
+        spool_ceiling_bytes: r.get("spool_ceiling_bytes"),
+        spool_max_lag_seconds: r.get("spool_max_lag_seconds"),
     }))
 }
 

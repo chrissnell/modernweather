@@ -14,12 +14,31 @@ workspace = true
 [dependencies]
 # Workspace crates, by layer (ci/layers.toml).
 mw-component.workspace = true
+mw-proto.workspace = true
 mw-types.workspace = true
 
 tokio.workspace = true
+# The fan-out ends on the same `CancellationToken` the supervisor's shutdown uses, so a
+# subscription returns `None` rather than parking an `OnReading` task forever (§3.6).
+tokio-util.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 smallvec.workspace = true
 crc32c.workspace = true
 arc-swap.workspace = true
+# The spool record's payload is byte-for-byte the wire `collector.v1.Envelope` (W7 D-11),
+# so the one encoder is `prost`'s and there is no spool-shaped sibling of the 591 lines of
+# hand-written mapping W3 §6.5 deletes.
+prost.workspace = true
+# W7 §7's gauges and counters. The recorder is `mw-obs`'s; this crate names the numbers it
+# owns and nothing else.
+metrics.workspace = true
+
+[dev-dependencies]
+# `test-util` for `tokio::time::pause()`, which is what makes the group-commit window and
+# the stalled-sink grace assertable in milliseconds rather than by sleeping. No `tempfile`:
+# the scratch directory is twenty lines in `testing.rs`, the same call `mw-store`'s tests
+# made.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+

@@ -1013,7 +1013,12 @@ mod tests {
             stdout.only_paths,
             [
                 "crates/modernweather/src/args.rs",
-                "crates/mw-obs/src/stderr.rs"
+                "crates/mw-obs/src/stderr.rs",
+                // A build script's only channel to cargo is stdout, and `println!` is the
+                // only way to write a `cargo::` directive. Added by
+                // implementation-plan.md M3-2 with `crates/mw-proto/build.rs`; see that
+                // rule's reason in ci/layers.toml.
+                "crates/mw-proto/build.rs"
             ],
             "the exempt set is the whole of this rule's narrowing, and widening it one \
              file at a time is the gradual version of the hole the mechanism closed"

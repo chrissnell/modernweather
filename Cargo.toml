@@ -88,6 +88,13 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 # One schema for REST-JSON and gRPC-protobuf (D-32), parsed at build time by `protox` so
 # no `protoc` binary is needed on any of the four cross targets or on a Pi (A-W3-1).
 prost = "0.14"
+# prost's companion crate for the well-known types. Not a substitution and not an addition
+# to D-32's table: `generated/proto/reading.proto` imports `google/protobuf/timestamp.proto`,
+# so the code prost generates names `prost_types::Timestamp` and will not compile without
+# it. The alternative -- `compile_well_known_types` -- emits a second copy of the well-known
+# types into whichever module includes the output, which would make two crates' `Timestamp`
+# different types.
+prost-types = "0.14"
 pbjson = "0.9"
 prost-build = "0.14"
 pbjson-build = "0.9"

@@ -14,14 +14,18 @@
 //! them. `StationId`, `StationKey`, `WebsiteId`, `OriginId`, `Seq`, `Envelope`,
 //! `Provenance` and `PathSet` are here, because implementation-plan.md M2-3 needs a name
 //! for the thing a `Trigger::OnReading` component is handed and for the station a
-//! `Calendar` component takes its time zone from. `Window`, `Agg` and the `ext.rs`
-//! additions to `Reading` are still absent: they belong to the window rollup (M6) and to
-//! the enrich stage (M3-3).
+//! `Calendar` component takes its time zone from; `Envelope::forward`, `Provenance::sealed`
+//! and `PartialReading` arrive with M3-2, which owns admission. (`FrameMeta` is M3-2's too
+//! and lives in `mw-component`, because the `Ingress` trait that takes it does.) `Window`,
+//! `Agg` and the
+//! `ext.rs` additions to `Reading` are still absent: they belong to the window rollup (M6)
+//! and to the enrich stage (M3-3).
 
 mod envelope;
 mod error;
 mod generated;
 mod id;
+mod partial;
 
 // Every public item of the three generated modules, re-exported and nothing added. The
 // list is exhaustive on purpose: the `generated` module is private, so an item that is not
@@ -31,6 +35,7 @@ pub use generated::aggregates::{AggregateColumn, Level, Strategy, LEVELS};
 pub use generated::metrics::{MetricKey, MetricMeta, Tier, UnitMeta, METRICS, UNITS};
 pub use generated::reading::Reading;
 
-pub use envelope::{Envelope, PathSet, Provenance};
+pub use envelope::{Envelope, ForwardRefused, PathProblem, PathSet, Provenance};
 pub use error::{Class, Classify, DisplayChain};
 pub use id::{OriginId, Seq, StationId, StationKey, WebsiteId};
+pub use partial::PartialReading;

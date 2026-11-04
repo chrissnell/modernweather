@@ -16,7 +16,18 @@ workspace = true
 mw-types.workspace = true
 
 prost.workspace = true
+prost-types.workspace = true
 pbjson.workspace = true
 serde.workspace = true
 chrono.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+# A pure-Rust protobuf parser, so no `protoc` binary is needed on any cross target or on a
+# Pi (A-W3-1). Both are pinned in `[workspace.dependencies]` and arrive here with the
+# build script itself, exactly as this crate's module doc said they would. `bytes` is not
+# listed anywhere: `Envelope::origin` and `Envelope::path` are `prost::bytes::Bytes`
+# through prost's own re-export, so the `bytes([...])` setting costs no second pin.
+protox.workspace = true
+prost-build.workspace = true
 
