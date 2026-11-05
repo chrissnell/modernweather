@@ -202,14 +202,23 @@ duplicate."""
 
 [[gate]]
 id = "driver-emulators"
-description = "Go emulators from the remoteweather tree driven against the Rust drivers"
+description = "Go emulators driven against the Rust station drivers"
 owner = "W2a §4a (station drivers)"
 arms_when = "tests/emulators/manifest.toml"
 cmd = ["cargo", "xtask", "emulator-tests"]
 note = """
-The emulators stay in Go on purpose (DESIGN.md D-40): an independently written emulator
-is a stronger oracle than one written alongside the driver. CI checks the Go reference
-out at a pinned commit and runs it as fixed external test infrastructure."""
+The emulators stay in Go on purpose (DESIGN.md D-40): an independently written emulator is
+a stronger oracle than one written alongside the driver, and A-W8-4 adds that they are
+consumed at a pinned commit of the reference repository.
+
+Which emulators run, which are still pending, and where each one lives is
+tests/emulators/manifest.toml -- and it is worth knowing before reading a green run that
+the reference repository has NO WeatherLink Live emulator at the pinned commit, so the one
+this gate runs today lives in THIS repository and is therefore not independently authored.
+The manifest records that in full, `cargo xtask emulator-tests` prints it on every run, and
+it is the programme owner's to resolve. The runner asserts that the declared number of
+tests passed, because a filter that matches no tests exits zero and a gate that reports
+green while running nothing is docs/reconciliation.md G-1."""
 
 [[gate]]
 id = "coverage-ratchet"

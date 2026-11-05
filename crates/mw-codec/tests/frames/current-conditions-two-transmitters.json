@@ -1,0 +1,47 @@
+{
+  "data": {
+    "did": "001D0A70C0DE",
+    "ts": 1762200240,
+    "conditions": [
+      {
+        "lsid": 70001,
+        "data_structure_type": 1,
+        "txid": 1,
+        "temp": 58.4,
+        "hum": 71.0,
+        "dew_point": 49.3,
+        "wet_bulb": 52.8,
+        "heat_index": 58.4,
+        "wind_speed_last": 1.0,
+        "wind_dir_last": 95,
+        "rain_size": 1,
+        "rain_rate_last": 0,
+        "rainfall_daily": 0,
+        "rx_state": 0,
+        "trans_battery_flag": 0
+      },
+      {
+        "lsid": 70002,
+        "data_structure_type": 1,
+        "txid": 2,
+        "temp": null,
+        "hum": null,
+        "dew_point": null,
+        "wet_bulb": null,
+        "heat_index": null,
+        "rx_state": 2,
+        "trans_battery_flag": 1
+      },
+      {
+        "lsid": 70003,
+        "data_structure_type": 1,
+        "txid": 3,
+        "temp": 39.9,
+        "hum": 88.0,
+        "rx_state": 0,
+        "trans_battery_flag": 0
+      }
+    ]
+  },
+  "error": null
+}

@@ -61,6 +61,10 @@ secrecy.workspace = true
 # the binary is the only place they meet. Under `resolver = "2"` a dev-dependency feature is
 # not unified into `cargo build`, so the shipped artefact does not carry the mock clock.
 tokio = { workspace = true, features = ["test-util"] }
+# A test-only dependency, for the one literal instant the station-ingest tests hand a
+# driver: `FrameMeta::received_at` is a `DateTime<Utc>` and the daemon itself never names
+# the type -- every clock it reads belongs to the supervisor or to the spool.
+chrono.workspace = true
 
 # Packaging, verbatim from docs/release.md §6, which asks for exactly this block when
 # `crates/modernweather` lands. `cargo xtask dist` reads ci/release.toml for the target

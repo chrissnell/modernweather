@@ -19,3 +19,9 @@ thiserror.workspace = true
 zerocopy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# For the TYPE and not for the clock. A frame can carry the instant the station says it
+# measured -- WeatherLink Live's `ts` -- and `PartialReading::observed_at` is a
+# `DateTime<Utc>`, so the type has to be nameable here. `ci/layers.toml` is what keeps it
+# honest: this crate's `forbidden_source` rejects a call that reads the clock, which is the
+# one of §1.2's four purity rules a manifest cannot express.
+chrono.workspace = true

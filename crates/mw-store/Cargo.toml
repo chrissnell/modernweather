@@ -23,5 +23,9 @@ serde.workspace = true
 secrecy.workspace = true
 chrono.workspace = true
 tokio.workspace = true
+# The station registry is published as one immutable snapshot and read without a lock
+# (D-32, W3 §2a.2): `resolve` is on the admit path, so it is a pointer load rather than a
+# mutex a reading waits on.
+arc-swap.workspace = true
 tracing.workspace = true
 thiserror.workspace = true

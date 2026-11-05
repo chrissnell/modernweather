@@ -262,7 +262,7 @@ follow-up rather than a gate on anything.
 | 5 | W3 | W3 mounts every route provider on **one listener**, including both gRPC services | W3 D-92: the gRPC service keeps its own socket | **FAILS** — same failure as C-W0-7; resolved by A-W3-4 |
 | 6 | W3 | W3 owns where the supervisor's durable state lives (OQ-D) | W3 D-41: the SQLite pool is a root resource owned by `main`, handing a one-table `ScheduleStore` to the supervisor | holds — answered more cleanly than OQ-D proposed |
 | 7 | W3 | The pure APRS encoder lives in a crate with no database or transport dependency | W3 §1.2: `mw-aprs`, forbidden `tokio`, `sqlx`, any transport | holds |
-| 8 | W3 | W3 treats the Go emulators as fixed external test infrastructure (D-40) | W3 D-82, assumption 8 | holds |
+| 8 | W3 | W3 treats the Go emulators as fixed external test infrastructure (D-40) | W3 D-82, assumption 8 | holds (narrowed) — **for the drivers the reference tree has an emulator for**. It has none for WeatherLink Live, which is the first driver the plan builds, so M3-1 arms `driver-emulators` against an emulator in **this** repository. See **O-13**. |
 | 9 | W3 | W3 defines `ComponentError` as typed and cause-chain-preserving (D-34) | W3 D-49, D-51 | holds |
 | 10 | W2 | The registry's per-metric `agg` is the same field that generates aggregate SQL and resolves an `OutputEncoder`'s `(Metric, Window, Agg)` | W2 D-11: the strategy vocabulary is `mean, min, max, total, circular_mean`, and there is **no `last`** — "it is not a composable state" | **FAILS** — see C-W2a-10 |
 | 11 | W2 | `Metric` is a registry-generated type an encoder can name in a const table, and `{Last, Mean, CircularMean, Max, Min, Sum}` is a subset of what the registry expresses | `generated/rust/metrics.rs` gives the type; the `Agg` set is **not** a subset | holds on the type, **FAILS** on the subset claim — folded into C-W2a-10 |
@@ -1196,6 +1196,7 @@ something it does not read. *Behavioural* — a byte a client does read, or coul
 | **DEV-5** | Three additive `X-MW-*` response headers (`X-MW-Snapshot-Age`, `X-MW-Degraded`) during a database outage | W3 D-36 | additive | **No.** Same allowlist property as DEV-1. The frozen *body* is never used to signal degradation — that was the explicit alternative W3 rejected. |
 | **DEV-7** | `/span`'s `solarjoules` becomes the bucket **total** instead of the bucket mean, and is NULL for pre-cutover history | **N-9** (implementation-plan.md M1-6) | behavioural — **corrects a meaningless statistic**, and **needs the owner's acknowledgement** | **Yes, and by orders of magnitude.** `solarjoules` carries the Campbell logger's `slr_mj`: energy per unit area accumulated since its previous output. The Go views stored `avg(solarjoules)`, which is the mean increment per reading and moves when the logger's output interval does; the registry now stores `total`, which is the bucket's insolation. At production's 2-second cadence that multiplies the value `/span` returns by roughly the bucket's reading count — **~30× at the 6 h band, ~150× at 48 h, ~1,800× at 14 d, ~43,200× at 366 d**. Two further consequences. (1) `/latest` serves the last raw reading, so after this change `/latest` and `/span` report different physical quantities under the same key and the same declared unit; the frozen contract has one name for them and `rainincremental`/`period_rain` is the only precedent, where the Go surface gave the bucket total a *second* name. (2) No Go view computed `sum(solarjoules)`, so `solarjoules_total` is NULL for the ~294 pre-cutover rollup days — and `solarjoules` is `"swift_optional": false` in `contract/legacy-v1.json`, the same property that makes `windd` a contract hazard, so the read path must coalesce it rather than emit null. **The conformance suite cannot catch any of this**: it compares shape, type and numeric formatting, not values (`contract/conformance/src/lib.rs`). |
 | **DEV-6** | Wildcard certificates match exactly one label; on an SNI miss the chain is exact → wildcard → designated default → refuse with `unrecognized_name` | W3 D-69, D-70 | behavioural — **closes two defects** | **Only by depending on the bugs.** The Go `strings.HasSuffix` check matches any depth *and* matches `evilexample.com` for `*.example.com`. On a miss, Go returns an arbitrary certificate by iterating a map — non-deterministic between runs, producing a browser interstitial that blames the user. |
+| **DEV-8** | A WeatherLink Live station's readings are stored in the units the registry declares (°F, inHg, inches), its indoor temperature and humidity are stored at all, its rainfall is converted from tip counts, its ten-minute wind average is stored, and its sensor records are matched by record type as well as by transmitter | **D-26** and `metrics/registry.toml`'s declared units, applied by implementation-plan.md **M3-1**; five defects in the Go driver | behavioural — **closes five defects**, and **needs the owner's acknowledgement** | **Yes, if the owner has ever run a WeatherLink Live.** (1) `internal/weatherstations/weatherlinklive/data_transformer.go` converts every temperature `(F - 32) * 5 / 9` and every pressure `* 33.8639`, writing Celsius into `outtemp` and hPa into `barometer`/`baromrelin`/`baromabsin` — columns `metrics/registry.toml` declares as `degF` and `inHg`, which the Go **Davis** driver on the same schema fills in °F and inHg (`convBigVal10` of the LOOP packet) and which `/latest` emits with no conversion. The two Go drivers therefore disagree about what the column means, and the WeatherLink Live one disagrees with the frozen contract: 62.7 °F is stored as 17.06 and rendered as 17.06 °F. (2) It copies `rainfall_daily` and `rain_rate_last` — which are **tip counts** — into `dayrain` and `rainrate`, declared `in` and `in_per_hour`. The error is the reciprocal of the collector size, so it is **100×** for a 0.01 in collector, **127×** for 0.2 mm, **254×** for 0.1 mm and **1000×** for 0.001 in; `rain_size`, the only value that can convert a count into a depth, is decoded into the struct and never used to convert anything (`discovery.go:217` only lists its name). (3) Its `th_indoor` arm looks for `DataStructureBarometer` (record type 3) while `temp_in` and `hum_in` are in record type 4, so `intemp` and `inhumidity` are never populated from one of these units at all. (4) `findCondition` returns the first record whose transmitter matches regardless of record type, so `th:2` on a deployment with a leaf/soil station on transmitter 2 reads `temp` out of a record that has none and the outdoor temperature silently stops. (5) `windspeed10` has a column, the unit reports `wind_speed_avg_last_10_min` on both transports, and the Go driver does not map it — so that column is empty for this station type and populated for Davis. The Rust codec stores the device's own units, converts rainfall through `rain_size`, leaves rainfall `NULL` when `rain_size` is absent rather than storing a count (**D-26**), reads the indoor record, prefers the record type the role implies before falling back to the transmitter, and fills `windspeed10`. **Marked as needing acknowledgement** for DEV-7's reason: these are corrections and not decisions, and whether a stored series changes meaning is the owner's call. **The conformance suite cannot catch any of it** — it compares shape, type and formatting, not values — and nothing in this repository can tell whether any WeatherLink Live data exists in the production database. |
 
 **DEV-4 answers W9's OQ-W9-4 in the affirmative**, which is what W9 asked W6 to decide. It belongs
 here rather than only in `docs/data-migration.md` for the reason W9 gave for rejecting its own option
@@ -1220,6 +1221,48 @@ reason the item was sized as a one-line registry edit needing no record, and tha
 hold. **Marked as needing the owner's acknowledgement**, like DEV-2, DEV-3 and DEV-6: the aggregation
 is an agent's technical judgement, and whether a chart's numbers may change by three orders of
 magnitude is not.
+
+**DEV-8 is a *driver* deviation rather than a read-path one, which is why it reads differently from
+the seven above it.** Nothing about the frozen contract changes: the keys, the types and the formatting
+are identical, and a client sees the same JSON shape it always did. What changes is the **number**
+under `otemp`, `bar`, `dayrain` and `rainrate` for a station of one type — and in the direction of the
+unit the registry, the contract and the other driver all already agree on. Three consequences worth
+stating rather than discovering:
+
+1. **Historic rows are not migrated.** M7-4's configuration migration and W9's data migration copy
+   what is there; a `outtemp` column holding Celsius for some past range is not something either can
+   detect, because 17.06 is a plausible Fahrenheit reading for a cold morning. If the owner has
+   WeatherLink Live history, a chart spanning the cutover will step.
+2. **It is invisible to every gate.** The `conformance` suite compares shape and formatting;
+   `db-tests` has no WeatherLink Live in it; the emulator level asserts the Rust decoder against a
+   Rust-adjacent oracle. The only check that could have caught the Go behaviour is the one this entry
+   *is*: reading the registry's declared unit next to the driver's arithmetic.
+3. **The rainfall case is not symmetrical with the others.** A temperature in the wrong unit is
+   recoverable arithmetic. A rain total in counts is only recoverable if `rain_size` is known for the
+   period, and nothing stored it — which is also why the Rust codec stores `NULL` rather than a count
+   when the device omits it.
+
+**One further behavioural change belongs with DEV-8 and is not a stored value: the sensor-mapping
+parse refuses configurations the Go daemon starts with.** `config.stations.wll_sensor_mapping` is
+validated at plan time, and a mapping that does not parse is a station that does not plan — which,
+because `plan()` is a pure function the boot sequence aborts on, is a daemon that does not start. The
+Go parser (`mapping_parser.go`) accepts all of the following and the transformer then silently has no
+arm for them: an unknown role (`wnid:1`), a role with no transmitter where one is required (`wind`),
+a transmitter on a role that has none (`baro:1`), a transmitter outside 1–8 (`th:0`, `th:99` —
+`validation.go`'s range check is never called by `station.go`), a leaf/soil role with no port
+(`soil_temp:2`), a `leaf_wet` port of 3 or 4 on a station with two leaf channels, a mis-cased option
+(`thsw:1:apptemp`), trailing junk (`soil_temp:2:1:junk`), and the same sensor twice (`wind:1,
+wind:1`). Each is now a plan error naming the station and the column.
+
+Validating at plan time rather than never is the improvement, and the cost is specific: **an
+operator's existing mapping string can stop the daemon rather than degrading it.** That is the right
+trade only because the configuration migration is a separate step — implementation-plan.md **M7-4**
+owns it, and normalising these strings is its job, so it is recorded here as a constraint on that
+item rather than left to be discovered at cutover. The alternative considered and not taken was to
+demote the four classes that are pure no-ops in Go (`MissingTxid`, `UnexpectedTxid`, `MissingPort`,
+`Duplicate`) to a counted warning that drops the entry; it was rejected because a station silently
+reporting less than it should is the defect class this programme exists to remove, and because the
+failure here is loud, at startup, and names the column to fix.
 
 **What is *not* in this ledger, and why each is more interesting than it looks.**
 
@@ -1250,7 +1293,7 @@ magnitude is not.
   repositories cannot be ruled out from here. **O-6** asks the owner for one line of access-log
   analysis.
 
-**The honest summary for the owner: no shipped client breaks.** Of six deviations, three are purely
+**The honest summary for the owner: no shipped client breaks.** Of eight deviations, two are purely
 additive and invisible to both clients by a verified property of the conformance runner; three are
 behavioural and every one of them closes a defect rather than removing a response a client reads. The
 one place a user-visible failure *does* ship is the one deviation this ledger does **not** carry —
@@ -1352,7 +1395,8 @@ endpoint the archive is carried and unreadable, which is the recorded trade.
 
 
 
-**Twelve, consolidated and deduplicated from sixty-two open questions across ten documents.** Fifty
+**Twelve from this pass, plus **O-13** raised by implementation-plan.md M3-1, consolidated and
+deduplicated from sixty-two open questions across ten documents.** Fifty
 are closed: forty-one were answered by a later document (W4 alone closed OQ-3, OQ-4, OQ-5, OQ-W1-2,
 OQ-W2-1 and OQ-W2-6; W3 closed its own ten plus OQ-D and W8's OQ-1 and OQ-2), four were resolved in
 §1 and §2 of this document (OQ-W4-6, OQ-W5-4, OQ-C, OQ-W9-4), and five became work items in §4
@@ -1592,6 +1636,43 @@ closing section. **(c)** A lightweight amendment protocol *between* work items, 
 *Recommendation:* **(b)**, and only if there is a next programme of this size. (a) is defensible — the
 mechanism did catch all six, and none was expensive. The reason to prefer (b) is that W6 resolved them
 by reading two documents, and the author of the model would have resolved them by knowing it.
+
+**O-13. The first station driver's emulator is not independently written, and D-40 says it should
+be.** *(raised by implementation-plan.md M3-1)*
+
+*Why it matters.* **D-40** keeps the four Go emulators in Go deliberately — "a driver tested against a
+simulator written in the same language from the same understanding tests that understanding against
+itself" — and **A-W8-4** adds that they are consumed at a pinned commit of the reference repository.
+The reference repository at the pinned commit has **no WeatherLink Live emulator**: its four are
+`cmd/davis-emulator`, `cmd/campbell-emulator`, `cmd/weather-station-simulator` (Davis on TCP 22222,
+Campbell on TCP 7000) and `cmd/live-data-simulator` (Campbell packets from live data). It is read-only
+to this programme, so one cannot be added there.
+
+M3-1 is the item whose done-criteria arm the `driver-emulators` gate (**D-64**), and WeatherLink Live
+is the only driver that exists, so the choice was between a gate that runs nothing — **G-1**, the
+defect this whole mechanism exists against — and an emulator written in this repository. M3-1 wrote
+one, in Go, at `tests/emulators/wll`, and recorded the trade in `tests/emulators/manifest.toml`:
+
+- **kept** — a separate process, a different language, real sockets, the real bind, and a driver
+  exercised for more than one batch. Four of D-40's five properties.
+- **lost** — independent authorship, which is the one the rationale is actually about. It was written
+  from the same reading of the published API as the driver, so it cannot catch a misunderstanding the
+  two share.
+
+*Options.* **(a)** Accept it, and let each driver's emulator live here as it arrives. **(b)** A
+`cmd/weatherlink-live-emulator` in the reference tree, written against the vendor documentation by
+somebody who is not writing the driver, with the pin bumped to the commit that adds it; the manifest
+entry's `origin` then becomes `"reference"` and the local copy is deleted. **(c)** Narrow D-40 by
+amendment to the drivers the reference tree actually covers, and say explicitly that a driver with no
+upstream emulator gets a local one — which is what the code does today, unamended.
+
+*Recommendation:* **(b)** for WeatherLink Live, because it is the owner's own station type and the one
+whose stored values DEV-8 changes, and **(c)** as the standing rule so that the next driver does not
+re-raise this. (a) is the status quo and is the weakest: it leaves D-40's decision table row saying
+something the tree does not do. Note that the gate is honest either way — it runs five real tests
+against a real second process, binds a declared test set by name, and prints the authorship caveat on
+every run — so this is a question about the strength of an oracle and not about whether anything is
+checked.
 
 ---
 
@@ -2087,7 +2168,7 @@ the consequence as a property of the environment. Nobody retested it, because it
 1. **This pass reconciles; it does not redesign.** Every resolution in §1 is either a clerical fix, a correction forced by measurement, or an acceptance of a recommendation its own author made. Where a resolution was a genuine design choice it went to §5.
 2. **329 assumptions were checked individually against the other document's Decisions section**, and all 329 are recorded in §1 as holding or not — 208 holding as written, 64 with a narrowing or correction, 8 forward, 49 failing across 27 distinct defects.
 3. **None of the 27 defects is a disagreement about what the system should do.** The dominant causes are stage-parallel blindness (9) and a request aimed at a document already merged (3).
-4. **The deviation ledger is a required deliverable of this work item**, because three documents reference it by name. It carries six entries; three are purely additive, three close defects, and none removes a response a shipped client reads.
+4. **The deviation ledger is a required deliverable of this work item**, because three documents reference it by name. It carries eight entries; two are purely additive, five close defects, one removes a response no shipped client requests, and none removes a response a shipped client reads.
 5. **The conformance gate's `arms_when` and `cmd` describe an interface nobody built** (G-1), so a job named "frozen contract conformance" has reported green on every PR while W1's suite — whose own done-criteria required it to pass — has never run in CI against either binary. Repointed in this PR; the Go-target run is raised as N-3.
 6. **A gate's `arms_when` must name a path that some work item's done-criteria require it to create.** G-1 is what happens otherwise. Recorded as D-64.
 7. **The configuration store and its migration are unowned** (G-2) and are the largest genuine absence found: nine-plus SQLite tables assumed by four documents, with no DDL and no migration mechanism, against D-8. Raised as N-4 and N-5.
@@ -2102,7 +2183,8 @@ the consequence as a property of the environment. Nobody retested it, because it
 ## Open questions
 
 All twelve are in §5 above, which is this document's point rather than an appendix: **O-1** to
-**O-4** are production queries, **O-5** to **O-11** are decisions, and **O-12** is a process finding
+**O-4** are production queries, **O-5** to **O-11** are decisions, **O-13** is a decision raised after
+this pass, and **O-12** is a process finding
 about the programme's own method. They are not restated here.
 
 ## Assumptions about other work items

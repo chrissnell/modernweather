@@ -21,3 +21,27 @@ tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+# `transport_auth` is a credential from the moment it is read (D-33), and `Endpoint`'s
+# parse refuses to let one arrive in a URL instead.
+secrecy.workspace = true
+# The station endpoint counters of `metrics.rs`. The recorder is `mw-obs`'s; this crate
+# names the one series it owns (A-W3-1, §5.10).
+metrics.workspace = true
+
+# The outbound HTTP request a `Trigger::Every` occurrence makes -- `/v1/current_conditions`
+# and `/v1/real_time` on a WeatherLink Live -- is written out in `http.rs` over a
+# `tokio::net::TcpStream` rather than taken from a client crate. `hyper` was tried: its
+# client needs a connection future that something else drives, which on this path means the
+# `tokio::spawn` `clippy.toml` forbids, and the mechanism that rule points at
+# (`mw_supervisor::task`) is a crate this one may not name. That module's documentation has
+# the whole argument.
+
+[dev-dependencies]
+# `macros` for `#[tokio::test]`, and `test-util` so that the broadcast listener's cancel
+# path is assertable without sleeping. No `tempfile` and no HTTP mock crate: the transcript
+# double is in `testing.rs` and the driver tests use a loopback socket.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# `CancellationToken`, to construct the `Cx` a `Serve` body is handed. The library itself
+# does not name it: a component observes cancellation through `Cx::cancelled`, which is
+# `mw-component`'s surface, so only a test that plays supervisor needs the type.
+tokio-util.workspace = true

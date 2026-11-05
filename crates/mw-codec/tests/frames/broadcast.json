@@ -1,0 +1,25 @@
+{
+  "did": "001D0A700002",
+  "ts": 1531754005,
+  "conditions": [
+    {
+      "lsid": 48308,
+      "data_structure_type": 1,
+      "txid": 1,
+      "wind_speed_last": 2.0,
+      "wind_dir_last": 165,
+      "rain_size": 2,
+      "rain_rate_last": 0,
+      "rain_15_min": 0,
+      "rain_60_min": 0,
+      "rain_24_hr": 0,
+      "rain_storm": 0,
+      "rain_storm_start_at": 1530255720,
+      "rainfall_daily": 63,
+      "rainfall_monthly": 63,
+      "rainfall_year": 63,
+      "wind_speed_hi_last_10_min": 3.0,
+      "wind_dir_at_hi_speed_last_10_min": 182
+    }
+  ]
+}

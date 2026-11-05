@@ -15,10 +15,14 @@
 
 /// The configuration store and its migrations (D-8, A-W6-2).
 pub mod config_db;
+/// `StationRegistry` over a published snapshot of `config.stations` -- W2a §4a.6's single
+/// identity-resolution gate.
+pub mod registry;
 /// `ScheduleStore` over `component_schedule` alone -- the supervisor's own durable state
 /// (**D-41**).
 pub mod schedule;
 /// The startup database-version assertion (**D-62**).
 pub mod version;
 
+pub use crate::registry::{ConfigRegistry, RegistrySnapshot, StationEntry};
 pub use crate::schedule::SqliteScheduleStore;

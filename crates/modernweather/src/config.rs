@@ -7,26 +7,28 @@
 //! websites -- so the crate that names the type is the crate that may name everything,
 //! which is this one.
 //!
-//! **What it holds, and what it does not.** Three tables: the listener, the weather
-//! database and the node row. Those are what the boot sequence itself needs -- where to
-//! bind, whether **D-62** has a server to assert, and whether this node has started
-//! before. Everything else in `migrations/config/` is read by the component that consumes
-//! it, and a field here for a table no consumer exists for yet would be this work item
-//! guessing at the shape M3-1 and M7 want.
+//! **What it holds, and what it does not.** Four tables: the listener, the weather
+//! database, the node row and `config.stations`. The first three are what the boot sequence
+//! itself needs -- where to bind, whether **D-62** has a server to assert, and whether this
+//! node has started before. The fourth arrived with the first registrar. Everything else in
+//! `migrations/config/` is read by the component that consumes it, and a field here for a
+//! table no consumer exists for yet would be guessing at a shape.
 //!
-//! The first registrar (implementation-plan.md M3-1's `mw_station::register`) is also the
-//! point at which this type stops being private to the binary: a registrar takes `&C`, and
-//! `mw-station` may not depend on `mw-store`. What it will need is a *trait* this type
-//! implements -- one per component crate, naming only the rows that crate plans from --
-//! which keeps the tree here and the queries there. That is M3-1's to design against a
-//! real consumer rather than this item's to invent without one.
+//! **The first registrar is also where this type stopped being private to the binary.** A
+//! registrar takes `&C` and `mw-station` may not depend on `mw-store`, so what it needs is a
+//! *trait* this type implements -- one per component crate, naming only the rows that crate
+//! plans from. [`mw_station::StationConfig`] is the first of them, and the station rows are
+//! copied column-into-field below because both crates are in the `service` layer and
+//! `ci/layers.toml` forbids either naming the other. That copy is what buys the property
+//! that `mw-store` cannot grow a `Transport` and `mw-station` cannot grow a query.
 
-use mw_component::Generation;
+use std::sync::Arc;
+
+use mw_component::{Generation, Ingress};
 use mw_store::config_db::{self, ConfigDbError, Listener, Node, WeatherDatabase};
 use sqlx::SqlitePool;
 
 /// Everything `plan()` and the boot sequence read from the configuration database.
-#[derive(Debug)]
 pub struct Config {
     /// Where the one listener binds (W3 §6.1).
     pub listener: Listener,
@@ -35,6 +37,26 @@ pub struct Config {
     pub weather_database: Option<WeatherDatabase>,
     /// This node's identity, if it has started before. `None` is a first start.
     pub node: Option<Node>,
+    /// Every `config.stations` row, as the columns hold it. The registry's snapshot is
+    /// built from these, because it needs `ingest_secret_hash` -- which is not a station
+    /// *driver's* concern and is deliberately absent from the row below.
+    pub stations: Vec<config_db::StationRow>,
+
+    /// The same rows in the shape `mw-station` plans from.
+    ///
+    /// `pub(crate)` rather than `pub`: the registrar reaches it through
+    /// [`mw_station::StationConfig`], so nothing outside this crate needs the field, and
+    /// this crate's own tests construct the type directly.
+    pub(crate) declared_stations: Vec<mw_station::StationRow>,
+
+    /// The write end of the reading pipeline, once the spool is open.
+    ///
+    /// `None` until `main` sets it, and legitimately `None` for a node with no `node` row:
+    /// no identity means no spool, which means nothing to admit readings to (W7 §8.2).
+    /// `mw_station::register` refuses to plan a station in that case rather than planning
+    /// one that cannot store anything.
+    pub(crate) ingress: Option<Arc<dyn Ingress>>,
+
     /// The generation these rows were read at (**D-53**).
     ///
     /// `ZERO` until something can bump it: a generation is assigned by `ConfigAdmin` on
@@ -47,12 +69,25 @@ pub struct Config {
 impl Config {
     /// Read the configuration. Step 4 of the boot sequence.
     pub async fn load(pool: &SqlitePool) -> Result<Self, ConfigDbError> {
+        let stations = config_db::stations(pool).await?;
         Ok(Config {
             listener: config_db::listener(pool).await?,
             weather_database: config_db::weather_database(pool).await?,
             node: config_db::node(pool).await?,
+            declared_stations: stations.iter().map(declare).collect(),
+            stations,
+            ingress: None,
             generation: Generation::ZERO,
         })
+    }
+
+    /// Hand the configuration the write end of the pipeline, once the spool is open.
+    ///
+    /// Step 4b produces it and step 5 reads it, so this is the one mutation between them.
+    /// `mw_station::config`'s module documentation has the reasoning for why the handle
+    /// travels this way rather than off the capability bus.
+    pub fn set_ingress(&mut self, ingress: Arc<dyn Ingress>) {
+        self.ingress = Some(ingress);
     }
 
     /// The address the one listener binds, and therefore where `/metrics` is served.
@@ -91,12 +126,77 @@ pub struct AddressError {
     pub port: u16,
 }
 
+impl std::fmt::Debug for Config {
+    /// `Ingress` is a capability handle and is not `Debug`; the station rows carry a
+    /// `SecretString` each. What is useful in a log line is how much of each there is.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("listener", &self.listener)
+            .field("weather_database", &self.weather_database.is_some())
+            .field("node", &self.node)
+            .field("stations", &self.stations.len())
+            .field("ingress", &self.ingress.is_some())
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+impl mw_station::StationConfig for Config {
+    fn stations(&self) -> &[mw_station::StationRow] {
+        &self.declared_stations
+    }
+
+    fn ingress(&self) -> Option<&Arc<dyn Ingress>> {
+        self.ingress.as_ref()
+    }
+}
+
+/// One `config.stations` row, as the station crate declares components from.
+///
+/// Column into field, and nothing else: every validation is `mw_station`'s, because the
+/// crate that owns what a transport *is* is the crate that should refuse one that is not.
+fn declare(row: &config_db::StationRow) -> mw_station::StationRow {
+    mw_station::StationRow {
+        key: row.station_key.clone(),
+        name: row.name.clone(),
+        kind: row.kind.clone(),
+        enabled: row.enabled,
+        identity_kind: row.identity_kind.clone(),
+        presented_key: row.presented_key.clone(),
+        transport: row
+            .transport_kind
+            .as_ref()
+            .map(|kind| mw_station::TransportColumns {
+                kind: kind.clone(),
+                dev: row.transport_dev.clone(),
+                baud: row.transport_baud,
+                host: row.transport_host.clone(),
+                port: row.transport_port,
+                url: row.transport_url.clone(),
+                method: row.transport_method.clone(),
+                auth: row.transport_auth.clone(),
+                streaming: row.transport_streaming,
+                mount: row.transport_mount.clone(),
+                group: row.transport_group.clone(),
+                topic: row.transport_topic.clone(),
+                tls_ca: row.transport_tls_ca_path.clone(),
+                tls_cert: row.transport_tls_cert_path.clone(),
+                tls_key: row.transport_tls_key_path.clone(),
+            }),
+        wll_sensor_mapping: row.wll_sensor_mapping.clone(),
+        wll_poll_interval_seconds: row.wll_poll_interval_seconds,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn config(addr: &str, port: u16) -> Config {
         Config {
+            stations: Vec::new(),
+            declared_stations: Vec::new(),
+            ingress: None,
             listener: Listener {
                 listen_addr: addr.to_string(),
                 http_port: port,
