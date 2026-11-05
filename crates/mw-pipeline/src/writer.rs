@@ -168,102 +168,120 @@ mod tests {
         assert_eq!(id.as_str(), "writer:timescale");
     }
 
-    /// A `ReadingSink` that answers whatever the test wants, so the adapter's arithmetic
-    /// is assertable without a database.
-    #[derive(Debug)]
-    struct FakeStore(Result<mw_component::Stored, &'static str>);
+    /// The adapter's own behaviour, which needs a **real `tokio` runtime** and therefore
+    /// cannot run under `--cfg loom`.
+    ///
+    /// That flag applies to every crate in the graph, and `tokio` gates its whole `net`
+    /// module behind `#![cfg(not(loom))]` — so `runtime::Builder::build` asserts the I/O
+    /// driver is disabled and a `#[tokio::test]` panics before its body runs. The same
+    /// reason `tests/spool.rs`, `tests/fanout.rs` and `tests/ingress.rs` each carry
+    /// `#![cfg(not(loom))]` at the top; `.github/workflows/pr.yml`'s loom job explains the
+    /// flag's reach in full.
+    ///
+    /// Nothing here is a concurrency model, so nothing is lost by excluding it: this
+    /// module asserts the arithmetic between `Stored` and `Acked`, which is sequential.
+    #[cfg(not(loom))]
+    mod adapter {
+        use super::*;
 
-    impl ReadingSink for FakeStore {
-        fn store<'a>(
-            &'a self,
-            batch: &'a [Envelope],
-        ) -> BoxFuture<'a, Result<mw_component::Stored, mw_component::StoreError>> {
-            let answer = match &self.0 {
-                Ok(stored) => Ok(mw_component::Stored {
-                    // `stored` is a prefix length, so it only means anything against the
-                    // batch it was given.
-                    stored: stored.stored.min(batch.len()),
-                    rows: stored.rows,
-                }),
-                Err(why) => Err(mw_component::StoreError::unavailable(
-                    std::io::Error::other(*why),
-                )),
+        /// A `ReadingSink` that answers whatever the test wants, so the adapter's arithmetic
+        /// is assertable without a database.
+        #[derive(Debug)]
+        struct FakeStore(Result<mw_component::Stored, &'static str>);
+
+        impl ReadingSink for FakeStore {
+            fn store<'a>(
+                &'a self,
+                batch: &'a [Envelope],
+            ) -> BoxFuture<'a, Result<mw_component::Stored, mw_component::StoreError>> {
+                let answer = match &self.0 {
+                    Ok(stored) => Ok(mw_component::Stored {
+                        // `stored` is a prefix length, so it only means anything against the
+                        // batch it was given.
+                        stored: stored.stored.min(batch.len()),
+                        rows: stored.rows,
+                    }),
+                    Err(why) => Err(mw_component::StoreError::unavailable(
+                        std::io::Error::other(*why),
+                    )),
+                };
+                Box::pin(async move { answer })
+            }
+        }
+
+        fn cx() -> Cx {
+            let (_tx, rx) = tokio::sync::watch::channel(mw_component::Generation::ZERO);
+            Cx::new(
+                ComponentId::new(ID).expect("valid"),
+                tokio_util::sync::CancellationToken::new(),
+                mw_component::Generation::ZERO,
+                rx,
+            )
+        }
+
+        fn envelope(seq: u64) -> Envelope {
+            let at =
+                chrono::DateTime::from_timestamp(1_767_225_600 + seq as i64, 0).expect("in range");
+            Envelope {
+                station: mw_types::StationKey::new("backyard"),
+                observed_at: at,
+                received_at: at,
+                provenance: mw_types::Provenance::admitted(
+                    mw_types::OriginId::new([4; 16]),
+                    mw_types::Seq::new(seq),
+                ),
+                reading: std::sync::Arc::new(mw_types::Reading::default()),
+            }
+        }
+
+        /// **The whole batch is acknowledged, not the row count.** Two envelopes that
+        /// collapsed to one row are both durably handled, and a cursor that stopped at the row
+        /// count would replay the second one forever.
+        #[tokio::test]
+        async fn the_ack_is_the_envelope_count_and_not_the_row_count() {
+            let batch: Vec<Envelope> = (0..4).map(envelope).collect();
+            let mut sink = StoreSink {
+                store: Arc::new(FakeStore(Ok(mw_component::Stored { stored: 4, rows: 1 }))),
             };
-            Box::pin(async move { answer })
+            let Acked(n) = sink
+                .deliver(&batch, &cx())
+                .await
+                .expect("the fake store succeeds");
+            assert_eq!(n, 4, "four envelopes handled, even though they are one row");
         }
-    }
 
-    fn cx() -> Cx {
-        let (_tx, rx) = tokio::sync::watch::channel(mw_component::Generation::ZERO);
-        Cx::new(
-            ComponentId::new(ID).expect("valid"),
-            tokio_util::sync::CancellationToken::new(),
-            mw_component::Generation::ZERO,
-            rx,
-        )
-    }
-
-    fn envelope(seq: u64) -> Envelope {
-        let at = chrono::DateTime::from_timestamp(1_767_225_600 + seq as i64, 0).expect("in range");
-        Envelope {
-            station: mw_types::StationKey::new("backyard"),
-            observed_at: at,
-            received_at: at,
-            provenance: mw_types::Provenance::admitted(
-                mw_types::OriginId::new([4; 16]),
-                mw_types::Seq::new(seq),
-            ),
-            reading: std::sync::Arc::new(mw_types::Reading::default()),
+        /// A store failure becomes a `ComponentError` naming the action, which is what the
+        /// supervisor turns into `Failed` + `Backoff` with the cursor where it was (§2.3).
+        #[tokio::test]
+        async fn a_store_failure_names_the_action_and_keeps_its_chain() {
+            let batch = vec![envelope(1)];
+            let mut sink = StoreSink {
+                store: Arc::new(FakeStore(Err("connection reset by peer"))),
+            };
+            let e = sink
+                .deliver(&batch, &cx())
+                .await
+                .expect_err("the fake store fails");
+            let chain = mw_types::DisplayChain(&e).to_string();
+            assert!(chain.contains("could not be reached"), "{chain}");
+            assert!(chain.contains("connection reset by peer"), "{chain}");
+            let as_component: mw_component::ComponentError = e.into();
+            assert_eq!(
+                mw_types::DisplayChain(&as_component).to_string(),
+                "store a batch of readings: the weather database could not be reached: \
+                 connection reset by peer"
+            );
         }
-    }
 
-    /// **The whole batch is acknowledged, not the row count.** Two envelopes that
-    /// collapsed to one row are both durably handled, and a cursor that stopped at the row
-    /// count would replay the second one forever.
-    #[tokio::test]
-    async fn the_ack_is_the_envelope_count_and_not_the_row_count() {
-        let batch: Vec<Envelope> = (0..4).map(envelope).collect();
-        let mut sink = StoreSink {
-            store: Arc::new(FakeStore(Ok(mw_component::Stored { stored: 4, rows: 1 }))),
-        };
-        let Acked(n) = sink
-            .deliver(&batch, &cx())
-            .await
-            .expect("the fake store succeeds");
-        assert_eq!(n, 4, "four envelopes handled, even though they are one row");
-    }
-
-    /// A store failure becomes a `ComponentError` naming the action, which is what the
-    /// supervisor turns into `Failed` + `Backoff` with the cursor where it was (§2.3).
-    #[tokio::test]
-    async fn a_store_failure_names_the_action_and_keeps_its_chain() {
-        let batch = vec![envelope(1)];
-        let mut sink = StoreSink {
-            store: Arc::new(FakeStore(Err("connection reset by peer"))),
-        };
-        let e = sink
-            .deliver(&batch, &cx())
-            .await
-            .expect_err("the fake store fails");
-        let chain = mw_types::DisplayChain(&e).to_string();
-        assert!(chain.contains("could not be reached"), "{chain}");
-        assert!(chain.contains("connection reset by peer"), "{chain}");
-        let as_component: mw_component::ComponentError = e.into();
-        assert_eq!(
-            mw_types::DisplayChain(&as_component).to_string(),
-            "store a batch of readings: the weather database could not be reached: \
-             connection reset by peer"
-        );
-    }
-
-    /// An empty batch is a no-op rather than a statement. The fan-out does not deliver
-    /// one, but a filter applied downstream can produce one (`ReadingBatch::is_empty`).
-    #[tokio::test]
-    async fn an_empty_batch_acknowledges_nothing_and_asks_for_nothing() {
-        let mut sink = StoreSink {
-            store: Arc::new(FakeStore(Ok(mw_component::Stored::default()))),
-        };
-        let Acked(n) = sink.deliver(&[], &cx()).await.expect("no-op");
-        assert_eq!(n, 0);
+        /// An empty batch is a no-op rather than a statement. The fan-out does not deliver
+        /// one, but a filter applied downstream can produce one (`ReadingBatch::is_empty`).
+        #[tokio::test]
+        async fn an_empty_batch_acknowledges_nothing_and_asks_for_nothing() {
+            let mut sink = StoreSink {
+                store: Arc::new(FakeStore(Ok(mw_component::Stored::default()))),
+            };
+            let Acked(n) = sink.deliver(&[], &cx()).await.expect("no-op");
+            assert_eq!(n, 0);
+        }
     }
 }
