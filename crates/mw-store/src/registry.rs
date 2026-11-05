@@ -39,13 +39,19 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use mw_component::{ComponentId, FrameMeta, IdentitySource, Reject, StationRegistry};
+use mw_component::{
+    ComponentId, FrameMeta, IdentitySource, Reject, StationMeta, StationProjection, StationRegistry,
+};
 use mw_types::StationKey;
 
 use crate::config_db::StationRow;
 
 /// What the gate knows about one station.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` but not `Eq`: the coordinates and the snow base distance are `f64`, which
+/// has no total equality, and the comparison this type is compared for is a test asserting
+/// a snapshot's contents.
+#[derive(Debug, Clone, PartialEq)]
 pub struct StationEntry {
     /// The station this resolves to.
     pub station: StationKey,
@@ -65,6 +71,13 @@ pub struct StationEntry {
     pub identity: IdentitySource,
     /// Whether the protocol presents a secret that has to be verified.
     pub has_secret: bool,
+    /// What the enrich stage reads (**R1**, W3 §2.5).
+    pub meta: StationMeta,
+    /// What the weather schema's `stations` projection should say (**D-56**, W4 §2.1).
+    ///
+    /// Carried on the entry rather than looked up separately, because both are a copy of
+    /// the same row and a second map keyed the same way is a second thing to keep in step.
+    pub projection: StationProjection,
 }
 
 /// One immutable view of `config.stations`, as the gate reads it.
@@ -80,6 +93,14 @@ pub struct RegistrySnapshot {
     by_claim: BTreeMap<String, StationEntry>,
     /// Receiving component to station, for a `Fixed` identity.
     by_receiver: BTreeMap<ComponentId, StationEntry>,
+    /// Station key to entry, for the two lookups that are **not** authentication.
+    ///
+    /// Keyed by the station's own key rather than by a claim or a receiver, because
+    /// `metadata` and `projection` answer "what is configured for this station" and the
+    /// station is already resolved by the time either is asked. Deliberately **not** a
+    /// resolution path: a key that is not here answers "nothing configured", which is what
+    /// keeps a peer's unregistered station storable (see `StationRegistry::metadata`).
+    by_station: BTreeMap<String, StationEntry>,
 }
 
 impl RegistrySnapshot {
@@ -107,6 +128,25 @@ impl RegistrySnapshot {
                     .ingest_secret_hash
                     .as_deref()
                     .is_some_and(|h| !h.is_empty()),
+                meta: StationMeta {
+                    latitude: row.latitude,
+                    longitude: row.longitude,
+                    altitude_m: row.altitude_m,
+                    snow_base_distance_mm: row.snow_base_distance_mm,
+                },
+                projection: StationProjection {
+                    name: row.name.clone(),
+                    kind: row.kind.clone(),
+                    // Empty is not a zone. The column is nullable and an operator can
+                    // also leave it blank, and `chrono-tz` would reject `""` at the
+                    // calendar trigger -- so it is normalised to absent here, where the
+                    // row is read, rather than at every reader.
+                    timezone: row.timezone.clone().filter(|z| !z.trim().is_empty()),
+                    latitude: row.latitude,
+                    longitude: row.longitude,
+                    altitude_m: row.altitude_m,
+                    snow_base_distance_mm: row.snow_base_distance_mm,
+                },
             };
             entries.insert(row.station_key.as_str(), entry.clone());
             if let Some(claim) = row.presented_key.as_deref().filter(|c| !c.is_empty()) {
@@ -126,9 +166,14 @@ impl RegistrySnapshot {
                     .map(|entry| (component.clone(), entry.clone()))
             })
             .collect();
+        let by_station = entries
+            .into_iter()
+            .map(|(key, entry)| (key.to_string(), entry))
+            .collect();
         Self {
             by_claim,
             by_receiver,
+            by_station,
         }
     }
 
@@ -239,6 +284,28 @@ impl StationRegistry for ConfigRegistry {
             }
         }
     }
+
+    /// The four static values **R1** admits into a derived column.
+    ///
+    /// Total: an unknown station is [`StationMeta::EMPTY`], not a refusal. A `disabled`
+    /// station answers its configured metadata rather than nothing, because `enabled` is
+    /// about *collection* and this is asked after a reading already exists -- a reading
+    /// forwarded by a peer, or one admitted before the operator switched the station off.
+    fn metadata(&self, station: &StationKey) -> StationMeta {
+        self.snapshot
+            .load()
+            .by_station
+            .get(station.as_str())
+            .map_or(StationMeta::EMPTY, |e| e.meta)
+    }
+
+    fn projection(&self, station: &StationKey) -> Option<StationProjection> {
+        self.snapshot
+            .load()
+            .by_station
+            .get(station.as_str())
+            .map(|e| e.projection.clone())
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +327,11 @@ mod tests {
             .into(),
             presented_key: claim.map(str::to_string),
             ingest_secret_hash: None,
+            latitude: Some(39.7392),
+            longitude: Some(-104.9903),
+            altitude_m: Some(1609.0),
+            timezone: Some("America/Denver".into()),
+            snow_base_distance_mm: Some(1500.0),
             transport_kind: Some("udp_in".into()),
             transport_dev: None,
             transport_baud: None,

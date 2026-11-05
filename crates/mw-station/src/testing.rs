@@ -13,7 +13,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use mw_component::{AdmitError, Admitted, BoxFuture, FrameMeta, Ingress, Reject, StationRegistry};
+use mw_component::{
+    AdmitError, Admitted, BoxFuture, FrameMeta, Ingress, Reject, StationMeta, StationProjection,
+    StationRegistry,
+};
 use mw_types::{Envelope, OriginId, PartialReading, Seq, StationKey};
 
 use crate::session::ByteStream;
@@ -227,5 +230,17 @@ impl StationRegistry for OneStation {
             Some(claim) if claim.to_ascii_lowercase() == self.claim => Ok(self.station.clone()),
             _ => Err(Reject::UnknownStation),
         }
+    }
+
+    /// Nothing configured. A driver test asserts what the *codec* decoded, and an enriched
+    /// column here would make the expected reading depend on this registry's coordinates
+    /// rather than on the frame -- `mw_pipeline::enrich`'s own tests are where the derived
+    /// values are asserted.
+    fn metadata(&self, _station: &StationKey) -> StationMeta {
+        StationMeta::EMPTY
+    }
+
+    fn projection(&self, _station: &StationKey) -> Option<StationProjection> {
+        None
     }
 }

@@ -947,6 +947,17 @@ pub struct StationRow {
     pub enabled: bool,
     /// `identity_kind`.
     pub identity_kind: String,
+    /// `latitude`, degrees north.
+    pub latitude: Option<f64>,
+    /// `longitude`, degrees east.
+    pub longitude: Option<f64>,
+    /// `altitude_m`, **metres**. The weather schema's projection column is `altitude_ft`;
+    /// both units are in both column names so the conversion cannot be done twice.
+    pub altitude_m: Option<f64>,
+    /// `timezone`, an IANA name. `None` is a station whose rollovers happen in UTC.
+    pub timezone: Option<String>,
+    /// `snow_base_distance_mm`: the distance the gauge reads with no snow under it.
+    pub snow_base_distance_mm: Option<f64>,
     /// `presented_key` -- the identifier a non-`fixed` station presents.
     pub presented_key: Option<String>,
     /// `ingest_secret_hash` -- the protocol secret's hash, where the protocol has one.
@@ -999,7 +1010,8 @@ pub struct StationRow {
 pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbError> {
     let rows = sqlx::query(
         "SELECT station_key, name, type, enabled, identity_kind, presented_key, \
-                ingest_secret_hash, transport_kind, transport_dev, transport_baud, \
+                ingest_secret_hash, latitude, longitude, altitude_m, timezone, \
+                snow_base_distance_mm, transport_kind, transport_dev, transport_baud, \
                 transport_host, transport_port, transport_url, transport_method, \
                 transport_auth, transport_streaming, transport_mount, transport_group, \
                 transport_topic, transport_tls_ca_path, transport_tls_cert_path, \
@@ -1022,6 +1034,11 @@ pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbErro
                 identity_kind: r.get("identity_kind"),
                 presented_key: r.get("presented_key"),
                 ingest_secret_hash: r.get("ingest_secret_hash"),
+                latitude: r.get("latitude"),
+                longitude: r.get("longitude"),
+                altitude_m: r.get("altitude_m"),
+                timezone: r.get("timezone"),
+                snow_base_distance_mm: r.get("snow_base_distance_mm"),
                 transport_kind: r.get("transport_kind"),
                 transport_dev: r.get("transport_dev"),
                 transport_baud: r.get("transport_baud"),

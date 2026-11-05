@@ -397,12 +397,12 @@ impl CapabilityHandle for std::sync::Arc<dyn Ingress> {
 
 /// Identity resolution: the one gate, and the only producer of a [`StationKey`].
 ///
-/// **The query set is deliberately one method.** A handle trait is the query set its
-/// consumer writes (this crate's module doc), and what `Ingress::admit` needs from the
-/// station registry is "turn this frame into a station or refuse it". Coordinates, the
-/// callsign, the snow base distance and the registration path are the same capability's
-/// surface and they arrive with the items that read them — M3-1's drivers, M6-1's APRS,
-/// M6-4's enrolment.
+/// **The query set is two methods, and the second one arrived with its reader.** A handle
+/// trait is the query set its consumer writes (this crate's module doc), and what
+/// `Ingress::admit` needs from the station registry is "turn this frame into a station or
+/// refuse it" plus the static metadata the enrich stage is a pure function *of*. The
+/// callsign and the registration path are the same capability's surface and still arrive
+/// with the items that read them — M6-1's APRS, M6-4's enrolment.
 ///
 /// **Synchronous on purpose.** W3 **D-87** requires `admit` to do no I/O but the spool
 /// append, and a `fn` returning a `Result` rather than a future is that requirement
@@ -415,6 +415,115 @@ pub trait StationRegistry: Send + Sync + 'static {
     /// The secret comparison is the implementation's and must be constant-time
     /// (`subtle`, **D-33**).
     fn resolve(&self, meta: &FrameMeta) -> Result<StationKey, Reject>;
+
+    /// The static metadata the enrich stage reads (**R1**, W3 §2.5).
+    ///
+    /// Total rather than fallible: every field of [`StationMeta`] is already an `Option`
+    /// because every configuration column is nullable, so a station the registry has
+    /// never heard of is [`StationMeta::EMPTY`] and not an error. That matters on
+    /// `Ingress::accept`, where the station key is a peer's claim until M6-4's registry
+    /// check lands — an unknown key there must mean "derive what needs no metadata" and
+    /// not "refuse the envelope", because refusing it would lose a reading a peer has
+    /// already acknowledged.
+    ///
+    /// Synchronous for `resolve`'s reason, and over the same snapshot.
+    fn metadata(&self, station: &StationKey) -> StationMeta;
+
+    /// What the weather schema's `stations` read-side projection should say about this
+    /// station (**D-56**, W4 §2.1).
+    ///
+    /// `None` for a station this node has no configuration row for, which is a peer's
+    /// received station until M6-4 and is **not** an error: the writer falls back to what
+    /// the reading said about itself rather than refusing to store it.
+    ///
+    /// Separate from [`StationRegistry::metadata`] rather than one wider type, because
+    /// their callers are different in a way that shows up in the signature.
+    /// `metadata` is on `admit`'s hot path and is `Copy` — four `Option<f64>`, no
+    /// allocation. This one allocates two `String`s and is called once per **batch** by
+    /// `writer:timescale`, off that path entirely. Merging them would put two allocations
+    /// on the path W3 **D-87** exists to keep free of everything but an `fsync`.
+    fn projection(&self, station: &StationKey) -> Option<StationProjection>;
+}
+
+/// The weather schema's `stations` row, as configuration knows it (W4 §2.1).
+///
+/// A **projection**, not a registry of record: `config:sqlite`'s `StationRegistry` is
+/// authoritative for a station's existence, credentials and configuration, and this is the
+/// subset a reading-side query needs so that `/span` can resolve a display name with a
+/// join instead of a column repeated on every row of a hundred-million-row table.
+///
+/// `name` and `kind` are not `Option` because the projection's columns are `NOT NULL` and
+/// the configuration's are too. Everything else is nullable in both places.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct StationProjection {
+    /// `config.stations.name` -> `stations.name`.
+    pub name: String,
+    /// `config.stations.type` -> `stations.type`. The **configured** device type, which is
+    /// `campbellscientific` rather than the driver's self-reported `campbell`
+    /// (docs/legacy-api-contract.md §3.1 is explicit that the two sets must not be
+    /// unified).
+    pub kind: String,
+    /// `config.stations.timezone` -> `stations.timezone`. An IANA name. `None` means the
+    /// column's own `DEFAULT 'UTC'` is the honest answer.
+    pub timezone: Option<String>,
+    /// Degrees north.
+    pub latitude: Option<f64>,
+    /// Degrees east.
+    pub longitude: Option<f64>,
+    /// **Metres**, as `config.stations.altitude_m` holds it. The projection's column is
+    /// `altitude_ft`, and the conversion is the writer's — both units are in both column
+    /// names so that it cannot be done twice or not at all.
+    pub altitude_m: Option<f64>,
+    /// Millimetres, the gauge's zero point.
+    pub snow_base_distance_mm: Option<f64>,
+}
+
+/// The static station metadata **R1** admits into a derived value (W3 §2.5).
+///
+/// **R1 is "a pure function of a single reading plus static station metadata", and this
+/// type is the second half of that sentence.** It is deliberately small: a field here is a
+/// licence to compute a column at ingest, so adding one widens what R1 permits. Each of
+/// the four is here because exactly one derived value needs it, and the enrich stage's own
+/// tests name which.
+///
+/// Every field is an `Option` because every one of the four configuration columns is
+/// nullable (`migrations/config/`), and `None` means the derived value is `None` rather
+/// than a default: a latitude of 0.0 is the Gulf of Guinea, and a snow base distance of
+/// 0.0 would make every depth the negation of the distance. **D-26** again, one level up
+/// from a sensor.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct StationMeta {
+    /// `config.stations.latitude`, degrees north.
+    pub latitude: Option<f64>,
+    /// `config.stations.longitude`, degrees east.
+    pub longitude: Option<f64>,
+    /// `config.stations.altitude_m`, metres above sea level.
+    ///
+    /// Metres, which is the column's unit and the unit the clear-sky model's barometric
+    /// term wants. The weather schema's `stations.altitude_ft` projection is a different
+    /// column in a different unit and is not this.
+    pub altitude_m: Option<f64>,
+    /// `config.stations.snow_base_distance_mm`: the distance the gauge reads with no snow
+    /// under it, in millimetres.
+    pub snow_base_distance_mm: Option<f64>,
+}
+
+impl StationMeta {
+    /// A station with no configured metadata — which is every station that has not been
+    /// given coordinates, and every station this node has not heard of.
+    pub const EMPTY: Self = Self {
+        latitude: None,
+        longitude: None,
+        altitude_m: None,
+        snow_base_distance_mm: None,
+    };
+
+    /// The coordinates, when both are present. A latitude without a longitude is not a
+    /// position, and the clear-sky model needs both or neither.
+    #[must_use]
+    pub fn coordinates(&self) -> Option<(f64, f64)> {
+        self.latitude.zip(self.longitude)
+    }
 }
 
 impl CapabilityHandle for std::sync::Arc<dyn StationRegistry> {

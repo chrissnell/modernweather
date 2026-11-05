@@ -731,6 +731,44 @@ jobs:
       - name: Apply the migrations twice and compare
         run: cargo xtask gate db-migrate-twice
 
+  db-tests:
+    name: database tests (real TimescaleDB)
+    runs-on: ubuntu-latest
+    services:
+      timescaledb:
+        # The same image and the same reasoning as the `database` job: DESIGN.md D-2
+        # requires TimescaleDB 2.31 with timescaledb_toolkit, and the plain
+        # timescale/timescaledb image has no toolkit.
+        image: timescale/timescaledb-ha:pg17
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      # `cargo xtask db-tests` builds the connection string from these. PGDATABASE is the
+      # database the image creates, and nothing here drops it — the tests apply
+      # migrations/ through sqlx's own migrator and delete only their own station rows.
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGDATABASE: postgres
+      PGSSLMODE: disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      # No psql: this gate needs no client of its own, which is the one difference from the
+      # `database` and `conformance` jobs and the reason this job has no apt step.
+      - name: Run the tests that need a database
+        run: cargo xtask gate db-tests
+
   coverage:
     name: coverage ratchet
     runs-on: ubuntu-latest
@@ -820,6 +858,7 @@ jobs:
       - conformance-fixtures
       - driver-emulators
       - database
+      - db-tests
       - coverage
     if: always()
     runs-on: ubuntu-latest

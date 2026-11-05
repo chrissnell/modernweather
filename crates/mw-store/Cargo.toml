@@ -29,3 +29,11 @@ tokio.workspace = true
 arc-swap.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+# `db:postgres` observes cancellation at an await inside its own `Serve` loop, which A-W6-1
+# makes explicitly not a second clock. The token is the supervisor's.
+tokio-util.workspace = true
+
+[dev-dependencies]
+# `macros` for `#[tokio::test]`. `crates/mw-store/tests/db.rs` and the `db:postgres` body's
+# own tests are async; everything else in this crate is not.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -257,7 +257,7 @@ pub async fn probe(url: &str) -> Result<Observed, VersionError> {
                 redacted: redact(url),
                 source,
             })?;
-    let answered = ask(&mut conn).await;
+    let answered = observe(&mut conn).await;
     // Closed rather than dropped on **both** paths, so the server does not log an
     // unexpected EOF -- including when the query is what failed, which is the path that
     // used to produce exactly the EOF this exists to avoid.
@@ -265,8 +265,16 @@ pub async fn probe(url: &str) -> Result<Observed, VersionError> {
     answered
 }
 
-/// The three questions, over an open connection.
-async fn ask(conn: &mut PgConnection) -> Result<Observed, VersionError> {
+/// The three questions, over a connection somebody else owns.
+///
+/// Public because **D-62** is asserted twice over two different connections. The boot
+/// sequence has no pool yet and uses [`probe`], which opens one connection and closes it;
+/// `db:postgres` owns the pool and must re-assert on its own first connection, because the
+/// boot sequence's assertion is allowed to be skipped for a server that did not answer in
+/// time (**D-27**) and that carve-out is only safe while something re-asserts. Asking over
+/// the pool's own connection rather than opening a second one is what makes the assertion
+/// about the connection the writer will actually use.
+pub async fn observe(conn: &mut PgConnection) -> Result<Observed, VersionError> {
     let row = sqlx::query(
         "SELECT current_setting('server_version_num')::int / 10000 AS pg_major, \
                 (SELECT extversion FROM pg_extension WHERE extname = 'timescaledb') AS ts, \

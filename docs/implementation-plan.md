@@ -516,6 +516,17 @@ a DST transition in a station's zone produces exactly one daily rollover.
 **Test strategy:** the DST cases are unit tests over `chrono-tz` with no database — a nonexistent
 local time fires at the first instant after the gap, an ambiguous one fires on the first occurrence
 only, deduplicated by occurrence key (W2a D-13).
+**Constraint inherited from M3-3, which is the first item to need the read half of the store.**
+`db:postgres` publishes exactly one handle per capability and today that handle is the **write** half
+— `Arc<dyn ReadingSink>`, which is what `writer:timescale` resolves. W3 §2a.1 keeps the read half a
+separate trait on purpose (**D-30**: "named separately so nobody makes the website a sink"), so
+`span`/`latest`/`window`/`almanac` arrive as their own trait and **not** as four more methods on the
+write one. This item is the first to need it, so it chooses between the two shapes the design leaves:
+one published handle offering both halves, or the write half travelling outside the capability bus
+the way `Ingress` does today. `mw_component::store`'s module documentation states both and
+deliberately does not pick, because the choice depends on the read side's query set. Also inherited:
+`stations.timezone` is populated by `writer:timescale`, so `Calendar { TzSource::Station }` has a
+zone to read for any station that has reported.
 
 **Milestone 3 done when:** a WeatherLink Live station feeds the Rust daemon, readings are durable
 across a kill -9, and `observations` contains NULLs where the station reports nothing. **The Go

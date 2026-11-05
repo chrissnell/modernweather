@@ -15,6 +15,8 @@
 
 /// The configuration store and its migrations (D-8, A-W6-2).
 pub mod config_db;
+/// `db:postgres`: the weather pool, its version assertion and its publish/revoke loop.
+pub mod pg;
 /// `StationRegistry` over a published snapshot of `config.stations` -- W2a §4a.6's single
 /// identity-resolution gate.
 pub mod registry;
@@ -23,6 +25,9 @@ pub mod registry;
 pub mod schedule;
 /// The startup database-version assertion (**D-62**).
 pub mod version;
+/// `writer:timescale`'s batch `INSERT` and **D-56**'s read-side projections.
+pub mod writer;
 
 pub use crate::registry::{ConfigRegistry, RegistrySnapshot, StationEntry};
 pub use crate::schedule::SqliteScheduleStore;
+pub use crate::writer::TimescaleWriter;
