@@ -39,16 +39,17 @@
 //!
 //! `ComponentControl` and `LogControl` (this crate's own surface), `ReadingStream` and
 //! `ScheduleStore` (the two the supervisor itself consumes), `Ingress` -- the write end of
-//! `ReadingStream` -- `ReadingSink` -- the write half of `ReadingStore`, which is what
-//! `writer:timescale` resolves -- and the two methods of `StationRegistry` that admission
-//! and the enrich stage need. The rest of the store handles -- `ReadingStore`'s read half,
-//! `ForecastStore`, `AlertStore`, `SnowCache`, `ConfigStore`, `ConfigAdmin`,
-//! `WindowedView`, `LatestSnapshot`, `HttpRoutes` -- arrive with the work items that
-//! consume them, because a handle trait is a *query set* and the item that writes the
-//! queries is the item that knows them. `StationRegistry` grew its second method that way
-//! and will grow the rest the same way. What is fixed here is the mechanism every one of
-//! them uses: [`CapabilityHandle`] associates a handle type with its capability, and
-//! [`BuildCx`] resolves it **once**, in `build`.
+//! `ReadingStream` -- both halves of the reading store, published together as [`Store`]
+//! and consumed one half each by `writer:timescale` and `window:rollup` -- [`WindowedView`]
+//! -- the roll-up's own surface -- and the two methods of `StationRegistry` that admission
+//! and the enrich stage need. The rest -- `ForecastStore`, `AlertStore`, `SnowCache`,
+//! `ConfigStore`, `ConfigAdmin`, `LatestSnapshot`, `HttpRoutes` -- arrive with the work
+//! items that consume them, because a handle trait is a *query set* and the item that
+//! writes the queries is the item that knows them. `StationRegistry` grew its second
+//! method that way, [`ReadingStore`] has three of its four and will grow `span`, `latest`
+//! and `almanac` the same way. What is fixed here is the mechanism every one of them uses:
+//! [`CapabilityHandle`] associates a handle type with its capability, and [`BuildCx`]
+//! resolves it **once**, in `build`.
 
 mod body;
 mod capability;
@@ -65,6 +66,7 @@ mod state;
 mod store;
 mod stream;
 mod trigger;
+mod window;
 
 pub use body::{BoxFuture, BuildFn, Builder, OnReading, ReadingBatch, Serve, Tick};
 pub use capability::{
@@ -88,9 +90,13 @@ pub use routes::{Match, Methods, RouteEntry, RouteManifest, Scope};
 pub use schedule::{OccurrenceKey, OccurrenceRecord, ScheduleStore, ScheduleStoreError};
 pub use spec::{ComponentSpec, ConfigDigest, SpecFingerprint, DEFAULT_GRACE};
 pub use state::{ComponentStatus, Counters, ScheduleState, State, WaitingOn};
-pub use store::{ReadingSink, StoreError, Stored};
+pub use store::{
+    Bucket, BucketLevel, BucketQuery, Bucketed, Piece, ReadingSink, ReadingStore, SeriesQuery,
+    Store, StoreError, Stored, TotalsQuery,
+};
 pub use stream::{ReadingStream, ReadingSubscription, StreamError};
 pub use trigger::{
     BodyKind, CronProblem, CronSpec, FirstRun, LocalTime, Misfire, Phase, ReadingFilter,
     ReadingPolicy, StationSet, Trigger, TzSource, Zone, ZoneError,
 };
+pub use window::{Declaration, Resolved, WindowError, WindowedView};

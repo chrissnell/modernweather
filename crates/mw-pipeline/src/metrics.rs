@@ -133,6 +133,18 @@ pub fn register() {
         "mw_stream_lagged_total",
         "Envelopes a Lossy subscriber fell too far behind to receive"
     );
+    metrics::describe_counter!(
+        "mw_rollup_buckets_read_total",
+        "1-minute aggregate buckets window:rollup has read into its ring"
+    );
+    metrics::describe_counter!(
+        "mw_rollup_pieces_summed_total",
+        "Aggregate-level range sums window:rollup has asked the store for"
+    );
+    metrics::describe_counter!(
+        "mw_rain_rollovers_total",
+        "Station-local day boundaries that have moved"
+    );
 
     // Zeroed, so "nothing has gone wrong yet" is an assertion rather than an absence.
     metrics::counter!("mw_spool_appends_total").absolute(0);
@@ -143,6 +155,12 @@ pub fn register() {
     metrics::counter!("mw_spool_cursor_skipped_envelopes_total").absolute(0);
     metrics::counter!("mw_ingest_duplicates_total").absolute(0);
     metrics::counter!("mw_ingest_window_overrun_total").absolute(0);
+    metrics::counter!("mw_rollup_buckets_read_total").absolute(0);
+    metrics::counter!("mw_rollup_pieces_summed_total").absolute(0);
+    // Zeroed for a reason this one specifically needs: a daily rollover increments once a
+    // day per station, so a scraper that found no series could not tell "it has not been a
+    // day yet" from "the component never started".
+    metrics::counter!("mw_rain_rollovers_total").absolute(0);
     for reason in Reject::ALL {
         metrics::counter!("mw_readings_rejected_total", "reason" => reason.as_str()).absolute(0);
     }
@@ -223,6 +241,34 @@ pub fn rows_written(n: u64) {
 /// observations per frame with no timestamp on any of them.
 pub fn rows_collapsed(n: u64) {
     metrics::counter!("mw_observations_rows_collapsed_total").increment(n);
+}
+
+/// 1-minute buckets one `window:rollup` tick read.
+///
+/// In the steady state this is **one per station per tick**, because the refresh is
+/// incremental. A rate that matches the ring size is a component that is re-reading the
+/// whole hour every minute, which means its ring is being thrown away -- a restart loop, or
+/// a bucket stream whose instants are going backwards.
+pub fn rollup_buckets_read(n: u64) {
+    metrics::counter!("mw_rollup_buckets_read_total").increment(n);
+}
+
+/// Range sums one `window:rollup` tick asked for.
+///
+/// Bounded by the decomposition rather than by the window: a local year is about four
+/// hundred *buckets* but only a handful of pieces, and this counts the pieces. It rises
+/// sharply at a local new year, when the year window stops being one day long.
+pub fn rollup_pieces_summed(n: u64) {
+    metrics::counter!("mw_rollup_pieces_summed_total").increment(n);
+}
+
+/// One station-local day boundary moved.
+///
+/// **One per station per local day, including the days that are 23 and 25 hours long.** A
+/// value of two for one local date would be fall-back's second pass through local midnight
+/// having been counted, which is what the occurrence key exists to prevent.
+pub fn rain_rolled_over() {
+    metrics::counter!("mw_rain_rollovers_total").increment(1);
 }
 
 /// Envelopes the dedup gate already had (W7 §4.4). Expected and non-zero in a diamond.

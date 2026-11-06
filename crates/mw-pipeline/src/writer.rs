@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use mw_component::{
     BoxFuture, Builder, Capability, ComponentId, ComponentIdError, ComponentSpec, Cx, Need,
-    ReadingFilter, ReadingPolicy, ReadingSink, Trigger,
+    ReadingFilter, ReadingPolicy, ReadingSink, Store, Trigger,
 };
 use mw_types::Envelope;
 
@@ -88,7 +88,14 @@ pub fn spec() -> Result<ComponentSpec, ComponentIdError> {
                 // body has no way to ask whether the database is still there, so an outage
                 // reaches it as a lifecycle state — `Waiting { on: ReadingStore }` — and
                 // not as an error branch at a call site.
-                let store = cx.hard::<Arc<dyn ReadingSink>>()?;
+                //
+                // The published handle is both halves of the pool (`mw_component::store`),
+                // and this is the **upcast to the half this component declared**: after
+                // this line the body holds an `Arc<dyn ReadingSink>` and cannot reach a
+                // read method even though it resolved the same capability
+                // `window:rollup` does. W2a §4.1b's `ReadingStore H W` against
+                // `ReadingStore H`, in the types.
+                let store: Arc<dyn ReadingSink> = cx.hard::<Arc<dyn Store>>()?;
                 Ok(SpooledSink::new(id, StoreSink { store }))
             }
         }),

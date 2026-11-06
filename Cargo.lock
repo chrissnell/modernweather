@@ -1559,6 +1559,7 @@ dependencies = [
  "chrono-tz",
  "mw-types",
  "secrecy",
+ "smallvec",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1637,6 +1638,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "chrono",
+ "chrono-tz",
  "crc32c",
  "metrics",
  "mw-component",

@@ -87,6 +87,11 @@ const DECLARED: &[&str] = &[
     "the_projections_reflect_what_has_been_written",
     "a_station_the_registry_does_not_know_is_still_stored",
     "a_vanished_configuration_row_does_not_erase_the_projection",
+    // implementation-plan.md M3-4's first done-criterion, and the two reads the rest of
+    // the window rollup is built on.
+    "a_ten_minute_mean_over_the_rolled_up_buckets_equals_the_mean_from_raw",
+    "a_range_stitched_across_three_levels_totals_the_same_as_raw",
+    "an_hourly_rain_series_is_read_in_order_with_dry_hours_absent",
 ];
 
 /// The panic messages `crates/mw-store/tests/db.rs`'s own harness produces when the

@@ -14,7 +14,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::time::{Duration, SystemTime};
 
-use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use mw_component::{
     stable_hash, ComponentId, CronSpec, FirstRun, LocalTime, OccurrenceKey, Phase, Trigger, Zone,
 };
@@ -491,38 +491,19 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
-/// Resolve a local date and time in `zone` to an instant, applying W2a §1.6's DST rules.
+/// Resolve a local date and time in `zone` to an instant.
 ///
-/// - **Spring forward** (a local time that does not exist): fire at **the first instant
-///   that exists after the gap**. The occurrence is not skipped, because a daily rollover
-///   that silently does not happen once a year is the worst possible failure mode — it is
-///   invisible and it corrupts one day's totals.
-/// - **Fall back** (a local time that happens twice): fire on the **first** occurrence
-///   only. The occurrence key is keyed on local date and slot rather than on the instant,
-///   so the second pass is recognised as already completed.
+/// Delegates to [`Zone::at`], which carries the DST rules and their reasoning. It was
+/// written here and moved down a layer when `mw_pipeline`'s rollup needed the same
+/// arithmetic for a station's local day, month and year boundaries: the two crates are in
+/// the same layer and may not name each other, so a copy in each would be a copy that can
+/// disagree about which instant a rollover happens at.
+///
+/// Kept as a named function rather than inlined at its three call sites so that this
+/// module's own tests — the ones that assert W2a Decision 13 against `America/Denver` —
+/// keep testing the thing the clock actually calls.
 pub fn resolve(zone: Zone, date: NaiveDate, time: LocalTime) -> Option<DateTime<Utc>> {
-    let naive_time = NaiveTime::from_hms_opt(u32::from(time.hour), u32::from(time.minute), 0)?;
-    let tz = zone.tz();
-    match tz.from_local_datetime(&date.and_time(naive_time)) {
-        chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&Utc)),
-        chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest.with_timezone(&Utc)),
-        chrono::LocalResult::None => {
-            // Walk forward a minute at a time to the first instant on the far side of the
-            // gap. Observed gaps are 30 or 60 minutes; two hours is the largest in the
-            // zone database, and 180 is a bound rather than an expectation.
-            for minutes in 1..=180 {
-                let candidate = date.and_time(naive_time) + chrono::Duration::minutes(minutes);
-                match tz.from_local_datetime(&candidate) {
-                    chrono::LocalResult::Single(dt) => return Some(dt.with_timezone(&Utc)),
-                    chrono::LocalResult::Ambiguous(earliest, _) => {
-                        return Some(earliest.with_timezone(&Utc))
-                    }
-                    chrono::LocalResult::None => {}
-                }
-            }
-            None
-        }
-    }
+    zone.at(date, time)
 }
 
 #[cfg(test)]
@@ -587,6 +568,103 @@ mod tests {
         // next day, because the slot for 2026-11-01 is behind us.
         let next = next_calendar(&daily(1, 30), zone(), first.at).unwrap();
         assert_eq!(next.local_date.to_string(), "2026-11-02");
+    }
+
+    /// **W2a Decision 13 at the slot that matters: local midnight.** The existing two
+    /// tests use 02:30 and 01:30 in `America/Denver`, where midnight is ordinary — so a
+    /// daily rollover scheduled at 00:00 was never exercised against a transition that
+    /// happens *at* 00:00. Two zones have one every year:
+    ///
+    /// - `America/Havana` goes 00:00 -> 01:00 in March (midnight does not exist) and
+    ///   01:00 -> 00:00 in November (midnight happens twice).
+    /// - `America/Santiago` goes 00:00 -> 01:00 in September.
+    ///
+    /// The property asserted is `implementation-plan.md` M3-4's done-criterion from the
+    /// clock's side: walking a year of occurrences produces **exactly one per local date**,
+    /// each with a distinct occurrence key, and the keys are the local dates. The component
+    /// half — that one occurrence moves the boundary once — is
+    /// `mw_pipeline::rollup::state`'s.
+    #[test]
+    fn a_daily_midnight_occurrence_is_one_per_local_date_across_a_midnight_transition() {
+        for name in [
+            "America/Havana",
+            "America/Santiago",
+            "America/Denver",
+            // The control: Arizona observes no DST, so every local day is 24 hours and the
+            // walk must still produce one occurrence per date.
+            "America/Phoenix",
+        ] {
+            let z = Zone::new(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let spec = daily(0, 0);
+            let mut cursor = at("2026-01-01T00:00:00Z");
+            let mut dates: Vec<NaiveDate> = Vec::new();
+            let mut instants: Vec<DateTime<Utc>> = Vec::new();
+            // Four hundred occurrences: more than a year, so both of a zone's transitions
+            // are inside the walk whichever months they fall in.
+            for _ in 0..400 {
+                let Some(next) = next_calendar(&spec, z, cursor) else {
+                    panic!("{name}: no occurrence after {cursor}");
+                };
+                assert!(next.at > cursor, "{name}: {next:?} is not after {cursor}");
+                assert_eq!(next.slot, 0, "{name}: one slot a day");
+                dates.push(next.local_date);
+                instants.push(next.at);
+                cursor = next.at;
+            }
+
+            // One occurrence per local date, in order, with no date repeated and none
+            // skipped. A repeat is fall-back firing twice; a skip is spring-forward
+            // swallowing a day's rollover, which is the invisible failure that corrupts
+            // one day's totals once a year.
+            let unique: std::collections::BTreeSet<NaiveDate> = dates.iter().copied().collect();
+            assert_eq!(unique.len(), dates.len(), "{name}: a local date repeated");
+            for pair in dates.windows(2) {
+                assert_eq!(
+                    pair[1],
+                    pair[0]
+                        .succ_opt()
+                        .unwrap_or_else(|| panic!("{name}: {:?} has no next day", pair[0])),
+                    "{name}: {:?} is not the day after {:?}",
+                    pair[1],
+                    pair[0]
+                );
+            }
+
+            // The occurrence key is the local date, so the second pass through an
+            // ambiguous midnight produces a key the supervisor has already recorded --
+            // which is what `handle_misfire` and `Clock::push_now` deduplicate on.
+            let id = ComponentId::new("rain:rollover:backyard").expect("a valid id");
+            let keys: std::collections::BTreeSet<OccurrenceKey> = dates
+                .iter()
+                .map(|d| OccurrenceKey::new(id.clone(), *d, 0))
+                .collect();
+            assert_eq!(keys.len(), dates.len(), "{name}: two dates, one key");
+
+            // And the days really are 23, 24 or 25 hours long, which is what a boundary
+            // computed as "the previous one plus 86,400 seconds" would get wrong.
+            let lengths: std::collections::BTreeSet<i64> = instants
+                .windows(2)
+                .map(|w| (w[1] - w[0]).num_hours())
+                .collect();
+            assert!(
+                lengths.iter().all(|h| (23..=25).contains(h)),
+                "{name}: day lengths {lengths:?}"
+            );
+            if name == "America/Phoenix" {
+                assert_eq!(
+                    lengths,
+                    std::collections::BTreeSet::from([24]),
+                    "Arizona observes no DST, and it still has a local midnight a \
+                     rollover resets on"
+                );
+            } else {
+                assert!(
+                    lengths.contains(&23) && lengths.contains(&25),
+                    "{name} transitions in each direction within the walk, so it must \
+                     contain a 23-hour and a 25-hour day: {lengths:?}"
+                );
+            }
+        }
     }
 
     #[test]

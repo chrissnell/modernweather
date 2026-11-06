@@ -36,6 +36,12 @@ prost.workspace = true
 metrics.workspace = true
 
 [dev-dependencies]
+# A DEV dependency, not a dependency. `window:rollup`'s calendar boundaries are in the
+# station's zone (W3 D-24), and the resolution is `mw_component::Zone::at`'s -- this crate
+# never names a zone, it is handed an opaque `Zone`. What the tests need it for is the other
+# direction: asserting that a boundary really is local midnight means rendering an instant
+# back into the zone, which is `Zone::tz()`'s `chrono_tz::Tz`.
+chrono-tz.workspace = true
 # `test-util` for `tokio::time::pause()`, which is what makes the group-commit window and
 # the stalled-sink grace assertable in milliseconds rather than by sleeping. No `tempfile`:
 # the scratch directory is twenty lines in `testing.rs`, the same call `mw-store`'s tests

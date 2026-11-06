@@ -17,17 +17,24 @@
 pub mod config_db;
 /// `db:postgres`: the weather pool, its version assertion and its publish/revoke loop.
 pub mod pg;
+/// `window:rollup`'s three reads over the aggregate hierarchy -- the read half of
+/// `ReadingStore`.
+pub mod reader;
 /// `StationRegistry` over a published snapshot of `config.stations` -- W2a §4a.6's single
 /// identity-resolution gate.
 pub mod registry;
 /// `ScheduleStore` over `component_schedule` alone -- the supervisor's own durable state
 /// (**D-41**).
 pub mod schedule;
+/// `TimescaleStore`: both halves of the weather pool, as the one published handle.
+pub mod store;
 /// The startup database-version assertion (**D-62**).
 pub mod version;
 /// `writer:timescale`'s batch `INSERT` and **D-56**'s read-side projections.
 pub mod writer;
 
-pub use crate::registry::{ConfigRegistry, RegistrySnapshot, StationEntry};
+pub use crate::reader::TimescaleReader;
+pub use crate::registry::{ConfigRegistry, RegistrySnapshot, StationEntry, ZoneProblem};
 pub use crate::schedule::SqliteScheduleStore;
+pub use crate::store::TimescaleStore;
 pub use crate::writer::TimescaleWriter;

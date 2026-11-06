@@ -703,7 +703,7 @@ fn a_calendar_without_a_time_zone_is_rejected() {
         Trigger::Calendar {
             spec: CronSpec::daily_at(LocalTime::new(0, 10)),
             tz: TzSource::Station {
-                station: mw_types::StationId::new(4),
+                station: mw_types::StationKey::new("suncrest:snow"),
                 zone: None,
             },
             misfire: Misfire::DEFAULT,
@@ -712,7 +712,12 @@ fn a_calendar_without_a_time_zone_is_rejected() {
     );
     let err = validate(vec![rollover], &ctx()).expect_err("no zone");
     assert!(matches!(err, PlanError::MissingTimeZone { .. }));
-    assert!(err.to_string().contains("station 4"), "{err}");
+    // The station is named by its **key**, which is the thing an operator can go and fix
+    // a row for -- `mw_component::TzSource::Station`'s own documentation has why a
+    // surrogate integer was the wrong field here.
+    let text = err.to_string();
+    assert!(text.contains("`suncrest:snow`"), "{text}");
+    assert!(text.contains("config.stations.timezone"), "{text}");
 
     // The deployment default reads as a sentence rather than as a substitution.
     let deployment = spec(
@@ -735,7 +740,7 @@ fn a_calendar_without_a_time_zone_is_rejected() {
         Trigger::Calendar {
             spec: CronSpec::daily_at(LocalTime::new(0, 10)),
             tz: TzSource::Station {
-                station: mw_types::StationId::new(4),
+                station: mw_types::StationKey::new("suncrest:snow"),
                 zone: Some(Zone::new("America/Denver").unwrap()),
             },
             misfire: Misfire::DEFAULT,
