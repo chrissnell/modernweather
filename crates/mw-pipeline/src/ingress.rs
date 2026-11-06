@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! 1. resolve(meta) -> StationKey | Reject            W2a §4a.6, the single gate
-//! 2. for each PartialReading: merge into a Reading; enrich                (M3-3)
+//! 2. for each PartialReading: merge into a Reading; enrich              R1, §2.5
 //! 3. seq = the next spool append position                                 W7 D-4
 //! 4. envelope = Envelope { station, observed_at, received_at, provenance, reading }
 //! 5. spool.append(&envelopes)                        group commit; the atom
@@ -34,22 +34,28 @@
 //!
 //! # What is deliberately not here
 //!
-//! Three of W7 §4.4's eleven `accept` steps and one of `admit`'s are other items', and each
-//! is marked at the point it would go rather than only listed here, because a comment in a
-//! source file is not a work item (docs/reconciliation.md G-5) and a list in a module doc
-//! is not either:
+//! Three of W7 §4.4's eleven `accept` steps are other items', and each is marked at the
+//! point it would go rather than only listed here, because a comment in a source file is
+//! not a work item (docs/reconciliation.md G-5) and a list in a module doc is not either:
 //!
-//! - **enrich** (`admit` step 2, `accept` step 8) — M3-3, which owns **R1** and the rule
-//!   that `enrich` writes a metric only where the value is `None`.
 //! - **`origin ∈ peer.origins`** (`accept` step 3) — M6-4, which owns the peer registry and
 //!   the `relay = false` default.
 //! - **the clock-skew window** (`accept` step 4) — M6-4, with the rest of §4.6's boundary
 //!   validation.
-//! - **`station_key` resolves in `StationRegistry`** (`accept` step 5) — M6-4. The handle's
-//!   one method takes a `FrameMeta`, which a forwarded envelope does not have; the lookup a
-//!   peer's envelope needs is by key, and the item that adds that method is the item that
-//!   needs it.
-//! - **the `config.stations` upsert** (**D-56**) — M3-3, which that item's text carries.
+//! - **`station_key` resolves in `StationRegistry`** (`accept` step 5) — M6-4. The lookup a
+//!   peer's envelope needs is by key, and [`StationRegistry::metadata`] is now by key — but
+//!   it is total by design (an unknown station is `StationMeta::EMPTY`, not a refusal), so
+//!   it is deliberately **not** the resolution check. Turning it into one would make an
+//!   unplaced station's envelopes unstorable.
+//!
+//! **The `stations` upsert of D-56 is not here either, and that one is a departure rather
+//! than a deferral.** D-56 assigns it to `admit`, and `admit` cannot do it: W3 **D-87**
+//! allows no I/O on this path but the spool append, and `ci/layers.toml` forbids this crate
+//! `sqlx` and `mw-store` outright, so there is no expression of "upsert a PostgreSQL row"
+//! available here at all. `writer:timescale` does it instead, in the same statement as the
+//! rows it describes. Filed as a proposed amendment to D-56 in `docs/reconciliation.md`'s
+//! *Proposed amendments* section; `mw_store::writer`'s module documentation carries the
+//! consequence.
 
 use std::sync::Arc;
 
@@ -167,15 +173,28 @@ impl SpoolIngress {
         // them agree by construction, which is the invariant `admit` is supposed to
         // establish.
         let received_at = to_millis(meta.received_at);
+        // One lookup per batch rather than one per reading: every reading in a batch is
+        // from the same station -- `resolve` has already said so -- and the metadata is a
+        // snapshot read, so hoisting it is the same answer with one pointer load.
+        let meta_for_station = self.registry.metadata(&station);
         for partial in batch {
             let observed_at = partial.observed_at.map_or(received_at, to_millis);
             let mut reading = partial.values.clone();
             reading.time = observed_at;
             reading.station_id = station.as_str().to_string();
-            // M3-3's enrich stage goes here: pure, idempotent, writing a metric only where
-            // the value is `None` (W3 §2.5 consequence 3) -- which is what makes a
-            // forwarded envelope safe across a hop. Until it exists, a reading reaches the
-            // spool exactly as the codec produced it, which is correct and incomplete.
+            // The enrich stage (**R1**, W3 §2.5): pure, idempotent, writing a metric only
+            // where the value is `None`. After this line, storage, the snapshot and every
+            // peer see the same enriched reading, which is the whole reason it is here
+            // rather than in the writer -- and `reading.time` is already the admitted
+            // observation instant, which the clear-sky model is a function of.
+            crate::enrich::enrich(&mut reading, &meta_for_station);
+            // After enrich, and it is worth being exact about what that does and does not
+            // buy: every derived value is a function of at least one *reported* metric, so
+            // enrich cannot turn an empty reading into a content-carrying one and this
+            // order changes which readings are rejected not at all. It is this way round
+            // because the check is about the reading that will be stored, and a later
+            // derived value that needed only the station's metadata -- an altitude-derived
+            // constant, say -- would make the two orders differ silently.
             if !carries_a_metric(&reading) {
                 // W7 §4.6: an all-`None` reading becomes an all-`NULL` row the aggregates
                 // still have to process. Counted per reading, and the batch still commits,
@@ -267,10 +286,33 @@ impl SpoolIngress {
             // 3. `origin ∈ peer.origins` -- M6-4's, with the peer registry.
             // 4. The clock-skew window -- M6-4's, with §4.6's boundary validation.
             // 5. `station_key` resolves -- M6-4's, with the registry method it needs.
-            // 8. enrich -- M3-3's. Idempotent and `None`-only, which is what makes a
-            // collector agree with its satellite rather than recompute from a different
-            // formula version.
-            candidates.push(envelope.clone());
+            // 8. enrich. Idempotent and `None`-only, which is what makes a collector agree
+            // with its satellite rather than recompute from a different formula version.
+            // It is here rather than skipped because a satellite may be *older* than this
+            // build, and W7 §4.4 step 8 is where a column the satellite had never heard
+            // of gets filled.
+            //
+            // `metadata` is by station **key**, which on this path is still the peer's
+            // claim until step 5 lands -- so an unregistered key answers
+            // `StationMeta::EMPTY` and the three metadata-dependent columns stay `NULL`.
+            // That is the right failure: a guessed latitude would put a clear-sky figure
+            // in a column for a station nobody has placed.
+            // Derived from the **borrowed** envelope, before anything is cloned: this
+            // envelope's `Arc<Reading>` is shared with the caller's batch, so
+            // `Arc::make_mut` is unconditionally a 216-field deep copy and up to fifteen
+            // allocations. `derive` answers "is there anything to write" exactly and
+            // allocates nothing, so an envelope a satellite already enriched -- the
+            // common case on a collector -- costs six `is_some()` reads and no copy.
+            let derived = crate::enrich::derive(
+                &envelope.reading,
+                &self.registry.metadata(&envelope.station),
+            );
+            let mut candidate = envelope.clone();
+            if !derived.is_empty() {
+                crate::enrich::apply(std::sync::Arc::make_mut(&mut candidate.reading), derived);
+                m::enriched_on_accept(1);
+            }
+            candidates.push(candidate);
         }
 
         // 6, 7 and 9 are **one call and one critical section**: intern the origin, take
@@ -557,6 +599,29 @@ mod tests {
         );
         // The clause itself, over the only shape that reaches it -- a well-formed path.
         assert_eq!(receive_check(&path(&[a, b, c]), c, b), Ok(()));
+    }
+
+    /// Enrich cannot rescue an all-`None` reading, which is the precondition the ordering
+    /// comment in `admit_inner` rests on. Over every derived column, with the station
+    /// metadata that would let each one fire.
+    #[test]
+    fn the_enrich_stage_cannot_turn_an_empty_reading_into_a_stored_row() {
+        let mut empty = mw_types::Reading {
+            time: chrono::Utc::now(),
+            station_id: "backyard".into(),
+            ..mw_types::Reading::default()
+        };
+        let rich = mw_component::StationMeta {
+            latitude: Some(39.7392),
+            longitude: Some(-104.9903),
+            altitude_m: Some(1609.0),
+            snow_base_distance_mm: Some(1500.0),
+        };
+        assert!(
+            !crate::enrich::enrich(&mut empty, &rich),
+            "every R1 value is a function of at least one reported metric"
+        );
+        assert!(!carries_a_metric(&empty));
     }
 
     #[test]

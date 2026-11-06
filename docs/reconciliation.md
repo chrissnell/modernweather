@@ -1197,6 +1197,7 @@ something it does not read. *Behavioural* — a byte a client does read, or coul
 | **DEV-7** | `/span`'s `solarjoules` becomes the bucket **total** instead of the bucket mean, and is NULL for pre-cutover history | **N-9** (implementation-plan.md M1-6) | behavioural — **corrects a meaningless statistic**, and **needs the owner's acknowledgement** | **Yes, and by orders of magnitude.** `solarjoules` carries the Campbell logger's `slr_mj`: energy per unit area accumulated since its previous output. The Go views stored `avg(solarjoules)`, which is the mean increment per reading and moves when the logger's output interval does; the registry now stores `total`, which is the bucket's insolation. At production's 2-second cadence that multiplies the value `/span` returns by roughly the bucket's reading count — **~30× at the 6 h band, ~150× at 48 h, ~1,800× at 14 d, ~43,200× at 366 d**. Two further consequences. (1) `/latest` serves the last raw reading, so after this change `/latest` and `/span` report different physical quantities under the same key and the same declared unit; the frozen contract has one name for them and `rainincremental`/`period_rain` is the only precedent, where the Go surface gave the bucket total a *second* name. (2) No Go view computed `sum(solarjoules)`, so `solarjoules_total` is NULL for the ~294 pre-cutover rollup days — and `solarjoules` is `"swift_optional": false` in `contract/legacy-v1.json`, the same property that makes `windd` a contract hazard, so the read path must coalesce it rather than emit null. **The conformance suite cannot catch any of this**: it compares shape, type and numeric formatting, not values (`contract/conformance/src/lib.rs`). |
 | **DEV-6** | Wildcard certificates match exactly one label; on an SNI miss the chain is exact → wildcard → designated default → refuse with `unrecognized_name` | W3 D-69, D-70 | behavioural — **closes two defects** | **Only by depending on the bugs.** The Go `strings.HasSuffix` check matches any depth *and* matches `evilexample.com` for `*.example.com`. On a miss, Go returns an arbitrary certificate by iterating a map — non-deterministic between runs, producing a browser interstitial that blames the user. |
 | **DEV-8** | A WeatherLink Live station's readings are stored in the units the registry declares (°F, inHg, inches), its indoor temperature and humidity are stored at all, its rainfall is converted from tip counts, its ten-minute wind average is stored, and its sensor records are matched by record type as well as by transmitter | **D-26** and `metrics/registry.toml`'s declared units, applied by implementation-plan.md **M3-1**; five defects in the Go driver | behavioural — **closes five defects**, and **needs the owner's acknowledgement** | **Yes, if the owner has ever run a WeatherLink Live.** (1) `internal/weatherstations/weatherlinklive/data_transformer.go` converts every temperature `(F - 32) * 5 / 9` and every pressure `* 33.8639`, writing Celsius into `outtemp` and hPa into `barometer`/`baromrelin`/`baromabsin` — columns `metrics/registry.toml` declares as `degF` and `inHg`, which the Go **Davis** driver on the same schema fills in °F and inHg (`convBigVal10` of the LOOP packet) and which `/latest` emits with no conversion. The two Go drivers therefore disagree about what the column means, and the WeatherLink Live one disagrees with the frozen contract: 62.7 °F is stored as 17.06 and rendered as 17.06 °F. (2) It copies `rainfall_daily` and `rain_rate_last` — which are **tip counts** — into `dayrain` and `rainrate`, declared `in` and `in_per_hour`. The error is the reciprocal of the collector size, so it is **100×** for a 0.01 in collector, **127×** for 0.2 mm, **254×** for 0.1 mm and **1000×** for 0.001 in; `rain_size`, the only value that can convert a count into a depth, is decoded into the struct and never used to convert anything (`discovery.go:217` only lists its name). (3) Its `th_indoor` arm looks for `DataStructureBarometer` (record type 3) while `temp_in` and `hum_in` are in record type 4, so `intemp` and `inhumidity` are never populated from one of these units at all. (4) `findCondition` returns the first record whose transmitter matches regardless of record type, so `th:2` on a deployment with a leaf/soil station on transmitter 2 reads `temp` out of a record that has none and the outdoor temperature silently stops. (5) `windspeed10` has a column, the unit reports `wind_speed_avg_last_10_min` on both transports, and the Go driver does not map it — so that column is empty for this station type and populated for Davis. The Rust codec stores the device's own units, converts rainfall through `rain_size`, leaves rainfall `NULL` when `rain_size` is absent rather than storing a count (**D-26**), reads the indoor record, prefers the record type the role implies before falling back to the transmitter, and fills `windspeed10`. **Marked as needing acknowledgement** for DEV-7's reason: these are corrections and not decisions, and whether a stored series changes meaning is the owner's call. **The conformance suite cannot catch any of it** — it compares shape, type and formatting, not values — and nothing in this repository can tell whether any WeatherLink Live data exists in the production database. |
+| **DEV-9** | The enrich stage computes `windchill`, `heatindex`, `aqi_pm25_aqin`, `aqi_pm10_aqin`, `potentialsolarwatts` and `snowdepth` **at ingest and stores them**, for every station rather than for the one driver that computed each; `windchill` and `heatindex` are `NULL` rather than the air temperature where their formula does not apply; and the clear-sky model reads the **station's** longitude instead of the **server's** time zone | **R1** (W3 §2.5), applied by implementation-plan.md **M3-3** | behavioural — **changes what five stored series mean**, and **needs the owner's acknowledgement** | **On the wire: one key changes, and it is `potentialsolarwatts`. In the database: five columns change meaning.** The distinction is the whole of this entry and the first draft of it got it wrong, so it is stated before the parts: the Go **read path** already computed three of these per request, so the JSON a client sees for them does not change — what changes is the *column*, which is what `/span`'s aggregate levels and every future query read. Taken in four parts. **(1) `windchill`/`heatindex` — the column changes, the JSON cannot.** The Go drivers store the *air temperature* where the formula does not apply (`utils.go:CalculateWindChill` returns `tempF` above 50 °F or below 3 mph); this stores `NULL`. The frozen JSON is unaffected **because the frozen handler never reads the column**: `transform.go:18` recomputes both from `OutTemp` plus wind speed or humidity on every request, which is exactly what `metrics/registry.toml`'s `legacy_read_time_computed` flag records and what `docs/metric-registry.md` §6.1 means by "the column and the JSON key are not guaranteed to be the same number". **So M4-2 must recompute them too, and this entry is the reason that is now a constraint rather than an open question** — reading the column and zero-filling it would produce `mean(windchill)` where Go produces `windchill(mean(outtemp), mean(windspeed))`, and those differ by more than rounding: for a bucket of two readings at (40 °F, 10 mph) and (60 °F, 10 mph), Go emits 46.04 and the column-mean path emits 33.64. Recorded as a constraint on M4-2 in the plan. The column itself improves either way: a stored `windchill == outtemp` is indistinguishable from a real wind chill and makes the column's `min` and `mean` the temperature's for every summer bucket. **(2) `potentialsolarwatts` — the one key that changes on the wire.** Only the Go **Campbell** driver computed it, so the column is NULL for every other station type and the frozen DTO zero-fills it; it is now computed for any station whose configuration has **coordinates** and whose reading carries **`outtemp` and `outhumidity`** (the model needs all three, so a station with coordinates and no humidity sensor still stores NULL). Where the Go daemon's own time zone is the station's — the production configuration, and the only one in which the Go behaviour is correct — the two agree to **1.1 × 10⁻¹² W/m²** over five zones × 53 days × 24 hours, measured against the Go function. They differ in two cases, both Go defects: a daemon whose zone is not the station's (`pkg/solar/asce.go` reads `time.Local`, and D-24 already says every calendar quantity is the station's), and any station in the eastern hemisphere, where Go's meridian table maps `+7` to 105° exactly as it maps `-7` and the offset doubles instead of cancelling. **(3) `snowdepth` — column only.** Computed per request in Go from a per-website cache (`restserver/controller.go:903`), so the **column** and every aggregate bucket are NULL today while the **response** already carries a number for any snow site with a configured base distance. The arithmetic is unchanged (`base_distance - snowdistance`, with Go's own `snowdistance > 0` guard) and it now reaches storage, which is what gets it into the aggregate levels. One consequence Go does not have: the Go snow-gauge driver discards a distance greater than the base at the device (`snowgauge/station.go:172`), so Go never stored a negative depth and this will — a mis-set base distance now contaminates `min`/`mean`/`max` buckets rather than leaving a gap. The enrich stage is the wrong layer to filter at (it is handed an already-admitted reading), so the discard is recorded as a constraint on **M6-1**'s snow-gauge driver in the plan. **(4) The two AQI keys — column only, and one naming oddity worth knowing.** The Go handler reads the column only when it is greater than zero and **computes otherwise** on both `/latest` and `/span` (`transform.go:209`, called per bucket at `:80`), so a client was never charting a flat zero here; the column is now populated from the same EPA table in `pkg/aqi/aqi.go`, so the handler's stored branch returns the number its computed branch would have. The oddity: `aqi_pm25_aqin` is derived from **`pm25`** (the outdoor sensor) and not from `pm25_in_aqin`, because that is what `transform.go:216` does. Faithful, and newly *stored* — so a station with only an outdoor particulate sensor and no AQIN device now has a permanently populated `aqi_pm25_aqin` column where Go left it NULL and carried the number only in the response. Every formula, constant, guard condition and `f32` rounding is asserted bit-for-bit against values produced by **running** the Go code at `c3ec9f7`. |
 
 **DEV-4 answers W9's OQ-W9-4 in the affirmative**, which is what W9 asked W6 to decide. It belongs
 here rather than only in `docs/data-migration.md` for the reason W9 gave for rejecting its own option
@@ -1253,6 +1254,42 @@ a transmitter on a role that has none (`baro:1`), a transmitter outside 1–8 (`
 (`soil_temp:2`), a `leaf_wet` port of 3 or 4 on a station with two leaf channels, a mis-cased option
 (`thsw:1:apptemp`), trailing junk (`soil_temp:2:1:junk`), and the same sensor twice (`wind:1,
 wind:1`). Each is now a plan error naming the station and the column.
+
+**DEV-9 is the enrich stage, and the thing worth reading twice is which column it does *not* fill.**
+W3 §2.5's table and implementation-plan.md M3-3's own text both read "solar potential/joules", which
+looks like one derived pair. It is not. `metrics/registry.toml`'s entry for `solar_joules` settles it
+in the opposite direction and names the file the question was addressed to: *"`pkg/solar` was the
+file this question was addressed to and it is not the answer: it holds the clear-sky irradiance
+models (ASCE, Bras, Ineichen-Perez) and the sunrise arithmetic, all in W/m², and never mentions
+solarjoules. Nothing computes this value — the instrument reports it."* It is the Campbell
+datalogger's `slr_mj`, carried through untouched. The registry is the source of truth for what a
+metric *is* (**D-20**), so there is nothing to derive, and `mw_pipeline::enrich` deliberately leaves
+it alone — recorded here as well as in that module, because the next reader of §2.5's table will
+have the same question and the registry comment is three thousand lines away from it.
+
+Two further things DEV-9 does not change, for the same reason: `sunrise`/`sunset` and the four lunar
+values stay **where they are served** (W2a Decision 36 — they are functions of `(date, lat, lon)` and
+not of a reading at all, so R1 does not reach them), and `storm_start` stays a station-reported
+column, which is W3 §2.5's own consequence 1.
+
+**One thing DEV-9 adds that Go does not have, because Go never stored these: a guard against values
+that are not numbers.** Every formula here reaches its inputs through `Option<f32>`, and `NaN` passes
+every guard condition in all of them — each comparison against a NaN is `false`, so a NaN
+temperature satisfies "is it too warm for wind chill" *and* "is the sun below the horizon", and a NaN
+particulate concentration falls past the whole EPA breakpoint table onto the "beyond the top band"
+arm and scores **500, Hazardous**. Go has the identical hole and it costs nothing there, because Go
+computes on the read path and the NaN lands in one response nobody keeps. Stored, one NaN in a
+`float4` column poisons every `mean`, `min` and `max` bucket above it, permanently and
+untraceably. So the stage returns `None` for an input or a result that is not finite, which is the
+answer **W3 D-26** gives for anything that is not a measurement. This is a *departure* from the Go
+arithmetic and the only one that is not a reproduction, which is why it is here rather than in a
+source comment.
+
+**DEV-9 is marked as needing the owner's acknowledgement for DEV-8's reason, stated there: "these are
+corrections and not decisions, and whether a stored series changes meaning is the owner's call."**
+Five columns change meaning. No gate can see any of it — the conformance suite compares shape, type
+and formatting rather than values, and `db-tests` has no WeatherLink Live, no snow gauge and no
+particulate sensor in it.
 
 Validating at plan time rather than never is the improvement, and the cost is specific: **an
 operator's existing mapping string can stop the daemon rather than degrading it.** That is the right
@@ -2211,7 +2248,51 @@ A-W2-1 and A-W2-2, W2a's D-30 split, W3's A-W3-1 to A-W3-4, W4's A-W4-1 to A-W4-
 A-W5-3, W7's A-W7-1 to A-W7-4, W8's A-1 to A-4 and W9's A-W9-1 to A-W9-3. All are applied there under
 the protocol; none is edited in place. See `docs/DESIGN.md`'s `## Amendments` section.
 
-This document proposes **one** amendment of its own, which is not to a decision.
+This document proposes **one** amendment of its own, which is not to a decision. A second was
+appended later by an implementation item and is marked as such.
+
+**A-M3-3-1 — D-56's `admit` half is not expressible, and lands on the writer instead.**
+*Proposed by implementation-plan.md **M3-3**, 2026-11-05. Not applied: the protocol above reserves
+that for a work item that owns the ledger.*
+
+*What was found.* **D-56** reads: *"`Ingress::admit` upserts `stations` on identity resolution;
+`writer:timescale` maintains `stations.last_seen` and `station_metrics`."* The first clause cannot be
+implemented as written, and not for want of trying — two independent mechanisms forbid it:
+
+- **W3 D-87** allows `admit` no I/O but the spool append, and that is a property of the signatures
+  rather than a rule the code follows. `StationRegistry::resolve` is a synchronous `fn` returning a
+  `Result`, `SpoolIngress` holds a spool and a registry handle and nothing else, and there is no
+  store handle anywhere on that path. An `admit` that upserted a PostgreSQL row would also be an
+  `admit` that can block on a database, which is the whole of what D-87 exists against — and
+  measured, in the Go collector, `LoadConfig()` on every reading is the shape it was written about.
+- **`ci/layers.toml`** forbids `mw-pipeline` both `sqlx` and `mw-store`, so "upsert a PostgreSQL row"
+  is not an expression that crate can contain. `cargo xtask gate layout` rejects the dependency that
+  would make it one, which means the first clause is not merely inadvisable there; it does not
+  compile.
+
+*What replaces it.* **Both** projections are maintained by `writer:timescale`, in the same
+transaction as the rows they describe. The projection is a copy of `config.stations`, so the writer
+needs the station registry — and it gets the handle **through the registrar**, the way
+`mw_station`'s ingress does, rather than as a declared `Need`. That is not a shortcut: W2a §4.1b
+gives `StationRegistry` to a `config:sqlite` component and no work item in
+`docs/implementation-plan.md` creates one, so a hard need on it would be "a requirement nobody
+provides" and `plan()` would refuse the whole configuration. `mw_store::registry`'s module
+documentation carries the same note for the same reason, and the need becomes declarable in the item
+that builds `config:sqlite`.
+
+*Why that is better rather than merely possible.* `station_metrics` has a foreign key to `stations`,
+so the two writes have to be ordered; with both in one transaction there is no window in which
+`observations` holds rows for a station `stations` does not have, and no ordering constraint between
+two components. The cost is one thing and it is small: the projection is refreshed when a station
+**reports** rather than when it is **configured**, so a station whose coordinates are edited while it
+is not reporting catches up on its next reading. `/span`'s join is the only reader and it reads rows
+that have readings.
+
+*Why the original was wrong rather than merely inconvenient.* D-56 was a clerical resolution of
+C-W4-20 — W4 identified the gap precisely and only lacked the authority to place it — and it placed
+the upsert on `admit` because `admit` is where the station is resolved. That is true and it is not
+sufficient: having the *data* is not the same as being allowed to do the *write*, and D-87 was
+decided in the same ledger.
 
 **A-W6-1 — retire `remoteweather:docs/rewrite/`, and reference the Go repository by URL only.**
 

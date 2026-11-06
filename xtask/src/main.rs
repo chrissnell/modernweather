@@ -22,6 +22,7 @@
 
 mod conformance;
 mod coverage;
+mod dbtests;
 mod dist;
 mod emulators;
 mod gates;
@@ -73,6 +74,9 @@ fn main() -> ExitCode {
         // The `driver-emulators` gate's command, and the same split as `gate-layout`:
         // `cargo xtask gate driver-emulators` consults ci/gates.toml and then runs this.
         "emulator-tests" => emulators::main(&owned),
+        // The `db-tests` gate's command, and the same split as `gate-layout`:
+        // `cargo xtask gate db-tests` consults ci/gates.toml and then runs this.
+        "db-tests" => dbtests::main(&owned),
         "coverage" => coverage::main(&owned).map(|()| ExitCode::SUCCESS),
         "dist" => dist::main(&owned).map(|()| ExitCode::SUCCESS),
         "targets" => dist::targets(&owned).map(|()| ExitCode::SUCCESS),
@@ -157,6 +161,13 @@ fn usage() {
          \x20                    passed. The tests are `--ignored` because they need a Go\n\
          \x20                    toolchain; the count is what makes a gate that ran\n\
          \x20                    nothing a failure rather than a pass.\n\
+         \x20 db-tests           run crates/mw-store/tests/db.rs against a real\n\
+         \x20                    TimescaleDB and fail unless exactly the declared tests\n\
+         \x20                    passed. The tests are `--ignored` because they need a\n\
+         \x20                    server; the declared NAMES are what makes a gate that ran\n\
+         \x20                    nothing, or ran something else, a failure (W3 D-84).\n\
+         \x20                    Reads PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE, or\n\
+         \x20                    MW_DB_TESTS_URL if it is set.\n\
          \x20 gate-layout        check the crate boundaries declared in ci/layers.toml:\n\
          \x20                    the layer order, every crate's forbidden list, and the\n\
          \x20                    source rules. Exit 1 on a violation.\n\

@@ -65,7 +65,7 @@ use crate::spool;
 /// One line per component crate, which is §1.3 rule 2: adding a component crate adds a line
 /// here and edits nothing else -- the shape `managers/controller.go` could not take, down to
 /// its `if con.Type == "management" { continue }`.
-const REGISTRARS: &[&dyn Registrar<Config>] = &[&Stations];
+const REGISTRARS: &[&dyn Registrar<Config>] = &[&Stations, &Database];
 
 /// `mw-station`'s registrar.
 ///
@@ -95,6 +95,71 @@ impl Registrar<Config> for Stations {
     }
 }
 
+/// `db:postgres` and `writer:timescale`, which are the two halves of the write path's
+/// far end.
+///
+/// An adapter here for `Stations`' reason and one more: the two specs come from two
+/// different crates — the pool from `mw-store`, the cursor from `mw-pipeline` — and those
+/// two crates are in the same layer and may not name each other (`mw_pipeline::writer`'s
+/// module documentation has the whole of that note). The binary is where they meet.
+///
+/// **Both are conditional, and on different things.**
+///
+/// - No `weather_database` row means neither: a node with no server has no `db:postgres`
+///   and therefore no `writer:timescale` (**D-44**, W7 §8.2's satellite). Emitting the
+///   writer alone would be a hard need with no provider, which `plan()` refuses — so the
+///   satellite shape would be a daemon that will not start.
+/// - No spool means no writer. `Trigger::OnReading` is validated against the root
+///   `ReadingStream`, which exists only for a node that has a `node` row and therefore a
+///   spool; without one `plan()` refuses the component, and refusing the *whole
+///   configuration* for a node that is serving but not ingesting is wrong. The pool still
+///   gets planned, because the read path (M3-4, M4-1) needs it with or without ingest.
+#[derive(Debug)]
+struct Database;
+
+impl Registrar<Config> for Database {
+    fn name(&self) -> &'static str {
+        "mw-store/mw-pipeline (the write path's far end)"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        let Some(db) = &cfg.weather_database else {
+            return Ok(());
+        };
+        // The same snapshot the ingress resolves against. `attach_registry` runs before
+        // `plan()` in every path that reaches here, and the `expect` would be a bug in the
+        // boot sequence rather than a configuration error -- so it is reported as a
+        // registrar error naming what is missing instead of a panic.
+        let registry = cfg.registry.as_ref().ok_or_else(|| {
+            RegisterError::new(
+                "the station registry has not been published, so `db:postgres` has \
+                 nothing to copy the read-side projection from",
+            )
+        })?;
+        out.push(
+            mw_store::pg::spec(db.url.clone(), Arc::clone(registry))
+                .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))?,
+        );
+        if cfg.ingress.is_some() {
+            out.push(
+                mw_pipeline::writer::spec()
+                    .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))?,
+            );
+        } else {
+            info!(
+                "a weather database is configured and this node has no spool, so the \
+                 pool is planned and `writer:timescale` is not -- there is no reading \
+                 stream for it to consume (W7 §8.2)"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Build the station registry and the write end of the pipeline, and hand both to the
 /// configuration.
 ///
@@ -113,7 +178,7 @@ impl Registrar<Config> for Stations {
 ///
 /// A function rather than inline code, so that the tests below drive the *same* assembly
 /// the daemon does. A second copy in a test would be a test of the copy.
-fn attach_ingress(cfg: &mut Config, fanout: &spool::Fanout) -> anyhow::Result<()> {
+fn attach_registry(cfg: &mut Config) -> anyhow::Result<()> {
     // The receivers a `Fixed` frame resolves through, minted by the registrar that minted
     // the component ids -- so the registry and the plan cannot disagree about what a
     // component is called.
@@ -148,11 +213,31 @@ fn attach_ingress(cfg: &mut Config, fanout: &spool::Fanout) -> anyhow::Result<()
              clear `ingest_secret_hash` for a station that does not need it."
         );
     }
-    let registry: Arc<dyn mw_component::StationRegistry> =
-        Arc::new(mw_store::ConfigRegistry::new(snapshot));
+    cfg.set_registry(
+        Arc::new(mw_store::ConfigRegistry::new(snapshot)) as Arc<dyn mw_component::StationRegistry>
+    );
+    Ok(())
+}
+
+/// Hand the configuration the write end of the pipeline, once the spool is open.
+///
+/// Separate from [`attach_registry`] because the two have different preconditions: the
+/// registry is built from rows step 4 already read and exists for every node, while the
+/// ingress needs the spool and therefore exists only for a node with an identity (W7
+/// §8.2). Splitting them is also what lets `db:postgres` be planned for a node that serves
+/// and does not ingest.
+///
+/// `SpoolIngress` holds the spool and the registry and nothing else, which is what makes
+/// **D-87** -- `admit` does no I/O but the spool append -- structurally true rather than a
+/// rule to remember: there is no database handle in it to reach for.
+fn attach_ingress(cfg: &mut Config, fanout: &spool::Fanout) -> anyhow::Result<()> {
+    let registry = cfg
+        .registry
+        .as_ref()
+        .context("the station registry has not been published")?;
     cfg.set_ingress(Arc::new(mw_pipeline::SpoolIngress::new(
         Arc::clone(&fanout.spool),
-        registry,
+        Arc::clone(registry),
     )) as Arc<dyn mw_component::Ingress>);
     Ok(())
 }
@@ -311,6 +396,7 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
 
     // Step 4c: identity resolution and the write end of the pipeline.
     mw_station::metrics::register();
+    attach_registry(&mut cfg).context("publishing the station registry")?;
     if let Some(fanout) = &fanout {
         attach_ingress(&mut cfg, fanout).context("assembling the reading pipeline")?;
     }
@@ -469,6 +555,7 @@ mod tests {
             stations: Vec::new(),
             declared_stations: Vec::new(),
             ingress: None,
+            registry: None,
             listener: Listener {
                 listen_addr: "127.0.0.1".into(),
                 http_port: 8080,
@@ -665,6 +752,7 @@ mod tests {
         let mut cfg = Config::load(&pool).await.expect("the configuration reads");
         let node = cfg.node.clone().expect("the node row was inserted");
         let fanout = spool::open(&node).expect("the spool opens");
+        attach_registry(&mut cfg).expect("the registry publishes");
         attach_ingress(&mut cfg, &fanout).expect("the pipeline assembles");
         (pool, cfg, fanout)
     }
@@ -850,6 +938,118 @@ mod tests {
             "nothing was appended, so there is no reading to store"
         );
         pool.close().await;
+    }
+
+    /// **The production shape: a weather database *and* a spool.**
+    ///
+    /// This is the only configuration that emits `writer:timescale`, and it is the one
+    /// every real deployment uses — so a mistake in that branch of the `Database`
+    /// registrar (the wrong `Need`, a provider that is not in the plan) is a daemon that
+    /// refuses to start. The other two shapes were covered and this one was not.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_weather_database_and_a_spool_plan_the_pool_and_the_writer() {
+        let scratch = Scratch::new("writer");
+        let port = free_port().await;
+        let (pool, mut cfg, fanout) = boot_to_pipeline(
+            &scratch,
+            &[broadcast_station("suncrest:roof", SERIAL, port)],
+        )
+        .await;
+        // The `weather_database` row the registrar reads. Set on the loaded configuration
+        // rather than inserted, because `Config::load` has already run.
+        cfg.weather_database = Some(config_db::WeatherDatabase {
+            url: secrecy::SecretString::from(
+                "postgresql://mw@127.0.0.1:5432/modernweather".to_string(),
+            ),
+        });
+
+        let roots = Roots {
+            schedule: Arc::new(SqliteScheduleStore::new(pool.clone())),
+            stream: Some(Arc::clone(&fanout.stream) as Arc<dyn mw_component::ReadingStream>),
+            log: Arc::new(mw_supervisor::testing::MemoryLogControl::new("info")),
+        };
+        let ctx = PlanContext::new(Generation::ZERO).with_roots(roots.capabilities());
+        let planned = plan(&cfg, REGISTRARS, &ctx).expect("the production shape plans");
+        let mut ids: Vec<&str> = planned
+            .ids()
+            .map(mw_component::ComponentId::as_str)
+            .collect();
+        ids.sort_unstable();
+        // The listener's id carries the ephemeral port, so the assertion is on the two
+        // components this registrar owns plus the shape of the third.
+        assert!(
+            ids.contains(&"db:postgres"),
+            "the pool must be planned: got {ids:?}"
+        );
+        assert!(
+            ids.contains(&"writer:timescale"),
+            "and so must the writer, which is the branch nothing covered: got {ids:?}"
+        );
+        // The listener, its re-arm (the fixture's station has a `transport_host`), the
+        // pool and the writer.
+        assert_eq!(ids.len(), 4, "got {ids:?}");
+        assert!(
+            ids.iter().any(|id| id.starts_with("station:wll:udp:")),
+            "got {ids:?}"
+        );
+        pool.close().await;
+    }
+
+    /// The satellite shape (W7 §8.2): a weather database and **no** spool.
+    ///
+    /// The pool is still planned, because the read path needs it with or without ingest;
+    /// `writer:timescale` is not, because `Trigger::OnReading` is validated against the
+    /// root `ReadingStream` and refusing the whole configuration for a node that serves
+    /// without ingesting would be wrong.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_weather_database_without_a_spool_plans_the_pool_and_not_the_writer() {
+        let mut cfg = config(true);
+        cfg.registry = Some(Arc::new(mw_store::ConfigRegistry::new(
+            mw_store::RegistrySnapshot::default(),
+        )));
+        // No `ingress`, which is what "no spool" means to the registrar.
+        assert!(cfg.ingress.is_none());
+
+        let roots = Roots {
+            schedule: Arc::new(mw_supervisor::testing::MemoryScheduleStore::new()),
+            stream: None,
+            log: Arc::new(mw_supervisor::testing::MemoryLogControl::new("info")),
+        };
+        let ctx = PlanContext::new(Generation::ZERO).with_roots(roots.capabilities());
+        let planned = plan(&cfg, REGISTRARS, &ctx).expect("a node that serves but does not ingest");
+        let ids: Vec<&str> = planned
+            .ids()
+            .map(mw_component::ComponentId::as_str)
+            .collect();
+        assert_eq!(ids, vec!["db:postgres"]);
+    }
+
+    /// No weather database: neither component, and that is not an error (**D-44**).
+    #[test]
+    fn no_weather_database_plans_neither_the_pool_nor_the_writer() {
+        let mut cfg = config(false);
+        cfg.registry = Some(Arc::new(mw_store::ConfigRegistry::new(
+            mw_store::RegistrySnapshot::default(),
+        )));
+        let mut out = Vec::new();
+        Database
+            .register(&cfg, &mut out)
+            .expect("no database is a legitimate configuration");
+        assert!(out.is_empty());
+    }
+
+    /// The registrar refuses rather than panicking when the boot sequence has not
+    /// published the registry — which would be a bug in `run()`'s ordering, not a
+    /// configuration error, and is reported as such.
+    #[test]
+    fn the_registrar_names_what_is_missing_rather_than_panicking() {
+        let cfg = config(true);
+        assert!(cfg.registry.is_none());
+        let mut out = Vec::new();
+        let e = Database
+            .register(&cfg, &mut out)
+            .expect_err("the registry has not been published");
+        assert!(e.to_string().contains("station registry"), "{e}");
     }
 
     /// Two units on one endpoint, a polled third, and the component set that follows.

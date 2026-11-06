@@ -32,8 +32,10 @@ mod partial;
 // re-exported is unreachable from the rest of the workspace -- and `dead_code` says so,
 // which is what keeps this list honest as the registry grows.
 pub use generated::aggregates::{AggregateColumn, Level, Strategy, LEVELS};
-pub use generated::metrics::{MetricKey, MetricMeta, Tier, UnitMeta, METRICS, UNITS};
-pub use generated::reading::Reading;
+pub use generated::metrics::{
+    DimensionMeta, MetricKey, MetricMeta, SqlType, Tier, UnitMeta, DIMENSIONS, METRICS, UNITS,
+};
+pub use generated::reading::{MetricValue, Reading};
 
 pub use envelope::{Envelope, ForwardRefused, PathProblem, PathSet, Provenance};
 pub use error::{Class, Classify, DisplayChain};

@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use mw_component::{
-    AcceptError, AdmitError, FrameMeta, IdentitySource, Ingress, Reject, StationRegistry,
+    AcceptError, AdmitError, FrameMeta, IdentitySource, Ingress, Reject, StationMeta,
+    StationRegistry,
 };
 use mw_pipeline::testing::{forwarded, frame, id, node, partial, reading, spool, Scratch};
 use mw_pipeline::{Clock, Spool, SpoolIngress, TestClock, MAX_BATCH_ENVELOPES};
@@ -30,12 +31,29 @@ struct CountingRegistry {
     station: Option<StationKey>,
     refuse: Option<Reject>,
     calls: AtomicUsize,
+    /// How many times the enrich stage asked for station metadata. Asserted rather than
+    /// ignored: W3 **D-87** allows no I/O on this path, and "one lookup per batch, not one
+    /// per reading" is the property that keeps a four-observation frame from four reads
+    /// of a published snapshot.
+    metadata_calls: AtomicUsize,
+    /// What `metadata` answers. `EMPTY` by default, which is a station with no configured
+    /// coordinates -- the shape every test but the enrich one wants.
+    meta: StationMeta,
 }
 
 impl CountingRegistry {
     fn resolving(station: &str) -> Arc<Self> {
         Arc::new(Self {
             station: Some(StationKey::new(station)),
+            ..Self::default()
+        })
+    }
+
+    /// A registry that resolves to `station` and answers `meta` for it.
+    fn with_metadata(station: &str, meta: StationMeta) -> Arc<Self> {
+        Arc::new(Self {
+            station: Some(StationKey::new(station)),
+            meta,
             ..Self::default()
         })
     }
@@ -50,6 +68,10 @@ impl CountingRegistry {
     fn calls(&self) -> usize {
         self.calls.load(Ordering::Relaxed)
     }
+
+    fn metadata_calls(&self) -> usize {
+        self.metadata_calls.load(Ordering::Relaxed)
+    }
 }
 
 impl StationRegistry for CountingRegistry {
@@ -59,6 +81,15 @@ impl StationRegistry for CountingRegistry {
             return Err(reason);
         }
         self.station.clone().ok_or(Reject::UnknownStation)
+    }
+
+    fn metadata(&self, _station: &StationKey) -> StationMeta {
+        self.metadata_calls.fetch_add(1, Ordering::Relaxed);
+        self.meta
+    }
+
+    fn projection(&self, _station: &StationKey) -> Option<mw_component::StationProjection> {
+        None
     }
 }
 
@@ -573,4 +604,247 @@ async fn a_full_batch_is_one_append_call_and_one_fsync() {
         },
         "256 records, one append call, one group commit"
     );
+}
+
+/// **The enrich stage is on `admit`'s path, before the spool** (W3 §2.5 consequence 2):
+/// storage, the snapshot and every peer see the same enriched reading, so what is in the
+/// spool is what is enriched.
+///
+/// Also the one performance property the stage has to hold: the station metadata is read
+/// **once per batch**, not once per reading. W3 **D-87** allows nothing on this path but
+/// the spool's `fsync`, and a four-observation frame doing four snapshot reads would be
+/// four pointer loads rather than one — cheap, but it is the kind of per-reading work the
+/// Go collector's `LoadConfig()` call is the extreme of, so it is asserted rather than
+/// assumed.
+#[tokio::test]
+async fn admit_enriches_before_the_spool_and_reads_the_station_metadata_once_per_batch() {
+    let scratch = Scratch::new("enrich-admit");
+    let clock = TestClock::fixed();
+    let s = spool(scratch.spool(), node(1), &clock);
+    let registry = CountingRegistry::with_metadata(
+        "backyard",
+        StationMeta {
+            latitude: Some(39.7392),
+            longitude: Some(-104.9903),
+            altitude_m: Some(1609.0),
+            snow_base_distance_mm: Some(1500.0),
+        },
+    );
+    let ingress = SpoolIngress::new(Arc::clone(&s), Arc::clone(&registry) as Arc<_>);
+    // Opened **before** the append: a new cursor starts at the tail and not at the oldest
+    // record, which is the spool's own documented behaviour (`a_new_cursor_starts_at_the_
+    // tail_and_not_at_the_oldest_record`).
+    let mut cursor = s
+        .open_cursor(id("test:reader"))
+        .expect("a fresh cursor on an unused id");
+
+    // A winter morning in Denver: cold enough and windy enough for wind chill, and the
+    // coordinates make the clear-sky figure computable.
+    let at = clock.now();
+    let batch: Vec<PartialReading> = (0..4)
+        .map(|_| {
+            PartialReading::at(
+                at,
+                mw_types::Reading {
+                    out_temp: Some(20.0),
+                    out_humidity: Some(60.0),
+                    wind_speed: Some(15.0),
+                    pm25: Some(30.0),
+                    snow_distance: Some(1200.0),
+                    ..mw_types::Reading::default()
+                },
+            )
+        })
+        .collect();
+    let admitted = ingress
+        .admit(&batch, &frame("station:davis", at))
+        .await
+        .expect("a resolvable frame");
+    assert_eq!(admitted.accepted, 4);
+    assert_eq!(
+        registry.metadata_calls(),
+        1,
+        "one metadata read for the whole batch"
+    );
+
+    // Read it back out of the spool rather than off the return value: the claim is about
+    // what is *durable*, which is the half that matters for "every peer sees the same
+    // enriched reading".
+    let read = cursor.read().expect("the records are readable");
+    assert_eq!(read.envelopes.len(), 4);
+    for (_, envelope) in &read.envelopes {
+        let r = &envelope.reading;
+        assert_eq!(
+            r.wind_chill,
+            mw_pipeline::enrich::wind_chill(20.0, 15.0),
+            "windchill is stored, not recomputed at read time"
+        );
+        assert_eq!(r.heat_index, None, "20 degF is below the heat-index range");
+        assert_eq!(r.aqi_pm25_aqin, mw_pipeline::enrich::aqi_pm25(30.0));
+        assert_eq!(r.snow_depth, Some(300.0), "1500 mm base less 1200 mm");
+        assert!(
+            r.potential_solar_watts.is_some(),
+            "the station has coordinates, so the clear-sky figure is computable"
+        );
+    }
+}
+
+/// A station with no configured coordinates gets the columns that need none and `NULL` for
+/// the three that do — **not** a zero. That is **D-26** one level up from a sensor, and it
+/// is the shape the `accept` path is in until M6-4 resolves a peer's station key.
+#[tokio::test]
+async fn an_unplaced_station_stores_null_for_the_metadata_derived_columns() {
+    let scratch = Scratch::new("enrich-unplaced");
+    let clock = TestClock::fixed();
+    let s = spool(scratch.spool(), node(1), &clock);
+    let registry = CountingRegistry::resolving("backyard");
+    let ingress = SpoolIngress::new(Arc::clone(&s), Arc::clone(&registry) as Arc<_>);
+    let mut cursor = s
+        .open_cursor(id("test:reader"))
+        .expect("a fresh cursor on an unused id");
+
+    let at = clock.now();
+    let batch = vec![PartialReading::at(
+        at,
+        mw_types::Reading {
+            out_temp: Some(20.0),
+            out_humidity: Some(60.0),
+            wind_speed: Some(15.0),
+            snow_distance: Some(1200.0),
+            ..mw_types::Reading::default()
+        },
+    )];
+    ingress
+        .admit(&batch, &frame("station:davis", at))
+        .await
+        .expect("a resolvable frame");
+
+    let read = cursor.read().expect("readable");
+    let r = &read.envelopes[0].1.reading;
+    assert!(r.wind_chill.is_some(), "wind chill needs no metadata");
+    assert_eq!(r.potential_solar_watts, None, "no coordinates, no figure");
+    assert_eq!(r.snow_depth, None, "no base distance, no depth");
+}
+
+/// **`accept` enriches too** (W7 §4.4 step 8), and only where a column is `None`.
+///
+/// Two envelopes from the same peer: one the satellite already enriched, one it did not.
+/// The first must come back byte-identical — that is what makes a collector agree with its
+/// satellite rather than recompute from a different formula version — and the second must
+/// come back filled, which is what covers a satellite older than this collector.
+#[tokio::test]
+async fn accept_fills_a_column_a_satellite_left_empty_and_never_rewrites_one_it_filled() {
+    let scratch = Scratch::new("enrich-accept");
+    let clock = TestClock::fixed();
+    let s = spool(scratch.spool(), node(3), &clock);
+    let registry = CountingRegistry::resolving("backyard");
+    let ingress = SpoolIngress::new(Arc::clone(&s), Arc::clone(&registry) as Arc<_>);
+    let mut cursor = s
+        .open_cursor(id("test:reader"))
+        .expect("a fresh cursor on an unused id");
+
+    let (a, c) = (node(1), node(3));
+    let at = clock.now();
+    let unenriched = peer_envelope(a, 1, at, c, None);
+    // A deliberately wrong value, so that "it was not recomputed" is distinguishable from
+    // "it was recomputed and happened to agree".
+    let already = peer_envelope(a, 2, at + chrono::Duration::seconds(1), c, Some(-99.0));
+
+    let accepted = ingress
+        .accept(&[unenriched, already], a)
+        .await
+        .expect("a well-formed batch");
+    assert_eq!(accepted.accepted, 2);
+
+    let read = cursor.read().expect("readable");
+    assert_eq!(read.envelopes.len(), 2);
+    assert_eq!(
+        read.envelopes[0].1.reading.wind_chill,
+        mw_pipeline::enrich::wind_chill(20.0, 15.0),
+        "the collector filled the column the satellite left empty"
+    );
+    assert_eq!(
+        read.envelopes[1].1.reading.wind_chill,
+        Some(-99.0),
+        "and left the one it had filled alone, wrong or not"
+    );
+    // The provenance is untouched by any of it (**D-60**).
+    for (_, envelope) in &read.envelopes {
+        assert_eq!(envelope.provenance.origin(), a);
+        assert_eq!(envelope.provenance.path().hops(), &[a, c]);
+    }
+}
+
+/// An envelope as a satellite would send it: admitted at `origin`, forwarded to `me`, and
+/// carrying the inputs wind chill is a function of.
+fn peer_envelope(
+    origin: mw_types::OriginId,
+    seq: u64,
+    at: chrono::DateTime<chrono::Utc>,
+    me: mw_types::OriginId,
+    wind_chill: Option<f32>,
+) -> Envelope {
+    let base = forwarded(origin, seq, "backyard", at, &[me]);
+    Envelope {
+        reading: Arc::new(mw_types::Reading {
+            time: at,
+            station_id: "backyard".into(),
+            out_temp: Some(20.0),
+            wind_speed: Some(15.0),
+            wind_chill,
+            ..mw_types::Reading::default()
+        }),
+        ..base
+    }
+}
+
+/// The `Arc` property `accept` depends on, asserted at the boundary that has the `Arc`.
+///
+/// `enrich::derive` returning an empty `Derived` is what keeps `Arc::make_mut` off the hot
+/// path, and "off the hot path" means the allocation is never un-shared. A refcount and a
+/// pointer are the only things that can say so, and neither is visible from inside the
+/// enrich stage.
+#[test]
+fn an_already_enriched_envelope_is_not_deep_copied_on_the_accept_path() {
+    use std::sync::Arc;
+
+    let meta = StationMeta {
+        latitude: Some(39.7392),
+        longitude: Some(-104.9903),
+        altitude_m: Some(1609.0),
+        snow_base_distance_mm: Some(1500.0),
+    };
+    let at = chrono::Utc::now();
+    let mut reading = mw_types::Reading {
+        time: at,
+        station_id: "backyard".into(),
+        out_temp: Some(20.0),
+        out_humidity: Some(60.0),
+        wind_speed: Some(15.0),
+        pm25: Some(30.0),
+        pm10_in_aqin: Some(80.0),
+        snow_distance: Some(1200.0),
+        ..mw_types::Reading::default()
+    };
+    // Enriched the way a satellite running this build would have left it.
+    assert!(mw_pipeline::enrich::enrich(&mut reading, &meta));
+    let enriched = Arc::new(reading);
+
+    // Two holders, exactly as `accept` has after cloning the envelope out of the batch.
+    let mut mine = Arc::clone(&enriched);
+    assert_eq!(Arc::strong_count(&enriched), 2);
+    assert!(
+        mw_pipeline::enrich::derive(&mine, &meta).is_empty(),
+        "there is nothing left for the collector to add"
+    );
+    assert!(
+        Arc::ptr_eq(&mine, &enriched),
+        "no deep copy happened: this is the whole of the claim"
+    );
+
+    // The converse, so the test cannot pass by never exercising the copy: clear a column
+    // the collector *can* fill, and the same path does un-share.
+    Arc::make_mut(&mut mine).wind_chill = None;
+    assert!(!mw_pipeline::enrich::derive(&mine, &meta).is_empty());
+    assert!(!Arc::ptr_eq(&mine, &enriched));
 }

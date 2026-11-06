@@ -46,6 +46,7 @@
 //! not a work item (docs/reconciliation.md G-5).
 
 pub mod clock;
+pub mod enrich;
 pub mod metrics;
 pub mod spool;
 pub mod testing;
@@ -53,8 +54,10 @@ pub mod testing;
 mod ingress;
 mod sink;
 mod stream;
+pub mod writer;
 
 pub use clock::{Clock, SystemClock, TestClock};
+pub use enrich::enrich;
 pub use ingress::{
     receive_check, IngressStats, SpoolIngress, MAX_BATCH_BYTES, MAX_BATCH_ENVELOPES,
 };

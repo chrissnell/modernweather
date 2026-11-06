@@ -106,6 +106,18 @@ pub fn register() {
         "Envelopes the dedup gate already had"
     );
     metrics::describe_counter!(
+        "mw_enrich_on_accept_total",
+        "Envelopes a peer sent that the enrich stage still had a column to fill"
+    );
+    metrics::describe_counter!(
+        "mw_observations_rows_total",
+        "Rows the writer put in `observations`"
+    );
+    metrics::describe_counter!(
+        "mw_observations_rows_collapsed_total",
+        "Envelopes that shared a (station, instant) with another in the same batch"
+    );
+    metrics::describe_counter!(
         "mw_ingest_window_overrun_total",
         "Sequence numbers that fell out of an origin's dedup window"
     );
@@ -182,6 +194,35 @@ pub fn ingested(station: &str, n: u64) {
 pub fn accepted(station: &str) {
     let _ = station;
     metrics::counter!("mw_readings_ingested_total", "station" => "peer").increment(1);
+}
+
+/// Envelopes arriving from a peer that the enrich stage still had something to write.
+///
+/// **Expected to be zero, and informative when it is not.** A satellite running this build
+/// enriched the envelope before it ever reached the wire (W3 §2.5 consequence 3), so a
+/// non-zero rate means either a satellite older than this collector or a column this build
+/// derives and that one did not — which is the version skew W7 §5.2 puts `software` on the
+/// peer row for. Not an error: the collector filling it is the design working.
+pub fn enriched_on_accept(n: u64) {
+    metrics::counter!("mw_enrich_on_accept_total").increment(n);
+}
+
+/// Rows the writer wrote. Against `mw_readings_ingested_total` this is the write path's
+/// end-to-end accounting: the two differ by the spool's lag and by the collapsing below.
+pub fn rows_written(n: u64) {
+    metrics::counter!("mw_observations_rows_total").increment(n);
+}
+
+/// Envelopes that shared a `(station_id, time)` with another in the same batch, and were
+/// therefore written as one row.
+///
+/// Not a loss in the spool's sense -- both are durably handled, and a sequential upsert
+/// would have left the same row standing -- but it **is** a reading that is not in the
+/// database, and the unique index on `(station_id, time)` means nothing else could be. A
+/// station whose rate here matches its ingest rate is a station reporting several
+/// observations per frame with no timestamp on any of them.
+pub fn rows_collapsed(n: u64) {
+    metrics::counter!("mw_observations_rows_collapsed_total").increment(n);
 }
 
 /// Envelopes the dedup gate already had (W7 §4.4). Expected and non-zero in a diamond.

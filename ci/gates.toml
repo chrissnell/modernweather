@@ -259,6 +259,26 @@ description = "Tests that need a real TimescaleDB, which fail rather than skip"
 owner = "W3 §8.2 (implementation-plan.md M3-3)"
 arms_when = "crates/mw-store/tests/db.rs"
 cmd = ["cargo", "xtask", "db-tests"]
+on_exit.1 = """
+the tests ran against a real server and the write path does not do what M3-3's done-criteria
+say it does. Read the libtest output above: it names which of the declared tests failed and
+what it asserted."""
+on_exit.2 = """
+the run reached no verdict, so it proved nothing about the write path either way. No
+reachable server, a target that would not build, migrations/ that `sqlx::migrate` would not
+apply, or a declared-test-set mismatch -- `xtask/src/dbtests.rs`'s DECLARED and the
+`#[test]` functions in crates/mw-store/tests/db.rs have to be the same set, and a renamed
+test is a test this gate no longer knows it is running.
+
+Deliberately NOT exit 1, following the `conformance` gate's precedent for the same reason
+(docs/reconciliation.md C-W2-20): "there was no database" and "the writer stores a zero
+where it should store NULL" otherwise produce the same red, and reporting the first as the
+second is the expensive direction for this gate to lie in.
+
+Point it at a server with PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE, or set
+MW_DB_TESTS_URL. CI runs it in the `db-tests` job against timescale/timescaledb-ha:pg17
+(DESIGN.md D-2); `PGDATABASE` defaults to `postgres`, which is the database that image
+creates."""
 note = """
 W3 Decision 84: database tests FAIL CI if they skip, so "green because it did not run" is
 unreachable. That is the exact failure mode docs/reconciliation.md G-1 documents, named as
@@ -269,7 +289,29 @@ CONFORMANCE_BASE_URL is unset. That is correct for a crate that must stay green 
 checkout with no server, and it is why the conformance gates above drive the BINARY rather
 than relying on `cargo test` to notice.
 
-Declared by W6 per W3 assumption 55. See docs/reconciliation.md G-4."""
+Declared by W6 per W3 assumption 55. See docs/reconciliation.md G-4.
+
+ARMED as of implementation-plan.md M3-3, which wrote crates/mw-store/tests/db.rs -- the
+deferred mechanism used exactly as designed. It is the second of G-4's four gates to arm
+itself from the work item that created its subject (`layout` was the first; `ui-bundle` and
+`ui-copy` are still deferred to M7-3).
+
+Three checks, because there are three ways a test suite reports green without running, and
+closing two of them is not enough:
+
+  1. the tests PANIC rather than skip when MW_DB_TESTS_URL is unset, which is Decision 84
+     literally. They are also `#[ignore]`d, so the `test` job -- which has no service
+     container -- stays green and honest.
+  2. `#[ignore]` means a filter that matched nothing exits ZERO, so `cargo xtask db-tests`
+     compares the test binary's own `--list` against a declared set of NAMES, in both
+     directions. Names rather than a count, because `xtask/src/emulators.rs` learned the
+     expensive way that a count catches a deleted test and does not catch a rename.
+  3. Names do not catch a GUTTED BODY -- a test emptied to `{}` still lists, still prints
+     `... ok` and still counts, which is the hole emulators.rs documents and does not
+     close. So each test ends by calling a helper that RUNS A QUERY and appends its own
+     name to an evidence file the gate creates, and the gate requires one line per declared
+     test. Verified by doing it: with one body emptied, libtest reported `9 passed` and the
+     gate exited 2 naming the gutted test."""
 
 [[gate]]
 id = "mgmt-schema-drift"

@@ -409,6 +409,25 @@ fn rust_reading(reg: &Registry) -> String {
          #![allow(clippy::struct_excessive_bools)]\n\n\
          use chrono::{DateTime, Utc};\n\n\
          use super::metrics::MetricKey;\n\n\
+         /// One metric's value, in the type its column holds.\n\
+         ///\n\
+         /// Five variants because `metrics/registry.toml` declares five `sql_type`s. A\n\
+         /// writer that bound every metric as a number would store the eleven text and\n\
+         /// four timestamp metrics as NULL, and an `int4` metric as a float — which is why\n\
+         /// `Reading::get`'s `f64` is not enough and this exists beside it.\n\
+         #[derive(Debug, Clone, Copy, PartialEq)]\n\
+         pub enum MetricValue<'a> {\n\
+         \x20   /// `float4`\n\
+         \x20   Float(f32),\n\
+         \x20   /// `int4`\n\
+         \x20   Int(i32),\n\
+         \x20   /// `int8`\n\
+         \x20   BigInt(i64),\n\
+         \x20   /// `text`\n\
+         \x20   Text(&'a str),\n\
+         \x20   /// `timestamptz`\n\
+         \x20   Time(DateTime<Utc>),\n\
+         }\n\n\
          #[derive(Debug, Clone, PartialEq, Default)]\n\
          pub struct Reading {\n",
     );
@@ -473,6 +492,50 @@ fn rust_reading(reg: &Registry) -> String {
             }
         }
     }
+    s.push_str("        }\n    }\n\n");
+
+    // The typed accessor the writer binds from. `get` cannot serve it: it widens to f64
+    // and answers `None` for the fifteen non-numeric metrics, so a writer driven off it
+    // would store a text metric as NULL and an int4 as a float. This is the other
+    // direction of the same registry-proofing: 212 columns named once, here, rather than
+    // in a hand-written match in `mw-store` that is the 591 lines of mapping code this
+    // type exists to delete.
+    s.push_str(
+        "    /// Read one metric as the type its column holds, for the paths that bind a\n\
+         \x20   /// value rather than read a number — the writer, and the wire mapping.\n\
+         \x20   ///\n\
+         \x20   /// `None` means the station did not report it, which stays a SQL `NULL`\n\
+         \x20   /// all the way down (**D-3**, **D-26**).\n\
+         \x20   #[must_use]\n\
+         \x20   pub fn value(&self, key: MetricKey) -> Option<MetricValue<'_>> {\n\
+         \x20       match key {\n",
+    );
+    for m in reg.live_metrics() {
+        let variant = pascal(&m.key);
+        let field = rust_ident(&m.key);
+        let wrap = match m.sql_type {
+            SqlType::Float4 => "MetricValue::Float",
+            SqlType::Int4 => "MetricValue::Int",
+            SqlType::Int8 => "MetricValue::BigInt",
+            SqlType::Text => "MetricValue::Text",
+            SqlType::Timestamptz => "MetricValue::Time",
+        };
+        match m.sql_type {
+            SqlType::Text => {
+                let _ = writeln!(
+                    s,
+                    "            MetricKey::{variant} => \
+                     self.{field}.as_deref().map({wrap}),"
+                );
+            }
+            _ => {
+                let _ = writeln!(
+                    s,
+                    "            MetricKey::{variant} => self.{field}.map({wrap}),"
+                );
+            }
+        }
+    }
     s.push_str("        }\n    }\n}\n");
     s
 }
@@ -496,6 +559,30 @@ fn rust_metrics(reg: &Registry) -> String {
     s.push_str(
         "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n\
          pub enum Tier {\n    Core,\n    Extended,\n}\n\n\
+         // The five PostgreSQL types metrics/registry.toml declares. Generated rather\n\
+         // than hand-written in the writer, because the writer's INSERT binds one array\n\
+         // per column and the array's element type is this.\n\
+         #[derive(Debug, Clone, Copy, PartialEq, Eq)]\n\
+         pub enum SqlType {\n\
+         \x20   Float4,\n\
+         \x20   Int4,\n\
+         \x20   Int8,\n\
+         \x20   Text,\n\
+         \x20   Timestamptz,\n\
+         }\n\n\
+         impl SqlType {\n\
+         \x20   /// The DDL spelling, which is also what a `::type[]` cast in a query needs.\n\
+         \x20   #[must_use]\n\
+         \x20   pub const fn ddl(self) -> &'static str {\n\
+         \x20       match self {\n\
+         \x20           SqlType::Float4 => \"float4\",\n\
+         \x20           SqlType::Int4 => \"int4\",\n\
+         \x20           SqlType::Int8 => \"int8\",\n\
+         \x20           SqlType::Text => \"text\",\n\
+         \x20           SqlType::Timestamptz => \"timestamptz\",\n\
+         \x20       }\n\
+         \x20   }\n\
+         }\n\n\
          #[derive(Debug, Clone, Copy)]\n\
          pub struct MetricMeta {\n\
          \x20   pub key: MetricKey,\n\
@@ -505,6 +592,7 @@ fn rust_metrics(reg: &Registry) -> String {
          \x20   pub label: &'static str,\n\
          \x20   pub unit: &'static str,\n\
          \x20   pub tier: Tier,\n\
+         \x20   pub sql_type: SqlType,\n\
          \x20   pub field_number: u32,\n\
          \x20   /// JSON keys the frozen legacy REST surface uses for this metric. Plural\n\
          \x20   /// because the shipped surface duplicates two of them.\n\
@@ -525,8 +613,8 @@ fn rust_metrics(reg: &Registry) -> String {
         let _ = writeln!(
             s,
             "    MetricMeta {{ key: MetricKey::{}, name: \"{}\", column: \"{}\", \
-             label: \"{}\", unit: \"{}\", tier: Tier::{}, field_number: {}, \
-             legacy_rest_keys: &[{}] }},",
+             label: \"{}\", unit: \"{}\", tier: Tier::{}, sql_type: SqlType::{:?}, \
+             field_number: {}, legacy_rest_keys: &[{}] }},",
             pascal(&m.key),
             m.key,
             m.column,
@@ -536,8 +624,48 @@ fn rust_metrics(reg: &Registry) -> String {
                 Tier::Core => "Core",
                 Tier::Extended => "Extended",
             },
+            m.sql_type,
             m.field_number,
             keys.join(", ")
+        );
+    }
+    s.push_str("];\n\n");
+
+    // The dimensions, as data. The writer needs them because `observations` has four
+    // columns that are not metrics, and a *fifth* stored dimension added to the registry
+    // must not become a column the writer silently never fills -- `mw_store`'s writer
+    // asserts this list against the four it knows and refuses to build otherwise.
+    s.push_str(
+        "// The reading's dimensions (docs/metric-registry.md \u{a7}1). `stored` is false for a\n\
+         // `metadata` dimension, which reaches the daemon on the wire and is never a column.\n\n\
+         #[derive(Debug, Clone, Copy)]\n\
+         pub struct DimensionMeta {\n\
+         \x20   /// The registry's stable key, which is also the Rust field name.\n\
+         \x20   pub name: &'static str,\n\
+         \x20   /// The column, where there is one. Empty for a `metadata` dimension.\n\
+         \x20   pub column: &'static str,\n\
+         \x20   pub sql_type: SqlType,\n\
+         \x20   /// Whether this dimension occupies a column of the raw hypertable.\n\
+         \x20   pub stored: bool,\n\
+         \x20   /// Whether the field is an `Option`.\n\
+         \x20   pub optional: bool,\n\
+         }\n\n",
+    );
+    let _ = writeln!(
+        s,
+        "pub static DIMENSIONS: [DimensionMeta; {}] = [",
+        reg.live_dimensions().len()
+    );
+    for d in reg.live_dimensions() {
+        let _ = writeln!(
+            s,
+            "    DimensionMeta {{ name: \"{}\", column: \"{}\", sql_type: SqlType::{:?}, \
+             stored: {}, optional: {} }},",
+            d.key,
+            if d.role.stored() { &d.column } else { "" },
+            d.sql_type,
+            d.role.stored(),
+            d.role.optional()
         );
     }
     s.push_str("];\n\n");

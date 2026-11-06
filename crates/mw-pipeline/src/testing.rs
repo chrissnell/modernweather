@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use mw_component::{ComponentId, FrameMeta, IdentitySource, Reject, StationRegistry};
+use mw_component::{ComponentId, FrameMeta, IdentitySource, Reject, StationMeta, StationRegistry};
 use mw_types::{Envelope, OriginId, PartialReading, Provenance, Reading, Seq, StationKey};
 
 use crate::clock::{Clock, TestClock};
@@ -147,6 +147,10 @@ pub struct MemoryRegistry {
     fixed: Mutex<Option<StationKey>>,
     presented: Mutex<BTreeMap<String, StationKey>>,
     refuse: Mutex<Option<Reject>>,
+    /// What `metadata` answers, for every station. One set rather than a map because the
+    /// enrich stage's own tests cover the per-station shape and what a *pipeline* test
+    /// needs is "this station has coordinates" or "it has none".
+    meta: Mutex<StationMeta>,
 }
 
 impl MemoryRegistry {
@@ -164,6 +168,12 @@ impl MemoryRegistry {
             refuse: Mutex::new(Some(reason)),
             ..Self::default()
         })
+    }
+
+    /// What `metadata` will answer. `StationMeta::EMPTY` until this is called, which is
+    /// the state a station with no configured coordinates is in.
+    pub fn with_metadata(&self, meta: StationMeta) {
+        *self.meta.lock().expect("the test registry is not poisoned") = meta;
     }
 
     /// Map a presented key to a station.
@@ -196,5 +206,16 @@ impl StationRegistry for MemoryRegistry {
                 .ok_or(Reject::UnknownStation),
             (_, None) => Err(Reject::UnknownStation),
         }
+    }
+
+    fn metadata(&self, _station: &StationKey) -> StationMeta {
+        *self.meta.lock().expect("not poisoned")
+    }
+
+    /// `None`: a spool test asserts what was appended, and the `stations` projection is
+    /// the writer's concern. `crates/mw-store/tests/db.rs` is where it is asserted against
+    /// the table it populates.
+    fn projection(&self, _station: &StationKey) -> Option<mw_component::StationProjection> {
+        None
     }
 }

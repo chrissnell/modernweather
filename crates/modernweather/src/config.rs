@@ -57,6 +57,15 @@ pub struct Config {
     /// one that cannot store anything.
     pub(crate) ingress: Option<Arc<dyn Ingress>>,
 
+    /// The published station registry, once the snapshot is built.
+    ///
+    /// Held here rather than only inside the ingress because **two** registrars need it:
+    /// `mw-station`'s, through the `Ingress` above, and `db:postgres`, whose writer copies
+    /// `config.stations` into the weather schema's read-side projection (**D-56**). One
+    /// snapshot, two readers — a second `ConfigRegistry` would be a second answer to
+    /// "where is this station", which is the one question W2a §4a.6 makes a single gate.
+    pub(crate) registry: Option<Arc<dyn mw_component::StationRegistry>>,
+
     /// The generation these rows were read at (**D-53**).
     ///
     /// `ZERO` until something can bump it: a generation is assigned by `ConfigAdmin` on
@@ -77,6 +86,7 @@ impl Config {
             declared_stations: stations.iter().map(declare).collect(),
             stations,
             ingress: None,
+            registry: None,
             generation: Generation::ZERO,
         })
     }
@@ -88,6 +98,11 @@ impl Config {
     /// travels this way rather than off the capability bus.
     pub fn set_ingress(&mut self, ingress: Arc<dyn Ingress>) {
         self.ingress = Some(ingress);
+    }
+
+    /// Hand the configuration the published station registry.
+    pub fn set_registry(&mut self, registry: Arc<dyn mw_component::StationRegistry>) {
+        self.registry = Some(registry);
     }
 
     /// The address the one listener binds, and therefore where `/metrics` is served.
@@ -136,6 +151,7 @@ impl std::fmt::Debug for Config {
             .field("node", &self.node)
             .field("stations", &self.stations.len())
             .field("ingress", &self.ingress.is_some())
+            .field("registry", &self.registry.is_some())
             .field("generation", &self.generation)
             .finish()
     }
@@ -197,6 +213,7 @@ mod tests {
             stations: Vec::new(),
             declared_stations: Vec::new(),
             ingress: None,
+            registry: None,
             listener: Listener {
                 listen_addr: addr.to_string(),
                 http_port: port,
