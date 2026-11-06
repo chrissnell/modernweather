@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use mw_component::{
     Builder, Capability, ComponentError, ComponentId, ComponentSpec, Cx, Provision, Publisher,
-    ReadingSink, Serve, StationRegistry, Trigger,
+    Serve, StationRegistry, Store, Trigger,
 };
 use mw_types::{Class, Classify, DisplayChain};
 use secrecy::ExposeSecret as _;
@@ -44,8 +44,8 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 
+use crate::store::TimescaleStore;
 use crate::version::{self, VersionError};
-use crate::writer::TimescaleWriter;
 
 /// The component's id. A constant because three other places name it: the spec, the log
 /// lines, and `writer:timescale`'s `Waiting { provider }`.
@@ -102,7 +102,7 @@ pub fn spec(
             let url = url.clone();
             let registry = Arc::clone(&registry);
             async move {
-                let publisher = cx.publisher::<Arc<dyn ReadingSink>>()?;
+                let publisher = cx.publisher::<Arc<dyn Store>>()?;
                 Ok(Pool {
                     url,
                     registry,
@@ -141,7 +141,7 @@ fn url_digest_input(url: &secrecy::SecretString) -> &str {
 struct Pool {
     url: secrecy::SecretString,
     registry: Arc<dyn StationRegistry>,
-    publisher: Publisher<Arc<dyn ReadingSink>>,
+    publisher: Publisher<Arc<dyn Store>>,
 }
 
 impl std::fmt::Debug for Pool {
@@ -170,8 +170,8 @@ impl Pool {
             Err(outcome) => return outcome,
         };
 
-        let writer = match TimescaleWriter::new(pool.clone(), Arc::clone(&self.registry)) {
-            Ok(writer) => writer,
+        let store = match TimescaleStore::new(pool.clone(), Arc::clone(&self.registry)) {
+            Ok(store) => store,
             Err(e) => {
                 pool.close().await;
                 // A build/registry disagreement, not a database problem. The next attempt
@@ -182,12 +182,12 @@ impl Pool {
             }
         };
         info!(
-            columns = writer.columns(),
+            write_columns = store.write_columns(),
+            read_columns = store.read_columns(),
             pool = POOL_SIZE,
             "the weather database is usable"
         );
-        self.publisher
-            .publish(Arc::new(writer) as Arc<dyn ReadingSink>);
+        self.publisher.publish(Arc::new(store) as Arc<dyn Store>);
 
         // The probe loop. W2a §3.4's worked example is explicit about where this ends:
         // `db:postgres` "probe fails -> revokes ReadingStore ... -> **Failed -> Backoff**",
@@ -415,7 +415,7 @@ mod tests {
         );
         let build = mw_component::BuildCx::new(cx.clone(), access);
         let publisher = build
-            .publisher::<Arc<dyn ReadingSink>>()
+            .publisher::<Arc<dyn Store>>()
             .expect("the spec declares this provision");
         (
             Box::new(Pool {

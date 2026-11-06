@@ -44,9 +44,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use chrono::{DateTime, TimeZone, Utc};
-use mw_component::{ReadingSink, StationRegistry};
+use mw_component::{
+    BucketLevel, BucketQuery, Piece, ReadingSink, ReadingStore, SeriesQuery, StationRegistry,
+    TotalsQuery,
+};
 use mw_store::config_db::StationRow;
-use mw_store::{version, ConfigRegistry, RegistrySnapshot, TimescaleWriter};
+use mw_store::{version, ConfigRegistry, RegistrySnapshot, TimescaleReader, TimescaleWriter};
 use mw_types::{Envelope, OriginId, Provenance, Reading, Seq, StationKey, DIMENSIONS, METRICS};
 use sqlx::{PgPool, Row};
 
@@ -1186,4 +1189,486 @@ async fn a_full_batch_of_256_is_one_statement() {
     assert_eq!(first, Some(40.0));
     assert_eq!(last, Some(40.0 + 255.0 / 8.0));
     touched(&pool, "a_full_batch_of_256_is_one_statement").await;
+}
+
+// ---------------------------------------------------------------------------------------
+// The read half — implementation-plan.md M3-4
+// ---------------------------------------------------------------------------------------
+
+/// Refresh the aggregate hierarchy over `[from, to)`, bottom level first.
+///
+/// Every level is `materialized_only = true` (the W4 migration says why: TimescaleDB
+/// cannot build an aggregate on a real-time aggregate), so an unrefreshed bucket returns
+/// **no row** rather than a partial one — and each level reads the level below it
+/// (**D-11**), so the order is load-bearing. In the daemon this is four policy jobs on four
+/// staggered schedules; in a test it has to be done by hand or the reads below find
+/// nothing.
+///
+/// The window is widened to whole buckets **per level**, because
+/// `refresh_continuous_aggregate` refuses a window narrower than one of the view's own
+/// buckets — "refresh window too small" — and a ten-minute range is narrower than a day.
+/// Widening is also what the real policies do: each one's `start_offset` covers several
+/// buckets so that a late or replayed reading in a recent bucket is picked up.
+async fn materialise(pool: &PgPool, from: DateTime<Utc>, to: DateTime<Utc>) {
+    for (view, bucket) in [
+        ("observations_1m", 60i64),
+        ("observations_5m", 300),
+        ("observations_1h", 3600),
+        ("observations_1d", 86_400),
+    ] {
+        let lo = from.timestamp() - from.timestamp().rem_euclid(bucket);
+        let floored = to.timestamp() - to.timestamp().rem_euclid(bucket);
+        let hi = if floored == to.timestamp() {
+            to.timestamp()
+        } else {
+            floored + bucket
+        };
+        sqlx::query(&format!(
+            "CALL refresh_continuous_aggregate('{view}', $1, $2)"
+        ))
+        .bind(at(lo))
+        .bind(at(hi.max(lo + bucket)))
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("refreshing {view}: {e}"));
+    }
+}
+
+/// **M3-4's first done-criterion: a ten-minute mean over the rolled-up buckets equals the
+/// same mean computed directly from raw.**
+///
+/// Ten minutes with **uneven** counts, which is the case that distinguishes a correct
+/// roll-up from the obvious wrong one: minute *k* carries *k+1* readings, so the mean of
+/// the per-minute means is not the mean of the readings. **D-12** measured that
+/// `avg(avg(x))` disagreed with the direct average in 658 of 868 real bucket pairs and in
+/// **all 56** uneven ones.
+///
+/// What this covers and what it does not, stated because the two halves are in two crates
+/// that may not name each other (`ci/layers.toml` puts `mw-store` and `mw-pipeline` in the
+/// same layer):
+///
+/// - **Here**: that `observations_1m`'s `_sum` and `_count` really are the sum and count of
+///   the raw readings, that [`TimescaleReader::buckets`] returns them in the positions
+///   `mw_types::LEVELS[0].columns` declares, and that `Σsum / Σcount` over ten of them is
+///   `avg()` over the raw rows — the database half, which no unit test can assert.
+/// - **`mw_pipeline::rollup::ring`**: that `Ring::resolve` performs exactly that expression
+///   for `Agg::Mean`, and the same for the other four strategies. The arithmetic below is
+///   the same expression deliberately, so the two are checkable against each other by
+///   reading them.
+#[tokio::test]
+#[ignore = "needs a real TimescaleDB; run `cargo xtask db-tests`"]
+async fn a_ten_minute_mean_over_the_rolled_up_buckets_equals_the_mean_from_raw() {
+    let station = "db-tests:rollup-mean";
+    let pool = prepare(&[station]).await;
+    let w = writer(&pool, station);
+
+    // 2026-01-05T00:00:00Z, well away from every other test's window so that the
+    // continuous-aggregate refresh below is cheap.
+    let base = 1_767_571_200i64;
+    let mut batch: Vec<Envelope> = Vec::new();
+    let mut seq = 0u64;
+    for minute in 0..10i64 {
+        // Minute k carries k+1 readings, each 1 degree apart from a per-minute base, so
+        // the counts are uneven and the per-minute means differ.
+        for reading in 0..=minute {
+            seq += 1;
+            batch.push(envelope(
+                station,
+                at(base + minute * 60 + reading),
+                seq,
+                Reading {
+                    out_temp: Some(40.0 + (minute * 10 + reading) as f32),
+                    wind_speed: Some(2.0 + minute as f32),
+                    ..Reading::default()
+                },
+            ));
+        }
+    }
+    let expected_rows = batch.len();
+    w.store(&batch).await.expect("the readings are stored");
+    materialise(&pool, at(base), at(base + 600)).await;
+
+    // What the database says, directly from raw. `avg(real)` returns double precision, so
+    // this is the same accumulation width the aggregate uses (**D-14**).
+    let direct: f64 = sqlx::query_scalar(
+        "SELECT avg(outtemp)::float8 FROM observations
+         WHERE station_id = $1 AND time >= $2 AND time < $3",
+    )
+    .bind(station)
+    .bind(at(base))
+    .bind(at(base + 600))
+    .fetch_one(&pool)
+    .await
+    .expect("the raw average");
+
+    // What the read half says, rolled up. The same expression
+    // `mw_pipeline::rollup::ring::Ring::resolve` evaluates for `Agg::Mean`.
+    let reader = TimescaleReader::new(pool.clone());
+    let buckets = reader
+        .buckets(BucketQuery {
+            station: StationKey::new(station),
+            since: at(base),
+            limit: 60,
+        })
+        .await
+        .expect("the 1-minute level is materialised");
+    assert_eq!(buckets.len(), 10, "ten minutes, ten buckets");
+    assert!(
+        buckets.windows(2).all(|w| w[0].bucket < w[1].bucket),
+        "oldest first, which is what an incremental refresh resumes from"
+    );
+    let columns = mw_types::LEVELS
+        .iter()
+        .find(|l| l.name == "1m")
+        .map(|l| l.columns)
+        .expect("the 1-minute level");
+    for b in &buckets {
+        assert_eq!(
+            b.values.len(),
+            columns.len(),
+            "one value per declared column, which is what lets a consumer index"
+        );
+    }
+    let position = |name: &str| {
+        columns
+            .iter()
+            .position(|c| c.column == name)
+            .unwrap_or_else(|| panic!("{name} is not a 1-minute column"))
+    };
+    let (sum_at, count_at) = (position("outtemp_sum"), position("outtemp_count"));
+    let mut total = 0.0f64;
+    let mut n = 0.0f64;
+    for b in &buckets {
+        if let (Some(s), Some(c)) = (b.values[sum_at], b.values[count_at]) {
+            total += s;
+            n += c;
+        }
+    }
+    assert!(n > 0.0, "ten buckets of readings");
+    assert_eq!(n as usize, expected_rows, "every reading is counted once");
+    let rolled = total / n;
+
+    // The two agree. Asserted as an exact difference rather than an epsilon chosen for
+    // comfort: both sides accumulate `outtemp::double precision` over the same values, so
+    // the only room for disagreement is summation order, and the figure this prints is
+    // what the PR reports.
+    assert!(
+        (rolled - direct).abs() < 1e-9,
+        "rolled up {rolled}, direct {direct}, difference {}",
+        rolled - direct
+    );
+
+    // **And the wrong answer is a long way away**, which is what makes the assertion above
+    // mean something. The mean of the per-minute means is what `avg(avg(x))` would give.
+    let mean_of_means: f64 = buckets
+        .iter()
+        .filter_map(|b| match (b.values[sum_at], b.values[count_at]) {
+            (Some(s), Some(c)) if c > 0.0 => Some(s / c),
+            _ => None,
+        })
+        .sum::<f64>()
+        / buckets.len() as f64;
+    assert!(
+        (mean_of_means - rolled).abs() > 1.0,
+        "the uneven counts have to make avg(avg(x)) wrong for this test to be testing \
+         anything: mean-of-means {mean_of_means}, correct {rolled}"
+    );
+
+    // The max follows the same path and is exact for a different reason: the max of the
+    // per-bucket maxima **is** the max of the readings, which is why a ten-minute wind gust
+    // needs no raw access even though `calculate_wind_gust` reads raw.
+    let max_at = position("windspeed_max");
+    let gust = buckets
+        .iter()
+        .filter_map(|b| b.values[max_at])
+        .fold(f64::NEG_INFINITY, f64::max);
+    let direct_gust: f64 = sqlx::query_scalar(
+        "SELECT max(windspeed)::float8 FROM observations
+         WHERE station_id = $1 AND time >= $2 AND time < $3",
+    )
+    .bind(station)
+    .bind(at(base))
+    .bind(at(base + 600))
+    .fetch_one(&pool)
+    .await
+    .expect("the raw maximum");
+    assert!(
+        (gust - direct_gust).abs() < 1e-9,
+        "{gust} against {direct_gust}"
+    );
+
+    // A metric nothing reported is NULL in the bucket state too, so an empty window is
+    // absent rather than zero (**D-26**) all the way down.
+    let unreported = position("soiltemp4_sum");
+    assert!(buckets.iter().all(|b| b.values[unreported].is_none()));
+
+    touched(
+        &pool,
+        "a_ten_minute_mean_over_the_rolled_up_buckets_equals_the_mean_from_raw",
+    )
+    .await;
+}
+
+/// **The decomposition's exactness claim, against the database.** A range stitched from day
+/// buckets with hour and minute edges sums to the same total as the raw rows it covers.
+///
+/// This is what makes a station-local month affordable: a local month in `America/Denver`
+/// begins at `07:00Z`, which is on the 1-hour grid and not the 1-day one, so the shape is
+/// *hour edges around day buckets*. **D-13** is why it is exact rather than close — a 1-day
+/// bucket's `rainincremental_total` is the sum of its 24 hourly totals, which are the sums
+/// of their 1-minute totals, every addition in double precision (**D-14**).
+///
+/// The Go equivalent stitches the same levels and loses up to five minutes of rain from
+/// every figure: `update_rainfall_summary` reads raw rows `>= date_trunc('hour', NOW()) +
+/// (minute/5*5) minutes`, so the 5-minute bucket in progress is counted by neither its
+/// aggregate term nor its raw term.
+#[tokio::test]
+#[ignore = "needs a real TimescaleDB; run `cargo xtask db-tests`"]
+async fn a_range_stitched_across_three_levels_totals_the_same_as_raw() {
+    let station = "db-tests:rollup-stitch";
+    let pool = prepare(&[station]).await;
+    let w = writer(&pool, station);
+
+    // 2026-01-07T00:00:00Z. Three days of rain, one hundredth of an inch every ten
+    // minutes, so the total over any range is a count of ten-minute slots.
+    let base = 1_767_744_000i64;
+    let minutes = 3 * 24 * 60;
+    let mut seq = 0u64;
+    for chunk in (0..minutes).step_by(256) {
+        let batch: Vec<Envelope> = (chunk..(chunk + 256).min(minutes))
+            .map(|m| {
+                seq += 1;
+                envelope(
+                    station,
+                    at(base + m * 60),
+                    seq,
+                    Reading {
+                        rain_incremental: if m % 10 == 0 { Some(0.01) } else { None },
+                        ..Reading::default()
+                    },
+                )
+            })
+            .collect();
+        w.store(&batch).await.expect("stored");
+    }
+    materialise(&pool, at(base), at(base + minutes * 60)).await;
+
+    let reader = TimescaleReader::new(pool.clone());
+    // A range whose ends are on neither the day nor the hour grid, which is the shape a
+    // station-local month in a 45-minute zone has: 2026-01-07T07:15Z to 2026-01-09T18:42Z,
+    // floored to the minute.
+    let from = at(base + 7 * 3600 + 15 * 60);
+    let until = at(base + 2 * 86_400 + 18 * 3600 + 42 * 60);
+    // `now` far enough past the range that every level's refresh margin is satisfied, so
+    // the decomposition really does reach for day buckets.
+    let now = until + chrono::Duration::days(2);
+
+    // The pieces a caller builds. Re-derived here rather than imported: `mw-pipeline` owns
+    // `decompose` and `ci/layers.toml` forbids this crate from naming it, so what this
+    // test asserts is the **store's** half — that one sum per piece, across three levels,
+    // adds up to the raw total. `mw_pipeline::rollup::calendar`'s own tests assert that the
+    // pieces tile the range.
+    let hour = chrono::Duration::hours(1);
+    let first_hour = from + (hour - chrono::Duration::minutes(15));
+    let first_day = at(base + 86_400);
+    let last_day = at(base + 2 * 86_400);
+    let last_hour = until - chrono::Duration::minutes(42);
+    let pieces = vec![
+        Piece {
+            level: BucketLevel::Minute,
+            from,
+            until: first_hour,
+        },
+        Piece {
+            level: BucketLevel::Hour,
+            from: first_hour,
+            until: first_day,
+        },
+        Piece {
+            level: BucketLevel::Day,
+            from: first_day,
+            until: last_day,
+        },
+        Piece {
+            level: BucketLevel::Hour,
+            from: last_day,
+            until: last_hour,
+        },
+        Piece {
+            level: BucketLevel::Minute,
+            from: last_hour,
+            until,
+        },
+    ];
+    // The pieces really do tile the range, asserted here so that a mistake in the fixture
+    // above is a failure about the fixture rather than about the store.
+    assert_eq!(pieces[0].from, from);
+    assert_eq!(pieces.last().expect("non-empty").until, until);
+    for pair in pieces.windows(2) {
+        assert_eq!(pair[0].until, pair[1].from, "{:?} {:?}", pair[0], pair[1]);
+    }
+    assert!(
+        pieces.iter().any(|p| p.level == BucketLevel::Day),
+        "the point of the stitch is that the middle is day buckets"
+    );
+    // The margin `mw_pipeline::rollup::calendar` applies: `now` is two days past the
+    // range's end, so every level's refresh interval has certainly passed and reaching for
+    // day buckets is legitimate rather than a read of something unmaterialised.
+    assert!(now - until > chrono::Duration::hours(1));
+
+    let sums = reader
+        .totals(TotalsQuery {
+            station: StationKey::new(station),
+            metric: mw_types::MetricKey::RainIncremental,
+            pieces: pieces.clone(),
+        })
+        .await
+        .expect("every level is materialised");
+    assert_eq!(sums.len(), pieces.len(), "one answer per piece, in order");
+    let stitched: f64 = sums.iter().flatten().sum();
+
+    // **`sum(rainincremental::double precision)`, not `sum(rainincremental)::float8`**, and
+    // the difference is the whole of **D-14**: `sum(real)` accumulates in `real` and
+    // returns `real`, so casting its answer afterwards compares a float4 accumulation
+    // against a float8 one. Measured here, that disagrees in the sixth significant figure
+    // — 3.5699973106384277 against 3.569999920204282 — which is the aggregate hierarchy
+    // being *right* and the convenient query being wrong. The generated views widen every
+    // sum for exactly this reason ("sums accumulate in double precision, never in the
+    // column's own type", which the metric registry's generator says in the header of every
+    // SQL file it emits), and this is the comparison that makes them comparable.
+    let direct: f64 = sqlx::query_scalar(
+        "SELECT sum(rainincremental::double precision) FROM observations
+         WHERE station_id = $1 AND time >= $2 AND time < $3",
+    )
+    .bind(station)
+    .bind(from)
+    .bind(until)
+    .fetch_one(&pool)
+    .await
+    .expect("the raw total");
+    assert!(
+        (stitched - direct).abs() < 1e-12,
+        "stitched {stitched}, direct {direct}, difference {}",
+        stitched - direct
+    );
+    assert!(
+        direct > 0.0,
+        "there has to be rain for this to mean anything"
+    );
+
+    // A piece no bucket falls in is `None`, not `0.0` — which is what makes an offline
+    // gauge distinguishable from a dry day (**D-26**). The Go equivalents all write
+    // `COALESCE(SUM(period_rain), 0)`.
+    let empty = reader
+        .totals(TotalsQuery {
+            station: StationKey::new(station),
+            metric: mw_types::MetricKey::RainIncremental,
+            pieces: vec![Piece {
+                level: BucketLevel::Minute,
+                from: at(base - 86_400),
+                until: at(base - 86_000),
+            }],
+        })
+        .await
+        .expect("an empty range is a legitimate question");
+    assert_eq!(empty, vec![None], "no buckets is absent, not zero");
+
+    touched(
+        &pool,
+        "a_range_stitched_across_three_levels_totals_the_same_as_raw",
+    )
+    .await;
+}
+
+/// The hourly series the storm walk reads: in bucket order, with a dry hour as `None`
+/// rather than as a gap in the sequence.
+///
+/// The **shape** is the answer here rather than the sum, which is why it is a third method
+/// on the read half: a rain event ends after 24 hours with no rain, and a dry spell is not
+/// expressible as a total. The Go implementation has no concept of an event at all —
+/// `calculate_storm_rainfall` carries `-- Simple approach: storm is any rainfall in the
+/// last 24 hours`.
+#[tokio::test]
+#[ignore = "needs a real TimescaleDB; run `cargo xtask db-tests`"]
+async fn an_hourly_rain_series_is_read_in_order_with_dry_hours_absent() {
+    let station = "db-tests:rollup-series";
+    let pool = prepare(&[station]).await;
+    let w = writer(&pool, station);
+
+    // 2026-01-11T00:00:00Z, six hours, raining in the first and the last only.
+    let base = 1_768_089_600i64;
+    let batch: Vec<Envelope> = (0..6i64)
+        .map(|h| {
+            envelope(
+                station,
+                at(base + h * 3600 + 90),
+                u64::try_from(h + 1).expect("in range"),
+                Reading {
+                    rain_incremental: if h == 0 || h == 5 { Some(0.2) } else { None },
+                    out_temp: Some(35.0),
+                    ..Reading::default()
+                },
+            )
+        })
+        .collect();
+    w.store(&batch).await.expect("stored");
+    materialise(&pool, at(base), at(base + 6 * 3600)).await;
+
+    let reader = TimescaleReader::new(pool.clone());
+    let series = reader
+        .series(SeriesQuery {
+            station: StationKey::new(station),
+            metric: mw_types::MetricKey::RainIncremental,
+            level: BucketLevel::Hour,
+            since: at(base),
+            limit: 720,
+        })
+        .await
+        .expect("the hourly level is materialised");
+
+    assert_eq!(series.len(), 6, "six hours with readings in them");
+    assert!(
+        series.windows(2).all(|w| w[0].bucket < w[1].bucket),
+        "oldest first, which the dry-gap walk depends on"
+    );
+    let wet: Vec<usize> = series
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.total.is_some_and(|t| t > 0.0))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(wet, vec![0, 5], "the first and the last hour, by position");
+    assert!(
+        series[1..5].iter().all(|b| b.total.is_none()),
+        "a dry hour is NULL and not 0.0, because the bucket's sum is over no rain rows: \
+         {series:?}"
+    );
+    // Within float4's precision of 0.2, not within a double's: `rainincremental` is a
+    // `float4` column, so 0.2 is stored as 0.20000000298023224 and the bucket's
+    // double-precision sum of it is exactly that. The widening (**D-14**) protects the
+    // *accumulation* order, not the value a 4-byte column can hold.
+    let first = series[0].total.expect("the first hour had rain");
+    assert!((first - 0.2).abs() < 1e-6, "{first}");
+
+    // A metric with no declared total is a named refusal rather than an empty series: W2
+    // D-11's vocabulary doing its job.
+    let e = reader
+        .series(SeriesQuery {
+            station: StationKey::new(station),
+            metric: mw_types::MetricKey::OutTemp,
+            level: BucketLevel::Hour,
+            since: at(base),
+            limit: 720,
+        })
+        .await
+        .expect_err("out_temp declares mean, min and max and no total");
+    let chain = mw_types::DisplayChain(&e).to_string();
+    assert!(chain.contains("OutTemp"), "{chain}");
+    assert!(chain.contains("does not declare a `total`"), "{chain}");
+
+    touched(
+        &pool,
+        "an_hourly_rain_series_is_read_in_order_with_dry_hours_absent",
+    )
+    .await;
 }

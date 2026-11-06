@@ -9,7 +9,9 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Duration;
 
-use mw_types::{OriginId, StationId, StationKey};
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone as _, Utc};
+
+use mw_types::{OriginId, StationKey};
 
 /// When a component runs.
 ///
@@ -233,6 +235,66 @@ impl Zone {
     pub fn name(self) -> &'static str {
         self.0.name()
     }
+
+    /// The instant a local date and time happens at in this zone, applying W2a §1.6's DST
+    /// rules.
+    ///
+    /// - **Spring forward** (a local time that does not exist): the **first instant that
+    ///   exists after the gap**. The occurrence is not skipped, because a daily rollover
+    ///   that silently does not happen once a year is the worst possible failure mode — it
+    ///   is invisible and it corrupts one day's totals. The same reasoning
+    ///   [`CronSpec::Monthly`] clamps the 31st of February for.
+    /// - **Fall back** (a local time that happens twice): the **first** occurrence only.
+    ///   [`crate::OccurrenceKey`] is keyed on local date and slot rather than on the
+    ///   instant, so the second pass is recognised as already completed rather than
+    ///   double-counting a rollover.
+    ///
+    /// `None` only for a time of day that is not one — an hour or minute out of range,
+    /// which [`LocalTime::is_valid`] is the plan-time check for — or for a gap longer than
+    /// any in the zone database.
+    ///
+    /// **Here rather than in the supervisor's clock, which is where it was written.** Two
+    /// things now need it and they are in the same layer, so neither may name the other:
+    /// `mw_supervisor::clock` computes a `Calendar` occurrence, and `mw_pipeline`'s rollup
+    /// computes the first instant of a station's local day, month and year to accumulate
+    /// from. A copy in each is a copy that can disagree, and the thing it would disagree
+    /// about is which instant a rollover happens at — so it lives once, in the crate that
+    /// already owns [`Zone`] and [`LocalTime`], exactly as `IdentitySource::schema_name`
+    /// does for the two crates that parse that column.
+    pub fn at(self, date: NaiveDate, time: LocalTime) -> Option<DateTime<Utc>> {
+        let naive = NaiveTime::from_hms_opt(u32::from(time.hour), u32::from(time.minute), 0)?;
+        let tz = self.tz();
+        match tz.from_local_datetime(&date.and_time(naive)) {
+            chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&Utc)),
+            chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest.with_timezone(&Utc)),
+            chrono::LocalResult::None => {
+                // Walk forward a minute at a time to the first instant on the far side of
+                // the gap. Observed gaps are 30 or 60 minutes; two hours is the largest in
+                // the zone database, and 180 is a bound rather than an expectation.
+                for minutes in 1..=180 {
+                    let candidate = date.and_time(naive) + chrono::Duration::minutes(minutes);
+                    match tz.from_local_datetime(&candidate) {
+                        chrono::LocalResult::Single(dt) => return Some(dt.with_timezone(&Utc)),
+                        chrono::LocalResult::Ambiguous(earliest, _) => {
+                            return Some(earliest.with_timezone(&Utc))
+                        }
+                        chrono::LocalResult::None => {}
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// The local date an instant falls on in this zone.
+    ///
+    /// The other half of [`Zone::at`], and the half a rollover needs to know *which* day it
+    /// is closing: `Zone::at(zone.date_of(now), LocalTime::MIDNIGHT)` is the first instant
+    /// of the local day `now` is in, which is what `date_trunc('day', NOW())` is trying and
+    /// failing to be.
+    pub fn date_of(self, at: DateTime<Utc>) -> NaiveDate {
+        at.with_timezone(&self.tz()).date_naive()
+    }
 }
 
 impl fmt::Display for Zone {
@@ -260,12 +322,19 @@ pub enum ZoneError {
 /// silent fallback to UTC. That fallback is exactly what the Go rollovers do today:
 /// `date_trunc('day', NOW())` truncates in the database server's zone and the device's
 /// declared `timezone` is used nowhere but rendering sun times.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TzSource {
     /// The station's zone.
     Station {
         /// Whose zone it is.
-        station: StationId,
+        ///
+        /// The **text** domain identity, not `mw_types::StationId`'s surrogate integer.
+        /// This field is what a `PlanError::MissingTimeZone` renders, and the whole value
+        /// of that error is that an operator can go and fix the row it names — "station 7"
+        /// is not that sentence. The weather schema made the same call for the same
+        /// reason: W4's migration keys `stations` on `station_id text` and its comment
+        /// explains why a surrogate was rejected.
+        station: StationKey,
         /// The resolved zone, if the station has a usable one.
         zone: Option<Zone>,
     },
@@ -285,9 +354,9 @@ impl TzSource {
     }
 
     /// Which station's zone this is, for the plan error's message.
-    pub fn station(&self) -> Option<StationId> {
+    pub fn station(&self) -> Option<&StationKey> {
         match self {
-            TzSource::Station { station, .. } => Some(*station),
+            TzSource::Station { station, .. } => Some(station),
             TzSource::Deployment { .. } => None,
         }
     }

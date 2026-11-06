@@ -212,14 +212,14 @@ pub enum PlanError {
     ///
     /// A plan error rather than a silent fallback to UTC, which is what every rollover in
     /// the Go tree does today (W2a Decision 11).
-    #[error("{}", missing_zone(id, *station))]
+    #[error("{}", missing_zone(id, station.as_ref()))]
     MissingTimeZone {
         /// The component.
         id: ComponentId,
         /// The station whose zone was asked for, or `None` for the deployment default —
         /// which renders differently, because "the time zone of station the deployment
         /// default" is not a sentence.
-        station: Option<mw_types::StationId>,
+        station: Option<mw_types::StationKey>,
     },
 
     /// A trigger and a body that do not agree — a `Service` with a `Tick`, say. The
@@ -243,10 +243,14 @@ pub enum PlanError {
     },
 }
 
-fn missing_zone(id: &ComponentId, station: Option<mw_types::StationId>) -> String {
+fn missing_zone(id: &ComponentId, station: Option<&mw_types::StationKey>) -> String {
     match station {
         Some(station) => format!(
-            "`{id}` schedules in the time zone of station {station}, which has none that is valid"
+            "`{id}` schedules in station `{station}`'s time zone and that station has no \
+             valid IANA one. Set `config.stations.timezone` for it: a rainfall day, month \
+             and year roll over at the station's own midnight (W3 D-24), and there is no \
+             boundary to accumulate from without a zone. A blank or absent value is what \
+             makes the rollover happen in the database server's zone instead."
         ),
         None => format!(
             "`{id}` schedules in the deployment's default time zone, which is not set to a \

@@ -24,8 +24,9 @@
 
 use std::sync::Arc;
 
-use mw_component::{Generation, Ingress};
+use mw_component::{Generation, Ingress, Zone};
 use mw_store::config_db::{self, ConfigDbError, Listener, Node, WeatherDatabase};
+use mw_types::StationKey;
 use sqlx::SqlitePool;
 
 /// Everything `plan()` and the boot sequence read from the configuration database.
@@ -66,6 +67,22 @@ pub struct Config {
     /// "where is this station", which is the one question W2a §4a.6 makes a single gate.
     pub(crate) registry: Option<Arc<dyn mw_component::StationRegistry>>,
 
+    /// The maintained window values, once `main` has built them.
+    ///
+    /// A root resource `main` owns, like the SQLite pool, the spool and the registry — and
+    /// here for the same reason the ingress is: **two** components write it,
+    /// `window:rollup` and `rain:rollover:<station>`, and the capability bus holds one
+    /// handle *type* per provider. `mw_pipeline::rollup`'s module documentation has the
+    /// whole of that argument.
+    pub(crate) rollup: Option<Arc<mw_pipeline::RollupState>>,
+
+    /// Every station and its **resolved** time zone, in station-key order.
+    ///
+    /// Taken from the registry snapshot rather than re-parsed, because the parse is the
+    /// validation (W2a Decision 11) and it already happened there: a second parse would be
+    /// a second answer to "which midnight does this station's day begin at".
+    pub(crate) station_zones: Vec<(StationKey, Option<Zone>)>,
+
     /// The generation these rows were read at (**D-53**).
     ///
     /// `ZERO` until something can bump it: a generation is assigned by `ConfigAdmin` on
@@ -87,6 +104,8 @@ impl Config {
             stations,
             ingress: None,
             registry: None,
+            rollup: None,
+            station_zones: Vec::new(),
             generation: Generation::ZERO,
         })
     }
@@ -100,9 +119,25 @@ impl Config {
         self.ingress = Some(ingress);
     }
 
-    /// Hand the configuration the published station registry.
-    pub fn set_registry(&mut self, registry: Arc<dyn mw_component::StationRegistry>) {
+    /// Hand the configuration the published station registry, and the resolved zones the
+    /// same snapshot produced.
+    ///
+    /// One call rather than two, because the zones come out of the snapshot the registry is
+    /// built from and splitting them would make it possible to publish one without the
+    /// other — which is a plan with a `TzSource::Station` that disagrees with the gate about
+    /// what the station's zone is.
+    pub fn set_registry(
+        &mut self,
+        registry: Arc<dyn mw_component::StationRegistry>,
+        zones: Vec<(StationKey, Option<Zone>)>,
+    ) {
         self.registry = Some(registry);
+        self.station_zones = zones;
+    }
+
+    /// Hand the configuration the maintained window values.
+    pub fn set_rollup(&mut self, rollup: Arc<mw_pipeline::RollupState>) {
+        self.rollup = Some(rollup);
     }
 
     /// The address the one listener binds, and therefore where `/metrics` is served.
@@ -152,6 +187,7 @@ impl std::fmt::Debug for Config {
             .field("stations", &self.stations.len())
             .field("ingress", &self.ingress.is_some())
             .field("registry", &self.registry.is_some())
+            .field("rollup", &self.rollup.is_some())
             .field("generation", &self.generation)
             .finish()
     }
@@ -164,6 +200,37 @@ impl mw_station::StationConfig for Config {
 
     fn ingress(&self) -> Option<&Arc<dyn Ingress>> {
         self.ingress.as_ref()
+    }
+}
+
+impl mw_pipeline::RollupConfig for Config {
+    fn has_weather_database(&self) -> bool {
+        self.weather_database.is_some()
+    }
+
+    fn rollup_state(&self) -> Option<&Arc<mw_pipeline::RollupState>> {
+        self.rollup.as_ref()
+    }
+
+    /// Only the stations this node **collects** for.
+    ///
+    /// A station with no `transport_kind` is one a peer forwards readings for — inventory
+    /// on this node rather than a component (`mw_station::config`) — and a disabled one has
+    /// collection switched off (W5 §1.2). Neither has windows to maintain, and emitting a
+    /// `rain:rollover` for either would make a configuration refuse to plan over a station
+    /// that is not reporting.
+    fn rollup_stations(&self) -> Vec<(StationKey, Option<Zone>)> {
+        let collecting: std::collections::BTreeSet<&str> = self
+            .stations
+            .iter()
+            .filter(|r| r.enabled && r.transport_kind.is_some())
+            .map(|r| r.station_key.as_str())
+            .collect();
+        self.station_zones
+            .iter()
+            .filter(|(key, _)| collecting.contains(key.as_str()))
+            .map(|(key, zone)| (key.clone(), *zone))
+            .collect()
     }
 }
 
@@ -214,6 +281,8 @@ mod tests {
             declared_stations: Vec::new(),
             ingress: None,
             registry: None,
+            rollup: None,
+            station_zones: Vec::new(),
             listener: Listener {
                 listen_addr: addr.to_string(),
                 http_port: port,

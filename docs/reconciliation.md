@@ -2248,8 +2248,8 @@ A-W2-1 and A-W2-2, W2a's D-30 split, W3's A-W3-1 to A-W3-4, W4's A-W4-1 to A-W4-
 A-W5-3, W7's A-W7-1 to A-W7-4, W8's A-1 to A-4 and W9's A-W9-1 to A-W9-3. All are applied there under
 the protocol; none is edited in place. See `docs/DESIGN.md`'s `## Amendments` section.
 
-This document proposes **one** amendment of its own, which is not to a decision. A second was
-appended later by an implementation item and is marked as such.
+This document proposes **one** amendment of its own, which is not to a decision. Three more
+were appended later by implementation items and are marked as such.
 
 **A-M3-3-1 — D-56's `admit` half is not expressible, and lands on the writer instead.**
 *Proposed by implementation-plan.md **M3-3**, 2026-11-05. Not applied: the protocol above reserves
@@ -2293,6 +2293,87 @@ C-W4-20 — W4 identified the gap precisely and only lacked the authority to pla
 the upsert on `admit` because `admit` is where the station is resolved. That is true and it is not
 sufficient: having the *data* is not the same as being allowed to do the *write*, and D-87 was
 decided in the same ledger.
+
+**A-M3-4-1 — the reading store's two halves are published as one handle.**
+*Proposed by implementation-plan.md **M3-4**, 2026-11-06. Not applied: the protocol above
+reserves that for a work item that owns the ledger.*
+
+*What was found.* **D-30** keeps the read and the write halves of the reading store as two
+traits, "named separately so nobody makes the website a sink", and `mw_component::store`'s
+module documentation (written by M3-3) left the next item a choice it could not make for
+itself: `db:postgres` publishes exactly one handle per capability, and until M3-4 that
+handle was the write half alone. Two shapes were available —
+
+1. one published handle offering both halves, each still its own trait; or
+2. the write half travelling outside the capability bus, which is what `Ingress` does
+   today.
+
+*What was chosen, and why the alternative was not available.* **Shape 1.** The `Ingress`
+precedent works because `main` *constructs* the spool, so it has something to hand to the
+configuration before `plan()` runs. The pool does not exist until `db:postgres`'s own task
+has connected and asserted **D-62** against it, so there is nothing for a registrar to hand
+anybody. Making shape 2 work would mean moving the pool into `main` as a fourth root
+resource — which is the `ValidateTimescaleDBConfig`-in-a-constructor shape **D-27** rejects,
+and which W2a §4.1 split `db:postgres` from `writer:timescale` precisely to avoid.
+
+*What that means in the types.* `mw_component::Store` is a trait with **no methods of its
+own**, whose only content is `ReadingSink + ReadingStore`. The two halves stay two traits
+with two query sets in two files, and a consumer **upcasts the handle to the half it
+declared**: `writer:timescale` keeps an `Arc<dyn ReadingSink>` and `window:rollup` keeps an
+`Arc<dyn ReadingStore>`, so after `build` neither can reach the other's methods even though
+both resolved `Capability::ReadingStore`. That is W2a §4.1b's `ReadingStore H W` against
+`ReadingStore H`, enforced rather than declared. Neither half implements `CapabilityHandle`
+on its own any more, so publishing two handle *types* under one exclusive capability — the
+shape that would fail at build time with `HandleTypeMismatch` — does not compile.
+
+*Why this is an amendment at all.* It contradicts nothing. **D-30** is about the traits and
+they are untouched; what is settled is a question the design deliberately left open, and
+recording the answer is what stops M4-1 and M4-2 reopening it.
+
+**A-M3-4-2 — `Window` is an enum, and `rain:totals` is realised as two components that
+already exist.**
+*Proposed by implementation-plan.md **M3-4**, 2026-11-06. Two departures from prose, neither
+from a decision.*
+
+*The first: `Window`.* `docs/component-model.md` §4b.2 sketches `pub struct Window(Duration)`
+with `Window::DAY` among its constants. **A station's local day is not a duration.** On a
+spring-forward date it is 23 hours and on a fall-back date it is 25, so a `DAY` expressed as
+86,400 seconds is wrong twice a year in exactly the way `date_trunc('day', NOW())` is wrong
+every day — which is the defect this item exists to close. §4b.3 says as much in prose two
+paragraphs later: *"`Window::DAY` is the one window that needs a time zone, and it takes it
+from the station"*, and a type that cannot hold a zone cannot express that. So `Window` is an
+enum: `Rolling(Duration)`, `PerHour(Duration)`, `Day`, `Month`, `Year`, `Storm`. No
+`DESIGN.md` decision fixes its shape, so there is nothing to amend — but the sketch is what a
+reader will have in mind. `Agg` is untouched and is exactly **D-50**'s five.
+
+`Window::PerHour` deserves its own line, because the obvious alternative would have been a
+sixth `Agg` and **D-50** forbids that. The frozen `/latest` body's `rainrate` is
+`sum(rainincremental) over 10 minutes x 6` (`rainfall_calc.go:149`) and **not** the
+`rainrate` column the station reported — `handlers.go:344` overwrites the column's value with
+the computed one, so the contract promises the extrapolation. That is not a sixth way of
+combining bucket state; it is the same `Sum` over the same buckets, reported per hour. What
+changes is the window's units, so it is the window that says so.
+
+*The second: where the rainfall accumulation lives.* W3 §2.5's consequence 2 writes
+`rain:totals` as a pair — "a `Calendar { daily 00:00, TzSource::Station }` component for the
+boundary plus `Every { 60 s }` for the accumulation since it, so the boundary is correct by
+construction". The pair is built, and the accumulating half is **`window:rollup`** rather
+than a third component. The reason is the capability inventory: W2a §2.1 has no capability
+for the rainfall windows, `snapshot:latest` declares `WindowedView` S and nothing else that
+could carry them, and `Window::DAY` is one of the windows `WindowedView` resolves — so the
+accumulation has to be inside `WindowedView`'s provider or it is not readable at all. The
+`Calendar` half is `rain:rollover:<station>`, which declares **no capabilities**: the
+boundary is a function of a zone and the clock, and a rollover that needed `ReadingStore`
+would sit in `Waiting` through a database outage and publish an hour-late boundary when the
+server came back — a wrong `dayrain` rather than a stale one. The two share an
+`Arc<RollupState>` handed to them through the registrar, the way `Ingress` is.
+
+*What is deliberately not in this item.* **The snow totals.** M3-4's prose lists R2's whole
+set, "the snow totals" included, and those are four components over
+`Capability::SnowCache` (W3 §2a.7, `docs/component-model.md` §4.3) which `db:postgres` does
+not publish — `mw_store::pg`'s own spec test on `main` asserts that, naming M5 and M6-3 as
+the items that bring it. `snow:*` additionally needs the PELT changepoint detection and the
+RBF smoothing, which is a body of arithmetic with its own done-criteria. M6-3 builds them.
 
 **A-W6-1 — retire `remoteweather:docs/rewrite/`, and reference the Go repository by URL only.**
 

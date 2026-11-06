@@ -370,7 +370,7 @@ fn check_declarations(spec: &ComponentSpec) -> Result<(), PlanError> {
             if tz.zone().is_none() {
                 return Err(PlanError::MissingTimeZone {
                     id: spec.id.clone(),
-                    station: tz.station(),
+                    station: tz.station().cloned(),
                 });
             }
         }

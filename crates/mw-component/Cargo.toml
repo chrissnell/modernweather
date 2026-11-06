@@ -25,6 +25,9 @@ tracing.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
+# `Resolved` holds an output's declaration table inline (D-59's reason, one level down):
+# the largest table in the system is eight rows, so a resolve allocates nothing.
+smallvec.workspace = true
 # `FrameMeta::presented_secret` is a `SecretString` rather than a `String` (**D-33**): a
 # station's `?PASSWORD=` crosses this boundary on its way to a constant-time comparison,
 # and the redaction belongs to the type rather than to every log site that might touch it.
