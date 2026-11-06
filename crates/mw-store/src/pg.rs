@@ -71,9 +71,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the pool is probed once it is published.
 const PROBE_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How many consecutive probe failures revoke the handle.
+/// How many consecutive probe failures end this component (and therefore withdraw the
+/// handle).
 ///
-/// W2a §3.4: revoke when the capability is **genuinely unusable** — "a dead connection
+/// W2a §3.4: a capability is revoked when it is **genuinely unusable** — "a dead connection
 /// pool, not a single failed query". Three at ten seconds is half a minute of silence,
 /// which is longer than a PostgreSQL restart takes and shorter than the uploaders' own
 /// periods, so a server bounce does not move every consumer through `Waiting` and back.
@@ -162,7 +163,8 @@ impl Pool {
     async fn run(self: Box<Self>, cx: Cx) -> Result<(), ComponentError> {
         // Connect, assert the version, publish. A connection failure here is the ordinary
         // case on a reboot and is retried by the supervisor's backoff; a version failure
-        // is not retried, because no amount of waiting makes a server newer.
+        // is retried too, because W2a **Decision 30** forbids permanent give-up -- see
+        // `connect`.
         let pool = match self.connect(&cx).await {
             Ok(pool) => pool,
             Err(outcome) => return outcome,
@@ -172,8 +174,10 @@ impl Pool {
             Ok(writer) => writer,
             Err(e) => {
                 pool.close().await;
-                // A build/registry disagreement, not a database problem. Fatal: the next
-                // attempt binds the same columns.
+                // A build/registry disagreement, not a database problem. The next attempt
+                // binds the same columns, so this is a component that will keep failing
+                // with the column named in `last_error` -- which is the visible state
+                // Decision 30 asks for instead of a give-up.
                 return Err(ComponentError::tick("build the batch writer", e));
             }
         };
@@ -185,12 +189,28 @@ impl Pool {
         self.publisher
             .publish(Arc::new(writer) as Arc<dyn ReadingSink>);
 
-        // The probe loop. The handle stays published while the pool answers, is revoked
-        // after `FAILURES_BEFORE_REVOKE` consecutive silences, and is republished on the
-        // first success after that -- `Publisher::publish` replaces, so a reconnected pool
-        // needs no revoke first.
+        // The probe loop. W2a §3.4's worked example is explicit about where this ends:
+        // `db:postgres` "probe fails -> revokes ReadingStore ... -> **Failed -> Backoff**",
+        // while its dependents go only to `Waiting`. So a database that stops answering
+        // ends this body with an error rather than parking it in `Running` with the handle
+        // withdrawn.
+        //
+        // **That is not a violation of D-27**, and the asymmetry is the reason: a `Failed`
+        // component does not cascade (§3.4's heading is "What `Failed` does to dependents:
+        // nothing, by default"). `writer:timescale` and `window:rollup` sit in
+        // `Waiting { on: ReadingStore }` and resume on their own; the frozen routes keep
+        // serving from the snapshot. What ending the body buys is everything a parked loop
+        // cannot have: `mw_component_state{state="backoff"}` instead of a `running` gauge
+        // that is lying, `last_error` carrying the cause, `restart_total` moving, and --
+        // because the next start runs `connect` again -- a **re-assertion of D-62 against
+        // whatever is answering now**, which matters when a URL behind DNS or an HA
+        // failover comes back as a different server.
+        //
+        // The handle is withdrawn without an explicit revoke here:
+        // `mw_supervisor::Supervisor::on_exit` calls `bus.revoke_all` before it decides
+        // what to do about the exit, "so a consumer is not left holding a handle to a dead
+        // provider".
         let mut failures = 0u32;
-        let mut published = true;
         loop {
             // The one await a `Service` owns inside its own loop, which A-W6-1 makes
             // explicitly not a second clock: the supervisor owns *when this component
@@ -200,51 +220,42 @@ impl Pool {
                 () = tokio::time::sleep(PROBE_INTERVAL) => {}
             }
             match sqlx::query("SELECT 1").execute(&pool).await {
-                Ok(_) => {
-                    if !published {
-                        info!(
-                            after_failures = failures,
-                            "the weather database is answering again"
-                        );
-                        let writer = TimescaleWriter::new(pool.clone(), Arc::clone(&self.registry))
-                            .map_err(|e| ComponentError::tick("rebuild the batch writer", e))?;
-                        self.publisher
-                            .publish(Arc::new(writer) as Arc<dyn ReadingSink>);
-                        published = true;
-                    }
-                    failures = 0;
-                }
+                Ok(_) => failures = 0,
                 Err(e) => {
                     failures += 1;
-                    if published && failures >= FAILURES_BEFORE_REVOKE {
-                        // Not a `Failed` component: **D-27** is that a database outage
-                        // degrades this daemon rather than stopping it. The consumers with
-                        // a hard need go to `Waiting`, the spool keeps accepting readings,
-                        // and `/latest` keeps serving from the snapshot (§2a.6).
+                    if failures >= FAILURES_BEFORE_REVOKE {
                         error!(
                             err = %DisplayChain(&e),
                             failures,
                             "the weather database has not answered {failures} probes, so \
-                             the store handle is withdrawn. Readings keep spooling and \
-                             nothing is lost; writer:timescale is now Waiting.",
+                             this component fails and its store handle is withdrawn (W2a \
+                             §3.4). Readings keep spooling and nothing is lost; \
+                             writer:timescale moves to Waiting and resumes on its own.",
                         );
-                        self.publisher.revoke();
-                        published = false;
-                    } else {
-                        warn!(
-                            err = %DisplayChain(&e),
-                            failures,
-                            "a weather database probe failed"
-                        );
+                        pool.close().await;
+                        return Err(ComponentError::tick(
+                            "keep the weather database pool usable",
+                            mw_component::StoreError::unavailable(e),
+                        ));
                     }
+                    // Not yet: §3.4 is explicit that a capability is revoked only when it
+                    // is "genuinely unusable -- a dead connection pool, not a single
+                    // failed query". Logged, because the alternative is a database that
+                    // has been intermittent for an hour with nothing anywhere saying so.
+                    warn!(
+                        err = %DisplayChain(&e),
+                        failures,
+                        "a weather database probe failed"
+                    );
                 }
             }
         }
 
         // Cancelled. Revoke before closing, so no consumer can hold a connection from a
-        // pool that is going away -- §3.6's "a consumer must never observe a revoked
-        // capability" is the supervisor's ordering, and this is the half this component
-        // owes it.
+        // pool that is going away. The supervisor's own `revoke_all` runs on a stop too,
+        // but it cannot order itself before `pool.close()` -- §3.6's "a consumer must
+        // never observe a revoked capability" is the supervisor's ordering, and this is
+        // the half this component owes it.
         self.publisher.revoke();
         pool.close().await;
         info!("the weather database pool is closed");
@@ -276,13 +287,26 @@ impl Pool {
         let pool = match pool {
             Ok(pool) => pool,
             Err(e) => {
+                let failed = version::VersionError::Unreachable {
+                    redacted: version::redact(self.url.expose_secret()),
+                    source: e,
+                };
+                // Logged here, not left to the supervisor: it logs a state transition at
+                // `debug!`, so a database that is simply not there produced **no log line
+                // at all** from this component -- measured, over forty seconds and two
+                // restarts. This is the most ordinary failure there is and the one an
+                // operator is most likely to be looking for. The dedupe layer throttles
+                // the repeat (§5.6), so a backoff loop does not fill the log.
+                warn!(
+                    err = %DisplayChain(&failed),
+                    class = mw_types::Class::RETRYABLE.as_str(),
+                    "the weather database could not be reached; this component will retry \
+                     and nothing stops ingesting (D-27)"
+                );
                 return Err(Err(ComponentError::tick(
                     "connect to the weather database",
-                    version::VersionError::Unreachable {
-                        redacted: version::redact(self.url.expose_secret()),
-                        source: e,
-                    },
-                )))
+                    failed,
+                )));
             }
         };
         match self.assert_version(&pool).await {
@@ -429,6 +453,12 @@ mod tests {
             !chain.contains("hunter2"),
             "the configured URL carries a password and this message is logged: {chain}"
         );
+        // `Retryable`, which is **D-27**: a reboot is the ordinary case and the
+        // supervisor's backoff is the retry. Worth asserting even though it changes
+        // nothing the supervisor does today -- `ComponentError::tick` is unconditionally
+        // `Retryable` and `task::interpret` branches only on `Ignorable` -- because the
+        // class is what the log line carries and what the future `tower` stack will read.
+        assert_eq!(e.class(), mw_types::Class::RETRYABLE);
         assert!(
             bus.0.lock().expect("not poisoned").is_empty(),
             "nothing was published, so a consumer stays in Waiting rather than being \

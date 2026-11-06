@@ -25,8 +25,12 @@
 //!    emptied. That is `xtask/src/emulators.rs`'s lesson applied here: a count catches a
 //!    deleted test and does not catch a rename, so the names bind identity.
 //!
-//! Run them with `cargo xtask db-tests`, which creates the database, applies `migrations/`
-//! and sets `MW_DB_TESTS_URL`. There is no second way in, by design.
+//! Run them with `cargo xtask db-tests`. It checks that something is listening, sets
+//! `MW_DB_TESTS_URL` from the standard libpq variables, and asserts afterwards that every
+//! declared test ran and reached the database. It does **not** create a database and does
+//! not apply the migrations: `PGDATABASE` defaults to `postgres`, which is the database the
+//! `timescale/timescaledb-ha:pg17` service container already has, and [`prepare`] applies
+//! `migrations/` from inside the test process through `sqlx`'s own migrator.
 //!
 //! # Isolation
 //!
@@ -58,9 +62,11 @@ fn url() -> String {
             "MW_DB_TESTS_URL is not set.\n\
              These tests need a real TimescaleDB and W3 Decision 84 makes skipping them a \
              CI failure rather than a pass, so this is a panic and not a `return`.\n\
-             Run them with `cargo xtask db-tests`, which creates the database, applies \
-             migrations/ and sets this variable. CI runs them in the `db-tests` job \
-             against timescale/timescaledb-ha:pg17 (DESIGN.md D-2)."
+             Run them with `cargo xtask db-tests`, which sets this variable from \
+             PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE and refuses to run if nothing is \
+             listening. It does not create a database: PGDATABASE defaults to `postgres`. \
+             CI runs them in the `db-tests` job against timescale/timescaledb-ha:pg17 \
+             (DESIGN.md D-2)."
         ),
     }
 }
@@ -119,6 +125,51 @@ async fn prepare(stations: &[&str]) -> PgPool {
             .expect("the test's own projection row is removable");
     }
     pool
+}
+
+/// **Evidence that this test reached the database**, which `cargo xtask db-tests` requires
+/// of every declared test before it reports the gate green.
+///
+/// The declared names stop a filter that matched nothing and stop a rename. They do not
+/// stop a **gutted body**: a test emptied to `{}` still lists, still prints `... ok`, and
+/// still counts. This is what stops that, and the mechanism is the point — the marker is
+/// printed *after* a query, so it cannot be produced by a test that never connected.
+/// Printing it from a helper the test must call is weaker than inspecting the rows from
+/// outside, and it is what is available to a gate that deliberately carries no database
+/// client of its own.
+async fn touched(pool: &PgPool, test: &str) {
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM observations")
+        .fetch_one(pool)
+        .await
+        .expect("the test reached the database");
+
+    // Appended to a file the gate names, rather than printed. Two reasons, and the second
+    // is the one that decided it:
+    //
+    // - `--nocapture` was the obvious route and does not work. libtest interleaves a
+    //   passing test's stdout onto the same line as its own `test <name> ... ` prefix, so
+    //   the verdict stops being parseable and `ok` lands on a line of its own.
+    // - `ci/layers.toml`'s `no-stdout-logging` rule forbids this crate stdout and stderr
+    //   macros outright (§5.1: those belong on the binary's argument-parsing path and
+    //   nowhere else). A test convenience is not a reason to widen a deliberate rule --
+    //   and that rule's scan is a substring match over the whole file, so this comment
+    //   may not name the macro either.
+    //
+    // A file is unambiguous either way, needs no libtest flag, and is appended to in order
+    // because the gate runs single-threaded. When the variable is unset -- a developer
+    // running `cargo test` directly -- the query above still runs, which is the half that
+    // belongs to the test; only the recording is skipped.
+    if let Ok(path) = std::env::var("MW_DB_TESTS_EVIDENCE") {
+        if !path.is_empty() {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&path)
+                .unwrap_or_else(|e| panic!("opening the evidence file {path}: {e}"));
+            writeln!(f, "{test} observations={rows}").expect("writing the evidence file");
+        }
+    }
 }
 
 /// A `config.stations` row with coordinates, for the projection.
@@ -204,6 +255,8 @@ fn envelope(station: &str, observed_at: DateTime<Utc>, seq: u64, reading: Readin
 #[tokio::test]
 #[ignore = "needs a real TimescaleDB; run `cargo xtask db-tests`"]
 async fn the_version_probe_reads_the_server_it_is_pointed_at() {
+    // Also the migrated schema, because the marker query at the end reads `observations`.
+    let pool = prepare(&[]).await;
     let observed = version::probe(&url())
         .await
         .expect("the probe's SQL runs and its columns decode");
@@ -225,12 +278,17 @@ async fn the_version_probe_reads_the_server_it_is_pointed_at() {
     // toolkit warning and is a pass.
     version::check(&observed).expect("the container satisfies D-42's required versions");
 
-    // `probe` closes its connection on both paths, which is what keeps the server from
-    // logging an unexpected EOF. Asserted by running it again: a leaked connection would
-    // accumulate, and the pool's own limit is what would eventually say so.
+    // Repeatable, which is the half of `probe`'s contract a test can see: it opens a bare
+    // `PgConnection` rather than a pool, so three extra iterations would not approach the
+    // server's `max_connections` and this does **not** assert that the connection is
+    // closed. Closure is why `probe` calls `conn.close()` on both paths -- without it the
+    // server logs an unexpected EOF -- and asserting it would mean reading
+    // `pg_stat_activity`, which is a test about PostgreSQL's bookkeeping rather than about
+    // this function.
     for _ in 0..3 {
         version::probe(&url()).await.expect("repeatable");
     }
+    touched(&pool, "the_version_probe_reads_the_server_it_is_pointed_at").await;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -329,6 +387,11 @@ async fn readings_land_in_observations_and_an_unreported_metric_is_null() {
     assert_eq!(rows[1].get::<Option<f32>, _>("outtemp"), Some(41.0));
     assert_eq!(rows[1].get::<Option<f32>, _>("outhumidity"), None);
     assert_eq!(rows[1].get::<Option<String>, _>("stationname"), None);
+    touched(
+        &pool,
+        "readings_land_in_observations_and_an_unreported_metric_is_null",
+    )
+    .await;
 }
 
 /// **Every column the registry declares exists in `observations`, with the declared type,
@@ -400,6 +463,11 @@ async fn the_observations_columns_are_exactly_what_the_registry_declares() {
          column -- `extra` is the one sanctioned exception (W4 §4).",
         only_actual.len()
     );
+    touched(
+        &pool,
+        "the_observations_columns_are_exactly_what_the_registry_declares",
+    )
+    .await;
 }
 
 /// One metric of each `sql_type` the registry declares, written and read back.
@@ -472,6 +540,7 @@ async fn one_metric_of_each_declared_type_round_trips() {
             .collect();
     assert!(keys.contains("extra_text1"), "got {keys:?}");
     assert!(keys.contains("storm_start"), "got {keys:?}");
+    touched(&pool, "one_metric_of_each_declared_type_round_trips").await;
 }
 
 /// The PostgreSQL type name for a declared `sql_type`.
@@ -574,37 +643,59 @@ async fn a_replayed_prefix_produces_no_duplicate_rows() {
         count, 40,
         "the correction replaced a row rather than adding one"
     );
+    touched(&pool, "a_replayed_prefix_produces_no_duplicate_rows").await;
 }
 
-/// Two envelopes in **one batch** sharing a `(station_id, time)`.
+/// Several envelopes in **one batch** sharing a `(station_id, time)`.
 ///
 /// Not a corner case: `Ingress::admit` substitutes the frame's arrival instant for every
 /// `PartialReading` the frame did not timestamp, so a Davis `LOOP 4` response is four
-/// readings at one instant. PostgreSQL refuses `ON CONFLICT DO UPDATE` twice against one
-/// row in one statement — *"cannot affect row a second time"* — so without the writer's
-/// collapse the **whole batch** fails, every time, for that station. This is the test that
-/// would have found it.
+/// readings at one instant. Two things have to hold, and the second is the one that is
+/// about data rather than about SQL.
+///
+/// 1. PostgreSQL refuses `ON CONFLICT DO UPDATE` twice against one row in one statement —
+///    *"cannot affect row a second time"* — so without the merge the **whole batch** fails,
+///    every time, for that station.
+/// 2. Those four observations do not measure the same things. Keeping the last envelope
+///    wholesale stores one of them and writes the other three as `NULL`, which is
+///    indistinguishable from "the station did not report it" (**W3 D-26**) and is a
+///    measurement nothing can recover. Each column takes the last non-`NULL` value instead.
+///
+/// The envelopes here carry **disjoint** metrics, which is the shape the Go frame actually
+/// has and the shape a homogeneous fixture cannot distinguish.
 #[tokio::test]
 #[ignore = "needs a real TimescaleDB; run `cargo xtask db-tests`"]
-async fn envelopes_sharing_an_instant_in_one_batch_collapse_instead_of_failing() {
+async fn envelopes_sharing_an_instant_in_one_batch_are_merged_instead_of_failing() {
     let station = "db-tests:collapse";
     let pool = prepare(&[station]).await;
     let w = writer(&pool, station);
 
     let observed_at = at(1_767_484_800);
-    let batch: Vec<Envelope> = (0..4u8)
-        .map(|i| {
-            envelope(
-                station,
-                observed_at,
-                u64::from(i) + 1,
-                Reading {
-                    out_temp: Some(30.0 + f32::from(i)),
-                    ..Reading::default()
-                },
-            )
-        })
-        .collect();
+    let batch: Vec<Envelope> = [
+        Reading {
+            out_temp: Some(30.0),
+            ..Reading::default()
+        },
+        Reading {
+            barometer: Some(29.92),
+            ..Reading::default()
+        },
+        Reading {
+            wind_speed: Some(7.25),
+            ..Reading::default()
+        },
+        Reading {
+            // A second value for a metric the first envelope also carried: last wins per
+            // column, which is what a sequence of upserts would have left.
+            out_temp: Some(33.0),
+            out_humidity: Some(61.0),
+            ..Reading::default()
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, r)| envelope(station, observed_at, i as u64 + 1, r))
+    .collect();
 
     let stored = w
         .store(&batch)
@@ -616,18 +707,54 @@ async fn envelopes_sharing_an_instant_in_one_batch_collapse_instead_of_failing()
     );
     assert_eq!(stored.rows, 1, "and they are one row");
 
-    let temp: Option<f32> =
-        sqlx::query_scalar("SELECT outtemp FROM observations WHERE station_id = $1 AND time = $2")
-            .bind(station)
-            .bind(observed_at)
-            .fetch_one(&pool)
-            .await
-            .expect("one row");
+    let row = sqlx::query(
+        "SELECT outtemp, outhumidity, barometer, windspeed \
+           FROM observations WHERE station_id = $1 AND time = $2",
+    )
+    .bind(station)
+    .bind(observed_at)
+    .fetch_one(&pool)
+    .await
+    .expect("exactly one row");
     assert_eq!(
-        temp,
+        row.get::<Option<f32>, _>("outtemp"),
         Some(33.0),
-        "the last envelope wins, which is what a sequence of upserts would have left"
+        "the later value for a metric two observations carried"
     );
+    assert_eq!(row.get::<Option<f32>, _>("outhumidity"), Some(61.0));
+    assert_eq!(
+        row.get::<Option<f32>, _>("barometer"),
+        Some(29.92),
+        "the second observation's barometer survived the merge rather than being nulled"
+    );
+    assert_eq!(
+        row.get::<Option<f32>, _>("windspeed"),
+        Some(7.25),
+        "and so did the third observation's wind speed"
+    );
+
+    // Every observation contributed, so every metric the frame carried is inventory.
+    let keys: BTreeSet<String> =
+        sqlx::query_scalar("SELECT metric_key FROM station_metrics WHERE station_id = $1")
+            .bind(station)
+            .fetch_all(&pool)
+            .await
+            .expect("read")
+            .into_iter()
+            .collect();
+    assert_eq!(
+        keys,
+        ["barometer", "out_humidity", "out_temp", "wind_speed"]
+            .into_iter()
+            .map(String::from)
+            .collect::<BTreeSet<_>>(),
+        "got {keys:?}"
+    );
+    touched(
+        &pool,
+        "envelopes_sharing_an_instant_in_one_batch_are_merged_instead_of_failing",
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -814,6 +941,7 @@ async fn the_projections_reflect_what_has_been_written() {
             .await
             .expect("read");
     assert_eq!(last, Some(second), "a replay does not rewind last_seen");
+    touched(&pool, "the_projections_reflect_what_has_been_written").await;
 }
 
 /// A station the registry has never heard of — a peer's received station, until M6-4
@@ -878,4 +1006,184 @@ async fn a_station_the_registry_does_not_know_is_still_stored() {
         .await
         .expect("counted");
     assert_eq!(count, 1);
+    touched(
+        &pool,
+        "a_station_the_registry_does_not_know_is_still_stored",
+    )
+    .await;
+}
+
+/// **A station whose configuration row goes away does not lose its projection.**
+///
+/// The `stations` row is a projection of `config.stations` (W4 §2.1), and the writer is
+/// what copies it. An operator who deletes or re-keys a configuration row while that
+/// station still has unacked envelopes in the spool would otherwise have the replay rewrite
+/// the projection from the reading: coordinates to `NULL`, `timezone` to `'UTC'`, and the
+/// display name to whatever the driver calls itself — or to the bare station key. `/span`
+/// renders that name, and M3-4's `Calendar { TzSource::Station }` reads that zone.
+///
+/// So the `DO UPDATE` is non-destructive: `coalesce` for the nullable columns, and the
+/// three `NOT NULL` ones are only overwritten when the configuration actually had an answer.
+#[tokio::test]
+#[ignore = "needs a real TimescaleDB; run `cargo xtask db-tests`"]
+async fn a_vanished_configuration_row_does_not_erase_the_projection() {
+    let station = "db-tests:vanished";
+    let pool = prepare(&[station]).await;
+
+    // First pass: the station is configured, so the projection is filled from it.
+    let configured = writer(&pool, station);
+    let first = at(1_767_744_000);
+    configured
+        .store(&[envelope(
+            station,
+            first,
+            1,
+            Reading {
+                out_temp: Some(44.0),
+                station_name: Some("what the driver calls itself".into()),
+                ..Reading::default()
+            },
+        )])
+        .await
+        .expect("stores");
+    let projection =
+        sqlx::query("SELECT name, timezone, latitude FROM stations WHERE station_id = $1")
+            .bind(station)
+            .fetch_one(&pool)
+            .await
+            .expect("the projection row exists");
+    assert_eq!(
+        projection.get::<String, _>("name"),
+        format!("{station} (configured)")
+    );
+    assert_eq!(projection.get::<String, _>("timezone"), "America/Denver");
+    assert_eq!(projection.get::<Option<f64>, _>("latitude"), Some(39.7392));
+
+    // Second pass: the configuration row is gone and a spooled envelope replays.
+    let orphaned: Arc<dyn StationRegistry> = Arc::new(ConfigRegistry::new(RegistrySnapshot::new(
+        &[row("db-tests:somebody-else")],
+        std::iter::empty(),
+    )));
+    let w = TimescaleWriter::new(pool.clone(), orphaned).expect("builds");
+    w.store(&[envelope(
+        station,
+        at(1_767_744_060),
+        2,
+        Reading {
+            out_temp: Some(45.0),
+            station_name: Some("what the driver calls itself".into()),
+            ..Reading::default()
+        },
+    )])
+    .await
+    .expect("an orphaned station's reading is still stored");
+
+    let projection = sqlx::query(
+        "SELECT name, type, timezone, latitude, longitude, altitude_ft, \
+                snow_base_distance_mm, last_seen \
+           FROM stations WHERE station_id = $1",
+    )
+    .bind(station)
+    .fetch_one(&pool)
+    .await
+    .expect("the projection row is still there");
+    assert_eq!(
+        projection.get::<String, _>("name"),
+        format!("{station} (configured)"),
+        "the configured name survived; the reading's own name did not overwrite it"
+    );
+    assert_eq!(projection.get::<String, _>("type"), "weatherlink-live");
+    assert_eq!(
+        projection.get::<String, _>("timezone"),
+        "America/Denver",
+        "a station's rollover zone is not quietly reset to UTC"
+    );
+    assert_eq!(projection.get::<Option<f64>, _>("latitude"), Some(39.7392));
+    assert_eq!(
+        projection.get::<Option<f64>, _>("longitude"),
+        Some(-104.9903)
+    );
+    assert!(projection.get::<Option<f64>, _>("altitude_ft").is_some());
+    assert_eq!(
+        projection.get::<Option<f64>, _>("snow_base_distance_mm"),
+        Some(1500.0)
+    );
+    // `last_seen` still advances: the reading was stored, which is the fact it records.
+    assert_eq!(
+        projection.get::<Option<DateTime<Utc>>, _>("last_seen"),
+        Some(at(1_767_744_060))
+    );
+    touched(
+        &pool,
+        "a_vanished_configuration_row_does_not_erase_the_projection",
+    )
+    .await;
+}
+
+/// **One statement at the designed batch size.**
+///
+/// W3 §2.4 sizes the durable cursor's read-ahead at 256 envelopes against PostgreSQL's
+/// 65,535-bind-parameter limit — "at the registry's 216 allocated columns the hard ceiling
+/// is 303 rows per multi-row `INSERT`; 256 is the power of two below it" — and the writer
+/// uses `unnest`, which binds one array per column and is therefore 216 parameters for any
+/// batch size. That turns §2.4's figure from a *limit* into a *latency* figure, and the
+/// unit test asserts the parameter count against the statement text.
+///
+/// What only a real server can answer is whether the statement actually executes at that
+/// width: array length is not parameter count, but a 256-element `timestamptz[]` across 216
+/// arrays is 55,296 values in one round trip and nothing had ever run it.
+#[tokio::test]
+#[ignore = "needs a real TimescaleDB; run `cargo xtask db-tests`"]
+async fn a_full_batch_of_256_is_one_statement() {
+    let station = "db-tests:full-batch";
+    let pool = prepare(&[station]).await;
+    let w = writer(&pool, station);
+
+    // 256 is `mw_pipeline::READ_AHEAD`, which is what the cursor hands a sink.
+    let batch: Vec<Envelope> = (0..256u32)
+        .map(|i| {
+            envelope(
+                station,
+                at(1_767_830_400 + i64::from(i) * 2),
+                u64::from(i) + 1,
+                Reading {
+                    out_temp: Some(40.0 + i as f32 / 8.0),
+                    barometer: Some(29.92),
+                    out_humidity: Some(55.0),
+                    extra_text1: Some(format!("reading {i}")),
+                    lightning_day: Some(i as i32),
+                    ..Reading::default()
+                },
+            )
+        })
+        .collect();
+
+    let stored = w.store(&batch).await.expect("256 rows in one statement");
+    assert_eq!(stored.stored, 256);
+    assert_eq!(stored.rows, 256, "256 distinct instants, 256 rows");
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM observations WHERE station_id = $1")
+        .bind(station)
+        .fetch_one(&pool)
+        .await
+        .expect("counted");
+    assert_eq!(count, 256);
+    // The ends, so a truncated array would be visible rather than averaged away.
+    let first: Option<f32> = sqlx::query_scalar(
+        "SELECT outtemp FROM observations WHERE station_id = $1 ORDER BY time LIMIT 1",
+    )
+    .bind(station)
+    .fetch_one(&pool)
+    .await
+    .expect("read");
+    let last: Option<f32> = sqlx::query_scalar(
+        "SELECT outtemp FROM observations WHERE station_id = $1 ORDER BY time DESC LIMIT 1",
+    )
+    .bind(station)
+    .fetch_one(&pool)
+    .await
+    .expect("read");
+    assert_eq!(first, Some(40.0));
+    assert_eq!(last, Some(40.0 + 255.0 / 8.0));
+    touched(&pool, "a_full_batch_of_256_is_one_statement").await;
 }

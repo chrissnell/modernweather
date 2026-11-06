@@ -485,6 +485,14 @@ the value is `None` (W3 D-25), which is what makes a forwarded envelope safe acr
 `writer:timescale` as a spool cursor with 256-envelope batches and
 `ON CONFLICT (station_id, time) DO UPDATE`. Per **D-56**, `admit` upserts `config.stations` and the
 writer maintains `last_seen` and `station_metrics`.
+> **D-56's first clause is not implementable, and the implementation departs from it.** `admit` may
+> do no I/O but the spool append (**D-87**) and `ci/layers.toml` forbids `mw-pipeline` both `sqlx`
+> and `mw-store`, so "upsert a PostgreSQL row" is not an expression that crate can contain. Both
+> projections are maintained by `writer:timescale` instead, in one transaction with the rows they
+> describe. Filed as proposed amendment **A-M3-3-1** in `docs/reconciliation.md`'s *Proposed
+> amendments* section; D-56 stands as written until that is applied. (Note also that this line says
+> `config.stations` where D-56 says `stations`: those are two different tables, and D-56 is about the
+> weather schema's read-side projection.)
 **Done when:** readings land in `observations`; a replayed prefix produces no duplicate rows; an
 unreported metric is **NULL**, not `0.0` (D-26); `station_metrics` reflects what has been written.
 **Test strategy:** needs a real TimescaleDB container, and per W3 D-84 **the test fails CI if it
@@ -524,9 +532,16 @@ separate trait on purpose (**D-30**: "named separately so nobody makes the websi
 write one. This item is the first to need it, so it chooses between the two shapes the design leaves:
 one published handle offering both halves, or the write half travelling outside the capability bus
 the way `Ingress` does today. `mw_component::store`'s module documentation states both and
-deliberately does not pick, because the choice depends on the read side's query set. Also inherited:
-`stations.timezone` is populated by `writer:timescale`, so `Calendar { TzSource::Station }` has a
-zone to read for any station that has reported.
+deliberately does not pick, because the choice depends on the read side's query set.
+
+**One more inherited from M3-3.** `stations.timezone` is populated by `writer:timescale`, so
+`Calendar { TzSource::Station }` has a zone to read for any station that has reported — **and this
+item validates it**, because nothing else does. The W4 migration's comment claimed the writer did;
+it does not, it copies the column and substitutes `'UTC'` for a NULL or blank one, and that comment
+is now corrected to say so. An IANA name cannot be checked by a SQL `CHECK` (`now() AT TIME ZONE x`
+is STABLE), so the natural place is `mw_store::RegistrySnapshot::new`, which already normalises a
+blank zone to absent — a `chrono_tz` parse there turns an operator's typo into a startup refusal
+naming the station instead of a rollover that silently happens in UTC.
 
 **Milestone 3 done when:** a WeatherLink Live station feeds the Rust daemon, readings are durable
 across a kill -9, and `observations` contains NULLs where the station reports nothing. **The Go
@@ -566,6 +581,15 @@ trailing bucket aggregated from raw, and the 60-second cache holds the **prefix 
 `/forecast` caches the stored `jsonb` text byte for byte and splices it between a prefix and a suffix
 (D-39) — nothing parses or re-emits it, which is how Postgres's whitespace and the missing trailing
 newline survive.
+**Constraint inherited from M3-3 (DEV-9): `windch` and `heatidx` are RECOMPUTED here, never read
+from their columns.** `metrics/registry.toml` marks both `legacy_read_time_computed` and
+`docs/metric-registry.md` §6.1 left "which one the contract actually promises" to W1; the frozen
+handler recomputes them from `OutTemp` plus wind speed or humidity on every request
+(`transform.go:18`), and M3-3 now stores `NULL` where the formula does not apply. Reading the column
+instead would emit `mean(windchill)` where the contract emits `windchill(mean(outtemp),
+mean(windspeed))`, which differ by far more than rounding at aggregate levels — measured, 46.04
+against 33.64 for a two-reading bucket at (40 °F, 10 mph) and (60 °F, 10 mph). So this is settled
+rather than open.
 **Scope narrowed 2026-10-31** (`docs/reconciliation.md` §6): only the **five** endpoints iOS calls are
 frozen — `/latest`, `/span/{hours}h`, `/snow`, `/stationinfo`, `/forecast/{hours}`. `/alerts`,
 `/api/remote-stations` and `format=msgpack` are **not implemented** (§6.3), which also disposes of
@@ -758,6 +782,13 @@ framing and read-timeout behaviour is where that class of defect lives.
 `?PASSWORD=` compared constant-time (W2a D-43). A second Ambient station is a config row, not a second
 HTTP server.
 **Done when:** each driver passes all three test levels against its pinned Go emulator.
+**Constraint inherited from M3-3 (DEV-9): the snow gauge must discard a distance greater than the
+station's configured base distance**, which is what `snowgauge/station.go:171-174` does at the device.
+M3-3 moved `snowdepth` to ingest, so such a reading now stores a **negative** depth into a column
+with `min`/`mean`/`max` aggregates over it, where in the Go version it never reached storage at all.
+The enrich stage is the wrong layer to filter at — it is handed an already-admitted reading, and
+dropping a metric there would make it a filter rather than a transform — so the discard belongs to
+the driver that knows the reading is a fault.
 **N-20 lands with Campbell:** the owner's station is on USB serial and the daemon is moving into
 Kubernetes, so Campbell must work over `TcpOut` against a `ser2net` bridge as well as over `Serial`.
 W2a §4a.5 already maps it as `Serial | TcpOut` and the Go version already dials TCP when

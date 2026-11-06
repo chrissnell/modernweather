@@ -53,10 +53,13 @@ pub const DEADLINE: Duration = Duration::from_secs(5);
 
 /// How long a stop waits for an in-flight transaction (W3 §3.6).
 ///
-/// The default is 10 s and §3.6 names this component as one of the two that need more:
-/// aborting mid-`COMMIT` is safe — the transaction rolls back and the cursor has not
-/// advanced — but it costs the batch a replay, and the 15 s is what makes that rare rather
-/// than routine on every `systemctl restart`.
+/// The default is 10 s and §3.6 names this component as one of the two that need more.
+/// Aborting mid-`COMMIT` is **safe** either way, and it is worth being exact about why: if
+/// the server had not yet processed the `COMMIT` the transaction rolls back, and if it had,
+/// the rows are durable and the batch replays — which `ON CONFLICT (station_id, time) DO
+/// UPDATE` is what makes harmless. Either way nothing is lost, because the cursor did not
+/// advance. What the extra five seconds buys is that the replay is rare rather than routine
+/// on every `systemctl restart`.
 pub const GRACE: Duration = Duration::from_secs(15);
 
 /// Declare `writer:timescale`.

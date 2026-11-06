@@ -186,20 +186,40 @@ impl TimescaleWriter {
     ) -> Result<(), StoreError> {
         let p = projection_columns(rows, self.registry.as_ref());
 
+        // A CTE rather than a plain `INSERT ... SELECT`, because the `DO UPDATE` needs one
+        // more fact per row than `stations` has a column for: whether the configuration
+        // store had an answer for this station at all. `EXCLUDED` can only name columns of
+        // the target table, so the flag travels as an eleventh `unnest` column in the CTE
+        // and is projected away before the insert.
         sqlx::query(
-            "INSERT INTO stations (station_id, name, type, timezone, latitude, longitude, \
+            "WITH incoming (station_id, name, type, timezone, latitude, longitude, \
+                             altitude_ft, snow_base_distance_mm, first_seen, last_seen, \
+                             configured) AS ( \
+                 SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], \
+                                      $5::float8[], $6::float8[], $7::float8[], \
+                                      $8::float8[], $9::timestamptz[], $10::timestamptz[], \
+                                      $11::bool[]) \
+             ) \
+             INSERT INTO stations (station_id, name, type, timezone, latitude, longitude, \
                                    altitude_ft, snow_base_distance_mm, first_seen, last_seen) \
-             SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], \
-                                  $5::float8[], $6::float8[], $7::float8[], $8::float8[], \
-                                  $9::timestamptz[], $10::timestamptz[]) \
+             SELECT station_id, name, type, timezone, latitude, longitude, altitude_ft, \
+                    snow_base_distance_mm, first_seen, last_seen \
+               FROM incoming \
              ON CONFLICT (station_id) DO UPDATE SET \
-                 name = EXCLUDED.name, \
-                 type = EXCLUDED.type, \
-                 timezone = EXCLUDED.timezone, \
-                 latitude = EXCLUDED.latitude, \
-                 longitude = EXCLUDED.longitude, \
-                 altitude_ft = EXCLUDED.altitude_ft, \
-                 snow_base_distance_mm = EXCLUDED.snow_base_distance_mm, \
+                 name = CASE WHEN (SELECT configured FROM incoming i \
+                                    WHERE i.station_id = stations.station_id) \
+                             THEN EXCLUDED.name ELSE stations.name END, \
+                 type = CASE WHEN (SELECT configured FROM incoming i \
+                                    WHERE i.station_id = stations.station_id) \
+                             THEN EXCLUDED.type ELSE stations.type END, \
+                 timezone = CASE WHEN (SELECT configured FROM incoming i \
+                                        WHERE i.station_id = stations.station_id) \
+                                 THEN EXCLUDED.timezone ELSE stations.timezone END, \
+                 latitude = coalesce(EXCLUDED.latitude, stations.latitude), \
+                 longitude = coalesce(EXCLUDED.longitude, stations.longitude), \
+                 altitude_ft = coalesce(EXCLUDED.altitude_ft, stations.altitude_ft), \
+                 snow_base_distance_mm = coalesce(EXCLUDED.snow_base_distance_mm, \
+                                                  stations.snow_base_distance_mm), \
                  first_seen = least(stations.first_seen, EXCLUDED.first_seen), \
                  last_seen = greatest(stations.last_seen, EXCLUDED.last_seen)",
         )
@@ -213,6 +233,7 @@ impl TimescaleWriter {
         .bind(&p.bases)
         .bind(&p.first_seen)
         .bind(&p.last_seen)
+        .bind(&p.configured)
         .execute(&mut **tx)
         .await
         .map_err(classify)?;
@@ -274,7 +295,9 @@ impl TimescaleWriter {
              SELECT * FROM unnest($1::text[], $2::text[], $3::timestamptz[], $4::timestamptz[]) \
              ON CONFLICT (station_id, metric_key) DO UPDATE SET \
                  first_seen = least(station_metrics.first_seen, EXCLUDED.first_seen), \
-                 last_seen = greatest(station_metrics.last_seen, EXCLUDED.last_seen)",
+                 last_seen = greatest(station_metrics.last_seen, EXCLUDED.last_seen) \
+               WHERE station_metrics.last_seen < EXCLUDED.last_seen \
+                  OR station_metrics.first_seen > EXCLUDED.first_seen",
         )
         .bind(&stations)
         .bind(&keys)
@@ -405,7 +428,7 @@ impl Column {
 }
 
 impl Rows {
-    /// Transpose a batch, **collapsing envelopes that share a `(station_id, time)`**.
+    /// Transpose a batch, **merging envelopes that share a `(station_id, time)`**.
     ///
     /// Not an optimisation — the statement is wrong without it. `observations` has a unique
     /// index on `(station_id, time)` and `ON CONFLICT DO UPDATE` may not touch the same row
@@ -415,22 +438,34 @@ impl Rows {
     /// A batch containing two such envelopes is not a corner case. `Ingress::admit`
     /// substitutes the frame's arrival instant for every `PartialReading` whose frame
     /// carried no timestamp, so a Davis `LOOP 4` response — four observations in one frame
-    /// — produces four readings with **identical** `(station_id, time)`. Sequential
-    /// upserts would have left the last one standing; this does the same thing in one
-    /// statement, keeping the last, which is also what a replay of the same prefix
-    /// produces. [`Stored::rows`] is how many rows survived, so the collapsing is a number
-    /// an operator can see rather than an invisible loss.
+    /// — produces four readings with **identical** `(station_id, time)`.
+    ///
+    /// **Merged column by column, not reduced to the last envelope**, and the difference is
+    /// data. Those four observations do not measure the same things: one carries the
+    /// temperature, another the barometer, another the wind. Keeping the last envelope
+    /// wholesale stores one of them and writes the other three as `NULL` — which is
+    /// indistinguishable from "the station did not report it" (**W3 D-26**) and is a
+    /// reading the station did take and nothing can recover. So each column takes the
+    /// **last non-`NULL` value** across the group: last-wins where two observations
+    /// disagree, union where they do not, which is exactly what a sequence of upserts
+    /// would have left and therefore still what a replay reproduces.
+    ///
+    /// [`Stored::rows`] is how many rows the batch became, so the merging is a number an
+    /// operator can see rather than an invisible collapse.
     fn collapse(batch: &[Envelope]) -> Rows {
-        // `(station, time)` to the index in `batch` that wins. `BTreeMap` rather than a
-        // hash map: the iteration order is then the row order, which makes the statement's
-        // parameters a deterministic function of the batch and a failing test
-        // reproducible.
-        let mut winner: BTreeMap<(&str, DateTime<Utc>), usize> = BTreeMap::new();
+        // `(station, time)` to every index in `batch` that lands on it, in arrival order.
+        // `BTreeMap` rather than a hash map: the iteration order is then the row order,
+        // which makes the statement's parameters a deterministic function of the batch and
+        // a failing test reproducible.
+        let mut groups: BTreeMap<(&str, DateTime<Utc>), Vec<usize>> = BTreeMap::new();
         for (i, envelope) in batch.iter().enumerate() {
-            winner.insert((envelope.station.as_str(), envelope.observed_at), i);
+            groups
+                .entry((envelope.station.as_str(), envelope.observed_at))
+                .or_default()
+                .push(i);
         }
 
-        let n = winner.len();
+        let n = groups.len();
         let mut rows = Rows {
             time: Vec::with_capacity(n),
             station_id: Vec::with_capacity(n),
@@ -446,14 +481,25 @@ impl Rows {
         };
 
         let mut mismatches = 0usize;
-        for (&(station, observed_at), &i) in &winner {
-            let reading = &batch[i].reading;
+        for (&(station, observed_at), members) in &groups {
+            // The last observation in the group that said anything about this field. The
+            // same rule as the metric columns below, applied to the two dimensions that
+            // are not metrics.
+            let latest = |pick: fn(&mw_types::Reading) -> Option<String>| -> Option<String> {
+                members.iter().rev().find_map(|&i| pick(&batch[i].reading))
+            };
+            let name = latest(|r| r.station_name.clone());
+            let kind = latest(|r| r.station_type.clone());
+
             rows.time.push(observed_at);
             rows.station_id.push(station.to_string());
-            rows.station_name.push(reading.station_name.clone());
-            rows.station_type.push(reading.station_type.clone());
+            rows.station_name.push(name.clone());
+            rows.station_type.push(kind.clone());
             for (column, meta) in rows.metrics.iter_mut().zip(METRICS.iter()) {
-                let value = reading.value(meta.key);
+                let value = members
+                    .iter()
+                    .rev()
+                    .find_map(|&i| batch[i].reading.value(meta.key));
                 if value.is_some() {
                     rows.metric_seen
                         .entry((station.to_string(), meta.name))
@@ -469,11 +515,11 @@ impl Rows {
                 .and_modify(|span| span.extend(observed_at))
                 .or_insert_with(|| Span::at(observed_at));
             let reported = rows.reported.entry(station.to_string()).or_default();
-            if reading.station_name.is_some() {
-                reported.name = reading.station_name.clone();
+            if name.is_some() {
+                reported.name = name;
             }
-            if reading.station_type.is_some() {
-                reported.kind = reading.station_type.clone();
+            if kind.is_some() {
+                reported.kind = kind;
             }
         }
         if mismatches > 0 {
@@ -512,6 +558,13 @@ struct ProjectionColumns {
     bases: Vec<Option<f64>>,
     first_seen: Vec<DateTime<Utc>>,
     last_seen: Vec<DateTime<Utc>>,
+    /// Whether the configuration store had a row for this station.
+    ///
+    /// The `DO UPDATE` reads it to decide whether the three `NOT NULL` columns may be
+    /// overwritten. Without it, a reading that arrives for a station whose configuration
+    /// row has been deleted or re-keyed rewrites the projection's display name to the
+    /// station key -- which is what `/span` then joins to.
+    configured: Vec<bool>,
 }
 
 /// Build `stations`' columns for every station the batch carried.
@@ -527,7 +580,8 @@ fn projection_columns(rows: &Rows, registry: &dyn StationRegistry) -> Projection
     let mut p = ProjectionColumns::default();
     for (station, span) in &rows.stations {
         let configured = registry.projection(&StationKey::new(station.as_str()));
-        if configured.is_none() {
+        let was_configured = configured.is_some();
+        if !was_configured {
             // Once per batch per unknown station, at WARN rather than silently: a
             // projection row carrying the station key as its display name is what `/span`
             // will join to, and "the name on the chart is the key" is the observable
@@ -589,6 +643,7 @@ fn projection_columns(rows: &Rows, registry: &dyn StationRegistry) -> Projection
         p.bases.push(base);
         p.first_seen.push(span.first);
         p.last_seen.push(span.last);
+        p.configured.push(was_configured);
     }
     p
 }
@@ -608,7 +663,14 @@ fn observations_statement() -> String {
         .enumerate()
         .map(|(i, ddl)| format!("${}::{ddl}[]", i + 1))
         .collect();
-    // Every column, including the dimensions: an envelope replayed from the spool carries
+    // `observations` has one more column than this list: `extra jsonb`, W4 §4's escape
+    // hatch for unmodelled vendor fields, which is deliberately outside
+    // `metrics/registry.toml` (the registry is the source of truth for *modelled* metrics,
+    // OQ-W4-3). Absent from the column list means two things and both are wanted: nothing
+    // here writes it, and the `DO UPDATE` below cannot clobber it on a replay. A driver
+    // that fills it does so through a path this writer does not have yet.
+    //
+    // Every column that IS listed, including the dimensions: an envelope replayed from the spool carries
     // the same `stationname` it carried the first time, so assigning it again is the same
     // value, and a *corrected* reading for the same instant should correct every column it
     // names. `station_id` and `time` are the conflict target and cannot be assigned.
@@ -800,6 +862,86 @@ mod tests {
             "the oldest instant"
         );
         assert_eq!(rows.stations["backyard"].last, at(101), "and the newest");
+    }
+
+    /// **A frame's observations are merged, not reduced to the last one.**
+    ///
+    /// A Davis `LOOP 4` response is four observations in one frame, and `Ingress::admit`
+    /// substitutes the frame's arrival instant for every one the frame did not timestamp
+    /// -- so all four land on one `(station_id, time)`, and the unique index means one row.
+    /// Which row is the whole question: keeping the *last envelope wholesale* discards
+    /// whatever the first three measured, and they measured different things.
+    #[test]
+    fn observations_sharing_an_instant_are_merged_column_by_column() {
+        let when = at(100);
+        let readings = [
+            mw_types::Reading {
+                out_temp: Some(41.0),
+                ..mw_types::Reading::default()
+            },
+            mw_types::Reading {
+                barometer: Some(29.92),
+                ..mw_types::Reading::default()
+            },
+            mw_types::Reading {
+                wind_speed: Some(7.5),
+                ..mw_types::Reading::default()
+            },
+            mw_types::Reading {
+                // A later value for a metric an earlier observation also carried: last wins
+                // per column, which is what a sequence of upserts would have left.
+                out_temp: Some(42.0),
+                out_humidity: Some(55.0),
+                ..mw_types::Reading::default()
+            },
+        ];
+        let batch: Vec<Envelope> = readings
+            .into_iter()
+            .map(|r| Envelope {
+                reading: Arc::new(mw_types::Reading {
+                    time: when,
+                    station_id: "backyard".into(),
+                    ..r
+                }),
+                ..envelope("backyard", when, None)
+            })
+            .collect();
+
+        let rows = Rows::collapse(&batch);
+        assert_eq!(rows.time.len(), 1, "one instant, one row");
+        let float = |name: &str| -> Option<f32> {
+            let at = METRICS
+                .iter()
+                .position(|m| m.column == name)
+                .unwrap_or_else(|| panic!("{name} is a registry column"));
+            match &rows.metrics[at] {
+                Column::Float(v) => v[0],
+                _ => panic!("{name} is not a float4 column"),
+            }
+        };
+        assert_eq!(
+            float("outtemp"),
+            Some(42.0),
+            "the later value for a metric two observations carried"
+        );
+        assert_eq!(
+            float("barometer"),
+            Some(29.92),
+            "the second observation's barometer survives the merge"
+        );
+        assert_eq!(
+            float("windspeed"),
+            Some(7.5),
+            "and so does the third observation's wind speed"
+        );
+        assert_eq!(float("outhumidity"), Some(55.0));
+        // All four observations contributed, so all four metrics are inventory.
+        let seen = metrics_in(&batch);
+        assert_eq!(
+            seen.len(),
+            4,
+            "every metric the frame carried reaches station_metrics: {seen:?}"
+        );
     }
 
     /// **D-26**, in the shape it reaches the database: an unreported metric is a `None` in

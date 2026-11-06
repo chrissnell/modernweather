@@ -292,17 +292,26 @@ than relying on `cargo test` to notice.
 Declared by W6 per W3 assumption 55. See docs/reconciliation.md G-4.
 
 ARMED as of implementation-plan.md M3-3, which wrote crates/mw-store/tests/db.rs -- the
-deferred mechanism used exactly as designed, and the fourth of G-4's gates to arm itself
-from the work item that created its subject.
+deferred mechanism used exactly as designed. It is the second of G-4's four gates to arm
+itself from the work item that created its subject (`layout` was the first; `ui-bundle` and
+`ui-copy` are still deferred to M7-3).
 
-Two halves, and neither is enough on its own. The tests panic rather than skip when
-MW_DB_TESTS_URL is unset, which is Decision 84 literally; and they are `#[ignore]`d so the
-`test` job -- which has no service container -- stays green and honest, which means a
-filter that matched nothing would exit zero. `cargo xtask db-tests` closes the second by
-comparing the test binary's own `--list` against a declared set of NAMES, in both
-directions. Names rather than a count, because `xtask/src/emulators.rs` learned the
-expensive way that a count catches a deleted test and does not catch a rename or four
-emptied bodies."""
+Three checks, because there are three ways a test suite reports green without running, and
+closing two of them is not enough:
+
+  1. the tests PANIC rather than skip when MW_DB_TESTS_URL is unset, which is Decision 84
+     literally. They are also `#[ignore]`d, so the `test` job -- which has no service
+     container -- stays green and honest.
+  2. `#[ignore]` means a filter that matched nothing exits ZERO, so `cargo xtask db-tests`
+     compares the test binary's own `--list` against a declared set of NAMES, in both
+     directions. Names rather than a count, because `xtask/src/emulators.rs` learned the
+     expensive way that a count catches a deleted test and does not catch a rename.
+  3. Names do not catch a GUTTED BODY -- a test emptied to `{}` still lists, still prints
+     `... ok` and still counts, which is the hole emulators.rs documents and does not
+     close. So each test ends by calling a helper that RUNS A QUERY and appends its own
+     name to an evidence file the gate creates, and the gate requires one line per declared
+     test. Verified by doing it: with one body emptied, libtest reported `9 passed` and the
+     gate exited 2 naming the gutted test."""
 
 [[gate]]
 id = "mgmt-schema-drift"

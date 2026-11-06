@@ -73,73 +73,158 @@ const SEA_LEVEL_M: f64 = 0.0;
 use mw_component::StationMeta;
 use mw_types::Reading;
 
-/// Apply **R1** to one reading. Returns whether anything was written.
+/// The six values **R1** derives, computed but not yet stored.
 ///
-/// The return value is what lets `Ingress::accept` avoid cloning an `Arc<Reading>` that is
-/// already enriched, which is the common case on a collector: a satellite enriched it
-/// before it ever reached the wire.
-pub fn enrich(reading: &mut Reading, meta: &StationMeta) -> bool {
-    let mut changed = false;
-    // `write_if_none` rather than an assignment in each arm: "only where the value is
-    // `None`" is the idempotence property, and six open-coded `if x.is_none()` blocks are
-    // six places it can be forgotten.
-    changed |= write_if_none(&mut reading.wind_chill, || {
-        wind_chill(reading.out_temp?, reading.wind_speed?)
-    });
-    changed |= write_if_none(&mut reading.heat_index, || {
-        heat_index(reading.out_temp?, reading.out_humidity?)
-    });
-    changed |= write_if_none(&mut reading.aqi_pm25_aqin, || aqi_pm25(reading.pm25?));
-    changed |= write_if_none(&mut reading.aqi_pm10_aqin, || {
-        aqi_pm10(reading.pm10_in_aqin?)
-    });
-    changed |= write_if_none(&mut reading.potential_solar_watts, || {
-        let (latitude, longitude) = meta.coordinates()?;
-        Some(clear_sky_watts(
-            reading.time,
-            latitude,
-            longitude,
-            // A station with coordinates and no configured altitude is treated as being
-            // at sea level for the barometric term. **Named rather than written as a
-            // `0.0` fallback**, which is `ci/layers.toml`'s rule for exactly this crate:
-            // a bare zero substituted for an absent value is the `zf` of §1.7 wearing a
-            // different name, and the one place a zero may stand in for a `None` is the
-            // frozen DTO.
-            //
-            // It is a decision rather than a default on two grounds. It is the Go
-            // behaviour — `config.Altitude` is a non-nullable `float64` there and an unset
-            // column reads as zero — and the term is not sensitive: 1609 m against sea
-            // level moves the result by under 2%, which the module's altitude test
-            // measures rather than claims. Returning `None` instead would mean a station
-            // that has coordinates and no altitude stores no clear-sky figure at all,
-            // which is a worse answer than one that is 2% out.
-            meta.altitude_m.unwrap_or(SEA_LEVEL_M),
-            reading.out_temp?,
-            reading.out_humidity?,
-        ))
-    });
-    changed |= write_if_none(&mut reading.snow_depth, || {
-        snow_depth(reading.snow_distance?, meta.snow_base_distance_mm?)
-    });
-    changed
+/// # Why this is a separate step from writing them
+///
+/// `Ingress::accept` holds an `Arc<Reading>` whose refcount is already two by the time it
+/// reaches the enrich stage — the envelope was cloned out of the peer's batch — so
+/// `Arc::make_mut` is **always** on its deep-copy path: a 216-field struct and up to
+/// fifteen heap allocations, per envelope, including ones the dedup gate is about to
+/// discard. The only way to avoid that is to find out whether there is anything to write
+/// *before* asking for a mutable reading, and that is what this type is.
+///
+/// **The cheap approximation does not work, which is worth recording because it is the
+/// obvious fix.** "Is any of the six columns absent?" is `true` for almost every real
+/// reading: wind chill and heat index are mutually exclusive — one applies at or below
+/// 50 °F, the other at or above 80 °F — so in the 50–80 °F band both are legitimately
+/// `None` forever, and a station with no snow gauge and no particulate sensor has three
+/// more that never fill. A gate on absence would therefore fire on nearly every envelope
+/// and buy nothing. The exact question is "would enrich *write* anything", and the only
+/// way to answer it is to do the arithmetic — which is cheap, because every field here is
+/// `Copy` and nothing is allocated.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Derived {
+    /// `windchill`, °F.
+    pub wind_chill: Option<f32>,
+    /// `heatindex`, °F.
+    pub heat_index: Option<f32>,
+    /// `aqi_pm25_aqin`.
+    pub aqi_pm25_aqin: Option<i32>,
+    /// `aqi_pm10_aqin`.
+    pub aqi_pm10_aqin: Option<i32>,
+    /// `potentialsolarwatts`, W/m².
+    pub potential_solar_watts: Option<f32>,
+    /// `snowdepth`, millimetres.
+    pub snow_depth: Option<f32>,
 }
 
-/// Write `value()` into `slot` if `slot` is `None` and the value exists.
+impl Derived {
+    /// Nothing to store: either the reading already carried all six, or the inputs for the
+    /// missing ones are absent, or their formulae do not apply in these conditions.
+    ///
+    /// This is the predicate `Ingress::accept` tests before it asks for a mutable reading.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Derived::default()
+    }
+}
+
+/// Compute what **R1** would add to `reading`, without touching it.
 ///
-/// The whole of W3 §2.5 consequence 3, in one place. `value` is a closure rather than a
-/// value so that the inputs are not read -- and the clear-sky model not evaluated -- for a
-/// metric the station already reported.
-fn write_if_none<T>(slot: &mut Option<T>, value: impl FnOnce() -> Option<T>) -> bool {
+/// **A value whose slot is already `Some` is not computed at all** — which is the
+/// idempotence rule (W3 §2.5 consequence 3) expressed as "do not even evaluate", and is
+/// what keeps the clear-sky model's ten transcendental calls off the path for a satellite
+/// that already ran them. So this is both the check and the work: `enrich` is this
+/// followed by [`apply`], and the collector's path is this followed by `apply` only when
+/// the result is non-empty.
+#[must_use]
+pub fn derive(reading: &Reading, meta: &StationMeta) -> Derived {
+    Derived {
+        wind_chill: only_if_absent(reading.wind_chill, || {
+            wind_chill(reading.out_temp?, reading.wind_speed?)
+        }),
+        heat_index: only_if_absent(reading.heat_index, || {
+            heat_index(reading.out_temp?, reading.out_humidity?)
+        }),
+        aqi_pm25_aqin: only_if_absent(reading.aqi_pm25_aqin, || aqi_pm25(reading.pm25?)),
+        aqi_pm10_aqin: only_if_absent(reading.aqi_pm10_aqin, || aqi_pm10(reading.pm10_in_aqin?)),
+        potential_solar_watts: only_if_absent(reading.potential_solar_watts, || {
+            let (latitude, longitude) = meta.coordinates()?;
+            clear_sky_watts(
+                reading.time,
+                latitude,
+                longitude,
+                // A station with coordinates and no configured altitude is treated as
+                // being at sea level for the barometric term. **Named rather than written
+                // as a `0.0` fallback**, which is `ci/layers.toml`'s rule for exactly this
+                // crate: a bare zero substituted for an absent value is the `zf` of §1.7
+                // wearing a different name, and the one place a zero may stand in for a
+                // `None` is the frozen DTO.
+                //
+                // It is a decision rather than a default on two grounds. It is the Go
+                // behaviour — `config.Altitude` is a non-nullable `float64` there and an
+                // unset column reads as zero — and the term is not sensitive: 1609 m
+                // against sea level moves the result by under 2%, which the module's
+                // altitude test measures rather than claims. Returning `None` instead
+                // would mean a station that has coordinates and no altitude stores no
+                // clear-sky figure at all, which is a worse answer than one that is 2%
+                // out.
+                meta.altitude_m.unwrap_or(SEA_LEVEL_M),
+                reading.out_temp?,
+                reading.out_humidity?,
+            )
+        }),
+        snow_depth: only_if_absent(reading.snow_depth, || {
+            snow_depth(reading.snow_distance?, meta.snow_base_distance_mm?)
+        }),
+    }
+}
+
+/// `compute()` if and only if the slot is absent.
+///
+/// A generic function rather than a closure, because it is used at three different types
+/// and a closure is monomorphised to its first call. It exists at all because "writes a
+/// metric only where the value is `None`" is the idempotence property (W3 §2.5 consequence
+/// 3), and six open-coded `if slot.is_none()` blocks are six places to forget it.
+fn only_if_absent<T>(slot: Option<T>, compute: impl FnOnce() -> Option<T>) -> Option<T> {
     if slot.is_some() {
+        None
+    } else {
+        compute()
+    }
+}
+
+/// Store what [`derive`] computed. Returns whether anything was written.
+///
+/// Every field of `derived` is `Some` only where the reading's own slot was `None` — that
+/// is `derive`'s invariant — so this cannot overwrite a station-reported value and does
+/// not re-check.
+pub fn apply(reading: &mut Reading, derived: Derived) -> bool {
+    if derived.is_empty() {
         return false;
     }
-    match value() {
-        Some(v) => {
-            *slot = Some(v);
-            true
-        }
-        None => false,
-    }
+    let Derived {
+        wind_chill,
+        heat_index,
+        aqi_pm25_aqin,
+        aqi_pm10_aqin,
+        potential_solar_watts,
+        snow_depth,
+    } = derived;
+    // `or()` and not `=`: `derive`'s invariant says the right-hand side is `None` wherever
+    // the slot is `Some`, and spelling it this way means the property holds even if that
+    // invariant is ever weakened.
+    reading.wind_chill = reading.wind_chill.or(wind_chill);
+    reading.heat_index = reading.heat_index.or(heat_index);
+    reading.aqi_pm25_aqin = reading.aqi_pm25_aqin.or(aqi_pm25_aqin);
+    reading.aqi_pm10_aqin = reading.aqi_pm10_aqin.or(aqi_pm10_aqin);
+    reading.potential_solar_watts = reading.potential_solar_watts.or(potential_solar_watts);
+    reading.snow_depth = reading.snow_depth.or(snow_depth);
+    true
+}
+
+/// Apply **R1** to one reading. Returns whether anything was written.
+///
+/// [`derive`] then [`apply`]. `Ingress::admit` uses this, because it owns the reading and
+/// has nothing to gain from the split; `Ingress::accept` uses the two halves, because it
+/// holds a shared `Arc` and the split is what keeps a deep copy off its path.
+///
+/// The return value is also a **counter**: it is what moves `mw_enrich_on_accept_total`,
+/// which is how version skew between a collector and an older satellite becomes visible.
+pub fn enrich(reading: &mut Reading, meta: &StationMeta) -> bool {
+    let derived = derive(reading, meta);
+    apply(reading, derived)
 }
 
 /// Wind chill, °F — the NWS formula, and `None` where it does not apply.
@@ -155,8 +240,8 @@ fn write_if_none<T>(slot: &mut Option<T>, value: impl FnOnce() -> Option<T>) -> 
 /// `windchill == outtemp` is indistinguishable from a real wind chill that happens to
 /// equal the air temperature, so the column's `min` and `mean` aggregates become the
 /// temperature's for every summer bucket — a number nobody can use and nobody can detect.
-/// `NULL` is the fact ("there is no wind chill in these conditions"), it is what **D-26**
-/// asks of every other unreported value, and it costs the frozen contract nothing: the
+/// `NULL` is the fact ("there is no wind chill in these conditions"), it is what
+/// **W3 D-26** asks of every other unreported value, and it costs the frozen contract nothing: the
 /// legacy DTO zero-fills a `NULL` (§1.7's `zf`), which lands on exactly the `0` the Go
 /// handler emits. Where the formula *does* apply the column and the recomputation agree,
 /// so the frozen bytes are identical under both choices and only the column improves.
@@ -167,6 +252,9 @@ fn write_if_none<T>(slot: &mut Option<T>, value: impl FnOnce() -> Option<T>) -> 
 /// and the test below pins it against the Go output.
 #[must_use]
 pub fn wind_chill(temp_f: f32, wind_mph: f32) -> Option<f32> {
+    if !usable(temp_f) || !usable(wind_mph) {
+        return None;
+    }
     if temp_f > 50.0 || wind_mph < 3.0 {
         return None;
     }
@@ -185,15 +273,20 @@ pub fn wind_chill(temp_f: f32, wind_mph: f32) -> Option<f32> {
 /// with no decision behind it.
 #[must_use]
 pub fn heat_index(temp_f: f32, humidity: f32) -> Option<f32> {
+    if !usable(temp_f) || !usable(humidity) {
+        return None;
+    }
     if temp_f < 80.0 {
         return None;
     }
     // Each of these is the **shortest literal that round-trips to the same `f32` as the Go
-    // source's own decimal** -- `2.04901523` there, `2.049_015_3` here, the same 32 bits.
+    // source's own decimal** -- `10.14333127` there, `10.143_332` here, the same 32 bits.
     // Spelled this way because `clippy::excessive_precision` rejects the longer form, and
-    // worth the note because the obvious shortening is wrong: `2.049_015_2` is a
-    // *different* `f32`, and it moved the result in the fifth significant figure. The
-    // test below is a bit-for-bit equality against the Go output, which is what caught it.
+    // worth a note because shortening by eye does not work: `10.143_331` is a *different*
+    // `f32` (bits 1092766485 against 1092766486) and it moved the result in the fifth
+    // significant figure, while `2.049_015_2` and `2.049_015_3` are the *same* `f32` and
+    // either would do. The test below is a bit-for-bit equality against the Go output,
+    // which is what distinguishes them -- do not re-shorten these by hand.
     const C1: f32 = -42.379;
     const C2: f32 = 2.049_015_3;
     const C3: f32 = 10.143_332;
@@ -338,7 +431,13 @@ pub fn aqi_pm10(pm10: f32) -> Option<i32> {
 
 /// The EPA's piecewise-linear interpolation, `I = (Ih - Il)/(Ch - Cl) * (C - Cl) + Il`.
 fn index(table: &[Breakpoint], concentration: f32) -> Option<i32> {
-    if concentration < 0.0 {
+    // `!usable` before the sign test, because `NaN < 0.0` is false and `NaN <= c_high` is
+    // false for every band -- so a NaN concentration would fall past the whole table to
+    // the "beyond the top breakpoint" arm and store **500, "Hazardous"**. Go does exactly
+    // that (its `switch` reaches `default: return 500`); the difference is that Go only
+    // ever put that number in a *response* and this puts it in a column with `min`/`max`
+    // aggregates over it.
+    if !usable(concentration) || concentration < 0.0 {
         return None;
     }
     let c = f64::from(concentration);
@@ -377,6 +476,9 @@ fn index(table: &[Breakpoint], concentration: f32) -> Option<i32> {
 /// clamp to zero would make it look like bare ground.
 #[must_use]
 pub fn snow_depth(snow_distance_mm: f32, base_distance_mm: f64) -> Option<f32> {
+    if !usable(snow_distance_mm) || !base_distance_mm.is_finite() {
+        return None;
+    }
     if snow_distance_mm <= 0.0 || base_distance_mm <= 0.0 {
         return None;
     }
@@ -429,12 +531,24 @@ pub fn clear_sky_watts(
     altitude_m: f64,
     air_temp_f: f32,
     humidity: f32,
-) -> f32 {
+) -> Option<f32> {
     /// W/m² at the top of the atmosphere.
     const SOLAR_CONSTANT: f64 = 1361.0;
     /// Clearness index. 1.0 is the clear-sky assumption the column's name carries.
     const KT: f64 = 1.0;
 
+    if !usable(air_temp_f)
+        || !usable(humidity)
+        || !latitude.is_finite()
+        || !longitude.is_finite()
+        || !altitude_m.is_finite()
+    {
+        // The horizon guard below is `sw_a < 0.0`, which is **false** for NaN -- so
+        // without this a NaN temperature or humidity falls through it and stores NaN in a
+        // `float4` column, poisoning every `mean`, `min` and `max` bucket over it
+        // thereafter.
+        return None;
+    }
     let day_of_year = f64::from(at.ordinal());
     let utc_hours =
         f64::from(at.hour()) + f64::from(at.minute()) / 60.0 + f64::from(at.second()) / 3600.0;
@@ -471,10 +585,10 @@ pub fn clear_sky_watts(
     // Extraterrestrial radiation on a horizontal surface, W/m².
     let sw_a = SOLAR_CONSTANT * d_r * solar_z.to_radians().cos();
     if sw_a < 0.0 {
-        // The sun is below the horizon. Zero rather than `None`: "there is no clear-sky
-        // radiation at midnight" is a value, not an absence, and it is the value the Go
-        // function stores.
-        return 0.0;
+        // The sun is below the horizon. `Some(0.0)` rather than `None`: "there is no
+        // clear-sky radiation at midnight" is a value, not an absence, and it is the value
+        // the Go function produces.
+        return Some(0.0);
     }
     // Precipitable water, mm.
     let w = 0.15 * e_a * p_b + 0.6;
@@ -488,7 +602,30 @@ pub fn clear_sky_watts(
     } else {
         0.18 + 0.82 * k_b
     };
-    ((k_b + k_d) * sw_a) as f32
+    let watts = ((k_b + k_d) * sw_a) as f32;
+    // The last guard, and it catches what the input checks cannot. A humidity below zero
+    // is a finite number that makes the precipitable water `w` negative, and
+    // `(w / elevation_sin).powf(0.4)` of a negative base is NaN -- so the arithmetic can
+    // produce a non-number from inputs that were all perfectly good `f32`s. `None` keeps
+    // it out of a column the aggregates reduce over (**W3 D-26**).
+    watts.is_finite().then_some(watts)
+}
+
+/// Whether a sensor value is something arithmetic can be done with.
+///
+/// `NaN` and the infinities reach every formula here through `Option<f32>`, and none of the
+/// guard conditions below catches them: every comparison against a NaN is `false`, so a NaN
+/// passes "is it too warm for wind chill" and "is the sun below the horizon" alike.
+///
+/// **Go has the same hole and it does not matter there, which is the whole reason this
+/// exists.** The Go version computes these values on the **read** path, per request, so a
+/// NaN produced one of a JSON number nobody kept. Here they are **stored**, in columns the
+/// aggregate hierarchy takes `mean`, `min` and `max` over — and one NaN in a `float4`
+/// column poisons every bucket above it, permanently, with no way to tell afterwards which
+/// reading did it. `None` is the answer **W3 D-26** gives for a value that is not a
+/// measurement, and this is one.
+fn usable(v: f32) -> bool {
+    v.is_finite()
 }
 
 /// The equation of time, in minutes — `pkg/solar/ineichen-perez.go:equationOfTime`.
@@ -697,25 +834,93 @@ mod tests {
                 5.260_227e2,
             ),
         ] {
-            let got = clear_sky_watts(at(when), lat, lon, alt, temp, humidity);
+            let got = clear_sky_watts(at(when), lat, lon, alt, temp, humidity)
+                .expect("every input here is a usable number");
             assert_eq!(got, want, "{name}: {got:e} against Go's {want:e}");
         }
+    }
+
+    /// **A sensor value that is not a number derives nothing**, rather than storing a NaN
+    /// in a column the aggregates reduce over.
+    ///
+    /// Go reaches the same inputs and does not guard them, which does not matter there
+    /// because it computes on the read path. Here these are stored. The AQI case is the
+    /// loud one: `NaN < 0.0` is false and `NaN <= c_high` is false for every band, so a
+    /// NaN concentration falls past the whole EPA table and lands on "beyond the top
+    /// breakpoint" -- 500, "Hazardous".
+    #[test]
+    fn a_value_that_is_not_a_number_derives_nothing() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(wind_chill(bad, 15.0), None, "temp {bad}");
+            assert_eq!(wind_chill(20.0, bad), None, "wind {bad}");
+            assert_eq!(heat_index(bad, 50.0), None, "temp {bad}");
+            assert_eq!(heat_index(95.0, bad), None, "humidity {bad}");
+            assert_eq!(
+                aqi_pm25(bad),
+                None,
+                "a NaN would otherwise store 500 -- Hazardous"
+            );
+            assert_eq!(aqi_pm10(bad), None);
+            assert_eq!(snow_depth(bad, 1500.0), None, "distance {bad}");
+            assert_eq!(
+                clear_sky_watts(
+                    at("2026-06-21T19:00:00Z"),
+                    39.7392,
+                    -104.9903,
+                    1609.0,
+                    bad,
+                    25.0
+                ),
+                None,
+                "a NaN temperature would otherwise pass the `sw_a < 0.0` horizon guard"
+            );
+        }
+        // A humidity below zero is not a NaN and reaches the same place by arithmetic:
+        // `w` goes negative and `powf(0.4)` of a negative base is NaN. Caught by the
+        // output guard rather than the input one.
+        assert_eq!(
+            clear_sky_watts(
+                at("2026-06-21T19:00:00Z"),
+                39.7392,
+                -104.9903,
+                1609.0,
+                85.0,
+                -5.0
+            ),
+            None
+        );
+        // And the whole stage: a reading of NaNs derives nothing at all.
+        let mut nonsense = Reading {
+            time: at("2026-06-21T19:00:00Z"),
+            station_id: "backyard".into(),
+            out_temp: Some(f32::NAN),
+            out_humidity: Some(f32::NAN),
+            wind_speed: Some(f32::NAN),
+            pm25: Some(f32::NAN),
+            snow_distance: Some(f32::NAN),
+            ..Reading::default()
+        };
+        assert!(!enrich(&mut nonsense, &denver()));
     }
 
     /// The sun below the horizon is 0.0, not a negative number and not `None`.
     #[test]
     fn midnight_is_zero_watts_everywhere() {
         for lon in [-180.0, -104.9903, 0.0, 12.5, 179.0] {
-            let local_midnight = at("2026-02-10T00:00:00Z") - chrono::Duration::hours(0);
+            let utc_midnight = at("2026-02-10T00:00:00Z");
             // Pick the instant that is solar midnight at this longitude: solar noon is at
             // `12 - longitude/15` UTC, so midnight is twelve hours from it.
             let noon_utc: f64 = 12.0 - lon / 15.0;
             let midnight_utc = (noon_utc + 12.0).rem_euclid(24.0);
-            let when = local_midnight
-                + chrono::Duration::milliseconds((midnight_utc * 3_600_000.0) as i64);
+            // Solar noon is at `12 - longitude/15` UTC, so solar midnight is twelve hours
+            // from it. The equation of time (up to ~16 min) is deliberately ignored: at
+            // latitude 39.74 in February the sun is *hours* below the horizon at this
+            // instant, so the margin is not close.
+            let when =
+                utc_midnight + chrono::Duration::milliseconds((midnight_utc * 3_600_000.0) as i64);
             assert_eq!(
                 clear_sky_watts(when, 39.7392, lon, 1609.0, 40.0, 50.0),
-                0.0,
+                Some(0.0),
                 "longitude {lon} at its own solar midnight"
             );
         }
@@ -781,6 +986,104 @@ mod tests {
         );
     }
 
+    /// **The claim `Ingress::accept` rests on, asserted rather than commented.**
+    ///
+    /// `Derived::is_empty` must be `true` for a reading the stage has nothing to add to,
+    /// because that is what keeps `Arc::make_mut` — and therefore a 216-field deep copy —
+    /// off the collector's hot path. And it must be `false` whenever `enrich` would write
+    /// something, or the gate would silently skip real work.
+    ///
+    /// The second half walks the six columns from the other direction, so a seventh
+    /// derived value added to `derive` and forgotten in `Derived` fails here.
+    #[test]
+    fn derive_is_empty_exactly_when_enrich_would_write_nothing() {
+        let rich = denver();
+        let inputs = Reading {
+            time: at("2026-01-15T16:30:00Z"),
+            station_id: "backyard".into(),
+            out_temp: Some(20.0),
+            out_humidity: Some(60.0),
+            wind_speed: Some(15.0),
+            pm25: Some(30.0),
+            pm10_in_aqin: Some(80.0),
+            snow_distance: Some(1200.0),
+            ..Reading::default()
+        };
+
+        // Before: five of the six are derivable, so there is work. (`heat_index` is not:
+        // 20 °F is below its range, and that is the case the cheap "is any column absent"
+        // gate gets wrong — see `Derived`'s own documentation.)
+        let first = derive(&inputs, &rich);
+        assert!(!first.is_empty());
+        assert_eq!(
+            first.heat_index, None,
+            "20 degF is below the heat-index range, so it is not pending work"
+        );
+        let mut enriched = inputs.clone();
+        assert!(enrich(&mut enriched, &rich));
+
+        // After: nothing left to add, even though `heat_index` is still `None` — which is
+        // the whole reason the gate has to be exact rather than an absence check. This is
+        // the collector's common case and the one that must not copy.
+        assert_eq!(enriched.heat_index, None);
+        assert!(
+            derive(&enriched, &rich).is_empty(),
+            "a reading the stage has nothing to add to must not reach Arc::make_mut"
+        );
+        let mut again = enriched.clone();
+        assert!(!enrich(&mut again, &rich));
+
+        // Clearing any ONE of the five it filled must bring the gate back, and `enrich`
+        // must put back exactly what was cleared.
+        // A named type because `clippy::type_complexity` is right that the inline form is
+        // unreadable: it is a list of (column name, the way to clear that column).
+        type ClearOne = (&'static str, fn(&mut Reading));
+        let clear: [ClearOne; 5] = [
+            ("wind_chill", |r| r.wind_chill = None),
+            ("aqi_pm25_aqin", |r| r.aqi_pm25_aqin = None),
+            ("aqi_pm10_aqin", |r| r.aqi_pm10_aqin = None),
+            ("potential_solar_watts", |r| r.potential_solar_watts = None),
+            ("snow_depth", |r| r.snow_depth = None),
+        ];
+        for (name, clear_one) in clear {
+            let mut r = enriched.clone();
+            clear_one(&mut r);
+            assert!(
+                !derive(&r, &rich).is_empty(),
+                "{name} is absent and derivable, so the gate must let enrich run"
+            );
+            assert!(enrich(&mut r, &rich), "{name} must be written");
+            assert_eq!(r, enriched, "and written back exactly as it was cleared");
+        }
+    }
+
+    /// `derive` must not evaluate a value whose slot is already filled — which is what
+    /// keeps the clear-sky model's ten transcendental calls off a collector's path.
+    ///
+    /// Asserted by giving the reading coordinates and a *wrong* stored value: if `derive`
+    /// computed it anyway it would return `Some(the right answer)` and the gate would fire.
+    #[test]
+    fn derive_does_not_recompute_a_value_the_station_already_reported() {
+        let reading = Reading {
+            time: at("2026-06-21T19:00:00Z"),
+            station_id: "backyard".into(),
+            out_temp: Some(85.0),
+            out_humidity: Some(25.0),
+            potential_solar_watts: Some(-1.0),
+            ..Reading::default()
+        };
+        let derived = derive(&reading, &denver());
+        assert_eq!(
+            derived.potential_solar_watts, None,
+            "a filled slot is not computed at all, let alone overwritten"
+        );
+        // And the formula would otherwise have produced something very different.
+        assert!(
+            clear_sky_watts(reading.time, 39.7392, -104.9903, 1609.0, 85.0, 25.0).expect("usable")
+                > 1000.0
+        );
+    }
+
     /// A reading with no metadata still gets the three columns that need none, and gets
     /// `NULL` for the three that do. The accept path depends on this: a peer's station key
     /// is a claim until M6-4, so `metadata` answers `EMPTY` for it.
@@ -839,8 +1142,9 @@ mod tests {
     #[test]
     fn an_unset_altitude_is_sea_level_and_the_term_is_not_sensitive() {
         let when = at("2026-06-21T19:00:00Z");
-        let sea = clear_sky_watts(when, 39.7392, -104.9903, 0.0, 85.0, 25.0);
-        let denver_alt = clear_sky_watts(when, 39.7392, -104.9903, 1609.0, 85.0, 25.0);
+        let sea = clear_sky_watts(when, 39.7392, -104.9903, 0.0, 85.0, 25.0).expect("usable");
+        let denver_alt =
+            clear_sky_watts(when, 39.7392, -104.9903, 1609.0, 85.0, 25.0).expect("usable");
         let ratio = f64::from(denver_alt) / f64::from(sea);
         assert!(
             (1.0..1.03).contains(&ratio),

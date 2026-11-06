@@ -33,6 +33,21 @@
 //! set and only the item that writes those queries knows it. What it does do is refuse to
 //! let the two merge into one trait with eight methods, which is the thing **D-30** is
 //! against.
+//!
+//! **The third shape — two handle *types* published under one capability — is not
+//! representable, and it is the one somebody will reach for.** `Capability::ReadingStore`
+//! is `Arity::Exclusive`; `Publisher::publish` replaces per `(provider, capability)` and
+//! `CapabilitySlot::sole` returns the single entry, so a `db:postgres` that published both
+//! `Arc<dyn ReadingSink>` and `Arc<dyn ReadingStore>` would have the second clobber the
+//! first, and `writer:timescale`'s `cx.hard::<Arc<dyn ReadingSink>>()` would then fail
+//! with `BuildError::HandleTypeMismatch` — at build time, not compile time.
+//!
+//! Which is also the limit of the `Ingress`/`ReadingStream` precedent above, stated
+//! precisely: those two share a capability but only **one of them is ever on the bus**.
+//! `ReadingStream` is a root provided by `main`, and `Arc<dyn Ingress>` travels through
+//! the registrar and is never published (`mw_station::config`'s module documentation has
+//! why). So the precedent licenses sharing a capability *name*; it does not license two
+//! published handles.
 
 use std::sync::Arc;
 
@@ -110,9 +125,22 @@ pub enum StoreError {
 
     /// The server rejected the statement, or a value would not encode.
     ///
-    /// Fatal: a column that is not there is not there on the next attempt either, and
-    /// retrying it would turn a build/schema mismatch into an unbounded backoff with
-    /// nothing in the log that names the cause once.
+    /// `Fatal`: a column that is not there is not there on the next attempt either.
+    ///
+    /// **Known gap — the classification changes nothing today, and that is worth saying
+    /// rather than discovering.** `From<StoreError> for ComponentError` wraps this in
+    /// `ComponentError::tick`, whose own `Classify` is unconditionally `Retryable` and
+    /// deliberately does not consult the boxed source (`mw_component::error`'s comment
+    /// explains why), and `mw_supervisor::task::interpret` branches only on `Ignorable`.
+    /// So a permanently-rejected batch — a `CHECK` violation, a NUL byte in a text metric
+    /// — replays forever until the spool's `max_lag` abandons the cursor seven days later,
+    /// exactly as a database outage would. What the variant buys today is the **log line**
+    /// and the cause chain under it.
+    ///
+    /// Recorded the way `mw_pipeline::sink` records its own `Acked(0)` divergence, and for
+    /// the same reason: the alternative is a comment that reads as a behavioural promise.
+    /// Closing it needs `Sink::deliver`'s error to reach the supervisor with its concrete
+    /// type intact, which is `mw-component`'s trait and `mw-supervisor`'s driver.
     #[error("the weather database rejected the write")]
     Rejected {
         /// The cause.

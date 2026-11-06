@@ -287,22 +287,29 @@ impl SpoolIngress {
             // 4. The clock-skew window -- M6-4's, with §4.6's boundary validation.
             // 5. `station_key` resolves -- M6-4's, with the registry method it needs.
             // 8. enrich. Idempotent and `None`-only, which is what makes a collector agree
-            // with its satellite rather than recompute from a different formula version:
-            // for an envelope a satellite running this code already enriched, every slot
-            // is `Some` and this is a read-only pass that clones nothing. It is here
-            // rather than skipped because a satellite may be *older* than this build, and
-            // W7 §4.4 step 8 is where a column the satellite had never heard of gets
-            // filled.
+            // with its satellite rather than recompute from a different formula version.
+            // It is here rather than skipped because a satellite may be *older* than this
+            // build, and W7 §4.4 step 8 is where a column the satellite had never heard
+            // of gets filled.
             //
             // `metadata` is by station **key**, which on this path is still the peer's
             // claim until step 5 lands -- so an unregistered key answers
             // `StationMeta::EMPTY` and the three metadata-dependent columns stay `NULL`.
             // That is the right failure: a guessed latitude would put a clear-sky figure
             // in a column for a station nobody has placed.
+            // Derived from the **borrowed** envelope, before anything is cloned: this
+            // envelope's `Arc<Reading>` is shared with the caller's batch, so
+            // `Arc::make_mut` is unconditionally a 216-field deep copy and up to fifteen
+            // allocations. `derive` answers "is there anything to write" exactly and
+            // allocates nothing, so an envelope a satellite already enriched -- the
+            // common case on a collector -- costs six `is_some()` reads and no copy.
+            let derived = crate::enrich::derive(
+                &envelope.reading,
+                &self.registry.metadata(&envelope.station),
+            );
             let mut candidate = envelope.clone();
-            let station_meta = self.registry.metadata(&candidate.station);
-            let reading = std::sync::Arc::make_mut(&mut candidate.reading);
-            if crate::enrich::enrich(reading, &station_meta) {
+            if !derived.is_empty() {
+                crate::enrich::apply(std::sync::Arc::make_mut(&mut candidate.reading), derived);
                 m::enriched_on_accept(1);
             }
             candidates.push(candidate);

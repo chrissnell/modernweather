@@ -151,7 +151,9 @@ impl Registrar<Config> for Database {
             );
         } else {
             info!(
-                "a weather database is configured and this node has no spool, so the pool                  is planned and `writer:timescale` is not -- there is no reading stream                  for it to consume (W7 §8.2)"
+                "a weather database is configured and this node has no spool, so the \
+                 pool is planned and `writer:timescale` is not -- there is no reading \
+                 stream for it to consume (W7 §8.2)"
             );
         }
         Ok(())
@@ -936,6 +938,118 @@ mod tests {
             "nothing was appended, so there is no reading to store"
         );
         pool.close().await;
+    }
+
+    /// **The production shape: a weather database *and* a spool.**
+    ///
+    /// This is the only configuration that emits `writer:timescale`, and it is the one
+    /// every real deployment uses — so a mistake in that branch of the `Database`
+    /// registrar (the wrong `Need`, a provider that is not in the plan) is a daemon that
+    /// refuses to start. The other two shapes were covered and this one was not.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_weather_database_and_a_spool_plan_the_pool_and_the_writer() {
+        let scratch = Scratch::new("writer");
+        let port = free_port().await;
+        let (pool, mut cfg, fanout) = boot_to_pipeline(
+            &scratch,
+            &[broadcast_station("suncrest:roof", SERIAL, port)],
+        )
+        .await;
+        // The `weather_database` row the registrar reads. Set on the loaded configuration
+        // rather than inserted, because `Config::load` has already run.
+        cfg.weather_database = Some(config_db::WeatherDatabase {
+            url: secrecy::SecretString::from(
+                "postgresql://mw@127.0.0.1:5432/modernweather".to_string(),
+            ),
+        });
+
+        let roots = Roots {
+            schedule: Arc::new(SqliteScheduleStore::new(pool.clone())),
+            stream: Some(Arc::clone(&fanout.stream) as Arc<dyn mw_component::ReadingStream>),
+            log: Arc::new(mw_supervisor::testing::MemoryLogControl::new("info")),
+        };
+        let ctx = PlanContext::new(Generation::ZERO).with_roots(roots.capabilities());
+        let planned = plan(&cfg, REGISTRARS, &ctx).expect("the production shape plans");
+        let mut ids: Vec<&str> = planned
+            .ids()
+            .map(mw_component::ComponentId::as_str)
+            .collect();
+        ids.sort_unstable();
+        // The listener's id carries the ephemeral port, so the assertion is on the two
+        // components this registrar owns plus the shape of the third.
+        assert!(
+            ids.contains(&"db:postgres"),
+            "the pool must be planned: got {ids:?}"
+        );
+        assert!(
+            ids.contains(&"writer:timescale"),
+            "and so must the writer, which is the branch nothing covered: got {ids:?}"
+        );
+        // The listener, its re-arm (the fixture's station has a `transport_host`), the
+        // pool and the writer.
+        assert_eq!(ids.len(), 4, "got {ids:?}");
+        assert!(
+            ids.iter().any(|id| id.starts_with("station:wll:udp:")),
+            "got {ids:?}"
+        );
+        pool.close().await;
+    }
+
+    /// The satellite shape (W7 §8.2): a weather database and **no** spool.
+    ///
+    /// The pool is still planned, because the read path needs it with or without ingest;
+    /// `writer:timescale` is not, because `Trigger::OnReading` is validated against the
+    /// root `ReadingStream` and refusing the whole configuration for a node that serves
+    /// without ingesting would be wrong.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_weather_database_without_a_spool_plans_the_pool_and_not_the_writer() {
+        let mut cfg = config(true);
+        cfg.registry = Some(Arc::new(mw_store::ConfigRegistry::new(
+            mw_store::RegistrySnapshot::default(),
+        )));
+        // No `ingress`, which is what "no spool" means to the registrar.
+        assert!(cfg.ingress.is_none());
+
+        let roots = Roots {
+            schedule: Arc::new(mw_supervisor::testing::MemoryScheduleStore::new()),
+            stream: None,
+            log: Arc::new(mw_supervisor::testing::MemoryLogControl::new("info")),
+        };
+        let ctx = PlanContext::new(Generation::ZERO).with_roots(roots.capabilities());
+        let planned = plan(&cfg, REGISTRARS, &ctx).expect("a node that serves but does not ingest");
+        let ids: Vec<&str> = planned
+            .ids()
+            .map(mw_component::ComponentId::as_str)
+            .collect();
+        assert_eq!(ids, vec!["db:postgres"]);
+    }
+
+    /// No weather database: neither component, and that is not an error (**D-44**).
+    #[test]
+    fn no_weather_database_plans_neither_the_pool_nor_the_writer() {
+        let mut cfg = config(false);
+        cfg.registry = Some(Arc::new(mw_store::ConfigRegistry::new(
+            mw_store::RegistrySnapshot::default(),
+        )));
+        let mut out = Vec::new();
+        Database
+            .register(&cfg, &mut out)
+            .expect("no database is a legitimate configuration");
+        assert!(out.is_empty());
+    }
+
+    /// The registrar refuses rather than panicking when the boot sequence has not
+    /// published the registry — which would be a bug in `run()`'s ordering, not a
+    /// configuration error, and is reported as such.
+    #[test]
+    fn the_registrar_names_what_is_missing_rather_than_panicking() {
+        let cfg = config(true);
+        assert!(cfg.registry.is_none());
+        let mut out = Vec::new();
+        let e = Database
+            .register(&cfg, &mut out)
+            .expect_err("the registry has not been published");
+        assert!(e.to_string().contains("station registry"), "{e}");
     }
 
     /// Two units on one endpoint, a polled third, and the component set that follows.

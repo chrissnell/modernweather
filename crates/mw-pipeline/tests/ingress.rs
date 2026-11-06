@@ -797,3 +797,54 @@ fn peer_envelope(
         ..base
     }
 }
+
+/// The `Arc` property `accept` depends on, asserted at the boundary that has the `Arc`.
+///
+/// `enrich::derive` returning an empty `Derived` is what keeps `Arc::make_mut` off the hot
+/// path, and "off the hot path" means the allocation is never un-shared. A refcount and a
+/// pointer are the only things that can say so, and neither is visible from inside the
+/// enrich stage.
+#[test]
+fn an_already_enriched_envelope_is_not_deep_copied_on_the_accept_path() {
+    use std::sync::Arc;
+
+    let meta = StationMeta {
+        latitude: Some(39.7392),
+        longitude: Some(-104.9903),
+        altitude_m: Some(1609.0),
+        snow_base_distance_mm: Some(1500.0),
+    };
+    let at = chrono::Utc::now();
+    let mut reading = mw_types::Reading {
+        time: at,
+        station_id: "backyard".into(),
+        out_temp: Some(20.0),
+        out_humidity: Some(60.0),
+        wind_speed: Some(15.0),
+        pm25: Some(30.0),
+        pm10_in_aqin: Some(80.0),
+        snow_distance: Some(1200.0),
+        ..mw_types::Reading::default()
+    };
+    // Enriched the way a satellite running this build would have left it.
+    assert!(mw_pipeline::enrich::enrich(&mut reading, &meta));
+    let enriched = Arc::new(reading);
+
+    // Two holders, exactly as `accept` has after cloning the envelope out of the batch.
+    let mut mine = Arc::clone(&enriched);
+    assert_eq!(Arc::strong_count(&enriched), 2);
+    assert!(
+        mw_pipeline::enrich::derive(&mine, &meta).is_empty(),
+        "there is nothing left for the collector to add"
+    );
+    assert!(
+        Arc::ptr_eq(&mine, &enriched),
+        "no deep copy happened: this is the whole of the claim"
+    );
+
+    // The converse, so the test cannot pass by never exercising the copy: clear a column
+    // the collector *can* fill, and the same path does un-share.
+    Arc::make_mut(&mut mine).wind_chill = None;
+    assert!(!mw_pipeline::enrich::derive(&mine, &meta).is_empty());
+    assert!(!Arc::ptr_eq(&mine, &enriched));
+}
