@@ -1525,3 +1525,69 @@ fn the_declaration_table_matches_the_contract() {
         );
     }
 }
+
+/// **The anti-drift check two doc comments name and nobody had written.**
+///
+/// `provides_latest_snapshot` is a second statement of a condition `register` already owns,
+/// and `crates/mw-api-legacy` plans itself on the answer. The two were not the same: the
+/// predicate ended `(has_reading_stream() || has_weather_database())` while only
+/// `latest_spec` provides the capability and it is pushed only on `has_reading_stream()`.
+/// A node with a weather database and no spool therefore got `api:legacy` planned with a
+/// hard need nobody provides, and `plan()` refused the whole configuration -- a daemon that
+/// exits before `READY=1`, on the shape W7 §8.2 calls a serve-only node.
+///
+/// Over every combination of the conditions rather than a sample, because the defect was in
+/// one corner of it.
+#[test]
+fn the_predicate_agrees_with_what_register_plans() {
+    for bits in 0..32u8 {
+        let cfg = Cfg {
+            render: (bits & 1 != 0).then(|| CountingRender::new() as Arc<dyn SnapshotRender>),
+            state: (bits & 2 != 0).then(state),
+            registry: (bits & 4 != 0)
+                .then(|| MemoryRegistry::fixed("backyard") as Arc<dyn StationRegistry>),
+            stream: bits & 8 != 0,
+            db: bits & 16 != 0,
+            windows: None,
+        };
+        let mut specs = Vec::new();
+        // `register` returns an error only for a configuration it considers malformed
+        // rather than unplanned; either way nothing provides the capability.
+        let planned = register(&cfg, &mut specs).is_ok()
+            && specs.iter().any(|s| {
+                s.provides
+                    .iter()
+                    .any(|p| p.capability == Capability::LatestSnapshot)
+            });
+        assert_eq!(
+            provides_latest_snapshot(&cfg),
+            planned,
+            "bits {bits:05b} (render/state/registry/stream/db): the predicate says {} and \
+             register plans {}. `api:legacy` declares a hard LatestSnapshot on the \
+             predicate's word, so a `true` here with no provider is a daemon that refuses \
+             to start.",
+            provides_latest_snapshot(&cfg),
+            planned
+        );
+    }
+}
+
+/// The corner that shipped, named on its own so a regression says what it is.
+#[test]
+fn a_serve_only_node_does_not_claim_a_latest_snapshot_provider() {
+    let cfg = Cfg {
+        stream: false,
+        db: true,
+        ..Cfg::full()
+    };
+    assert_eq!(
+        ids(&cfg),
+        vec![WARM_ID],
+        "the seed, and nothing that provides"
+    );
+    assert!(
+        !provides_latest_snapshot(&cfg),
+        "`snapshot:warm` writes the table and provides nothing: the capability is Exclusive \
+         and two providers would be a plan error"
+    );
+}

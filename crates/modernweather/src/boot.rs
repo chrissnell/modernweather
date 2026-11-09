@@ -629,10 +629,27 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     // state slot `attach_registry` created; the slot is empty until `api:legacy` reaches
     // `Running`, at which point every frozen path answers its contract response -- see
     // that component's own note on why an empty slot is not a state D-48 is about.
-    let legacy = cfg
-        .legacy_routes
-        .as_ref()
-        .map(|state| mw_api_legacy::routes(Arc::clone(state)));
+    //
+    // **Mounted on the PLAN, not on the slot.** `attach_registry` sets `legacy_routes`
+    // unconditionally, so merging on its presence mounted the table on nodes where
+    // `register` deliberately planned no component -- and then nothing ever filled the
+    // slot, so `unmounted()` answered a permanent body-less `503` on all five frozen
+    // paths. That is the response **D-48** declares unobservable, and
+    // `mw_pipeline::snapshot`'s own documentation says such a node gets `mw-http`'s bare
+    // `404`. It did not; the fall-through worked and the frozen paths never reached it.
+    //
+    // The shape is ordinary: websites and stations configured, no spool and no weather
+    // database yet -- a staged rollout, or a serve-only node before its database URL is
+    // written.
+    let legacy = plan
+        .ids()
+        .any(|id| id.as_str() == mw_api_legacy::ID)
+        .then(|| {
+            cfg.legacy_routes
+                .as_ref()
+                .map(|state| mw_api_legacy::routes(Arc::clone(state)))
+        })
+        .flatten();
     let bound = mw_http::bind(
         cfg.listen_addr()?,
         mw_http::MetricsRoute::new(Arc::new(move || metrics.render()), mw_obs::CONTENT_TYPE),

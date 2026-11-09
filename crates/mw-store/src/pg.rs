@@ -259,6 +259,18 @@ impl Pool {
                              §3.4). Readings keep spooling and nothing is lost; \
                              writer:timescale moves to Waiting and resumes on its own.",
                         );
+                        // **Revoke before closing, the same order the cancel path takes
+                        // below and for the same reason.** Closing first and leaving
+                        // `revoke_all` to the supervisor's `on_exit` left a window in which
+                        // `Deferred::load()` still handed out a closed pool, so `/span`,
+                        // `/snow` and `/forecast` answered their `500` instead of the
+                        // degraded response the absent handle produces -- deterministically
+                        // rather than by timing. §3.6's "a consumer must never observe a
+                        // revoked capability" is the supervisor's ordering; this is the half
+                        // this component owes it, and it owes it on both exits.
+                        self.publisher.revoke();
+                        self.forecasts.revoke();
+                        self.snow.revoke();
                         pool.close().await;
                         return Err(ComponentError::tick(
                             "keep the weather database pool usable",

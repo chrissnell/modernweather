@@ -669,6 +669,118 @@ mod tests {
         }
     }
 
+    /// A `BuildCx` whose slot sender the test keeps, so it can publish **after** the build.
+    ///
+    /// That is the whole point of [`Deferred`] and the one thing a forgotten sender cannot
+    /// express: `BuildCx::soft` reads its slot once, and the supervisor never rebuilds a
+    /// `Running` component when a soft capability arrives later, so a `soft` handle taken
+    /// at build time is `None` for the life of every process whose database connects after
+    /// the consumer starts.
+    fn deferred_cx() -> (BuildCx, watch::Sender<Arc<CapabilitySlot>>) {
+        let (_gen_tx, gen_rx) = watch::channel(Generation::ZERO);
+        std::mem::forget(_gen_tx);
+        let cx = Cx::new(
+            id("api:legacy"),
+            CancellationToken::new(),
+            Generation::ZERO,
+            gen_rx,
+        );
+        let (tx, rx) = watch::channel(Arc::new(CapabilitySlot {
+            providers: Vec::new(),
+        }));
+        let access = CapabilityAccess::new(
+            vec![Need::soft(Capability::ReadingStore)].into(),
+            Vec::new().into(),
+            vec![(Capability::ReadingStore, rx)],
+            Arc::new(RecordingBus::default()),
+        );
+        (BuildCx::new(cx, access), tx)
+    }
+
+    /// **The defect `Deferred` exists for, as a test.** The handle is taken at build time
+    /// and read per request, so a provider that publishes after the build is seen.
+    #[test]
+    fn a_deferred_handle_resolves_after_the_build() {
+        let (cx, tx) = deferred_cx();
+        let store = cx.deferred::<FakeStore>().expect("declared soft");
+        assert!(store.load().is_none(), "nothing is published yet");
+        assert!(!store.is_available());
+
+        tx.send(Arc::new(slot_with(
+            "db:postgres",
+            Arc::new(FakeStore("pool")),
+        )))
+        .expect("the receiver is alive");
+        assert_eq!(
+            store.load().expect("published after the build").0,
+            "pool",
+            "a Deferred that cached its first read would be None forever"
+        );
+        assert!(store.is_available());
+
+        // And revocation is seen the same way, which is what makes the degraded response
+        // reachable again rather than sticky.
+        tx.send(Arc::new(CapabilitySlot {
+            providers: Vec::new(),
+        }))
+        .expect("the receiver is alive");
+        assert!(store.load().is_none(), "a revoked slot reads as absent");
+    }
+
+    /// A provider that publishes a handle under a type this consumer does not resolve reads
+    /// as unavailable rather than panicking -- `Additive::load`'s reasoning, and the only
+    /// answer a frozen route can take (**D-48**).
+    #[test]
+    fn a_deferred_handle_of_the_wrong_type_reads_as_absent() {
+        let (cx, tx) = deferred_cx();
+        let store = cx.deferred::<FakeStore>().expect("declared soft");
+        tx.send(Arc::new(slot_with("db:postgres", Arc::new(FakeRoutes))))
+            .expect("the receiver is alive");
+        assert!(store.load().is_none(), "the downcast fails, so it degrades");
+        // `is_available` deliberately does not check the type: it answers "somebody
+        // published", which is the field `X-MW-Degraded` and the log line want.
+        assert!(store.is_available());
+    }
+
+    /// §1.3 rule 3 again, on the deferred path: a need nobody declared cannot be resolved
+    /// even when a provider has published it.
+    #[test]
+    fn an_undeclared_need_cannot_be_deferred_either() {
+        let cx = build_cx(
+            vec![Need::hard(Capability::LatestSnapshot)],
+            vec![],
+            vec![(
+                Capability::ReadingStore,
+                slot_with("db:postgres", Arc::new(FakeStore("pool"))),
+            )],
+            Arc::new(RecordingBus::default()),
+        );
+        assert!(matches!(
+            cx.deferred::<FakeStore>(),
+            Err(BuildError::UndeclaredNeed { .. })
+        ));
+    }
+
+    /// A `Deferred` over a need declared **hard** is also a refusal: a hard need is resolved
+    /// once because the supervisor guarantees it for the component's whole life, and
+    /// deferring it would be asking for a guarantee to be re-checked.
+    #[test]
+    fn a_hard_need_cannot_be_deferred() {
+        let cx = build_cx(
+            vec![Need::hard(Capability::ReadingStore)],
+            vec![],
+            vec![(
+                Capability::ReadingStore,
+                slot_with("db:postgres", Arc::new(FakeStore("pool"))),
+            )],
+            Arc::new(RecordingBus::default()),
+        );
+        assert!(
+            cx.deferred::<FakeStore>().is_err(),
+            "a hard need is not a deferred one"
+        );
+    }
+
     #[test]
     fn a_declared_hard_need_resolves_to_its_typed_handle() {
         let cx = build_cx(
