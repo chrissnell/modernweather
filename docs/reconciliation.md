@@ -2248,7 +2248,7 @@ A-W2-1 and A-W2-2, W2a's D-30 split, W3's A-W3-1 to A-W3-4, W4's A-W4-1 to A-W4-
 A-W5-3, W7's A-W7-1 to A-W7-4, W8's A-1 to A-4 and W9's A-W9-1 to A-W9-3. All are applied there under
 the protocol; none is edited in place. See `docs/DESIGN.md`'s `## Amendments` section.
 
-This document proposes **one** amendment of its own, which is not to a decision. Three more
+This document proposes **one** amendment of its own, which is not to a decision. Four more
 were appended later by implementation items and are marked as such.
 
 **A-M3-3-1 — D-56's `admit` half is not expressible, and lands on the writer instead.**
@@ -2374,6 +2374,48 @@ set, "the snow totals" included, and those are four components over
 not publish — `mw_store::pg`'s own spec test on `main` asserts that, naming M5 and M6-3 as
 the items that bring it. `snow:*` additionally needs the PELT changepoint detection and the
 RBF smoothing, which is a body of arithmetic with its own done-criteria. M6-3 builds them.
+
+**A-M4-1-1 — `snapshot:warm` requires `ReadingStore` HARD, because a soft need seeds
+nothing.**
+*Proposed by implementation-plan.md **M4-1**, 2026-11-09. Not applied: the protocol above
+reserves that for a work item that owns the ledger. **D-37** stands as written until it is.*
+
+*What was found.* **D-37** reads: *"`snapshot:warm` is an `OnStartup` component that seeds the
+snapshot table from the store so a restart does not 404 a station that was inside the
+10-minute window; with `ReadingStore` unavailable it finishes empty rather than refusing to
+start."* W3 §2a.6 spells the requirement `ReadingStore` **soft**.
+
+**Soft does not work, and the reason is the supervisor rather than the decision.** W2a
+Decision 17 is that *only hard edges form the ordering graph*, and `mw_supervisor`
+implements exactly that: a soft need is read in `degraded()` and contributes to
+`State::Running { degraded }`, and nothing anywhere delays a start for one. An `OnStartup`
+component with soft `ReadingStore` therefore fires the instant it is spawned — which on
+**every** node, healthy or not, is before `db:postgres` has connected, asserted **D-62** and
+published. `mw_store::pg` publishes after a successful connect and not before, by design
+(**D-27**: a server that is slow or unreachable at startup is logged and started past). So
+the seed would run against `None` and populate nothing, always, and the one thing the
+component exists to do would never happen.
+
+Waiting for the handle *after* `build` is not available either, and deliberately:
+`BuildCx::additive` refuses a non-additive capability precisely so that a component cannot
+watch an exclusive one appear and decide for itself what its absence means (W2a Decision 21).
+
+*What is proposed.* D-37 gains: *the requirement is `ReadingStore` **hard**. With the
+database down the component sits in `Waiting { ReadingStore }` rather than reaching
+`Finished`, and the observable is unchanged — an empty snapshot table, and `/latest` 404ing
+until a reading arrives.*
+
+*Why this is safe, which is the part that matters.* **Nothing requires `snapshot:warm`**: it
+provides no capability, so its `Waiting` cascades nowhere. In particular it does not reach
+**D-48** — the invariant that a `503` from an unmounted route is unobservable on a frozen
+path — because that invariant rests on `snapshot:latest`, which provides `LatestSnapshot`,
+declares **no hard requirement at all**, and publishes its handle in `build`.
+`crates/modernweather/tests/snapshot_degraded.rs` asserts both halves against the real
+supervisor with `db:postgres` planned and never publishing.
+
+What the change buys beyond correctness at startup: when the server comes back, the seed
+actually runs, where a soft need would have finished empty an hour earlier and never looked
+again.
 
 **A-W6-1 — retire `remoteweather:docs/rewrite/`, and reference the Go repository by URL only.**
 

@@ -65,7 +65,7 @@ use crate::spool;
 /// One line per component crate, which is §1.3 rule 2: adding a component crate adds a line
 /// here and edits nothing else -- the shape `managers/controller.go` could not take, down to
 /// its `if con.Type == "management" { continue }`.
-const REGISTRARS: &[&dyn Registrar<Config>] = &[&Stations, &Database, &Rollup];
+const REGISTRARS: &[&dyn Registrar<Config>] = &[&Stations, &Database, &Rollup, &Snapshot];
 
 /// `mw-station`'s registrar.
 ///
@@ -188,6 +188,35 @@ impl Registrar<Config> for Rollup {
     }
 }
 
+/// `snapshot:latest` and `snapshot:warm` — the hot path's memory and its cold start.
+///
+/// An adapter here for `Rollup`'s reason. The four conditions under which one or both are
+/// not planned belong to `mw_pipeline::snapshot::register`, which makes all of them and
+/// logs each; this adapter makes none.
+///
+/// **Neither is planned in this build**, because the payload renderer is the frozen 133-key
+/// DTO's serialiser and `mw-api-legacy` exclusively owns it (implementation-plan.md M4-2).
+/// `Config::snapshot_render` answers `None` and the registrar says so at `info`. The
+/// registrar is wired now rather than with M4-2 so that landing the renderer is one line
+/// in `crate::config` and nothing here.
+#[derive(Debug)]
+struct Snapshot;
+
+impl Registrar<Config> for Snapshot {
+    fn name(&self) -> &'static str {
+        "mw-pipeline (the latest-conditions snapshot)"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        mw_pipeline::snapshot::register(cfg, out)
+            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
+    }
+}
+
 /// Build the station registry and the write end of the pipeline, and hand both to the
 /// configuration.
 ///
@@ -280,6 +309,46 @@ fn attach_registry(cfg: &mut Config) -> anyhow::Result<()> {
     // it.
     let stations = mw_pipeline::RollupConfig::rollup_stations(&*cfg);
     cfg.set_rollup(Arc::new(mw_pipeline::RollupState::new(stations)));
+    // The snapshot table, over the same two sets the key is a product of (**D-31**). A
+    // fourth root resource for the rollup state's reason -- two components write it -- and
+    // built here rather than in the registrar so that both of them are handed the same
+    // table.
+    //
+    // **Every station, not only the collecting ones.** `window:rollup` maintains windows
+    // for the stations this node collects for, because a window is accumulated from frames
+    // this node received. A snapshot is the other way round: `/latest?station=` may name
+    // **any** configured device (W3 §2a.4), and a station a peer forwards readings for
+    // arrives through `Ingress::accept` and has conditions to serve. Filtering here would
+    // make those readings fold into no key at all.
+    let websites: Vec<mw_component::WebsiteView> = cfg
+        .websites
+        .iter()
+        .map(|w| mw_component::WebsiteView {
+            id: mw_types::WebsiteId::new(w.id),
+            name: w.name.clone(),
+            primary_station: w
+                .primary_station_key
+                .as_deref()
+                .map(mw_types::StationKey::new),
+            snow_enabled: w.snow_enabled,
+            snow_station: w.snow_station_key.as_deref().map(mw_types::StationKey::new),
+        })
+        .collect();
+    let snapshot_stations: Vec<mw_types::StationKey> = cfg
+        .stations
+        .iter()
+        .map(|r| mw_types::StationKey::new(r.station_key.as_str()))
+        .collect();
+    info!(
+        websites = websites.len(),
+        stations = snapshot_stations.len(),
+        keys = websites.len() * snapshot_stations.len(),
+        "snapshot table allocated"
+    );
+    cfg.set_snapshot(Arc::new(mw_pipeline::SnapshotState::new(
+        websites,
+        snapshot_stations,
+    )));
     Ok(())
 }
 
@@ -618,9 +687,11 @@ mod tests {
         Config {
             stations: Vec::new(),
             declared_stations: Vec::new(),
+            websites: Vec::new(),
             ingress: None,
             registry: None,
             rollup: None,
+            snapshot: None,
             station_zones: Vec::new(),
             listener: Listener {
                 listen_addr: "127.0.0.1".into(),
@@ -1063,6 +1134,21 @@ mod tests {
         assert!(
             ids.contains(&"rain:rollover:suncrest:roof"),
             "one rollover per collecting station: got {ids:?}"
+        );
+        // **The snapshot components are not planned, and that is this build's scope
+        // boundary rather than a gap.** `snapshot:latest` and `snapshot:warm` are
+        // implementation-plan.md M4-1's and are complete; what they need and do not have is
+        // the payload renderer, which is the frozen 133-key DTO's serialiser and belongs
+        // exclusively to `mw-api-legacy` (M4-2). `Config::snapshot_render` answers `None`,
+        // so `mw_pipeline::snapshot::register` plans neither and says so at `info`.
+        //
+        // Asserted rather than left to the count below, so that the item which lands the
+        // renderer is told by a failing test to update this -- the same role
+        // `mw_store::pg`'s spec test plays for `SnowCache`.
+        assert!(
+            !ids.contains(&"snapshot:latest") && !ids.contains(&"snapshot:warm"),
+            "the snapshot components need M4-2's renderer; when it lands, this assertion \
+             inverts and the count below becomes 8: got {ids:?}"
         );
         // The listener, its re-arm (the fixture's station has a `transport_host`), the
         // pool, the writer, the rollup and the rollover.

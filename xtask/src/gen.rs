@@ -536,7 +536,50 @@ fn rust_reading(reg: &Registry) -> String {
             }
         }
     }
-    s.push_str("        }\n    }\n}\n");
+    s.push_str("        }\n    }\n\n");
+
+    // The inverse of `value`, and the one caller is `ReadingStore::latest`: a row of
+    // `observations` read back column by column has to land in the field the column came
+    // from, and `mw-store` has no way to name 212 fields that is not the hand-written
+    // mapping this type exists to delete. Generated here for `value`'s reason, from the
+    // same list, so the two directions cannot drift.
+    //
+    // `false` for a value whose variant is not the metric's column type, rather than a
+    // silent drop: a caller that binds an `int4` column as a float has a decode bug, and a
+    // setter that ignored it would store the metric as NULL and look like a sensor that did
+    // not report.
+    s.push_str(
+        "    /// Write one metric from the type its column holds — the inverse of\n\
+         \x20   /// [`Reading::value`], for the paths that decode a row rather than bind one.\n\
+         \x20   ///\n\
+         \x20   /// `false` if `value` is not the variant this metric's column holds, in which\n\
+         \x20   /// case nothing is written. An absent value is not expressed here at all:\n\
+         \x20   /// every field starts `None` on `Reading::default()`, and a `NULL` column is\n\
+         \x20   /// a `set` that is never called (**D-26**).\n\
+         \x20   pub fn set(&mut self, key: MetricKey, value: MetricValue<'_>) -> bool {\n\
+         \x20       match (key, value) {\n",
+    );
+    for m in reg.live_metrics() {
+        let variant = pascal(&m.key);
+        let field = rust_ident(&m.key);
+        let (pattern, expression) = match m.sql_type {
+            SqlType::Float4 => ("MetricValue::Float(v)", "v"),
+            SqlType::Int4 => ("MetricValue::Int(v)", "v"),
+            SqlType::Int8 => ("MetricValue::BigInt(v)", "v"),
+            SqlType::Text => ("MetricValue::Text(v)", "v.to_string()"),
+            SqlType::Timestamptz => ("MetricValue::Time(v)", "v"),
+        };
+        let _ = writeln!(
+            s,
+            "            (MetricKey::{variant}, {pattern}) => \
+             self.{field} = Some({expression}),"
+        );
+    }
+    // One arm for every mismatched pair, which is 212 x 4 of them and not worth
+    // enumerating. `return false` rather than falling through, so the `true` below is
+    // reached only by an arm that actually wrote something.
+    s.push_str("            _ => return false,\n");
+    s.push_str("        }\n        true\n    }\n}\n");
     s
 }
 

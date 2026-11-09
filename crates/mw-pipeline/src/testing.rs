@@ -10,8 +10,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use mw_component::{ComponentId, FrameMeta, IdentitySource, Reject, StationMeta, StationRegistry};
-use mw_types::{Envelope, OriginId, PartialReading, Provenance, Reading, Seq, StationKey};
+use mw_component::{
+    ComponentId, Encoding, FrameMeta, IdentitySource, Payload, Reject, RenderError, SnapshotKey,
+    SnapshotRender, SnapshotSource, StationMeta, StationRegistry, WebsiteView,
+};
+use mw_types::{
+    Envelope, OriginId, PartialReading, Provenance, Reading, Seq, StationKey, WebsiteId,
+};
 
 use crate::clock::{Clock, TestClock};
 use crate::spool::{Spool, SpoolConfig};
@@ -129,6 +134,111 @@ pub fn forwarded(
             .expect("the test's own path has no repeat");
     }
     envelope
+}
+
+/// A sealed envelope admitted locally by this node — the shape the fan-out delivers.
+pub fn admitted(station: &str, at: DateTime<Utc>, barometer: f32) -> Envelope {
+    Envelope {
+        station: StationKey::new(station),
+        observed_at: at,
+        received_at: at,
+        provenance: Provenance::admitted(node(1), Seq::new(1)),
+        reading: Arc::new(Reading {
+            // `SpoolIngress::admit` sets `reading.time = observed_at` (`ingress.rs`), and
+            // the snapshot's `observed_at` is read off the reading -- so a test envelope
+            // whose two instants disagreed would be testing a state the pipeline cannot
+            // produce.
+            time: at,
+            station_id: station.to_string(),
+            ..reading(barometer)
+        }),
+    }
+}
+
+/// One configured website, for a snapshot key's left half (**D-31**).
+pub fn website(id: i64, name: &str, primary: &str) -> WebsiteView {
+    WebsiteView {
+        id: WebsiteId::new(id),
+        name: name.to_string(),
+        primary_station: Some(StationKey::new(primary)),
+        snow_enabled: false,
+        snow_station: None,
+    }
+}
+
+/// A [`SnapshotRender`] that records what it was asked for and emits assertable bytes.
+///
+/// The real one is `mw-api-legacy`'s 133-key DTO (implementation-plan.md M4-2); what a
+/// pipeline test needs is that the fold happened, for which key, and with which window
+/// values folded in. So the payload is `<key>|<barometer>|<gust>` — the three facts the
+/// tests here assert — and every call is counted, which is what makes **D-33**'s
+/// eager/lazy split observable rather than described.
+#[derive(Debug, Default)]
+pub struct CountingRender {
+    calls: Mutex<Vec<(Encoding, SnapshotKey)>>,
+    /// A revision the test can move, to assert that an `ETag` follows the serialiser.
+    revision: Mutex<u64>,
+}
+
+impl CountingRender {
+    /// A renderer that produces JSON and nothing else, which is this build's real set.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::new(Vec::new()),
+            revision: Mutex::new(1),
+        })
+    }
+
+    /// Every render call, in order.
+    pub fn calls(&self) -> Vec<(Encoding, SnapshotKey)> {
+        self.calls.lock().expect("not poisoned").clone()
+    }
+
+    /// How many times it has been asked to render.
+    pub fn count(&self) -> usize {
+        self.calls.lock().expect("not poisoned").len()
+    }
+}
+
+impl SnapshotRender for CountingRender {
+    fn revision(&self) -> u64 {
+        *self.revision.lock().expect("not poisoned")
+    }
+
+    fn encodings(&self) -> &'static [Encoding] {
+        &[Encoding::Json]
+    }
+
+    fn render(&self, encoding: Encoding, source: &SnapshotSource) -> Result<Payload, RenderError> {
+        if encoding != Encoding::Json {
+            return Err(RenderError::EncodingUnsupported {
+                encoding,
+                declared: "json".to_string(),
+            });
+        }
+        self.calls
+            .lock()
+            .expect("not poisoned")
+            .push((encoding, source.key.clone()));
+        let gust = source
+            .windows
+            .value((
+                mw_types::MetricKey::WindSpeed,
+                mw_types::Window::Rolling(mw_types::Window::TEN_MINUTES),
+                mw_types::Agg::Max,
+            ))
+            .ok()
+            .flatten();
+        let barometer = source.reading.barometer;
+        Ok(format!(
+            "{}|{}|{}",
+            source.key,
+            barometer.map_or_else(|| "-".to_string(), |v| format!("{v}")),
+            gust.map_or_else(|| "-".to_string(), |v| format!("{v}")),
+        )
+        .into_bytes()
+        .into())
+    }
 }
 
 /// The frame metadata of a `Fixed`-identity transport.

@@ -44,15 +44,22 @@
 //! readings is maintained by a component and read from memory, never computed per request,
 //! and that module is the memory plus the arithmetic.
 //!
-//! Not yet, each with the item that owns it: `snapshot:latest` (M4-1), `snow:*` (M6-3) and
-//! `live:stream` (M4-3). The seams they attach to are marked where they land —
-//! `ingress.rs` names enrich at the line it goes on — because a list in a module doc is
-//! not a work item (docs/reconciliation.md G-5).
+//! Also here: [`snapshot`] -- `snapshot:latest` and `snapshot:warm`, the hot path's memory.
+//! `/latest` is 93% of the measured request mix and is served from an `ArcSwap` of
+//! pre-serialised bytes, so a database outage no longer touches it: that module is the
+//! table, the fold, and the cold-start seed.
+//!
+//! Not yet, each with the item that owns it: the snapshot payload **renderer** (M4-2, which
+//! exclusively owns the frozen DTO), `snow:*` (M6-3) and `live:stream` (M4-3). The seams
+//! they attach to are marked where they land — `ingress.rs` names enrich at the line it
+//! goes on — because a list in a module doc is not a work item
+//! (docs/reconciliation.md G-5).
 
 pub mod clock;
 pub mod enrich;
 pub mod metrics;
 pub mod rollup;
+pub mod snapshot;
 pub mod spool;
 pub mod testing;
 
@@ -69,6 +76,8 @@ pub use ingress::{
 pub use rollup::state::{Boundaries, Rollover, RollupState, Windows};
 pub use rollup::{RollupConfig, RollupPlanError};
 pub use sink::{Acked, Never, OverAck, RecordingSink, Sink, SpooledSink};
+pub use snapshot::state::SnapshotState;
+pub use snapshot::{SnapshotConfig, SnapshotPlanError};
 pub use spool::{
     Committed, Cursor, CursorPosition, CursorState, Draft, Spool, SpoolConfig, SpoolError,
     SpoolStats, CEILING_BYTES, GROUP_COMMIT_APPENDS, GROUP_COMMIT_WINDOW, LOSSY_CAPACITY, MAX_LAG,

@@ -1063,6 +1063,61 @@ pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbErro
         .collect()
 }
 
+/// One `config.website` row, as the columns hold it.
+///
+/// **Only the columns a snapshot key needs**, which is the four **D-31** names plus the
+/// identity: the key is `(website, station)` because the primary-device selection, the snow
+/// device and the website's own name are per website. The rest of the table — `hostname`,
+/// `page_title`, `about_station_html`, the radar token, the TLS paths — belongs to the
+/// hostname router and the website renderer, and those are M4-3's: a field here for a
+/// consumer that does not exist yet would be a guess at a shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebsiteRow {
+    /// `id` -- the surrogate key the snapshot table is keyed by.
+    pub id: i64,
+    /// `name`.
+    pub name: String,
+    /// `primary_station_key`. Nullable, and `ON DELETE SET NULL`.
+    pub primary_station_key: Option<String>,
+    /// `snow_enabled`.
+    pub snow_enabled: bool,
+    /// `snow_station_key`. The table's own `CHECK` makes this non-NULL whenever
+    /// `snow_enabled` is set.
+    pub snow_station_key: Option<String>,
+}
+
+/// Read every `config.website` row, ordered by id.
+///
+/// Ordered for [`stations`]'s reason: the order reaches the plan through the snapshot
+/// components' `ConfigDigest`, and an unordered `SELECT` would make the plan diff depend on
+/// SQLite's row order.
+///
+/// **Every row, including a portal.** Which of them produce components is the consumer's to
+/// decide; a `WHERE` here would put that decision in two places.
+pub async fn websites(pool: &SqlitePool) -> Result<Vec<WebsiteRow>, ConfigDbError> {
+    let rows = sqlx::query(
+        "SELECT id, name, primary_station_key, snow_enabled, snow_station_key \
+         FROM website ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|source| ConfigDbError::Query {
+        what: "the website rows",
+        source,
+    })?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(WebsiteRow {
+                id: r.get("id"),
+                name: r.get("name"),
+                primary_station_key: r.get("primary_station_key"),
+                snow_enabled: flag(&r, "snow_enabled")?,
+                snow_station_key: r.get("snow_station_key"),
+            })
+        })
+        .collect()
+}
+
 /// A `0`/`1` column as a `bool`, refusing anything else.
 ///
 /// The column's own `CHECK` permits exactly those two, so a third value means this build

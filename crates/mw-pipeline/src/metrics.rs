@@ -57,6 +57,18 @@ pub fn register() {
         "mw_readings_dropped_total",
         "Readings lost rather than refused, by reason"
     );
+    metrics::describe_counter!(
+        "mw_snapshot_published_total",
+        "Current-conditions snapshots rendered, per website and station"
+    );
+    metrics::describe_gauge!(
+        "mw_snapshot_age_seconds",
+        "How old each key's newest folded reading is"
+    );
+    metrics::describe_gauge!(
+        "mw_snapshot_degraded",
+        "1 while a key's window-derived values are served from their last good value"
+    );
     metrics::describe_gauge!("mw_spool_depth_bytes", "How much the spool holds on disk");
     metrics::describe_gauge!(
         "mw_spool_depth_envelopes",
@@ -269,6 +281,51 @@ pub fn rollup_pieces_summed(n: u64) {
 /// having been counted, which is what the occurrence key exists to prevent.
 pub fn rain_rolled_over() {
     metrics::counter!("mw_rain_rollovers_total").increment(1);
+}
+
+/// One current-conditions snapshot rendered into the table.
+///
+/// Three series, because an operator asks three different questions of a snapshot:
+///
+/// - `mw_snapshot_published_total{website,station}` — is the fold happening at all? In the
+///   steady state this is one per website per reading, so a station at a 2-second cadence
+///   bound to two websites is one per second.
+/// - `mw_snapshot_age_seconds{website,station}` — §2a.6's gauge, and the number behind the
+///   `X-MW-Snapshot-Age` header. It is the **reading's** age rather than the render's, which
+///   is what W1's 10-minute recency rule is measured against: a value climbing past 600 is
+///   a station whose `/latest` has started answering 404.
+/// - `mw_snapshot_degraded{website,station}` — **D-36**'s indicator as a number, 1 while the
+///   window-derived values are being served from their last good value. This is the series
+///   an alert fires on, because the frozen body cannot carry the fact and must not.
+///
+/// The labels are a website id and a station key, both bounded by the configuration (§5.10)
+/// — W3 §2a.4's worst case is 30 pairs.
+pub fn snapshot_published(
+    key: &mw_component::SnapshotKey,
+    observed_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    fresh: bool,
+) {
+    let website = key.website.to_string();
+    let station = key.station.as_str().to_string();
+    metrics::counter!(
+        "mw_snapshot_published_total",
+        "website" => website.clone(),
+        "station" => station.clone(),
+    )
+    .increment(1);
+    metrics::gauge!(
+        "mw_snapshot_age_seconds",
+        "website" => website.clone(),
+        "station" => station.clone(),
+    )
+    .set((now - observed_at).num_milliseconds() as f64 / 1000.0);
+    metrics::gauge!(
+        "mw_snapshot_degraded",
+        "website" => website,
+        "station" => station,
+    )
+    .set(if fresh { 0.0 } else { 1.0 });
 }
 
 /// Envelopes the dedup gate already had (W7 §4.4). Expected and non-zero in a diamond.

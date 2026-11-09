@@ -50,10 +50,12 @@ use std::fmt::Write as _;
 
 use chrono::{DateTime, Utc};
 use mw_component::{
-    BoxFuture, Bucket, BucketLevel, BucketQuery, Bucketed, Piece, ReadingStore, SeriesQuery,
-    StoreError, TotalsQuery,
+    BoxFuture, Bucket, BucketLevel, BucketQuery, Bucketed, LatestQuery, Piece, ReadingStore,
+    SeriesQuery, StoreError, TotalsQuery,
 };
-use mw_types::{AggregateColumn, MetricKey, Strategy, LEVELS};
+use mw_types::{
+    AggregateColumn, MetricKey, MetricValue, Reading, SqlType, Strategy, LEVELS, METRICS,
+};
 use sqlx::{PgPool, Row};
 
 /// The widest bucket read this module will issue, in rows.
@@ -65,11 +67,26 @@ use sqlx::{PgPool, Row};
 /// the shape that turns an outage into an allocation failure.
 const MAX_ROWS: usize = 10_000;
 
+/// The raw hypertable, which [`TimescaleReader::latest`] is the only read of.
+const OBSERVATIONS: &str = "observations";
+
+/// The four stored dimension columns of `observations`, in the order the writer declares
+/// them -- so a `SELECT` built here and the `INSERT` built there name the same columns in
+/// the same order.
+///
+/// Duplicated from `crate::writer` rather than shared, and the duplication is the point:
+/// the writer *asserts* this list against `mw_types::DIMENSIONS` at build time and refuses
+/// to construct if they disagree, which is the check that keeps both copies honest. Sharing
+/// one constant would make the assertion cover a list nobody could get wrong.
+const DIMENSION_COLUMNS: [&str; 4] = ["time", "station_id", "stationname", "stationtype"];
+
 /// The read half of the pool (W3 §2a.1's `ReadingStore`).
 pub struct TimescaleReader {
     pool: PgPool,
     /// Built once, because it is 624 cast column expressions.
     buckets: String,
+    /// Built once, because it is 216 column names.
+    latest: String,
 }
 
 impl std::fmt::Debug for TimescaleReader {
@@ -91,6 +108,7 @@ impl TimescaleReader {
     pub fn new(pool: PgPool) -> Self {
         Self {
             buckets: buckets_statement(),
+            latest: latest_statement(),
             pool,
         }
     }
@@ -163,6 +181,74 @@ impl ReadingStore for TimescaleReader {
                 }
             }
             Ok(answers)
+        })
+    }
+
+    fn latest<'a>(&'a self, q: LatestQuery) -> BoxFuture<'a, Result<Option<Reading>, StoreError>> {
+        Box::pin(async move {
+            let Some(row) = sqlx::query(&self.latest)
+                .bind(q.station.as_str())
+                .bind(q.since)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(classify)?
+            else {
+                // A station with nothing in the window. `snapshot:warm` leaves its key
+                // unpopulated and `/latest` 404s until a reading arrives, which is the
+                // answer the contract already has bytes for.
+                return Ok(None);
+            };
+            let mut reading = Reading {
+                time: row.try_get(0).map_err(StoreError::rejected)?,
+                station_id: row.try_get(1).map_err(StoreError::rejected)?,
+                station_name: row.try_get(2).map_err(StoreError::rejected)?,
+                station_type: row.try_get(3).map_err(StoreError::rejected)?,
+                ..Reading::default()
+            };
+            for (i, meta) in METRICS.iter().enumerate() {
+                let at = DIMENSION_COLUMNS.len() + i;
+                // Decoded in the column's own type and placed through the generated
+                // setter, which is `Reading::value`'s inverse over the same list -- so a
+                // metric added to `metrics/registry.toml` is read back with no edit here.
+                // A NULL column is a `set` that never happens, and the field stays `None`
+                // (**D-26**).
+                let placed = match meta.sql_type {
+                    SqlType::Float4 => row
+                        .try_get::<Option<f32>, _>(at)
+                        .map_err(StoreError::rejected)?
+                        .map(|v| reading.set(meta.key, MetricValue::Float(v))),
+                    SqlType::Int4 => row
+                        .try_get::<Option<i32>, _>(at)
+                        .map_err(StoreError::rejected)?
+                        .map(|v| reading.set(meta.key, MetricValue::Int(v))),
+                    SqlType::Int8 => row
+                        .try_get::<Option<i64>, _>(at)
+                        .map_err(StoreError::rejected)?
+                        .map(|v| reading.set(meta.key, MetricValue::BigInt(v))),
+                    SqlType::Text => row
+                        .try_get::<Option<String>, _>(at)
+                        .map_err(StoreError::rejected)?
+                        .map(|v| reading.set(meta.key, MetricValue::Text(&v))),
+                    SqlType::Timestamptz => row
+                        .try_get::<Option<DateTime<Utc>>, _>(at)
+                        .map_err(StoreError::rejected)?
+                        .map(|v| reading.set(meta.key, MetricValue::Time(v))),
+                };
+                if placed == Some(false) {
+                    // Unreachable while this match and the generator agree, and named
+                    // rather than ignored because the failure it guards is a metric that
+                    // silently reads back as NULL for one SQL type.
+                    return Err(StoreError::rejected(std::io::Error::other(format!(
+                        "`{}` decoded as {} and `Reading::set` would not take that type. \
+                         The generated setter and this decode disagree about the column's \
+                         type, which means `metrics/registry.toml` changed and \
+                         `cargo xtask codegen` has not been re-run.",
+                        meta.column,
+                        meta.sql_type.ddl(),
+                    ))));
+                }
+            }
+            Ok(Some(reading))
         })
     }
 
@@ -245,6 +331,41 @@ fn total_column(
                  already declares."
             )))
         })
+}
+
+/// `SELECT <216 columns> FROM observations WHERE station_id = $1 AND time >= $2 ORDER BY
+/// time DESC LIMIT 1`.
+///
+/// No casts, unlike [`buckets_statement`]: the aggregate read wants one decode path over
+/// four SQL types because it indexes 624 columns positionally, and this one wants the
+/// column's own type because it is rebuilding a [`Reading`] whose fields are those types.
+/// A cast to `float8` here would turn the eleven `text` metrics and the four
+/// `timestamptz` ones into NULL.
+///
+/// `ORDER BY time DESC LIMIT 1` with the `time >= $2` bound is an index seek: `observations`
+/// is a hypertable partitioned on `time` with `(station_id, time)` unique, so the planner
+/// reads the newest chunk the bound allows and stops. Without the bound it would be the
+/// same seek on a station that is reporting and a scan back through every chunk on one that
+/// is not -- which is exactly the station `snapshot:warm` asks about.
+fn latest_statement() -> String {
+    let mut sql = String::with_capacity(64 + (DIMENSION_COLUMNS.len() + METRICS.len()) * 20);
+    sql.push_str("SELECT ");
+    for (i, column) in DIMENSION_COLUMNS
+        .iter()
+        .copied()
+        .chain(METRICS.iter().map(|m| m.column))
+        .enumerate()
+    {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(column);
+    }
+    let _ = write!(
+        sql,
+        " FROM {OBSERVATIONS} WHERE station_id = $1 AND time >= $2 ORDER BY time DESC LIMIT 1"
+    );
+    sql
 }
 
 /// `SELECT bucket, <624 cast columns> FROM observations_1m WHERE ... ORDER BY bucket LIMIT`.

@@ -92,6 +92,10 @@ const DECLARED: &[&str] = &[
     "a_ten_minute_mean_over_the_rolled_up_buckets_equals_the_mean_from_raw",
     "a_range_stitched_across_three_levels_totals_the_same_as_raw",
     "an_hourly_rain_series_is_read_in_order_with_dry_hours_absent",
+    // implementation-plan.md M4-1's one database-shaped claim: `ReadingStore::latest`
+    // reads 216 real columns back into a `Reading` in the types they hold, which the
+    // snapshot tests over a fake store cannot say anything about.
+    "the_newest_reading_in_the_window_is_read_back_whole",
 ];
 
 /// The panic messages `crates/mw-store/tests/db.rs`'s own harness produces when the
