@@ -93,6 +93,7 @@ async fn free_port() -> u16 {
     let probe = mw_http::bind(
         "127.0.0.1:0".parse().expect("a literal address"),
         mw_http::MetricsRoute::new(std::sync::Arc::new(String::new), mw_obs::CONTENT_TYPE),
+        None,
     )
     .await
     .expect("a loopback port is available");

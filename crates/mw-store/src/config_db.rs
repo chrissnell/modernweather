@@ -532,10 +532,15 @@ mod tests {
         .await
         .expect("two stations");
         sqlx::query(
-            "INSERT INTO website (id, name, hostname, primary_station_key, snow_enabled,
-                                  snow_station_key)
-             VALUES (7, 'portal', 'portal.example.com', 'ridge', 1, 'ridge'),
-                    (2, 'suncrest', 'suncrest.example.com', 'backyard', 0, NULL)",
+            "INSERT INTO website (id, name, hostname, page_title, about_station_html,
+                                  primary_station_key, snow_enabled, snow_station_key,
+                                  air_quality_enabled, air_quality_station_key, is_portal,
+                                  radar_enabled, radar_token, radar_registered_at)
+             VALUES (7, 'portal', 'portal.example.com', 'Portal', '',
+                     'ridge', 1, 'ridge', 1, 'backyard', 1, 0, '', NULL),
+                    (2, 'suncrest', 'suncrest.example.com', 'Suncrest Live Weather',
+                     '<p>On a ridge.</p>', 'backyard', 0, NULL, 0, NULL, 0, 1,
+                     'contract-radar-token', 1762000000)",
         )
         .execute(&pool)
         .await
@@ -558,6 +563,14 @@ mod tests {
                 // rather than as an empty string -- which is what `snow_enabled = 0`
                 // means and what the table's own CHECK permits only in that pairing.
                 snow_station_key: None,
+                hostname: "suncrest.example.com".into(),
+                page_title: "Suncrest Live Weather".into(),
+                about_station_html: "<p>On a ridge.</p>".into(),
+                air_quality_enabled: false,
+                air_quality_station_key: None,
+                is_portal: false,
+                radar_enabled: true,
+                radar_token: "contract-radar-token".into(),
             }
         );
         assert_eq!(
@@ -568,6 +581,14 @@ mod tests {
                 primary_station_key: Some("ridge".into()),
                 snow_enabled: true,
                 snow_station_key: Some("ridge".into()),
+                hostname: "portal.example.com".into(),
+                page_title: "Portal".into(),
+                about_station_html: String::new(),
+                air_quality_enabled: true,
+                air_quality_station_key: Some("backyard".into()),
+                is_portal: true,
+                radar_enabled: false,
+                radar_token: String::new(),
             }
         );
 
@@ -1018,6 +1039,14 @@ pub async fn weather_database(pool: &SqlitePool) -> Result<Option<WeatherDatabas
 /// and `mw_component::ConfigDigest` is what compares that.
 #[derive(Debug, Clone)]
 pub struct StationRow {
+    /// `id` -- the surrogate integer the **frozen contract** returns.
+    ///
+    /// `/stationinfo` emits `stations[].id`, `/api/stations` emits `id`, and both accept
+    /// `?station_id=`; W3 §7's config payload emits `stationID` and `airQualityDeviceID`.
+    /// `station_key` is the domain identity and is unique, but it is text, so it cannot be
+    /// the source of those fields -- which is why the Go `devices.id` surrogate is carried
+    /// forward (the column's own comment in `migrations/config/`).
+    pub id: i64,
     /// `station_key` -- the domain identity.
     pub station_key: String,
     /// `name`.
@@ -1090,7 +1119,7 @@ pub struct StationRow {
 /// therefore the plan diff -- depend on SQLite's row order.
 pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbError> {
     let rows = sqlx::query(
-        "SELECT station_key, name, type, enabled, identity_kind, presented_key, \
+        "SELECT id, station_key, name, type, enabled, identity_kind, presented_key, \
                 ingest_secret_hash, latitude, longitude, altitude_m, timezone, \
                 snow_base_distance_mm, transport_kind, transport_dev, transport_baud, \
                 transport_host, transport_port, transport_url, transport_method, \
@@ -1108,6 +1137,7 @@ pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbErro
     rows.into_iter()
         .map(|r| {
             Ok(StationRow {
+                id: r.get("id"),
                 station_key: r.get("station_key"),
                 name: r.get("name"),
                 kind: r.get("type"),
@@ -1146,12 +1176,17 @@ pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbErro
 
 /// One `config.website` row, as the columns hold it.
 ///
-/// **Only the columns a snapshot key needs**, which is the four **D-31** names plus the
-/// identity: the key is `(website, station)` because the primary-device selection, the snow
-/// device and the website's own name are per website. The rest of the table — `hostname`,
-/// `page_title`, `about_station_html`, the radar token, the TLS paths — belongs to the
-/// hostname router and the website renderer, and those are M4-3's: a field here for a
-/// consumer that does not exist yet would be a guess at a shape.
+/// Two consumers, and between them they want most of the table. The snapshot key needs the
+/// four **D-31** names plus the identity — the primary-device selection, the snow device
+/// and the website's own name are per website, which is why the key is `(website, station)`.
+/// The frozen REST surface adds the rest: `hostname` is what a request resolves a website
+/// by, `about_station_html` is `/stationinfo`'s `about_text`, `is_portal` is what makes
+/// `/api/stations` a `403` or a `200`, and the air-quality binding is where `/almanac`
+/// reads its particulate extremes from.
+///
+/// Still absent, and still deliberately: the TLS paths and `is_default_tls`, which belong
+/// to the SNI resolver, and `apple_app_id`, which only the rendered page carries. Both are
+/// M4-3's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebsiteRow {
     /// `id` -- the surrogate key the snapshot table is keyed by.
@@ -1165,6 +1200,26 @@ pub struct WebsiteRow {
     /// `snow_station_key`. The table's own `CHECK` makes this non-NULL whenever
     /// `snow_enabled` is set.
     pub snow_station_key: Option<String>,
+    /// `hostname`, lower-case and port-free. `""` is the **default** website, which an
+    /// unmatched `Host` resolves to -- the schema's three `CHECK`s are what make a stored
+    /// value that can never match unrepresentable.
+    pub hostname: String,
+    /// `page_title`. Reaches the wire through `/api/stations`' nested `website` block.
+    pub page_title: String,
+    /// `about_station_html`. `/stationinfo`'s `about_text`, HTML and not plain text.
+    pub about_station_html: String,
+    /// `air_quality_enabled`.
+    pub air_quality_enabled: bool,
+    /// `air_quality_station_key`. Non-NULL whenever `air_quality_enabled` is set.
+    pub air_quality_station_key: Option<String>,
+    /// `is_portal`. The only website `/api/stations` answers for.
+    pub is_portal: bool,
+    /// `radar_enabled`.
+    pub radar_enabled: bool,
+    /// `radar_token`. **Public** in the rendered markup and on `/stationinfo`, which is
+    /// what makes it a plain `String` here rather than a `SecretString`: the schema's
+    /// "write-only" note is about the management API, not about secrecy.
+    pub radar_token: String,
 }
 
 /// Read every `config.website` row, ordered by id.
@@ -1177,7 +1232,9 @@ pub struct WebsiteRow {
 /// decide; a `WHERE` here would put that decision in two places.
 pub async fn websites(pool: &SqlitePool) -> Result<Vec<WebsiteRow>, ConfigDbError> {
     let rows = sqlx::query(
-        "SELECT id, name, primary_station_key, snow_enabled, snow_station_key \
+        "SELECT id, name, primary_station_key, snow_enabled, snow_station_key, hostname, \
+                page_title, about_station_html, air_quality_enabled, \
+                air_quality_station_key, is_portal, radar_enabled, radar_token \
          FROM website ORDER BY id",
     )
     .fetch_all(pool)
@@ -1194,6 +1251,14 @@ pub async fn websites(pool: &SqlitePool) -> Result<Vec<WebsiteRow>, ConfigDbErro
                 primary_station_key: r.get("primary_station_key"),
                 snow_enabled: flag(&r, "snow_enabled")?,
                 snow_station_key: r.get("snow_station_key"),
+                hostname: r.get("hostname"),
+                page_title: r.get("page_title"),
+                about_station_html: r.get("about_station_html"),
+                air_quality_enabled: flag(&r, "air_quality_enabled")?,
+                air_quality_station_key: r.get("air_quality_station_key"),
+                is_portal: flag(&r, "is_portal")?,
+                radar_enabled: flag(&r, "radar_enabled")?,
+                radar_token: r.get("radar_token"),
             })
         })
         .collect()

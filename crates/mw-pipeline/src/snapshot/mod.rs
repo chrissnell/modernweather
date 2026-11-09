@@ -375,6 +375,33 @@ pub fn register<C: SnapshotConfig + ?Sized>(
     Ok(())
 }
 
+/// Whether this configuration will contain a `LatestSnapshot` provider.
+///
+/// **The question `api:legacy` has to ask before it declares a hard need.** `plan()` refuses
+/// a configuration whose hard need nobody provides, so a surface that requires
+/// `LatestSnapshot` -- which **D-48** requires it to -- can only be planned when one of the
+/// two components below will be. The alternative is a daemon that refuses to start on a
+/// configuration with no stations in it.
+///
+/// Exported from here rather than reimplemented by the consumer because the conditions are
+/// [`register`]'s and there must be one copy of them.
+/// `the_predicate_agrees_with_what_register_plans` is the anti-drift check, over every
+/// shape the four conditions produce.
+///
+/// **One consequence worth stating rather than discovering**: a node whose snapshot key set
+/// is empty -- no website, or no station -- gets no `LatestSnapshot` provider and therefore
+/// no frozen route table, so a request to it is `mw-http`'s bare `404` rather than the
+/// contract's `503 {"error":"No weather websites configured",...}` (W3 §6.3). That body is
+/// reachable only on a node that has a station and at least one website whose `Host` the
+/// request does not match. No fixture covers the no-website case, and the node it describes
+/// is a fresh install nothing is pointed at yet.
+pub fn provides_latest_snapshot<C: SnapshotConfig>(cfg: &C) -> bool {
+    cfg.snapshot_render().is_some()
+        && cfg.snapshot_state().is_some_and(|state| !state.is_empty())
+        && cfg.snapshot_registry().is_some()
+        && (cfg.has_reading_stream() || cfg.has_weather_database())
+}
+
 /// Why a configuration does not produce a snapshot plan.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SnapshotPlanError {

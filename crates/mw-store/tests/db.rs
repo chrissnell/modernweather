@@ -178,6 +178,7 @@ async fn touched(pool: &PgPool, test: &str) {
 /// A `config.stations` row with coordinates, for the projection.
 fn row(key: &str) -> StationRow {
     StationRow {
+        id: 1,
         station_key: key.into(),
         name: format!("{key} (configured)"),
         kind: "weatherlink-live".into(),

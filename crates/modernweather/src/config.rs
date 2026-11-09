@@ -7,12 +7,13 @@
 //! websites -- so the crate that names the type is the crate that may name everything,
 //! which is this one.
 //!
-//! **What it holds, and what it does not.** Four tables: the listener, the weather
-//! database, the node row and `config.stations`. The first three are what the boot sequence
-//! itself needs -- where to bind, whether **D-62** has a server to assert, and whether this
-//! node has started before. The fourth arrived with the first registrar. Everything else in
-//! `migrations/config/` is read by the component that consumes it, and a field here for a
-//! table no consumer exists for yet would be guessing at a shape.
+//! **What it holds, and what it does not.** Five tables: the listener, the weather
+//! database, the node row, `config.stations` and `config.website`. The first three are what
+//! the boot sequence itself needs -- where to bind, whether **D-62** has a server to assert,
+//! and whether this node has started before. The fourth arrived with the first registrar
+//! and the fifth with the frozen REST surface. Everything else in `migrations/config/` is
+//! read by the component that consumes it, and a field here for a table no consumer exists
+//! for yet would be guessing at a shape.
 //!
 //! **The first registrar is also where this type stopped being private to the binary.** A
 //! registrar takes `&C` and `mw-station` may not depend on `mw-store`, so what it needs is a
@@ -26,7 +27,7 @@ use std::sync::Arc;
 
 use mw_component::{Generation, Ingress, Zone};
 use mw_store::config_db::{self, ConfigDbError, Listener, Node, WeatherDatabase, WebsiteRow};
-use mw_types::StationKey;
+use mw_types::{StationKey, WebsiteId};
 use sqlx::SqlitePool;
 
 /// Everything `plan()` and the boot sequence read from the configuration database.
@@ -45,10 +46,21 @@ pub struct Config {
 
     /// Every `config.website` row, in id order.
     ///
-    /// The left half of the snapshot's `(website, station)` key (**D-31**). Only the five
-    /// columns a payload depends on; the hostname router and the website renderer read the
-    /// rest and both are M4-3's.
+    /// The left half of the snapshot's `(website, station)` key (**D-31**), and the whole of
+    /// what the frozen REST surface reads a website for. The TLS paths and `apple_app_id`
+    /// are still absent: they belong to the SNI resolver and the rendered page, and both are
+    /// M4-3's.
     pub websites: Vec<WebsiteRow>,
+
+    /// The website rows in the shape `mw-api-legacy` plans from.
+    ///
+    /// `pub(crate)` for [`Config::declared_stations`]' reason: the registrar reaches them
+    /// through [`mw_api_legacy::LegacyConfig`], so nothing outside this crate needs the
+    /// field.
+    pub(crate) legacy_websites: Vec<mw_api_legacy::WebsiteView>,
+
+    /// The station rows in the shape `mw-api-legacy` plans from.
+    pub(crate) legacy_stations: Vec<mw_api_legacy::StationView>,
 
     /// The same rows in the shape `mw-station` plans from.
     ///
@@ -91,6 +103,37 @@ pub struct Config {
     /// whole of that argument.
     pub(crate) snapshot: Option<Arc<mw_pipeline::SnapshotState>>,
 
+    /// The frozen route table's state slot, once `main` has built it.
+    ///
+    /// A root resource for [`Config::snapshot`]'s reason and one more: the **listener** is
+    /// built from it too, in the same function, so the slot has to exist before `plan()`
+    /// runs. `api:legacy` installs its handler set into it while the component is
+    /// `Running`, which is what makes "the table is mounted" and "the component is
+    /// running" one fact (`mw_api_legacy::component`).
+    pub(crate) legacy_routes: Option<Arc<mw_api_legacy::RouteState>>,
+
+    /// The frozen DTO's serialiser, once `main` has built it.
+    ///
+    /// **This is the one line M4-1 said would change.** `snapshot:latest` and
+    /// `snapshot:warm` are complete and were not planned, because the payload is the frozen
+    /// 133-key DTO and `mw-api-legacy` exclusively owns its serialiser; this is that
+    /// serialiser, and both components plan now.
+    ///
+    /// Held as the concrete type and upcast in the accessor, for [`Config::rollup`]'s
+    /// reason: **two** consumers want two types. `api:legacy` needs the `Renderer` itself
+    /// -- `/snow` folds its revision into an `ETag` without going through a snapshot -- and
+    /// the snapshot components need `Arc<dyn SnapshotRender>`. One object, so the two
+    /// cannot disagree about what version the bytes are.
+    pub(crate) legacy_render: Option<Arc<mw_api_legacy::Renderer>>,
+
+    /// The same renderer, upcast once to the capability the snapshot components declare.
+    ///
+    /// Two fields for one object, exactly as [`Config::snapshot_windows`] is: upcasting
+    /// here rather than in the accessor keeps it a borrow, which is what the trait's
+    /// signature asks for -- and keeps "these are the same object" a fact of
+    /// [`Config::set_legacy`] rather than of two call sites.
+    pub(crate) snapshot_render: Option<Arc<dyn mw_component::SnapshotRender>>,
+
     /// The same rollup state as [`Config::rollup`], upcast once to the capability the
     /// snapshot components declare.
     ///
@@ -121,18 +164,24 @@ impl Config {
     /// Read the configuration. Step 4 of the boot sequence.
     pub async fn load(pool: &SqlitePool) -> Result<Self, ConfigDbError> {
         let stations = config_db::stations(pool).await?;
+        let websites = config_db::websites(pool).await?;
         Ok(Config {
             listener: config_db::listener(pool).await?,
             weather_database: config_db::weather_database(pool).await?,
             node: config_db::node(pool).await?,
             declared_stations: stations.iter().map(declare).collect(),
+            legacy_websites: websites.iter().map(declare_website).collect(),
+            legacy_stations: stations.iter().map(declare_station).collect(),
             stations,
-            websites: config_db::websites(pool).await?,
+            websites,
             ingress: None,
             registry: None,
             rollup: None,
             snapshot: None,
             snapshot_windows: None,
+            legacy_routes: None,
+            legacy_render: None,
+            snapshot_render: None,
             station_zones: Vec::new(),
             generation: Generation::ZERO,
         })
@@ -176,6 +225,23 @@ impl Config {
     /// Hand the configuration the published snapshot table.
     pub fn set_snapshot(&mut self, snapshot: Arc<mw_pipeline::SnapshotState>) {
         self.snapshot = Some(snapshot);
+    }
+
+    /// Hand the configuration the frozen route table's state slot and the DTO's
+    /// serialiser.
+    ///
+    /// One call, because the two are the same item's and a configuration with one and not
+    /// the other is a plan that either refuses `api:legacy` or silently drops the snapshot
+    /// components -- both of which are a wiring mistake rather than a state worth
+    /// representing.
+    pub fn set_legacy(
+        &mut self,
+        routes: Arc<mw_api_legacy::RouteState>,
+        render: Arc<mw_api_legacy::Renderer>,
+    ) {
+        self.legacy_routes = Some(routes);
+        self.snapshot_render = Some(Arc::clone(&render) as Arc<dyn mw_component::SnapshotRender>);
+        self.legacy_render = Some(render);
     }
 
     /// The address the one listener binds, and therefore where `/metrics` is served.
@@ -228,6 +294,7 @@ impl std::fmt::Debug for Config {
             .field("websites", &self.websites.len())
             .field("rollup", &self.rollup.is_some())
             .field("snapshot", &self.snapshot.is_some())
+            .field("legacy_routes", &self.legacy_routes.is_some())
             .field("generation", &self.generation)
             .finish()
     }
@@ -304,13 +371,92 @@ impl mw_pipeline::SnapshotConfig for Config {
         self.snapshot_windows.as_ref()
     }
 
-    /// **`None` until M4-2.** The payload is the frozen 133-key DTO and `mw-api-legacy`
-    /// exclusively owns its serialiser (W3 D-9), so there is nothing here to hand over yet
-    /// and `mw_pipeline::snapshot::register` plans neither component. When M4-2 lands it is
-    /// a `mw_api_legacy::Renderer` built in [`crate::boot`] beside the registry, and this
-    /// is the one line that changes.
+    /// The `mw_api_legacy::Renderer`, built in [`crate::boot`] beside the registry.
+    ///
+    /// `None` only before `set_legacy` has run, which is a boot sequence that has not
+    /// reached step 4c -- `mw_pipeline::snapshot::register` then plans neither component
+    /// and says so at `info`, which is the state every build before M4-2 was in.
     fn snapshot_render(&self) -> Option<&Arc<dyn mw_component::SnapshotRender>> {
-        None
+        self.snapshot_render.as_ref()
+    }
+}
+
+/// What the frozen REST surface plans from.
+///
+/// Column into field, like [`mw_station::StationConfig`] above it and for the same reason:
+/// `mw-api-legacy` may not depend on `mw-store`, so what it gets is a trait this crate
+/// implements over rows it has already read. The copy is what buys the property that
+/// `mw-store` cannot grow a route and `mw-api-legacy` cannot grow a query.
+impl mw_api_legacy::LegacyConfig for Config {
+    fn legacy_websites(&self) -> &[mw_api_legacy::WebsiteView] {
+        &self.legacy_websites
+    }
+
+    fn legacy_stations(&self) -> &[mw_api_legacy::StationView] {
+        &self.legacy_stations
+    }
+
+    /// Where `/api/stations` reports this server answers.
+    ///
+    /// `https` when a TLS port is configured, and **that port** rather than the plaintext
+    /// one: the block is a URL the website builds, so it has to name the port a browser
+    /// should use. A node with both serves the frozen surface on both; the website links
+    /// to the secure one, which is what the Go handler's `protocol` field was for.
+    fn legacy_listener(&self) -> mw_api_legacy::Listener {
+        match self.listener.https_port {
+            Some(port) => mw_api_legacy::Listener { port, tls: true },
+            None => mw_api_legacy::Listener {
+                port: self.listener.http_port,
+                tls: false,
+            },
+        }
+    }
+
+    fn legacy_route_state(&self) -> Option<&Arc<mw_api_legacy::RouteState>> {
+        self.legacy_routes.as_ref()
+    }
+
+    fn legacy_render(&self) -> Option<&Arc<mw_api_legacy::Renderer>> {
+        self.legacy_render.as_ref()
+    }
+
+    /// Answered by the crate that plans the provider, so there is one copy of the
+    /// conditions.
+    fn has_latest_snapshot(&self) -> bool {
+        mw_pipeline::snapshot::provides_latest_snapshot(self)
+    }
+}
+
+/// One `config.website` row, as the frozen surface reads it.
+fn declare_website(row: &WebsiteRow) -> mw_api_legacy::WebsiteView {
+    mw_api_legacy::WebsiteView {
+        id: WebsiteId::new(row.id),
+        name: row.name.clone(),
+        hostname: row.hostname.clone(),
+        page_title: row.page_title.clone(),
+        about_text: row.about_station_html.clone(),
+        primary_station: row.primary_station_key.clone().map(StationKey::new),
+        snow_enabled: row.snow_enabled,
+        snow_station: row.snow_station_key.clone().map(StationKey::new),
+        air_quality_enabled: row.air_quality_enabled,
+        air_quality_station: row.air_quality_station_key.clone().map(StationKey::new),
+        is_portal: row.is_portal,
+        radar_enabled: row.radar_enabled,
+        radar_token: row.radar_token.clone(),
+    }
+}
+
+/// One `config.stations` row, as the frozen surface reads it.
+fn declare_station(row: &config_db::StationRow) -> mw_api_legacy::StationView {
+    mw_api_legacy::StationView {
+        id: row.id,
+        key: StationKey::new(row.station_key.clone()),
+        name: row.name.clone(),
+        kind: row.kind.clone(),
+        enabled: row.enabled,
+        latitude: row.latitude,
+        longitude: row.longitude,
+        timezone: row.timezone.clone(),
     }
 }
 
@@ -360,6 +506,11 @@ mod tests {
             stations: Vec::new(),
             declared_stations: Vec::new(),
             websites: Vec::new(),
+            legacy_websites: Vec::new(),
+            legacy_stations: Vec::new(),
+            legacy_routes: None,
+            legacy_render: None,
+            snapshot_render: None,
             ingress: None,
             registry: None,
             rollup: None,

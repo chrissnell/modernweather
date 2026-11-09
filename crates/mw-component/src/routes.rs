@@ -249,6 +249,30 @@ impl RouteManifest {
     }
 }
 
+/// The handle type `Capability::HttpRoutes` is published under.
+///
+/// **A marker trait with no methods, and that is the point.** The *pure* half of what a
+/// route provider offers is the [`RouteManifest`] on its `Provision` (**D-51**), which is
+/// what `plan()` needs and all it needs. The *impure* half is an `axum::Router`, and this
+/// crate may not name `axum` (`ci/layers.toml`) -- so a router cannot be the handle type
+/// and a handle trait with a query set cannot be written until the listener is a component
+/// with something to ask (M4-3).
+///
+/// What the publication buys today is the capability **graph**: a provider appears and
+/// disappears with its component, so "the table is mounted" and "the component is
+/// `Running`" are one fact, which is what **D-48**'s invariant is stated over. The route
+/// table itself travels to the listener as a root resource the binary owns, exactly as
+/// `SnapshotState` and `RollupState` do.
+///
+/// Declared here rather than in the providing crate because of the orphan rule and not
+/// only by convention: `impl CapabilityHandle for Arc<dyn Trait>` needs the trait and the
+/// impl in one crate, and `CapabilityHandle` is this one's.
+pub trait RouteProvider: Send + Sync + 'static {}
+
+impl crate::cx::CapabilityHandle for std::sync::Arc<dyn RouteProvider> {
+    const CAPABILITY: crate::capability::Capability = crate::capability::Capability::HttpRoutes;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

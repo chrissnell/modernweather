@@ -262,6 +262,99 @@ impl<H: CapabilityHandle> Additive<H> {
     }
 }
 
+/// A **soft, exclusive** capability's handle, read when it is used rather than when the
+/// component was built.
+///
+/// # The defect this type exists to close
+///
+/// [`BuildCx::soft`] borrows the slot once and returns what is in it. For a component whose
+/// hard needs are satisfied in the first reconcile pass that is almost always `None`, and it
+/// stays `None` for the life of the process: `mw_supervisor`'s reconcile does not rebuild a
+/// `Running` component when a soft capability later arrives — the `(State::Running, true)`
+/// arm refreshes the `degraded` label and returns. M4-1's code review found
+/// `snapshot:latest` in exactly that state against `WindowedView`, with every snapshot
+/// `Degraded` forever; `snapshot:latest`'s answer was to take the handle from the registrar,
+/// which works because `RollupState` is a root resource `main` owns.
+///
+/// **`api:legacy` has no such answer, and that is the whole reason this type is here.** Its
+/// three read stores — `ReadingStore`, `ForecastStore` and `SnowCache` — are published by
+/// `db:postgres`, whose pool does not exist until its own task has connected and asserted
+/// **D-62** ([`crate::Store`]'s module documentation has why that cannot be a root
+/// resource). So the handle genuinely arrives after the build, and a once-only read makes
+/// `/span`, `/almanac` and `/forecast` permanently empty on a healthy process.
+///
+/// # Why this is not the hole [`Additive`] declines to open
+///
+/// [`BuildCx::additive`] refuses an exclusive capability, on the grounds that a component
+/// able to watch its database being revoked would decide for itself what that means — W2a
+/// Decision 21's "no error branch in business logic". This type is **restricted to a `Soft`
+/// need**, and a `Soft` need is the declaration that the component *does* degrade in a
+/// defined way: `docs/component-model.md` §3.2's table says so for this exact component and
+/// capability — *"`api:legacy` `/forecast` | failing query | `Running { degraded:
+/// [ForecastStore] }`, defined stale/empty response"*. Decision 21 is about `Hard` needs,
+/// where absence means `Waiting` and there is nothing to decide. Asking for this against a
+/// `Hard` need is [`BuildError::UndeclaredNeed`], the same answer [`BuildCx::soft`] gives
+/// for the inverse mistake.
+///
+/// Recorded as **A-M4-2-1** in `docs/reconciliation.md`'s *Proposed amendments*: it resolves
+/// a shape the design left between Decision 21 and §3.2's table rather than contradicting a
+/// decision.
+pub struct Deferred<H: CapabilityHandle> {
+    rx: watch::Receiver<Arc<CapabilitySlot>>,
+    _handle: PhantomData<fn() -> H>,
+}
+
+impl<H: CapabilityHandle> fmt::Debug for Deferred<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Deferred")
+            .field("capability", &H::CAPABILITY)
+            .field("available", &self.rx.borrow().is_available())
+            .finish()
+    }
+}
+
+impl<H: CapabilityHandle> Clone for Deferred<H> {
+    fn clone(&self) -> Self {
+        Self {
+            rx: self.rx.clone(),
+            _handle: PhantomData,
+        }
+    }
+}
+
+impl<H: CapabilityHandle> Deferred<H> {
+    /// The handle, if a provider has published one.
+    ///
+    /// `None` is the degraded state the `Soft` need declared, not an error. A handle
+    /// published under a type this consumer does not resolve is **also** `None` and is
+    /// logged, for [`Additive::load`]'s reason: the supervisor moves it as an
+    /// `Arc<dyn Any>` and never learns what it should have been, so without this line the
+    /// affected endpoints would serve the empty response forever with nothing saying why.
+    pub fn load(&self) -> Option<H> {
+        let slot = self.rx.borrow();
+        let published = slot.sole()?;
+        match published.handle.downcast_ref::<H>() {
+            Some(h) => Some(h.clone()),
+            None => {
+                tracing::warn!(
+                    provider = %published.provider,
+                    capability = %H::CAPABILITY,
+                    expected = std::any::type_name::<H>(),
+                    "a published handle is not the type this consumer resolves; the \
+                     capability reads as unavailable and the consumer will degrade"
+                );
+                None
+            }
+        }
+    }
+
+    /// Whether a provider has published anything at all, for a log field and for
+    /// `X-MW-Degraded`. Does not check the handle's type; [`Deferred::load`] does.
+    pub fn is_available(&self) -> bool {
+        self.rx.borrow().is_available()
+    }
+}
+
 /// What a component's body is handed: identity, cancellation, and the configuration
 /// generation it was built from.
 ///
@@ -436,6 +529,33 @@ impl BuildCx {
         Ok(Publisher {
             provider: self.cx.id.clone(),
             bus: Arc::clone(&self.access.publisher),
+            _handle: PhantomData,
+        })
+    }
+
+    /// A handle for a **soft** requirement, read at use rather than at build.
+    ///
+    /// [`Deferred`]'s own documentation has the whole of why this exists and why it is not
+    /// the hole [`BuildCx::additive`] declines to open. Two refusals, each with a distinct
+    /// name: the capability was not declared (rule 3), or it was declared `Hard` — for
+    /// which [`BuildCx::hard`] is the right call and absence means `Waiting` rather than
+    /// degradation.
+    pub fn deferred<H: CapabilityHandle>(&self) -> Result<Deferred<H>, BuildError> {
+        let need = self.require_declared(H::CAPABILITY)?;
+        if need.strength != Strength::Soft {
+            return Err(BuildError::UndeclaredNeed {
+                capability: H::CAPABILITY,
+            });
+        }
+        let rx = self
+            .access
+            .slot(H::CAPABILITY)
+            .ok_or(BuildError::Unavailable {
+                capability: H::CAPABILITY,
+            })?
+            .clone();
+        Ok(Deferred {
+            rx,
             _handle: PhantomData,
         })
     }

@@ -566,6 +566,29 @@ mod driven {
                 .cloned();
             Box::pin(async move { Ok(found) })
         }
+
+        /// `/span` and `/almanac` have no caller in this module -- both are
+        /// `api:legacy`'s. Answered as empty rather than `unimplemented!`, so a future
+        /// caller gets a wrong answer it can see instead of a panic inside a component
+        /// tick.
+        fn span<'a>(
+            &'a self,
+            _q: mw_component::SpanQuery,
+        ) -> BoxFuture<'a, Result<mw_component::Span, StoreError>> {
+            Box::pin(async {
+                Ok(mw_component::Span {
+                    prefix: Vec::new(),
+                    tail: None,
+                })
+            })
+        }
+
+        fn almanac<'a>(
+            &'a self,
+            _q: mw_component::AlmanacQuery,
+        ) -> BoxFuture<'a, Result<Vec<mw_component::AlmanacRecord>, StoreError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     fn folder(

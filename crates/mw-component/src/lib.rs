@@ -42,15 +42,21 @@
 //! `ReadingStream` -- both halves of the reading store, published together as [`Store`]
 //! and consumed one half each by `writer:timescale` and `window:rollup` -- [`WindowedView`]
 //! -- the roll-up's own surface -- [`LatestSnapshot`], which is what makes the `/latest`
-//! handler unable to query -- and the two methods of `StationRegistry` that admission and
-//! the enrich stage need. The rest -- `ForecastStore`, `AlertStore`, `SnowCache`,
-//! `ConfigStore`, `ConfigAdmin`, `HttpRoutes` -- arrive with the work items that consume
-//! them, because a handle trait is a *query set* and the item that writes the queries is
-//! the item that knows them. `StationRegistry` grew its second method that way, and
-//! [`ReadingStore`] has grown `latest` beside its three for `snapshot:warm` and will grow
-//! `span` and `almanac` the same way. What is fixed here is the mechanism every one of them uses:
-//! [`CapabilityHandle`] associates a handle type with its capability, and [`BuildCx`]
-//! resolves it **once**, in `build`.
+//! handler unable to query -- the two methods of `StationRegistry` that admission and the
+//! enrich stage need -- and, as of the frozen REST surface, [`ForecastStore`] and
+//! [`SnowCache`], beside [`ReadingStore`]'s `span` and `almanac`. `AlertStore`,
+//! `ConfigStore`, `ConfigAdmin` and `HttpRoutes` are still absent and arrive with the work
+//! items that consume them, because a handle trait is a *query set* and the item that
+//! writes the queries is the item that knows them. `StationRegistry` grew its second method
+//! that way, and `ReadingStore` grew `latest` for `snapshot:warm` and then `span`/`almanac`
+//! for `api:legacy`.
+//!
+//! What is fixed here is the mechanism every one of them uses: [`CapabilityHandle`]
+//! associates a handle type with its capability, and [`BuildCx`] resolves it in `build`.
+//! **Once**, for a `Hard` need -- absence there means `Waiting` and there is nothing for the
+//! component to decide. A `Soft` need is the declaration that the component degrades in a
+//! defined way instead, and for that the handle is read when it is used: [`Deferred`] has
+//! why a once-only read makes `Soft` meaningless and which defect it was observed as.
 
 mod body;
 mod capability;
@@ -77,7 +83,7 @@ pub use capability::{
 pub use control::{ComponentControl, ControlError, Generation, LogControl, LogControlError};
 pub use cx::{
     Additive, BuildCx, CapabilityAccess, CapabilityHandle, CapabilityPublisher, CapabilitySlot, Cx,
-    Published, Publisher,
+    Deferred, Published, Publisher,
 };
 pub use error::{BuildError, ComponentError, Outcome, PlanError};
 pub use id::{stable_hash, ComponentId, ComponentIdError, Fnv1a};
@@ -88,7 +94,7 @@ pub use ingress::{
     AcceptError, Accepted, AdmitError, Admitted, FrameMeta, Ingress, Reject, StationMeta,
     StationProjection, StationRegistry,
 };
-pub use routes::{Match, Methods, RouteEntry, RouteManifest, Scope};
+pub use routes::{Match, Methods, RouteEntry, RouteManifest, RouteProvider, Scope};
 pub use schedule::{OccurrenceKey, OccurrenceRecord, ScheduleStore, ScheduleStoreError};
 pub use snapshot::{
     ETag, Encoding, LatestSnapshot, Payload, PayloadRev, RenderError, Snapshot, SnapshotKey,
@@ -97,8 +103,10 @@ pub use snapshot::{
 pub use spec::{ComponentSpec, ConfigDigest, SpecFingerprint, DEFAULT_GRACE};
 pub use state::{ComponentStatus, Counters, ScheduleState, State, WaitingOn};
 pub use store::{
-    Bucket, BucketLevel, BucketQuery, Bucketed, LatestQuery, Piece, ReadingSink, ReadingStore,
-    SeriesQuery, Store, StoreError, Stored, TotalsQuery,
+    AlmanacQuery, AlmanacRecord, Bucket, BucketLevel, BucketQuery, Bucketed, Forecast,
+    ForecastQuery, ForecastStore, LatestQuery, Piece, ReadingSink, ReadingStore, SeriesQuery,
+    SnowCache, SnowTotals, Span, SpanBucket, SpanColumn, SpanQuery, Store, StoreError, Stored,
+    TotalsQuery,
 };
 pub use stream::{ReadingStream, ReadingSubscription, StreamError};
 pub use trigger::{

@@ -397,6 +397,7 @@ mod tests {
 
     fn row(key: &str, claim: Option<&str>) -> StationRow {
         StationRow {
+            id: 1,
             station_key: key.into(),
             name: key.into(),
             kind: "weatherlink-live".into(),

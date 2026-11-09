@@ -36,9 +36,13 @@ async fn metrics_is_served_on_the_bound_port_and_everything_else_is_a_404() {
     let payload = "mw_readings_ingested_total{station=\"backyard\"} 7\n";
     let route = MetricsRoute::new(Arc::new(move || payload.to_string()), CONTENT_TYPE);
     // Port 0: the kernel chooses, so two tests on one machine cannot collide.
-    let bound = bind("127.0.0.1:0".parse().expect("a literal address"), route)
-        .await
-        .expect("the port is bindable");
+    let bound = bind(
+        "127.0.0.1:0".parse().expect("a literal address"),
+        route,
+        None,
+    )
+    .await
+    .expect("the port is bindable");
     let addr = bound.local_addr();
     assert_ne!(addr.port(), 0, "the bound port is read back, not echoed");
 
@@ -78,9 +82,13 @@ async fn the_payload_is_rendered_per_request_rather_than_once() {
         }),
         CONTENT_TYPE,
     );
-    let bound = bind("127.0.0.1:0".parse().expect("a literal address"), route)
-        .await
-        .expect("bindable");
+    let bound = bind(
+        "127.0.0.1:0".parse().expect("a literal address"),
+        route,
+        None,
+    )
+    .await
+    .expect("bindable");
     let addr = bound.local_addr();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let server = bound.serve(async move {
@@ -104,11 +112,17 @@ async fn a_port_already_held_is_reported_with_the_address() {
     let first = bind(
         "127.0.0.1:0".parse().expect("a literal address"),
         MetricsRoute::new(Arc::new(String::new), CONTENT_TYPE),
+        None,
     )
     .await
     .expect("bindable");
     let addr = first.local_addr();
-    let again = bind(addr, MetricsRoute::new(Arc::new(String::new), CONTENT_TYPE)).await;
+    let again = bind(
+        addr,
+        MetricsRoute::new(Arc::new(String::new), CONTENT_TYPE),
+        None,
+    )
+    .await;
     let error = again.expect_err("the port is held");
     assert!(
         error.to_string().contains(&addr.to_string()),
@@ -124,9 +138,13 @@ async fn a_client_that_never_finishes_its_request_cannot_hold_the_drain_open() {
     // unauthenticated main port, which is what made that a remote problem rather than a
     // developer's.
     let route = MetricsRoute::new(Arc::new(String::new), CONTENT_TYPE);
-    let bound = bind("127.0.0.1:0".parse().expect("a literal address"), route)
-        .await
-        .expect("bindable");
+    let bound = bind(
+        "127.0.0.1:0".parse().expect("a literal address"),
+        route,
+        None,
+    )
+    .await
+    .expect("bindable");
     let addr = bound.local_addr();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     // A short deadline so the test asserts the deadline exists rather than its value.
