@@ -67,10 +67,10 @@ pub async fn handle(h: &Handlers, host: &str, params: &Params) -> Response<Body>
         // this endpoint already has; a `503` is not (**D-48** governs the frozen five and
         // this one is coupled, but a different status for an unavailable database would
         // still be a second answer to the same question).
-        return render(BTreeMap::new());
+        return render(BTreeMap::new(), BTreeMap::new());
     };
 
-    let mut rows = match store
+    let rows = match store
         .almanac(AlmanacQuery {
             station: station.key.clone(),
         })
@@ -83,11 +83,25 @@ pub async fn handle(h: &Handlers, host: &str, params: &Params) -> Response<Body>
     // The particulate half, from the website's air-quality device. Only the six records
     // that device owns are taken from it, so a station that is both -- an AirGradient bound
     // as a website's primary device -- does not read its own rows twice.
-    if let Some(air) = website
-        .air_quality_station
-        .as_ref()
-        .filter(|_| website.air_quality_enabled)
-    {
+    //
+    // **It SUBSTITUTES rather than inserting, and that is the whole difference.** Go writes
+    // `aqRecords = r` and then reads the four keys out of `aqRecords`
+    // (`handlers.go:1383-1397`), so an air-quality device with no cached extremes makes
+    // those keys **absent** even when the queried station has rows of its own. Merging the
+    // device's rows over the station's left the station's in place, which is the
+    // eight-keys-against-fourteen behaviour `ci/conformance/rust-seed/04-caches.sql` was
+    // built to watch.
+    //
+    // **And a failed read is logged, not fatal.** Go's `else { log.Error(...) }` leaves
+    // `aqRecords` as the station's own records and still answers `200`; returning a `500`
+    // turned a transient second query into a failed response on a coupled endpoint.
+    //
+    // **The condition is the binding, not a flag.** Go tests
+    // `website.AirQualityDeviceName != ""`. `air_quality_enabled` is a separate column that
+    // `migrations/config` only constrains in one direction -- `enabled = 1` implies a key --
+    // so `enabled = 0` with a key set is representable, and filtering on it diverged there.
+    let mut air_quality = rows.clone();
+    if let Some(air) = website.air_quality_station.as_ref() {
         if air != &station.key {
             match store
                 .almanac(AlmanacQuery {
@@ -95,31 +109,31 @@ pub async fn handle(h: &Handlers, host: &str, params: &Params) -> Response<Body>
                 })
                 .await
             {
-                Ok(air_rows) => {
-                    for (record, row) in index(air_rows) {
-                        if AIR_QUALITY_RECORDS.contains(&record.as_str()) {
-                            rows.insert(record, row);
-                        }
-                    }
-                }
-                Err(e) => return store_failed(&e),
+                Ok(air_rows) => air_quality = index(air_rows),
+                Err(e) => tracing::warn!(
+                    err = %mw_types::DisplayChain(&e),
+                    station = %air,
+                    "the air-quality almanac cache could not be read, so /almanac answers \
+                     with the queried station's own records"
+                ),
             }
         }
     }
 
-    render(rows)
+    render(rows, air_quality)
 }
 
 /// The six records `/almanac` reads from the website's air-quality device rather than from
 /// the station the request named.
-const AIR_QUALITY_RECORDS: [&str; 6] = [
-    "high_pm25",
-    "high_pm10_in",
-    "high_co2",
-    "high_tvoc",
-    "high_aqi_pm25",
-    "high_aqi_pm10",
-];
+/// The four keys read from the air-quality device's records rather than the station's.
+///
+/// **Four, not six.** `high_aqi_pm25` and `high_aqi_pm10` are not read from the cache at
+/// all: Go **derives** them from the PM extremes (`handlers.go:1402-1413`) with
+/// `getOrCalculateAQIPM25`, carrying the PM record's own timestamp and no `wind_dir`. The
+/// table's `CHECK` still permits those two `record` values, for a writer a later item may
+/// add -- this handler ignores such a row, because the contract's bytes are a function of
+/// the PM extreme and not of whatever was stored beside it.
+const AIR_QUALITY_RECORDS: [&str; 4] = ["high_pm25", "high_pm10_in", "high_co2", "high_tvoc"];
 
 /// The cache's rows, keyed by the JSON field they populate.
 fn index(rows: Vec<mw_component::AlmanacRecord>) -> BTreeMap<String, AlmanacRecord> {
@@ -145,7 +159,24 @@ fn index(rows: Vec<mw_component::AlmanacRecord>) -> BTreeMap<String, AlmanacReco
 /// The `CHECK` is the contract: a typo in a `record` value would silently drop a field from
 /// a response rather than fail, which is what that constraint exists to prevent and why
 /// this function can place by name without a fallback.
-fn render(mut rows: BTreeMap<String, AlmanacRecord>) -> Response<Body> {
+fn render(
+    mut rows: BTreeMap<String, AlmanacRecord>,
+    mut air_quality: BTreeMap<String, AlmanacRecord>,
+) -> Response<Body> {
+    let high_pm25 = air_quality.remove(AIR_QUALITY_RECORDS[0]);
+    let high_pm10_in = air_quality.remove(AIR_QUALITY_RECORDS[1]);
+    // **Derived, the way Go derives them.** AQI is monotonic in particulate concentration,
+    // so the peak AQI is the AQI of the peak PM, carried at that reading's timestamp and
+    // with no `wind_dir` -- which Go's own comment says in those words.
+    let derive = |pm: Option<&AlmanacRecord>, f: fn(f32) -> Option<i32>| {
+        pm.map(|record| AlmanacRecord {
+            value: zf(f(record.value).map(|v| v as f32)),
+            timestamp: record.timestamp.clone(),
+            wind_dir: None,
+        })
+    };
+    let high_aqi_pm25 = derive(high_pm25.as_ref(), mw_pipeline::enrich::aqi_pm25);
+    let high_aqi_pm10 = derive(high_pm10_in.as_ref(), mw_pipeline::enrich::aqi_pm10);
     let mut take = |name: &str| rows.remove(name);
     let dto = Almanac {
         high_temp: take("high_temp"),
@@ -159,12 +190,13 @@ fn render(mut rows: BTreeMap<String, AlmanacRecord>) -> Response<Body> {
         max_snow_hour: take("max_snow_hour"),
         max_snow_day: take("max_snow_day"),
         high_solar: take("high_solar"),
-        high_pm25: take("high_pm25"),
-        high_pm10_in: take("high_pm10_in"),
-        high_co2: take("high_co2"),
-        high_tvoc: take("high_tvoc"),
-        high_aqi_pm25: take("high_aqi_pm25"),
-        high_aqi_pm10: take("high_aqi_pm10"),
+        // The four from the air-quality device's records, and the two derived from them.
+        high_pm25,
+        high_pm10_in,
+        high_co2: air_quality.remove(AIR_QUALITY_RECORDS[2]),
+        high_tvoc: air_quality.remove(AIR_QUALITY_RECORDS[3]),
+        high_aqi_pm25,
+        high_aqi_pm10,
     };
     match to_json_line(&dto) {
         Ok(body) => reply::json(StatusCode::OK, Cache::MaxAge(MAX_AGE), body),
@@ -185,4 +217,87 @@ fn store_failed(e: &mw_component::StoreError) -> Response<Body> {
         StatusCode::INTERNAL_SERVER_ERROR,
         "error querying almanac data",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(value: f32) -> AlmanacRecord {
+        AlmanacRecord {
+            value,
+            timestamp: "2026-10-28T00:00:00Z".to_string(),
+            wind_dir: Some(270.0),
+        }
+    }
+
+    async fn body_of(r: Response<Body>) -> String {
+        let bytes = axum::body::to_bytes(r.into_body(), 1 << 20)
+            .await
+            .expect("a small body");
+        String::from_utf8(bytes.to_vec()).expect("utf-8")
+    }
+
+    /// **The air-quality device's records REPLACE the station's, they do not merge over
+    /// them.**
+    ///
+    /// Go writes `aqRecords = r` and reads the four keys out of `aqRecords`
+    /// (`handlers.go:1383-1397`), so a device with no cached extremes makes those keys
+    /// absent even when the queried station has rows of its own. Merging left the station's
+    /// in place, which is the eight-keys-against-fourteen behaviour
+    /// `ci/conformance/rust-seed/04-caches.sql` was built to watch.
+    #[tokio::test]
+    async fn an_air_quality_device_with_no_rows_removes_the_stations_own() {
+        let mut station_rows = BTreeMap::new();
+        station_rows.insert("high_temp".to_string(), record(101.0));
+        station_rows.insert("high_pm25".to_string(), record(35.0));
+
+        // The device answered, with nothing in it.
+        let body = body_of(render(station_rows.clone(), BTreeMap::new())).await;
+        assert!(body.contains("\"high_temp\""), "{body}");
+        assert!(
+            !body.contains("\"high_pm25\""),
+            "the AQ device has no row, so the key is absent even though the station has \
+             one: {body}"
+        );
+
+        // And when it does answer with rows, those are the ones served.
+        let mut device = BTreeMap::new();
+        device.insert("high_pm25".to_string(), record(55.4));
+        let body = body_of(render(station_rows, device)).await;
+        assert!(body.contains("\"high_pm25\":{\"value\":55.4"), "{body}");
+    }
+
+    /// **`high_aqi_pm25` and `high_aqi_pm10` are derived from the PM extremes, not read.**
+    ///
+    /// `handlers.go:1402-1413`: AQI is monotonic in particulate concentration, so the peak
+    /// AQI is the AQI of the peak PM, carried at that reading's timestamp and with **no**
+    /// `wind_dir`. Reading them as cache rows made them appear if and only if something had
+    /// written them, which is a different condition from Go's -- and let their value drift
+    /// from the PM extreme beside them.
+    #[tokio::test]
+    async fn the_aqi_extremes_are_derived_from_the_particulate_extremes() {
+        let mut device = BTreeMap::new();
+        device.insert("high_pm25".to_string(), record(35.4));
+        // A stored row the handler must ignore, which is the whole point: Go never reads one.
+        device.insert("high_aqi_pm25".to_string(), record(7.0));
+
+        let body = body_of(render(BTreeMap::new(), device)).await;
+        let want = mw_pipeline::enrich::aqi_pm25(35.4).expect("in range");
+        assert!(
+            body.contains(&format!("\"high_aqi_pm25\":{{\"value\":{want}")),
+            "derived from 35.4 µg/m³, which is AQI {want}, not the stored 7: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "\"high_aqi_pm25\":{{\"value\":{want},\"timestamp\":\"2026-10-28T00:00:00Z\"}}"
+            )),
+            "the PM record's own timestamp, and no wind_dir -- note the `wind_dir` the \
+             stored row carried is absent, which is Go's `WindDir: nil`: {body}"
+        );
+        // No PM extreme, no AQI extreme.
+        let body = body_of(render(BTreeMap::new(), BTreeMap::new())).await;
+        assert!(!body.contains("high_aqi_pm25"), "{body}");
+        assert!(!body.contains("high_aqi_pm10"), "{body}");
+    }
 }

@@ -75,12 +75,23 @@ pub struct Renderer {
     ///
     /// Not taken from [`StationMeta`], which carries the coordinates and not the zone.
     zones: BTreeMap<StationKey, Zone>,
+    /// Each station's coordinates, for the **website's primary** station.
+    ///
+    /// [`StationMeta`] carries the queried station's, which is what `/latest` needs for its
+    /// sun times -- but `moonCrescentAngle` is computed at the *primary device's* position
+    /// (`handlers.go:387`), and the primary may not be the station the request named. So
+    /// the renderer needs a position it was not handed, which is why this map exists
+    /// alongside [`Renderer::zones`] rather than being read off the snapshot.
+    positions: BTreeMap<StationKey, (f64, f64)>,
 }
 
 impl Renderer {
-    /// The renderer over the station zones the configuration declares.
-    pub fn new(zones: BTreeMap<StationKey, Zone>) -> Self {
-        Self { zones }
+    /// The renderer over the station zones and positions the configuration declares.
+    pub fn new(
+        zones: BTreeMap<StationKey, Zone>,
+        positions: BTreeMap<StationKey, (f64, f64)>,
+    ) -> Self {
+        Self { zones, positions }
     }
 
     /// How many stations have a configured zone, for the binary's boot log line.
@@ -105,7 +116,17 @@ impl Renderer {
         let r = &source.reading;
         let w = &source.windows;
         let meta = &source.meta;
-        let zone = self.zones.get(&source.key.station).map(|z| z.tz());
+        // **The website's primary station, whose zone formats the sun times and whose
+        // position orients the moon.** `handlers.go:372` takes `loc` from
+        // `getPrimaryDeviceConfigForWebsite(website)` and falls back to `time.Local`; the
+        // *minutes* it formats come from the queried station. So a request naming a
+        // non-primary station gets its own sunrise instant rendered in the primary's clock,
+        // which reads as odd and is the contract.
+        let primary = source.website.primary_station.as_ref();
+        let zone = primary
+            .and_then(|key| self.zones.get(key))
+            .or_else(|| self.zones.get(&source.key.station))
+            .map(|z| z.tz());
 
         let mut dto = LegacyWeatherReading {
             station_name: r.station_name.clone().unwrap_or_default(),
@@ -263,7 +284,7 @@ impl Renderer {
             zf(r.out_humidity),
         ));
 
-        self.sun_and_moon(&mut dto, r.time, &source.key.station, meta, zone);
+        self.sun_and_moon(&mut dto, r.time, &source.key.station, meta, zone, primary);
         dto
     }
 
@@ -281,7 +302,10 @@ impl Renderer {
         station: &StationKey,
         meta: &StationMeta,
         zone: Option<chrono_tz::Tz>,
+        primary: Option<&StationKey>,
     ) {
+        // **The queried station's position, for the sun.** Go reads its sun times from
+        // `GetSunTimes(stationName, dayOfYear)`, which is per station.
         let position = meta.coordinates();
         if let Some((lat, lon)) = position {
             // The day of year is the **station's**, not UTC's: a station in
@@ -316,7 +340,21 @@ impl Renderer {
         // difference is at most the snapshot's age; the payload has to be a function of
         // the reading for the `ETag` to be a validator at all (§2a.5), and no client can
         // tell a moon phase ten minutes out from one that is not.
-        let moon = sun::moon(at, position);
+        // **The PRIMARY station's position, for the moon.** `handlers.go:387` passes
+        // `getPrimaryDeviceConfigForWebsite(website)`'s latitude and longitude to
+        // `CalculateCrescentAngle`, not the queried station's -- so `/latest?station=X` on a
+        // website whose primary is Y computes the crescent's rotation at Y. Using the
+        // queried station's instead changed `moonCrescentAngle` on a frozen endpoint, and
+        // the fixtures that would notice set `body_equals: false` and assert shape only.
+        //
+        // Falls back to the queried station's position when the website names no primary or
+        // the primary has no coordinates, which is the geocentric `(0, 0)` sentinel's
+        // neighbourhood: Go passes `device.Latitude`/`Longitude`, which are zero for a row
+        // that has none, and `CalculateCrescentAngle` treats `(0, 0)` as "no observer".
+        let moon_position = primary
+            .and_then(|key| self.positions.get(key).copied())
+            .or(position);
+        let moon = sun::moon(at, moon_position);
         dto.moon_phase_name = moon.phase_name.to_string();
         // Through `zf` like every other float on the body, which makes **DEV-11**
         // structural rather than a property of this file. The arithmetic in `sun::moon` is
@@ -463,6 +501,55 @@ mod tests {
             },
             windows,
         }
+    }
+
+    /// **The primary station's position orients the moon, the queried station's the sun.**
+    ///
+    /// `handlers.go:387` passes `getPrimaryDeviceConfigForWebsite(website)`'s latitude and
+    /// longitude to `CalculateCrescentAngle`, so `/latest?station=X` on a website whose
+    /// primary is Y computes the crescent at Y. Using the queried station's position changed
+    /// `moonCrescentAngle` on a frozen endpoint, and the fixtures that would notice set
+    /// `body_equals: false` and assert shape only.
+    #[test]
+    fn the_crescent_is_oriented_at_the_websites_primary_station() {
+        let mut positions = BTreeMap::new();
+        positions.insert(StationKey::new("davis-full"), (39.900, -105.500));
+        positions.insert(StationKey::new("csi-minimal"), (39.800, -105.400));
+        let renderer = Renderer::new(BTreeMap::new(), positions);
+
+        // The request names `csi-minimal`; the website's primary is `davis-full`.
+        let mut src = source(
+            Reading {
+                out_temp: Some(40.0),
+                ..Reading::default()
+            },
+            resolved(),
+        );
+        src.key = SnapshotKey::new(WebsiteId::new(1), StationKey::new("csi-minimal"));
+        src.meta.latitude = Some(39.800);
+        src.meta.longitude = Some(-105.400);
+        let at_primary = renderer.reading(&src).moon_crescent_angle;
+
+        // The same request on a website that names no primary falls back to the queried
+        // station, which is the only position there is.
+        let mut without = src.clone();
+        without.website.primary_station = None;
+        let at_queried = renderer.reading(&without).moon_crescent_angle;
+
+        assert_ne!(
+            at_primary, at_queried,
+            "the two positions are 0.1 degrees apart, so the rotation differs -- if these \
+             are equal the primary is not being consulted"
+        );
+        // And the primary's answer is the one `davis-full` would have got for itself.
+        let mut as_primary = src.clone();
+        as_primary.key = SnapshotKey::new(WebsiteId::new(1), StationKey::new("davis-full"));
+        as_primary.meta.latitude = Some(39.900);
+        as_primary.meta.longitude = Some(-105.500);
+        assert_eq!(
+            renderer.reading(&as_primary).moon_crescent_angle,
+            at_primary
+        );
     }
 
     fn resolved() -> Resolved {

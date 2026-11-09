@@ -608,8 +608,14 @@ back the moment it was green. The two halves of that decision are asserted to be
 `/span` for a station with no non-NULL `winddir` must return 200 with `windd: 0`, which W4 D-8's
 finaliser makes true and which was a 500 in Go.
 **Deviations that land here:** DEV-1 (`ETag` on `/latest` and `/snow`) and DEV-5 (the `X-MW-*`
-headers). Both are additive and invisible to the suite by a verified property of the runner
-(`contract/conformance/src/lib.rs:320`).
+headers) — both additive and invisible to the suite by a verified property of the runner
+(`contract/conformance/src/lib.rs:320`) — plus **DEV-10** (O-5's `/stationinfo` fix, carried on the
+two existing fixtures rather than on a new one), **DEV-11** (a non-finite value zero-fills rather
+than truncating the body), **DEV-12** (`/span`'s window is bucket-aligned, so a response carries one
+element more than Go's — the price of D-54's stable cache key) and **DEV-13** (an unqualified
+`/forecast` takes the most recently updated row, because the new table has no surrogate `id` to
+recover Go's insertion order from). DEV-12 and DEV-13 were found by this item's code review; both are
+one-line decisions the owner can reverse.
 
 #### What landed, and the four places it is narrower or wider than the above
 

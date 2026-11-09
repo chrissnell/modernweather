@@ -401,7 +401,21 @@ fn attach_registry(cfg: &mut Config) -> anyhow::Result<()> {
         .iter()
         .filter_map(|(key, zone)| zone.map(|z| (key.clone(), z)))
         .collect();
-    let renderer = Arc::new(mw_api_legacy::Renderer::new(zones));
+    // The coordinates, for the same table: `/latest`'s `moonCrescentAngle` is computed at
+    // the **website's primary** station rather than at the station the request named
+    // (`handlers.go:387`), so the renderer needs a position the snapshot does not carry.
+    let positions: std::collections::BTreeMap<mw_types::StationKey, (f64, f64)> = cfg
+        .stations
+        .iter()
+        .filter_map(|row| {
+            let (lat, lon) = (row.latitude?, row.longitude?);
+            Some((
+                mw_types::StationKey::new(row.station_key.as_str()),
+                (lat, lon),
+            ))
+        })
+        .collect();
+    let renderer = Arc::new(mw_api_legacy::Renderer::new(zones, positions));
     info!(
         zones = renderer.zones(),
         "the frozen DTO's serialiser is built, so the snapshot components are planned"

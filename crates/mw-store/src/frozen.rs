@@ -97,14 +97,22 @@ impl ForecastStore for FrozenReads {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(classify)?,
-                // No station named. The frozen handler answers with *a* row for the span,
-                // and the Go one takes gorm's `First()` -- which orders by the surrogate
-                // `id` this table does not have and therefore means "whichever was
-                // inserted first". **Nothing in the contract says which station a
-                // stationless request gets**, so this answers with the most recently
-                // fetched forecast for that span: a deterministic answer, and the only one
-                // of the available orderings that is defensible on its own terms rather
-                // than as an accident of insertion order. `station_id` breaks a tie.
+                // No station named. The Go handler takes gorm's `First()`, which orders by
+                // the surrogate `id` this table does not have and therefore means
+                // "whichever was inserted first". Insertion order is not recoverable from a
+                // `(station_id, span_hours)` primary key, so *some* deterministic order has
+                // to be chosen, and "most recently updated" is the better of the two
+                // available answers for a cache: a stale row cannot win. `station_id` breaks
+                // a tie.
+                //
+                // **It is a byte difference on a response, so it is DEV-13** in
+                // `docs/reconciliation.md` §3 rather than a judgement recorded in a comment.
+                // Worth knowing while reading the fixture that covers it:
+                // `ci/conformance/rust-seed/04-caches.sql` backdates `csi-minimal`'s row so
+                // that `forecast-240-ten-daily-periods` selects `davis-full` deterministically
+                // under this ordering -- the Go rig gives both rows the same timestamp, so
+                // that fixture passes because the seed was shaped to the ordering and not
+                // because the two orderings agree.
                 None => sqlx::query(
                     "SELECT updated_at, data::text FROM forecasts \
                      WHERE span_hours = $1 ORDER BY updated_at DESC, station_id LIMIT 1",

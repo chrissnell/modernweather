@@ -27,12 +27,16 @@
 //! # Where the window is measured from
 //!
 //! `now - span`, **floored to the level's bucket grid**. The Go query is
-//! `bucket > NOW() - span` with no alignment, so this can include one additional oldest
-//! bucket; **D-55** is the authority -- "`/span/24h` means 24 hours of 5-minute buckets" --
-//! and an aligned window is what makes the cache key exact. The conformance suite compares
-//! element *shape* rather than element count, so the difference is invisible to it; it is
-//! recorded here because it is a byte difference a chart could see as one extra point at
-//! the far left.
+//! `bucket > NOW() - span` with no alignment, so this includes exactly one additional oldest
+//! bucket -- `floor(now-span) <= now-span` always, so it is one extra element on **every**
+//! response rather than sometimes. **D-55** is the authority ("`/span/24h` means 24 hours of
+//! 5-minute buckets") and an aligned window is what makes D-54's cache key stable: an
+//! unaligned `since` moves with every request, so every request would miss.
+//!
+//! The conformance suite compares element *shape* rather than element count, so it cannot
+//! see this. It is therefore **DEV-12** in `docs/reconciliation.md` §3 rather than a note
+//! here: §3's definition is "every place a design knowingly changes a byte a shipped client
+//! could observe", and a comment in a source file is not a work item (G-5).
 //!
 //! # What this endpoint does not populate
 //!
@@ -112,6 +116,17 @@ pub async fn handle(h: &Handlers, host: &str, span: &str, params: &Params) -> Re
             StatusCode::BAD_REQUEST,
             "time span exceeds maximum allowed duration of 1 year",
         );
+    }
+
+    // **A zero or negative span is an empty array**, which the Go query produces and this
+    // did not. `spanStart` is `now - span`, and the predicate is `bucket > spanStart`
+    // (`controller.go:890`), so a zero span asks for buckets strictly after *now* and finds
+    // none. Here it made `since == tail_start`, which is `SpanQuery`'s cache-hit sentinel --
+    // so the prefix was skipped and the still-filling bucket was appended anyway, and
+    // `/span/0` answered a one-element array. `parse_go_duration` maps a negative duration
+    // to zero, so this covers `/span/-1h` as well.
+    if duration.is_zero() {
+        return body(&[], &[], DEFAULT_MAX_AGE, &station.name, &station.kind);
     }
 
     let level = band(duration);
@@ -532,6 +547,17 @@ fn element(bucket: &SpanBucket, name: &str, kind: &str) -> LegacyWeatherReading 
 /// gets the computed value rather than a zero -- which is why a client was never charting a
 /// flat zero here.
 fn aqi(stored: Option<f64>, particulate: Option<f64>, compute: fn(f32) -> Option<i32>) -> f32 {
+    // **Rounded to an integer first, because Go never sees a fractional one.** The Go
+    // handler reads this column from the aggregate VIEW, which selects
+    // `avg(aqi_pm25_aqin)::int` (`internal/storage/timescaledb/sql.go`), and scans it into
+    // an `int32`. So the `> 0` test below is on the rounded number as well as the value
+    // being served: a bucket averaging 0.4 is `0` in Go, which falls through to the
+    // computed branch, where an unrounded `0.4` took the stored one.
+    //
+    // `round_ties_even`, because PostgreSQL's `double precision` to `int` cast is
+    // round-half-to-even -- verified on the server this runs against: 2.5 casts to 2 and
+    // 3.5 to 4.
+    let stored = stored.map(f64::round_ties_even);
     if let Some(value) = stored.filter(|v| *v > 0.0) {
         return value as f32;
     }
@@ -764,6 +790,33 @@ fn unit(s: &str) -> Option<(f64, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The stored AQI is an integer before the `> 0` test, because Go's view made it one.**
+    ///
+    /// The aggregate view selects `avg(aqi_pm25_aqin)::int`, so the Go handler never sees a
+    /// fraction: it chooses the stored branch on the rounded value and serves the rounded
+    /// value. Reading the unrounded mean changed both.
+    ///
+    /// `::int` on a `double precision` is round-half-to-even in PostgreSQL -- checked
+    /// against the server these tests run beside: 2.5 casts to 2 and 3.5 to 4.
+    #[test]
+    fn a_stored_aqi_is_rounded_the_way_the_aggregate_view_rounds_it() {
+        let compute = |_pm: f32| Some(99);
+        // 42.6 is `43` in the view, and `43` is what the contract carries.
+        assert_eq!(aqi(Some(42.6), None, compute), 43.0);
+        // Ties to even, both ways.
+        assert_eq!(aqi(Some(2.5), None, compute), 2.0);
+        assert_eq!(aqi(Some(3.5), None, compute), 4.0);
+        // **And the branch.** A bucket averaging 0.4 is `0` in the view, which is not `> 0`,
+        // so Go falls through and computes from the particulate. Unrounded, `0.4` took the
+        // stored branch and served `0.4`.
+        assert_eq!(aqi(Some(0.4), Some(12.0), compute), 99.0);
+        // 0.5 rounds to 0 as well (ties to even), and 0.6 to 1.
+        assert_eq!(aqi(Some(0.5), Some(12.0), compute), 99.0);
+        assert_eq!(aqi(Some(0.6), Some(12.0), compute), 1.0);
+        // No stored value and no particulate is the zero-fill, as before.
+        assert_eq!(aqi(None, None, compute), 0.0);
+    }
 
     /// Go's grammar, including the three cases the fixtures assert.
     #[test]

@@ -361,3 +361,31 @@ async fn a_prefix_the_aggregate_has_not_caught_up_to_is_not_cached() {
          would serve the same hole for the whole TTL"
     );
 }
+
+/// **A zero or negative span is an empty array, and the store is not asked.**
+///
+/// Go's predicate is `bucket > now - span` (`controller.go:890`), so a zero span asks for
+/// buckets strictly after *now* and finds none. Here it made `since == tail_start`, which is
+/// `SpanQuery`'s cache-hit sentinel -- the prefix was skipped and the still-filling bucket
+/// appended anyway, so `/span/0` answered a one-element array. `parse_go_duration` maps a
+/// negative Go duration to zero, so `/span/-1h` is the same request.
+#[tokio::test]
+async fn a_zero_span_is_an_empty_array() {
+    let store = Recording::new(Span {
+        prefix: vec![bucket(1, 10.0, 60)],
+        backfill: Vec::new(),
+        tail: Some(bucket(0, 11.0, 60)),
+    });
+    let h = handlers(Arc::clone(&store));
+
+    for path in ["/span/0?station=davis-full", "/span/-1h?station=davis-full"] {
+        let (status, body) = get(&h, path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(body, "[]\n", "{path}");
+    }
+    assert!(
+        store.queries().is_empty(),
+        "an empty window needs no query, and asking for one is how the sentinel got \
+         confused with a real range"
+    );
+}

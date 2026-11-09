@@ -1117,6 +1117,13 @@ pub struct StationRow {
 /// Ordered, because the order reaches the plan: a listener's `ConfigDigest` is over the
 /// group of rows it serves, and an unordered `SELECT` would make the digest -- and
 /// therefore the plan diff -- depend on SQLite's row order.
+///
+/// **By `name`, because the frozen `stations` array is.** `pkg/config/provider_sqlite.go`
+/// orders the station directory `ORDER BY name`, and `/stationinfo` and `/api/stations`
+/// serialise it in that order; `name` and `station_key` are independent `TEXT` columns with
+/// nothing tying them together, so a station renamed in the management UI without its key
+/// changing reordered a frozen array. `station_key` stays as the tiebreak, because `name`
+/// has no uniqueness constraint and the digest has to be stable.
 pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbError> {
     let rows = sqlx::query(
         "SELECT id, station_key, name, type, enabled, identity_kind, presented_key, \
@@ -1126,7 +1133,7 @@ pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbErro
                 transport_auth, transport_streaming, transport_mount, transport_group, \
                 transport_topic, transport_tls_ca_path, transport_tls_cert_path, \
                 transport_tls_key_path, wll_sensor_mapping, wll_poll_interval_seconds \
-         FROM stations ORDER BY station_key",
+         FROM stations ORDER BY name, station_key",
     )
     .fetch_all(pool)
     .await
