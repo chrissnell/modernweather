@@ -1,6 +1,7 @@
 {
   "name": "latest-no-recent-data",
   "description": "Configured device that has never reported: 404 with a plain-text body.",
+  "class": "frozen",
   "provenance": "derived from the SQLite configuration database only",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

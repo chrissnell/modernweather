@@ -159,6 +159,18 @@ impl RouteState {
         self.handlers.store(Some(handlers));
     }
 
+    /// [`RouteState::install`], for an integration test that drives the router without a
+    /// supervisor.
+    ///
+    /// Named so that it reads as test-only at every call site, rather than being a second
+    /// public way to mount a table: `tests/degraded.rs` is the one caller, and what it
+    /// tests -- **D-48**'s byte-level half -- cannot be reached through `build` without a
+    /// supervisor and a database to take away.
+    #[doc(hidden)]
+    pub fn install_for_test(&self, handlers: Arc<Handlers>) {
+        self.install(handlers);
+    }
+
     /// Clear the slot, which unmounts the table.
     fn clear(&self) {
         self.handlers.store(None);

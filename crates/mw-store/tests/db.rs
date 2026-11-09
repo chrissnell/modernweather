@@ -50,7 +50,9 @@ use mw_component::{
 };
 use mw_store::config_db::StationRow;
 use mw_store::{version, ConfigRegistry, RegistrySnapshot, TimescaleReader, TimescaleWriter};
-use mw_types::{Envelope, OriginId, Provenance, Reading, Seq, StationKey, DIMENSIONS, METRICS};
+use mw_types::{
+    Agg, Envelope, MetricKey, OriginId, Provenance, Reading, Seq, StationKey, DIMENSIONS, METRICS,
+};
 use sqlx::{PgPool, Row};
 
 /// The connection string, or a failure that names the gate.
@@ -1815,4 +1817,148 @@ async fn the_newest_reading_in_the_window_is_read_back_whole() {
     assert!(unknown.is_none());
 
     touched(&pool, "the_newest_reading_in_the_window_is_read_back_whole").await;
+}
+
+/// **W1-BUG-1 stays dead, end to end**: `/span` for a station that has never reported a
+/// wind direction returns a bucket with `winddir = 0`, not an error.
+///
+/// `ci/db/schema-assertions.sql` A-3 asserts the finaliser in isolation --
+/// `mw_circular_mean(NULL, NULL, NULL)` is `0` and not a division by zero. This asserts the
+/// **query the frozen endpoint actually issues**, over a station whose `winddir` column is
+/// NULL in every row, through `ReadingStore::span`. The two are different failures: the Go
+/// bug is `SQLSTATE 22012` from `circular_avg_final` dividing by an accumulator that stayed
+/// zero, and it is a *query* failure rather than a wrong number -- so a finaliser that was
+/// right and a `SELECT` that called it with the wrong arguments would pass A-3 and `500`
+/// here.
+///
+/// It is latent in the Go tree only because the Go writer inserts its whole reading struct,
+/// zeros included. **This** writer stores `NULL` for an unreported metric (**D-26**), which
+/// makes the defect live -- so the regression test belongs to the item that first issues
+/// the query, which is M4-2.
+///
+/// `windd` is `"swift_optional": false` in `contract/legacy-v1.json`, so returning NULL
+/// instead of `0` would fail the iOS decode of the whole `/span` response rather than one
+/// field. W4 **D-8** chose zero for that reason.
+#[tokio::test]
+#[ignore = "needs a real TimescaleDB; run `cargo xtask db-tests`"]
+async fn a_span_over_a_station_with_no_wind_direction_returns_zero_rather_than_failing() {
+    let station = "db-tests:w1-bug-1";
+    let pool = prepare(&[station]).await;
+    let w = writer(&pool, station);
+    let reader = TimescaleReader::new(pool.clone());
+
+    // 2026-01-12T00:00:00Z, away from every other test's window.
+    let base = 1_768_176_000i64;
+    let mut batch: Vec<Envelope> = Vec::new();
+    for minute in 0..10i64 {
+        batch.push(envelope(
+            station,
+            at(base + minute * 60),
+            (minute + 1) as u64,
+            Reading {
+                out_temp: Some(40.0 + minute as f32),
+                wind_speed: Some(3.0),
+                // **No `wind_dir`.** Which is the whole test: the column is NULL in every
+                // row, so the aggregate's sine sum, cosine sum and direction count are all
+                // NULL and the Go finaliser divides by zero.
+                ..Reading::default()
+            },
+        ));
+    }
+    w.store(&batch).await.expect("the readings are stored");
+    materialise(&pool, at(base), at(base + 600)).await;
+
+    let columns = vec![
+        (MetricKey::OutTemp, Agg::Mean),
+        (MetricKey::WindDir, Agg::CircularMean),
+        (MetricKey::WindSpeed, Agg::Mean),
+    ];
+    let span = reader
+        .span(mw_component::SpanQuery {
+            station: StationKey::new(station),
+            level: mw_component::BucketLevel::Minute,
+            since: at(base),
+            // The whole window is closed, so the prefix is all ten buckets and the tail is
+            // the minute after them -- which has no readings and must come back `None`
+            // rather than as a row of NULLs.
+            tail_start: at(base + 600),
+            columns,
+            limit: 64,
+        })
+        .await
+        .expect("the query RUNS, which is the half W1-BUG-1 is about");
+
+    assert_eq!(span.prefix.len(), 10, "ten one-minute buckets");
+    assert!(
+        span.tail.is_none(),
+        "the trailing bucket has no readings in it, so it is absent from the response \
+         rather than a row of zeros"
+    );
+    for (i, bucket) in span.prefix.iter().enumerate() {
+        assert_eq!(
+            bucket.values[1],
+            Some(0.0),
+            "bucket {i}: a station that never reported a direction gets 0, not NULL -- \
+             `windd` is a non-optional Swift Double and a missing key fails the decode of \
+             the whole /span response"
+        );
+        assert_eq!(
+            bucket.values[0],
+            Some(f64::from(40.0 + i as f32)),
+            "bucket {i}: the metrics it did report are unaffected"
+        );
+        assert_eq!(bucket.values[2], Some(3.0), "bucket {i}");
+    }
+
+    // And the converse, so that the zero above is not simply what this column always
+    // returns: a station that *does* report a direction gets the vector mean of it.
+    let reporting = "db-tests:w1-bug-1-reporting";
+    let pool = prepare(&[reporting]).await;
+    let w = writer(&pool, reporting);
+    let reader = TimescaleReader::new(pool.clone());
+    w.store(&[
+        envelope(
+            reporting,
+            at(base),
+            1,
+            Reading {
+                wind_dir: Some(80.0),
+                ..Reading::default()
+            },
+        ),
+        envelope(
+            reporting,
+            at(base + 10),
+            2,
+            Reading {
+                wind_dir: Some(100.0),
+                ..Reading::default()
+            },
+        ),
+    ])
+    .await
+    .expect("stores");
+    materialise(&pool, at(base), at(base + 60)).await;
+    let span = reader
+        .span(mw_component::SpanQuery {
+            station: StationKey::new(reporting),
+            level: mw_component::BucketLevel::Minute,
+            since: at(base),
+            tail_start: at(base + 60),
+            columns: vec![(MetricKey::WindDir, Agg::CircularMean)],
+            limit: 8,
+        })
+        .await
+        .expect("the query runs");
+    let got = span.prefix[0].values[0].expect("a direction was reported");
+    assert!(
+        (got - 90.0).abs() < 1e-6,
+        "the vector mean of 80 and 100 degrees is 90, got {got}"
+    );
+
+    touched(
+        &pool,
+        "a_span_over_a_station_with_no_wind_direction_returns_zero_rather_than_failing",
+    )
+    .await;
 }

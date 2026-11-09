@@ -569,10 +569,10 @@ through the frozen body (D-36).
 returns its contract response and never `503`. That is the check W1 and W2a both deferred to each
 other and neither made.
 
-### M4-2 — `mw-api-legacy`
+### M4-2 — `mw-api-legacy` *(landed 2026-11-09)*
 **Depends on:** M4-1, M2-5. **Blocks:** M4-3, M5.
 The compatibility adapter, which exclusively owns the 133-key DTO, both duplicate key pairs, the
-`mm`→inch split, `omitempty`, the four error-body conventions and msgpack. Legacy naming cannot leak
+`mm`→inch split, `omitempty` and the four error-body conventions. Legacy naming cannot leak
 into the core because `mw-types` has no `serde` dependency at all, and zero-filling cannot leak into
 storage because the only `unwrap_or(0.0)` in the workspace is `mw_api_legacy::zf` (D-10) — both
 enforced by the layout gate.
@@ -609,55 +609,99 @@ finaliser makes true and which was a 500 in Go.
 **Deviations that land here:** DEV-1 (`ETag` on `/latest` and `/snow`) and DEV-5 (the `X-MW-*`
 headers). Both are additive and invisible to the suite by a verified property of the runner
 (`contract/conformance/src/lib.rs:320`).
-**Constraints from M2-5**, which built the runner this item's headline done-criterion is measured by
-(`xtask/src/conformance.rs`). Recorded here rather than in that file, because a comment in a source
-file is not a work item (`docs/reconciliation.md` G-5):
-1. **The done-criterion above is not satisfiable as written, and closing that is part of this item.**
-   `cargo xtask conformance` replays all 70 fixtures and is green only when **none** fail; the scope
-   narrowing three paragraphs up means `/alerts`, `/api/remote-stations` and the msgpack fixtures
-   will still fail when every implemented endpoint is right. So this item has to introduce the
-   frozen / coupled / **not-implemented** classification as *data the runner reads* — not as a
-   narrower replay. The runner asserts that 70 fixtures were **attempted** precisely so that the
-   classification cannot arrive as a silent filter; a change that replays fewer fails that assertion
-   on purpose.
-2. **The weather database has to be seeded.** M2-5 brings the daemon up against a freshly migrated
-   but **empty** database, which is all a replay against 404s needs. Every frozen endpoint reads, so
-   the rig that makes a *green* run mean something belongs here — and W1's rig
-   (`contract/tools/rig/`) targets the **Go** schema, so it is a translation and not a copy.
-3. **`MIN_MANGLED_FAILURES = 26` has to be re-derived.** `contract/README.md`'s 26 is the count
-   against the Go daemon serving all 70 endpoints. Against a binary that does not implement three of
-   them, the floor the negative control must clear is a different number, and it must be measured
-   rather than assumed — a control whose floor is too low is the failure mode W1 Decision 10 exists
-   to prevent.
-**Constraints from M4-1**, which built `LatestSnapshot` and the half of **D-48** that does not need
-routes. Recorded here for the same reason M2-5's are, and because M4-1 deferred the rest of D-48 to
-this item: a deferral whose obligations live only in source comments is not a work item
-(`docs/reconciliation.md` G-5).
-1. **`Config::snapshot_render` must return `Some`.** `snapshot:latest` and `snapshot:warm` are
-   complete and are **not planned** in the shipping binary, because the payload is the frozen 133-key
-   DTO and this item owns its serialiser. One line in `crates/modernweather/src/config.rs` turns both
-   on; `boot.rs`'s plan test asserts they are absent today and fails the moment they are not, so the
-   tripwire will tell you.
-2. **`api:legacy`'s hard needs must be exactly `[LatestSnapshot]`.** This is the whole of D-48 and
-   **nothing currently asserts it** — M4-1's test chose the stand-in's declarations itself. A hard
-   `ReadingStore` here would make a frozen route unmountable whenever the database is down, and the
-   conformance suite cannot catch it, because it replays against a **healthy** database and a `503`
-   only appears when there is not one. Either add a plan-level test that no spec providing a
-   `RouteManifest` containing a frozen pattern has a hard need outside `{LatestSnapshot}`, or assert
-   this item's own `requires` set the way `mw_pipeline::snapshot`'s spec tests do.
-3. **D-48's byte-level half is this item's.** With the database **stopped**, each of the five frozen
-   routes must return its contract response — `/latest`'s `404 no recent weather data available for
-   this station\n` included — and never `503`. `cargo xtask gate conformance` does **not** establish
-   this: it replays against a running database, so a green conformance run does not imply D-48.
-   M4-1 tested the precondition (`crates/modernweather/tests/snapshot_degraded.rs`: a consumer whose
-   only hard need is `LatestSnapshot` reaches `Running` with `db:postgres` planned and never
-   publishing); the fixtures-with-the-database-down half arrives with the routes.
-4. **Two additive headers read `Snapshot`'s accessors**: `X-MW-Snapshot-Age` from
-   `Snapshot::age_seconds` and `X-MW-Degraded` from `Staleness::missing`, which is **D-36**'s only
-   path to a client. The staleness must not reach the frozen body.
-5. **`ETag` and `If-None-Match` are built.** `mw_component::ETag` escapes the station key into
-   `etagc` and implements RFC 9110 §13.1.2's weak comparison; the handler should use
-   `ETag::matches` rather than comparing strings, and must not "fix" `Cache-Control`.
+
+#### What landed, and the four places it is narrower or wider than the above
+
+**1. The done-criterion was not satisfiable as written, and closing that was part of the item — in
+two directions rather than one.** The scope narrowing meant the nine `retired` fixtures would still
+fail when every implemented endpoint was right, which this item's own brief recorded. The **second**
+direction it did not: the coupled class also contains the six HTML pages and seven embedded assets,
+and those are **M4-3's** by this plan's own text three paragraphs down — the `askama` port, the
+`GoHtmlEscaper`, the mime table, and a done-criterion that is a byte diff against those same
+recorded bodies. So "every coupled-class fixture" could not be green at M4-2 either.
+
+What landed is the classification as **data the runner reads** (work item **N-18**), plus a
+**policy** in `xtask/src/conformance.rs` that is checked in both directions:
+
+| Class | Count | The gate's rule |
+|---|---|---|
+| `frozen` | 42 | every one must pass |
+| `coupled` | 19 | every one must pass **except** the thirteen declared pending on M4-3 |
+| `retired` | 9 | reported, never gating |
+
+The pending list is declared by name next to the policy rather than read off the fixtures, and a
+fixture excused without a declaration **or** a declaration whose fixture has started passing is exit
+2. **M4-3's done-criteria therefore gain one line: the `PENDING` list in
+`xtask/src/conformance.rs` must be empty when that item lands**, and the gate will say so by
+refusing a stale excuse.
+
+**2. `/forecast` needed a table W4 never specified.** `docs/database-schema.md` does not mention a
+forecast anywhere; W1 assumption 12 names `almanac_cache` and `snow_totals_cache` as the two caches
+the frozen contract reads directly and stops. M6-3 owns the Aeris *components*, and this item owns
+the `/forecast` **handler** — which had no relation to read from. `migrations/` gains a narrow
+`forecasts` table, created by the item that first needed it rather than left for M6-3; **M6-3 should
+extend it rather than recreate it**, which an `ADD COLUMN` makes cheap (**D-9**). This is the same
+class of gap `docs/reconciliation.md` **G-2** records for the configuration store.
+
+**3. M4-1's `cx.soft()` defect has a second instance with no second fix, so the mechanism changed.**
+`BuildCx::soft` reads the slot once and the supervisor never rebuilds a `Running` component when a
+soft capability later arrives. M4-1 fixed `snapshot:latest` by taking the handle from the registrar,
+which works because `RollupState` is a root resource `main` owns. `api:legacy`'s three read stores
+belong to `db:postgres`'s pool, which cannot be one. `mw_component::Deferred<H>` is the answer — a
+soft-only handle read when it is used — and it is recorded as **A-M4-2-1** in
+`docs/reconciliation.md`'s *Proposed amendments*.
+
+**4. `api:legacy` is planned only where a `LatestSnapshot` provider will be.** The hard need set is
+exactly `{LatestSnapshot}` and a test asserts it, which is the obligation M4-1 recorded. The
+consequence nobody had written down is that `plan()` refuses a configuration whose hard need nobody
+provides — and `snapshot:latest` is the **only** provider of that capability (`snapshot:warm` writes
+the table and does not publish it, because the capability is `Exclusive` and two providers would be
+a plan error). So a node with an empty snapshot key set, or with neither a spool nor a weather
+database, would have been a daemon that refuses to start. `mw_pipeline::snapshot::
+provides_latest_snapshot` is the one copy of that condition and the registrar asks it.
+
+One consequence of that worth stating rather than discovering: a node with **no website row** gets no
+frozen route table, so a request to it is `mw-http`'s bare `404` rather than the contract's
+`503 {"error":"No weather websites configured",…}` (W3 §6.3). That body is reachable only on a node
+that has a station and at least one website whose `Host` the request does not match. No fixture
+covers the no-website case.
+
+**What else it needed, and did not have:** the weather database had to be **seeded**, which
+`ci/conformance/README.md` already recorded as this item's. `ci/conformance/rust-seed/` is a
+translation of W1's rig onto `observations` and W4's four aggregate levels, asserted per station and
+in both directions — two stations must have *no* readings, because that is what four fixtures are.
+The rig also configures a `node` row, which the Go rig had no equivalent of: without one the daemon
+has no spool, so no reading stream, so no `snapshot:latest`.
+
+**`MIN_MANGLED_FAILURES` was re-derived, and the shape changed rather than the number.**
+`contract/README.md`'s 26 is a count of *failures* against a Go daemon that passes all 70 directly.
+Against this target 22 fail whatever the proxy does, so a failure floor would be cleared by a proxy
+that mangled **nothing** — the exact failure mode W1 Decision 10 exists to prevent. The control now
+measures `direct.passed - control.passed`, the responses the proxy actually **broke**: measured at 23
+of the 48 the target serves, with a declared floor of 20.
+
+**Two deviations beyond the two listed above.** **DEV-10** is O-5's `/stationinfo` fix, recorded on
+the two affected fixtures as a `deviation` block the Rust-target replay applies and the Go-target
+replay does not — one fixture, both halves, both gates still asserting what their own target
+produces. **DEV-11** is `zf` filling a non-finite stored value like an absent one; Go fails the
+whole encode for it and `serde_json` would write `null`, and neither is a response a frozen route
+may give.
+
+**Every constraint M2-5 and M4-1 recorded is discharged.** M2-5's three — the done-criterion's
+satisfiability, the seeded weather database and `MIN_MANGLED_FAILURES` — are the three sections
+above. M4-1's five are: `Config::snapshot_render` returns `Some` and both snapshot components plan
+(the `boot.rs` tripwire inverted and its count went from 6 to 9); `api:legacy`'s hard needs are
+asserted to be exactly `{LatestSnapshot}`; the two additive headers read `Snapshot::age_seconds` and
+`Staleness::missing` and go out only when the snapshot is degraded; and `ETag::matches` is what
+`/latest` compares `If-None-Match` with, with `Cache-Control` left alone.
+
+**D-48's byte-level half is the fifth, and it has its own test**:
+`crates/mw-api-legacy/tests/degraded.rs` drives the real router with all three soft capability slots
+**empty** -- which is how the supervisor expresses a database that is down -- and asserts each of the
+five frozen routes' contract response plus a blanket "not one `503` and not one `5xx`" over nineteen
+paths. `cargo xtask gate conformance` cannot establish this, because it replays against a running
+database; that is exactly why the test is in-process and takes the capability away rather than the
+server.
 
 ### M4-3 — `mw-http` and `mw-web`
 **Depends on:** M4-2. **Blocks:** M5, M7.
@@ -677,6 +721,18 @@ the `GoHtmlEscaper` decision buys; the layout gate rejects `safe` and `escape("n
 **Deviations that land here:** DEV-2 (case-insensitive `Host`), DEV-3 (404 instead of directory
 listings), DEV-6 (single-label wildcard matching and the deterministic SNI miss chain). All three
 close defects; see `docs/reconciliation.md` §3.
+**Constraint from M4-2: the `PENDING` list in `xtask/src/conformance.rs` must be empty when this
+item lands.** Thirteen coupled-class fixtures -- the six HTML pages and the seven embedded assets --
+are excused from the `conformance` gate by that list because their subject is this item's. The gate
+checks it in **both** directions, so a declaration whose fixture has started passing is exit 2 and
+says to remove the entry; the list emptying is this item's visible done-criterion on that gate.
+**Two further responses are this item's, and both are currently `mw-http`'s bare 404**: the
+`404 page not found\n` body with `Content-Type: text/plain; charset=utf-8` that the asset file server
+gives (fixtures `asset-not-found` and `html-portal-on-non-portal`), and the `Vary: Accept-Encoding`
+that every one of the 70 fixtures asserts. `mw-api-legacy` sets that header explicitly on every
+response, because the runner compares a header's **value** exactly and `tower_http`'s
+`CompressionLayer` writes `vary: accept-encoding` in lower case -- so when this item adds compression
+it must not also add a second `Vary` (`mw_api_legacy::reply`'s module documentation).
 **Constraints from M4-1**, recorded here rather than in a source comment (`docs/reconciliation.md`
 G-5):
 1. **This item builds the thing that can emit a `503`**, which is the unmounted-declared-path

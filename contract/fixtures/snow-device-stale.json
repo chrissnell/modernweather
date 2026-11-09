@@ -1,6 +1,7 @@
 {
   "name": "snow-device-stale",
   "description": "Snow device offline for three days: /snow has NO recency filter, so it keeps returning the last known depth indefinitely.",
+  "class": "frozen",
   "provenance": "seeded directly into the weather hypertable (no Go driver exists that can be emulated here)",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

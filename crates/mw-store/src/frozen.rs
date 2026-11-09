@@ -97,16 +97,17 @@ impl ForecastStore for FrozenReads {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(classify)?,
-                // No station named. The frozen handler answers with *a* row for the span
-                // and the Go one takes gorm's `First()`, which orders by the surrogate
-                // `id` this table does not have. Ordered by station key instead, so the
-                // answer is at least deterministic across runs; nothing in the contract
-                // says which station a stationless request gets, and a configuration with
-                // two stations' forecasts for one span and no `?station=` is ambiguous at
-                // the request rather than here.
+                // No station named. The frozen handler answers with *a* row for the span,
+                // and the Go one takes gorm's `First()` -- which orders by the surrogate
+                // `id` this table does not have and therefore means "whichever was
+                // inserted first". **Nothing in the contract says which station a
+                // stationless request gets**, so this answers with the most recently
+                // fetched forecast for that span: a deterministic answer, and the only one
+                // of the available orderings that is defensible on its own terms rather
+                // than as an accident of insertion order. `station_id` breaks a tie.
                 None => sqlx::query(
                     "SELECT updated_at, data::text FROM forecasts \
-                     WHERE span_hours = $1 ORDER BY station_id LIMIT 1",
+                     WHERE span_hours = $1 ORDER BY updated_at DESC, station_id LIMIT 1",
                 )
                 .bind(span)
                 .fetch_optional(&self.pool)

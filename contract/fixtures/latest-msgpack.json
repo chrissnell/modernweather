@@ -1,6 +1,7 @@
 {
   "name": "latest-msgpack",
   "description": "format=msgpack switches the encoder for every endpoint that goes through responseformat.Formatter.",
+  "class": "retired",
   "provenance": "davis-emulator (cmd/davis-emulator), LOOP packets over TCP",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

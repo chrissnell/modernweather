@@ -15,20 +15,42 @@ record of what that cost: the `conformance` gate reported green by deferral for 
 the suite whose own done-criteria required it to pass had never executed. The existence of
 `go-target.sh` is what arms `conformance-fixtures` in `ci/gates.toml`.
 
-**Check 2 is armed and failing, which is its correct state until `implementation-plan.md` M4-2.**
-The Rust daemon serves `/metrics` and a 404 fallback, so `cargo xtask conformance` reports 70
-fixtures attempted and 70 failed and exits 1. That red is the deliverable of M2-5: the failure is
-visible from Milestone 2 onward instead of being discovered in Milestone 4. The two harnesses do the
-same job in the same order and assert the same things — read `go-target.sh` before changing either —
-and the differences are only the ones the target forces:
+**Check 2 is green as of `implementation-plan.md` M4-2**, and back in the `gate` job's `needs` in
+`.github/workflows/pr.yml`. It was armed and failing from M2 until then, which was its correct state
+and the deliverable of M2-5: the failure was visible from Milestone 2 onward instead of being
+discovered in Milestone 4.
+
+**Green does not mean "all 70 passed", and that is a policy rather than a concession.** The fixtures
+are classified (`docs/reconciliation.md` §6.4, work item **N-18**) and the classification is **data
+the runner reads** — all 70 are still attempted, which is what stops it being a silent filter:
+
+| Class | Count | What the gate does with it |
+|---|---|---|
+| `frozen` | 42 | every one must pass. A failure is a **contract break** — the iOS client is deployed independently of this server |
+| `coupled` | 19 | every one must pass **except** the thirteen whose subject M4-3 owns (the HTML pages and the asset trees), which are excused by a list declared in `xtask/src/conformance.rs` |
+| `retired` | 9 | `/alerts`, `/api/remote-stations` and `format=msgpack`, which **D-69** does not carry forward. Reported on every run, never gating |
+
+So a green run today prints `48 passed, 22 failed`. The excuse list is checked in **both**
+directions: a fixture excused without a declaration and a declaration whose fixture has started
+passing are each exit 2, because the first would make the gate narrower than it says and the second
+would leave it excusing a failure that cannot happen.
+
+**The Rust target is replayed with `--deviation DEV-10`.** `/stationinfo` emits `about_text` and
+`weather_device` unconditionally, which is `docs/reconciliation.md` **O-5** answered by the owner as
+option (b); the two affected fixtures carry the Rust target's response beside the Go server's, and
+`go-target.sh` passes no deviation. One fixture holds both halves, which is the only arrangement
+under which both gates keep asserting what their own target is supposed to produce.
+
+The two harnesses do the same job in the same order and assert the same things — read
+`go-target.sh` before changing either — and the differences are only the ones the target forces:
 
 | | `go-target.sh` | `cargo xtask conformance` |
 |---|---|---|
 | target | `rw`, built from `remoteweather` @ `c3ec9f7` | `target/debug/modernweather`, built from this tree |
-| configuration | `rw -config` + `config-seed.sql`, 7 devices and 6 websites | `migrations/config/`, applied by the daemon, then the `listener` and `weather_database` rows |
-| weather data | W1's rig (`contract/tools/rig/`), plus five migrations the Go daemon does not provision | nothing yet; seeding readings for the five frozen endpoints is M4-2's, which is what will make a *green* replay mean something |
+| configuration | `rw -config` + `config-seed.sql`, 7 devices and 6 websites | `migrations/config/`, applied by the daemon, then the `listener` and `weather_database` rows and the same 7 stations and 6 websites (`rust-seed/01-config.sql`) |
+| weather data | W1's rig (`contract/tools/rig/`), plus five migrations the Go daemon does not provision | `ci/conformance/rust-seed/` — a translation of that rig onto `observations` and W4's four aggregate levels, plus the three tables the frozen contract reads directly |
 | port | 18080, with the emulators on 22222 and 8123 | 18080, which is the port `mangle_proxy.py` forwards to |
-| negative control | always, and the run is accepted only if it fails | only once the direct replay is clean, because there is nothing to control for while every fixture already fails |
+| negative control | always, and the run is accepted only if it fails | only once the direct replay is accepted. The floor is **what the proxy broke** rather than how many fixtures failed: 22 fail here whatever the proxy does, so a failure floor would be cleared by a proxy that mangled nothing |
 | language | shell, because it must run with no Rust daemon in the tree | Rust, because the verdict — 70 attempted, transport failures, the control's three parts — is then unit-testable without a database |
 
 ## Running the Rust target
@@ -49,18 +71,46 @@ what it is for.
 
 `cargo xtask conformance --help` lists the knobs. The two that matter when reading a failure are
 `--no-build` (replay against the binary already at `--target-binary`) and `--keep-running`, which
-leaves the daemon up after any run that reached a verdict — including today's red one, which is
-when you most want to `curl` it. A run that reached *no* verdict cleans up after itself, because its
+leaves the daemon up after any run that reached a verdict — including a red one, which is when you
+most want to `curl` it. A run that reached *no* verdict cleans up after itself, because its
 processes would only mislead the next one. Replay output and the daemon's log land in
 `target/conformance-rust/`.
 
 Its two failure codes are declared in `ci/gates.toml` and mean different things: **1** is "the
-replay reached a verdict and the binary does not conform", which is today's expected state, and
-**2** is "the run reached no verdict" — a missing tool, a busy port, a database that would not
-answer, a daemon that never asserted its database version, a fixture count that is not 70, failures
-at the transport layer, or a negative control that did not hold. The split exists because a dead
-daemon and a wrong contract both produce 70 failures, and calling the first the second is the
-expensive direction for this gate to be wrong in.
+replay reached a verdict and the binary does not conform", and **2** is "the run reached no verdict"
+— a missing tool, a busy port, a database that would not answer, a daemon that never asserted its
+database version, a fixture count that is not 70, a fixture with no `class`, a deviation no fixture
+declares, a seed that produced no readings, a disagreement between the excuse list and what actually
+failed, failures at the transport layer, or a negative control that did not hold. The split exists
+because a dead daemon and a wrong contract both produce 70 failures, and calling the first the
+second is the expensive direction for this gate to be wrong in.
+
+## What the Rust target's run does, in order
+
+1. preflight the tools and the two ports;
+2. build the daemon and recreate `$PGDATABASE` from `migrations/`;
+3. **seed the weather database** from `ci/conformance/rust-seed/` — the `stations` projection, about
+   22,700 readings across five stations, a refresh of all four aggregate levels, and
+   `almanac_cache`, `snow_totals_cache` and `forecasts`. Asserted **per station** and in both
+   directions: two stations must have *no* readings, because that is what `latest-no-recent-data`,
+   `span-empty`, `almanac-empty` and `snow-device-never-reported` are;
+4. bootstrap the configuration database by starting the binary once, then seed the listener, the
+   weather database URL, the node row and W1's seven stations and six websites;
+5. start the daemon and wait for **`snapshot:warm`** to have run. That wait is not tidiness:
+   `snapshot:warm` is `OnStartup` with a hard `ReadingStore`, so it runs after `db:postgres` has
+   connected — which is after the daemon answers on `/metrics`. A replay that started first would
+   read a 404 from `/latest` for every station and report it as a contract break;
+6. replay all 70 fixtures with `--deviation DEV-10`, and judge by class;
+7. if accepted, replay through `mangle_proxy.py` and require it to have broken at least twenty of
+   the 48 responses the target serves. Measured at **23**: every JSON object or array on an
+   implemented endpoint. The 25 that still pass are the plain-text error bodies, the `403`, and the
+   whole `/forecast` family — the proxy rewrites parsed JSON and `/forecast`'s body is `jsonb` text
+   it does not match.
+
+**The rig configures a `node` row, which the Go rig had no equivalent of.** Without one the daemon
+has no spool, so no reading fan-out, so no `snapshot:latest` — which is the only provider of
+`LatestSnapshot`, and `api:legacy` requires it hard (**D-48**). The daemon then refuses the whole
+configuration. `spool_path` is relative and lands in `target/conformance-rust/spool`.
 
 ## Running the Go target
 
@@ -167,11 +217,24 @@ MIN_MANGLED_FAILURES=99    cargo xtask gate conformance-fixtures   # negative co
 The Rust target's equivalents, each watched against a real run rather than reasoned about:
 
 ```sh
+CONFORMANCE_FORCE_MANGLE=1        cargo xtask conformance   # 20 frozen-class failures, exit 1
 CONFORMANCE_FIXTURES=/some/subset cargo xtask conformance   # "attempted 3 fixtures, expected 70", exit 2
-CONFORMANCE_FORCE_MANGLE=1        cargo xtask conformance   # the replay goes through the proxy
 PATH=/usr/bin:/bin                cargo xtask conformance   # "missing required tool(s): psql, sqlite3", exit 2
 PGDATABASE=weather                cargo xtask conformance   # "refusing to drop `weather`", exit 2
 ```
+
+All four were run against this tree on 2026-11-09. `CONFORMANCE_FORCE_MANGLE=1` is the one that
+matters now that the gate is green: it sends the **accepted** replay through the proxy and the gate
+reports twenty frozen-class failures by name and exits 1, which is a gate being watched to fail
+rather than reasoned about.
+
+A subset now fails on the **deviation** check first unless it happens to include one of the two
+deviated fixtures — `--deviation DEV-10` against a fixture set that declares none is a refusal, so
+that a typo cannot silently make the Rust target assert the Go bytes. Include a deviated fixture and
+the `attempted 3 fixtures, expected 70` message is what comes back.
+
+A fixture with no `class` is the other new exit 2: `error: cannot read <dir>: … no `class` (frozen,
+coupled or retired)`.
 
 A daemon that dies at startup is the other one worth knowing: it ends the wait at once and says
 `the daemon exited during startup`, naming its log. It used to spend the full 60-second deadline and
@@ -195,6 +258,10 @@ the guard rejects it.
 | `config-seed.sql` | the capture rig's devices, websites and remote stations, as data |
 | `freeze-jobs.sql` | stops the almanac refresh job from rewriting a seeded snapshot mid-run |
 | `nullfill.sql` | the NULL→0 fill `contract/tools/README.md` leaves as a comment |
+| `rust-seed/01-config.sql` | the same devices and websites, in `migrations/config/`'s schema, plus the node row |
+| `rust-seed/02-weather.sql` | the `stations` projection and the readings, on `observations` |
+| `rust-seed/03-refresh.sql` | the four aggregate levels, refreshed coarsest-last |
+| `rust-seed/04-caches.sql` | `almanac_cache`, `snow_totals_cache` and `forecasts` |
 
 The Rust half has no files here: it is `xtask/src/conformance.rs`, because `ci/gates.toml` declares
 its command as `cargo xtask conformance` and the judgement it makes is worth having tests for.

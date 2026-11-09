@@ -1,6 +1,7 @@
 {
   "name": "span-72h-hourly-with-gap",
   "description": "48h < span <= 14d reads weather_1h. This series has a deliberate six-hour hole: the gap is simply absent buckets, not nulls.",
+  "class": "frozen",
   "provenance": "seeded directly into the weather hypertable (no Go driver exists that can be emulated here)",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

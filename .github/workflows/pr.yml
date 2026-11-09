@@ -438,27 +438,30 @@ jobs:
           fi
           psql --version
           sqlite3 --version
-      # THIS JOB IS RED, AND THAT IS THE POINT.
+      # THIS JOB IS GREEN AS OF implementation-plan.md M4-2, AND IT IS A REQUIRED CHECK.
       #
       # `cargo xtask conformance` builds the daemon, stands it up against a freshly migrated
-      # TimescaleDB and a seeded configuration database, and replays all 70 frozen fixtures
-      # at it. No legacy endpoint exists until implementation-plan.md M4-2, so all 70 fail on
-      # the status line and the gate exits 1. M2-5's done-criteria call for exactly that: a
-      # gate that is armed and honest from Milestone 2 onward rather than discovered in
-      # Milestone 4 (docs/reconciliation.md G-1).
+      # TimescaleDB, seeds both databases from `ci/conformance/rust-seed/`, and replays all
+      # 70 frozen fixtures at it -- then, only if that replay is accepted, runs W1
+      # Decision 10's negative control through `contract/tools/rig/mangle_proxy.py` and
+      # requires it to break at least twenty of the responses the target serves.
       #
-      # `set -o pipefail` is what makes that visible. The default shell is `bash -e` WITHOUT
-      # it, so the exit status of `gate | tee` was tee's -- always zero -- and this job was
-      # structurally incapable of reporting a conformance failure: G-1 in the job that exists
-      # to avoid it. M2-1 recorded the defect and assigned the fix here, because this is the
-      # work item that gives the gate something true to say. `coverage-ratchet` had the
-      # identical pipe and was fixed the same way in c1b645f.
+      # It was red by design from M2 until M4-2, which is what M2-5 armed it for: a gate that
+      # is honest from Milestone 2 onward rather than discovered in Milestone 4
+      # (docs/reconciliation.md G-1). M4-2 turned it green and put it back in the `gate`
+      # job's `needs`.
       #
-      # The CONSEQUENCE is a policy question this item does not answer: `conformance` is a
-      # dependency of the single required `gate` check, so an honest status here blocks every
-      # merge until M4-2 earns a green replay. Removing it from that job's `needs` for the
-      # M2-M4 window is a one-line change and it is the programme owner's to make -- taking
-      # it by way of a lint fix is how a required check quietly stops being required.
+      # `set -o pipefail` is what makes the verdict visible. The default shell is `bash -e`
+      # WITHOUT it, so the exit status of `gate | tee` was tee's -- always zero -- and this
+      # job was structurally incapable of reporting a conformance failure: G-1 in the job
+      # that exists to avoid it. `coverage-ratchet` had the identical pipe and was fixed the
+      # same way in c1b645f.
+      #
+      # **Two exit codes, and the distinction is load-bearing.** 1 is "the replay reached a
+      # verdict and the binary does not conform"; 2 is "the run reached no verdict" -- a
+      # missing tool, a busy port, a database that would not answer, a fixture count that is
+      # not 70, a deviation no fixture declares, a seed that inserted nothing, or a negative
+      # control that did not hold. ci/gates.toml declares both.
       - name: Replay the fixtures against the Rust binary
         run: |
           set -o pipefail
@@ -826,26 +829,23 @@ jobs:
     # The single required check. Everything below is a dependency, so branch protection
     # needs exactly one entry and never changes.
     #
-    # `conformance` is DELIBERATELY NOT in this list, and this is the only exception.
+    # `conformance` is back in this list, which is implementation-plan.md M4-2's own
+    # done-criterion.
     # ---------------------------------------------------------------------------------
-    # That job replays the frozen contract against the Rust binary, and until
-    # implementation-plan.md M4-2 implements mw-api-legacy it is RED BY DESIGN: all 70
-    # fixtures fail on the status line because no legacy endpoint exists yet. M2-5 armed it
-    # for exactly that reason -- a conformance gate reporting green while running nothing is
-    # what docs/reconciliation.md G-1 cost this programme.
+    # It was taken out by M2-5 and the reason was sound: that job replays the frozen
+    # contract against the Rust binary, and from M2 until M4-2 it was RED BY DESIGN -- all
+    # 70 fixtures failed on the status line because no legacy endpoint existed. A check that
+    # is red by design cannot be a required check; inside this list it would have blocked
+    # every merge for two milestones while saying nothing new on any of them, and a required
+    # check everybody overrides stops being read at all -- which lands where
+    # docs/reconciliation.md G-1 did, by a different route.
     #
-    # A check that is red by design cannot be a required check. Inside this list it would
-    # block every merge from M2 through M4 while saying nothing new on any of them, and a
-    # required check that everybody overrides for two milestones stops being read at all --
-    # which lands in the same place G-1 did, by a different route. So the job stays, stays
-    # red, and stays visible in the PR's check list and in the run summary; it just does not
-    # gate the merge.
-    #
-    # THE EXPIRY IS NOT A COMMENT. implementation-plan.md M4-2's done-criteria carry
-    # "`conformance` is back in pr.yml's `gate` needs", and ci/gates.toml says the same at
-    # the gate itself, because a comment in a workflow file is not a work item
-    # (docs/reconciliation.md G-5). Put the line back in the same PR that turns the gate
-    # green; `cargo xtask gates` is what proves it is still armed in the meantime.
+    # M4-2 implemented `mw-api-legacy`, so the gate is green and the line goes back in the
+    # same PR, which is what both that item's text and ci/gates.toml said would happen. What
+    # "green" means is the gate's policy and not "70 fixtures passed": 42 frozen-class and
+    # six coupled-class fixtures must pass, the nine `retired` ones (D-69) never gate, and
+    # the thirteen website fixtures M4-3 owns are excused by a list declared in
+    # xtask/src/conformance.rs and checked in both directions. See that file.
     needs:
       - fmt
       - clippy
@@ -858,6 +858,7 @@ jobs:
       - layout
       - codegen-drift
       - legacy-import-drift
+      - conformance
       - conformance-fixtures
       - driver-emulators
       - database

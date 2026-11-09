@@ -1,6 +1,7 @@
 {
   "name": "forecast-span-too-many-digits",
   "description": "The span segment must match ^\\\\d{1,4}$; five digits is 400 with an empty body.",
+  "class": "frozen",
   "provenance": "derived from the SQLite configuration database only",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

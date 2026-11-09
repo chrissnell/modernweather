@@ -1,6 +1,7 @@
 {
   "name": "snow-device-never-reported",
   "description": "Snow device configured but physically absent: no row with snowdistance > 0 exists, so every field is zero and the response is still 200.",
+  "class": "frozen",
   "provenance": "derived from the SQLite configuration database only",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

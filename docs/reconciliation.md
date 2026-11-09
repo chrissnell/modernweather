@@ -1195,6 +1195,8 @@ something it does not read. *Behavioural* — a byte a client does read, or coul
 | **DEV-4** | `/span`'s `period_rain` and `windd` differ from the Go server in the 6th significant figure | **D-14**, surfaced by W9 OQ-W9-4 | behavioural — **improves accuracy** | **Not meaningfully.** The Go view accumulates in `float4`; D-14 widened the accumulator because `sum(real)` is not associative. Measured at 2,160 readings per daily bucket: `period_rain` differs by up to 3.13 × 10⁻⁶ relative and `winddir` by 1.73 × 10⁻⁷ — and **both round to a different float32 in 100% of buckets**. At production's 2-second cadence the *Go* side's error is roughly 20× larger. iOS decodes both into `Double`; the website charts them. Nobody can see 10⁻⁶ on a rain gauge. |
 | **DEV-5** | Three additive `X-MW-*` response headers (`X-MW-Snapshot-Age`, `X-MW-Degraded`) during a database outage | W3 D-36 | additive | **No.** Same allowlist property as DEV-1. The frozen *body* is never used to signal degradation — that was the explicit alternative W3 rejected. |
 | **DEV-7** | `/span`'s `solarjoules` becomes the bucket **total** instead of the bucket mean, and is NULL for pre-cutover history | **N-9** (implementation-plan.md M1-6) | behavioural — **corrects a meaningless statistic**, and **needs the owner's acknowledgement** | **Yes, and by orders of magnitude.** `solarjoules` carries the Campbell logger's `slr_mj`: energy per unit area accumulated since its previous output. The Go views stored `avg(solarjoules)`, which is the mean increment per reading and moves when the logger's output interval does; the registry now stores `total`, which is the bucket's insolation. At production's 2-second cadence that multiplies the value `/span` returns by roughly the bucket's reading count — **~30× at the 6 h band, ~150× at 48 h, ~1,800× at 14 d, ~43,200× at 366 d**. Two further consequences. (1) `/latest` serves the last raw reading, so after this change `/latest` and `/span` report different physical quantities under the same key and the same declared unit; the frozen contract has one name for them and `rainincremental`/`period_rain` is the only precedent, where the Go surface gave the bucket total a *second* name. (2) No Go view computed `sum(solarjoules)`, so `solarjoules_total` is NULL for the ~294 pre-cutover rollup days — and `solarjoules` is `"swift_optional": false` in `contract/legacy-v1.json`, the same property that makes `windd` a contract hazard, so the read path must coalesce it rather than emit null. **The conformance suite cannot catch any of this**: it compares shape, type and numeric formatting, not values (`contract/conformance/src/lib.rs`). |
+| **DEV-10** | `/stationinfo` emits `about_text` and `weather_device` **unconditionally** rather than omitting them when unset | **O-5**, option (b), concurred by the owner; applied by implementation-plan.md **M4-2** | behavioural — **closes a live user-visible failure** | **Yes, and that is the point.** `StationInfo.aboutText` and `StationInfo.weatherDevice` are NON-OPTIONAL in the iOS client, so Go omitting either makes `JSONDecoder` throw `keyNotFound` and fail the decode of the **whole** object — the app loses the station list, the snow device, the air-quality device and the radar token, not just the missing field, and any portal website is permanently in that state. Emitting a key a non-optional property expects can only help; the website guards both reads. Two of the three `/stationinfo` fixtures carry a `deviation` block holding this response beside the Go server's, so `ci/conformance/go-target.sh` keeps asserting what shipped and `cargo xtask conformance` asserts the fix — one fixture, both halves, both gates still biting. |
+| **DEV-11** | A metric whose stored value is `NaN` or `±Inf` serialises as the contract's `0` rather than failing the response | **M4-2**, as a consequence of `mw_api_legacy::zf` | behavioural — **replaces a truncated body with a zero** | **Only in a case neither client can currently reach.** Go's `encoding/json` refuses a non-finite float outright, so the Go server's answer for a `NaN` column is a *failed encode after the `200` header has been written* — a truncated body. `serde_json` would write `null`, which fails the iOS decode of the whole object because every number on this surface is a non-optional Swift property. Neither is a response a frozen route may give (**D-48**), and a value that is not a number is not a measurement (**D-26**'s own standard), so it is filled like an absent one. `mw_pipeline::enrich` already refuses to *store* a non-finite derived value, so the only way to reach this is a driver writing one directly. |
 | **DEV-6** | Wildcard certificates match exactly one label; on an SNI miss the chain is exact → wildcard → designated default → refuse with `unrecognized_name` | W3 D-69, D-70 | behavioural — **closes two defects** | **Only by depending on the bugs.** The Go `strings.HasSuffix` check matches any depth *and* matches `evilexample.com` for `*.example.com`. On a miss, Go returns an arbitrary certificate by iterating a map — non-deterministic between runs, producing a browser interstitial that blames the user. |
 | **DEV-8** | A WeatherLink Live station's readings are stored in the units the registry declares (°F, inHg, inches), its indoor temperature and humidity are stored at all, its rainfall is converted from tip counts, its ten-minute wind average is stored, and its sensor records are matched by record type as well as by transmitter | **D-26** and `metrics/registry.toml`'s declared units, applied by implementation-plan.md **M3-1**; five defects in the Go driver | behavioural — **closes five defects**, and **needs the owner's acknowledgement** | **Yes, if the owner has ever run a WeatherLink Live.** (1) `internal/weatherstations/weatherlinklive/data_transformer.go` converts every temperature `(F - 32) * 5 / 9` and every pressure `* 33.8639`, writing Celsius into `outtemp` and hPa into `barometer`/`baromrelin`/`baromabsin` — columns `metrics/registry.toml` declares as `degF` and `inHg`, which the Go **Davis** driver on the same schema fills in °F and inHg (`convBigVal10` of the LOOP packet) and which `/latest` emits with no conversion. The two Go drivers therefore disagree about what the column means, and the WeatherLink Live one disagrees with the frozen contract: 62.7 °F is stored as 17.06 and rendered as 17.06 °F. (2) It copies `rainfall_daily` and `rain_rate_last` — which are **tip counts** — into `dayrain` and `rainrate`, declared `in` and `in_per_hour`. The error is the reciprocal of the collector size, so it is **100×** for a 0.01 in collector, **127×** for 0.2 mm, **254×** for 0.1 mm and **1000×** for 0.001 in; `rain_size`, the only value that can convert a count into a depth, is decoded into the struct and never used to convert anything (`discovery.go:217` only lists its name). (3) Its `th_indoor` arm looks for `DataStructureBarometer` (record type 3) while `temp_in` and `hum_in` are in record type 4, so `intemp` and `inhumidity` are never populated from one of these units at all. (4) `findCondition` returns the first record whose transmitter matches regardless of record type, so `th:2` on a deployment with a leaf/soil station on transmitter 2 reads `temp` out of a record that has none and the outdoor temperature silently stops. (5) `windspeed10` has a column, the unit reports `wind_speed_avg_last_10_min` on both transports, and the Go driver does not map it — so that column is empty for this station type and populated for Davis. The Rust codec stores the device's own units, converts rainfall through `rain_size`, leaves rainfall `NULL` when `rain_size` is absent rather than storing a count (**D-26**), reads the indoor record, prefers the record type the role implies before falling back to the transmitter, and fills `windspeed10`. **Marked as needing acknowledgement** for DEV-7's reason: these are corrections and not decisions, and whether a stored series changes meaning is the owner's call. **The conformance suite cannot catch any of it** — it compares shape, type and formatting, not values — and nothing in this repository can tell whether any WeatherLink Live data exists in the production database. |
 | **DEV-9** | The enrich stage computes `windchill`, `heatindex`, `aqi_pm25_aqin`, `aqi_pm10_aqin`, `potentialsolarwatts` and `snowdepth` **at ingest and stores them**, for every station rather than for the one driver that computed each; `windchill` and `heatindex` are `NULL` rather than the air temperature where their formula does not apply; and the clear-sky model reads the **station's** longitude instead of the **server's** time zone | **R1** (W3 §2.5), applied by implementation-plan.md **M3-3** | behavioural — **changes what five stored series mean**, and **needs the owner's acknowledgement** | **On the wire: one key changes, and it is `potentialsolarwatts`. In the database: five columns change meaning.** The distinction is the whole of this entry and the first draft of it got it wrong, so it is stated before the parts: the Go **read path** already computed three of these per request, so the JSON a client sees for them does not change — what changes is the *column*, which is what `/span`'s aggregate levels and every future query read. Taken in four parts. **(1) `windchill`/`heatindex` — the column changes, the JSON cannot.** The Go drivers store the *air temperature* where the formula does not apply (`utils.go:CalculateWindChill` returns `tempF` above 50 °F or below 3 mph); this stores `NULL`. The frozen JSON is unaffected **because the frozen handler never reads the column**: `transform.go:18` recomputes both from `OutTemp` plus wind speed or humidity on every request, which is exactly what `metrics/registry.toml`'s `legacy_read_time_computed` flag records and what `docs/metric-registry.md` §6.1 means by "the column and the JSON key are not guaranteed to be the same number". **So M4-2 must recompute them too, and this entry is the reason that is now a constraint rather than an open question** — reading the column and zero-filling it would produce `mean(windchill)` where Go produces `windchill(mean(outtemp), mean(windspeed))`, and those differ by more than rounding: for a bucket of two readings at (40 °F, 10 mph) and (60 °F, 10 mph), Go emits 46.04 and the column-mean path emits 33.64. Recorded as a constraint on M4-2 in the plan. The column itself improves either way: a stored `windchill == outtemp` is indistinguishable from a real wind chill and makes the column's `min` and `mean` the temperature's for every summer bucket. **(2) `potentialsolarwatts` — the one key that changes on the wire.** Only the Go **Campbell** driver computed it, so the column is NULL for every other station type and the frozen DTO zero-fills it; it is now computed for any station whose configuration has **coordinates** and whose reading carries **`outtemp` and `outhumidity`** (the model needs all three, so a station with coordinates and no humidity sensor still stores NULL). Where the Go daemon's own time zone is the station's — the production configuration, and the only one in which the Go behaviour is correct — the two agree to **1.1 × 10⁻¹² W/m²** over five zones × 53 days × 24 hours, measured against the Go function. They differ in two cases, both Go defects: a daemon whose zone is not the station's (`pkg/solar/asce.go` reads `time.Local`, and D-24 already says every calendar quantity is the station's), and any station in the eastern hemisphere, where Go's meridian table maps `+7` to 105° exactly as it maps `-7` and the offset doubles instead of cancelling. **(3) `snowdepth` — column only.** Computed per request in Go from a per-website cache (`restserver/controller.go:903`), so the **column** and every aggregate bucket are NULL today while the **response** already carries a number for any snow site with a configured base distance. The arithmetic is unchanged (`base_distance - snowdistance`, with Go's own `snowdistance > 0` guard) and it now reaches storage, which is what gets it into the aggregate levels. One consequence Go does not have: the Go snow-gauge driver discards a distance greater than the base at the device (`snowgauge/station.go:172`), so Go never stored a negative depth and this will — a mis-set base distance now contaminates `min`/`mean`/`max` buckets rather than leaving a gap. The enrich stage is the wrong layer to filter at (it is handed an already-admitted reading), so the discard is recorded as a constraint on **M6-1**'s snow-gauge driver in the plan. **(4) The two AQI keys — column only, and one naming oddity worth knowing.** The Go handler reads the column only when it is greater than zero and **computes otherwise** on both `/latest` and `/span` (`transform.go:209`, called per bucket at `:80`), so a client was never charting a flat zero here; the column is now populated from the same EPA table in `pkg/aqi/aqi.go`, so the handler's stored branch returns the number its computed branch would have. The oddity: `aqi_pm25_aqin` is derived from **`pm25`** (the outdoor sensor) and not from `pm25_in_aqin`, because that is what `transform.go:216` does. Faithful, and newly *stored* — so a station with only an outdoor particulate sensor and no AQIN device now has a permanently populated `aqi_pm25_aqin` column where Go left it NULL and carried the number only in the response. Every formula, constant, guard condition and `f32` rounding is asserted bit-for-bit against values produced by **running** the Go code at `c3ec9f7`. |
@@ -1303,14 +1305,13 @@ failure here is loud, at startup, and names the column to fix.
 
 **What is *not* in this ledger, and why each is more interesting than it looks.**
 
-- **The `/stationinfo` iOS decode hazard is not fixed** (W1 D-11, OQ-W1-1). A website with no about
-  text or no bound device returns a `/stationinfo` body iOS cannot decode **at all** — it loses the
-  station list, the snow device, the air-quality device and the radar token, not just the missing
-  field, and any portal website is permanently in this state. W1 recommended fixing it (option (b),
-  two characters) as an **explicit amendment after W1 merges**, because it changes bytes and needs the
-  owner's signature rather than an agent's judgement. It has not been decided, so W1's faithful
-  reproduction stands and the hazard ships. Carried to the owner as **O-5**. *This is the only item
-  in the programme where the frozen contract is knowingly preserving a live user-visible failure.*
+- **The `/stationinfo` iOS decode hazard was the one entry that belonged here, and it is now above
+  it** (W1 D-11, OQ-W1-1). A website with no about text or no bound device returned a `/stationinfo`
+  body iOS could not decode **at all**. W1 recommended fixing it (option (b), two characters) as an
+  explicit amendment, because it changes bytes and needs the owner's signature rather than an
+  agent's judgement; the owner gave it, and implementation-plan.md M4-2 applied it as **DEV-10**.
+  There is no longer an item in this programme where the frozen contract knowingly preserves a live
+  user-visible failure.
 - **The four unit and duplicate-field quirks are preserved, not fixed** (W1 D-12): `snowdepth` in
   millimetres on `/latest` and inches elsewhere; `ohum` and `outhumidity` carrying one value;
   `dayrain`/`rainday` likewise; `extrafloat1` meaning smoothed snow depth on `/span` for snow
@@ -1330,12 +1331,14 @@ failure here is loud, at startup, and names the column to fix.
   repositories cannot be ruled out from here. **O-6** asks the owner for one line of access-log
   analysis.
 
-**The honest summary for the owner: no shipped client breaks.** Of eight deviations, two are purely
-additive and invisible to both clients by a verified property of the conformance runner; three are
-behavioural and every one of them closes a defect rather than removing a response a client reads. The
-one place a user-visible failure *does* ship is the one deviation this ledger does **not** carry —
-the `/stationinfo` hazard the contract faithfully reproduces — and that is a decision the owner
-still owes (**O-5**).
+**The honest summary for the owner: no shipped client breaks.** Of ten deviations, two are purely
+additive and invisible to both clients by a verified property of the conformance runner; the
+behavioural ones each close a defect rather than removing a response a client reads.
+
+**O-5 is closed, so the sentence this paragraph used to end on is gone.** The one place a
+user-visible failure *did* ship was the `/stationinfo` hazard the contract faithfully reproduced;
+the owner answered option (b) and implementation-plan.md M4-2 applied it as **DEV-10**. Nothing in
+this ledger now records a deviation that leaves a shipped client broken.
 
 ---
 
@@ -1417,7 +1420,7 @@ endpoint the archive is carried and unreadable, which is the recorded trade.
 >
 > | | Question | Answer |
 > |---|---|---|
-> | **O-5** | The `/stationinfo` iOS decode hazard | **Option (b)** — drop `omitempty` from `about_text`, emit `0` for an unset `weather_device`. Concurred. Higher stakes than this document recorded: `/stationinfo` is one of the **five** endpoints iOS actually calls |
+> | **O-5** | The `/stationinfo` iOS decode hazard | **Option (b)** — drop `omitempty` from `about_text`, emit `0` for an unset `weather_device`. Concurred. Higher stakes than this document recorded: `/stationinfo` is one of the **five** endpoints iOS actually calls. **Applied** by implementation-plan.md M4-2 as **DEV-10**, with the Rust target's response recorded on the two affected fixtures beside the Go server's |
 > | **O-6** | Which legacy surface is dead | **Answered structurally; the access-log query is no longer needed.** Only the endpoints iOS calls are frozen — see §6. `/alerts` and `/api/remote-stations` have no iOS *or* website consumer, and no shipped client sends `format=msgpack` |
 > | **O-7** | The history question | **Option B** — import the archive. Concurred |
 > | **O-8** | RF beacon floor | **600 s.** Concurred. N-5's config migration raises a sub-600 s KISS device with a one-line report rather than failing the parse |
@@ -1568,6 +1571,21 @@ after which (a) is harmless.
 is a two-character schema change, it cannot break the tolerant client, and it fixes a real failure
 without waiting on App Store review. This is W1's own recommendation; it needs a signature because
 it is a deliberate deviation from "reproduce what shipped", not an agent's call.
+
+> **Answered (b) and applied**, by implementation-plan.md M4-2 as **DEV-10** in §3's ledger.
+>
+> "A new fixture" was read as *a fixture that records the new response*, and the record was put on
+> the two existing ones rather than beside them. The reason is that the **same 70 fixtures are
+> replayed against both targets**: `ci/conformance/go-target.sh` points the runner at the Go daemon,
+> which still omits both keys, so a fixture edited in place would turn that gate red for asserting
+> what actually ships. Each affected fixture therefore carries a `deviation` block with an id, and
+> the runner takes `--deviation DEV-10` — which `cargo xtask conformance` passes and `go-target.sh`
+> does not. An id no fixture declares is a refusal, so the flag cannot silently enable nothing.
+>
+> Adding a 71st fixture was the other reading and was not taken: the deviation changes the response
+> for cases the suite already covers, so a new file would record a request that is already there,
+> and the runner's `attempted == 70` assertion — which is what stops the classification being a
+> silent filter — would have had to move with it.
 
 **O-6. Which of the legacy surface is actually dead?** *(W1 OQ-W1-3 and OQ-W1-5)*
 
@@ -1794,6 +1812,21 @@ So the fixtures are **re-classified, not removed**:
 Carried as work item **N-18**: add a `class` field to each fixture, and make the runner report the
 two classes separately so a frozen-class failure is visibly different from a coupled-class one.
 `contract/legacy-v1.json`'s `frozen` key becomes the five rather than the sixteen.
+
+> **Done, by implementation-plan.md M4-2.** Every fixture carries `class` — 42 frozen, 19 coupled,
+> 9 retired — declared on its `spec(...)` line in `contract/tools/capture.py` so a re-capture
+> preserves it. The runner tags every verdict line with the class and prints a per-class summary;
+> the **policy** lives in `xtask/src/conformance.rs`, which is the split that matters: the runner
+> still replays all 70 and asserts that 70 were attempted, so a classification cannot arrive as a
+> narrower replay.
+>
+> Two departures from the table above, both deliberate. The `retired` fixtures are **kept rather
+> than deleted**: the `attempted == 70` assertion is what stops the classification being a silent
+> filter, and deleting nine would mean changing the number that assertion checks. And
+> `contract/legacy-v1.json`'s `frozen` key is **not** edited: that file is generated by
+> `tools/genschema.py` from `tools/endpoints.py` and the Go and Swift sources, so editing it by hand
+> is what `contract/README.md` forbids — the classification lives on the fixtures, which is where
+> the runner reads it.
 
 ### 6.5 Two consequences worth stating
 
@@ -2248,8 +2281,41 @@ A-W2-1 and A-W2-2, W2a's D-30 split, W3's A-W3-1 to A-W3-4, W4's A-W4-1 to A-W4-
 A-W5-3, W7's A-W7-1 to A-W7-4, W8's A-1 to A-4 and W9's A-W9-1 to A-W9-3. All are applied there under
 the protocol; none is edited in place. See `docs/DESIGN.md`'s `## Amendments` section.
 
-This document proposes **one** amendment of its own, which is not to a decision. Six more
+This document proposes **one** amendment of its own, which is not to a decision. Seven more
 were appended later by implementation items and are marked as such.
+
+**A-M4-2-1 — a `Soft` capability handle is read when it is used, not once at build.**
+*Proposed by implementation-plan.md **M4-2**, 2026-11-09. Not applied: the protocol above reserves
+that for a work item that owns the ledger.*
+
+*What was found.* `BuildCx::soft` borrows the capability slot once and returns what is in it, and
+`mw_supervisor`'s reconcile does not rebuild a `Running` component when a soft capability later
+arrives — the `(State::Running, true)` arm refreshes the `degraded` label and returns. So for a
+component whose hard needs are satisfied in the first reconcile pass, a soft handle is `None` for
+the life of the process. M4-1's code review found `snapshot:latest` in exactly that state against
+`WindowedView`, and its fix was to take the handle from the registrar instead — which works because
+`RollupState` is a root resource `main` owns.
+
+**`api:legacy` has no such fix available**, and that is why this is an amendment rather than a
+repetition. Its three read stores — `ReadingStore`, `ForecastStore`, `SnowCache` — are published by
+`db:postgres`, whose pool does not exist until its own task has connected and asserted **D-62**
+(`mw_component::store`'s module documentation has why that cannot be a root resource). The handle
+genuinely arrives after the build, and a once-only read makes `/span`, `/almanac` and `/forecast`
+permanently empty on a healthy process.
+
+*What replaces it.* `mw_component::Deferred<H>`, and `BuildCx::deferred::<H>()`, which is restricted
+to a **`Soft`** need. `BuildCx::additive` refuses an exclusive capability on the grounds that a
+component able to watch its database being revoked would decide for itself what that means — W2a
+Decision 21's "no error branch in business logic". That reasoning is about **`Hard`** needs, where
+absence means `Waiting` and there is nothing to decide. A `Soft` need is the declaration that the
+component *does* degrade in a defined way, and `docs/component-model.md` §3.2's table says so for
+this exact component and capability: *"`api:legacy` `/forecast` | failing query | `Running {
+degraded: [ForecastStore] }`, defined stale/empty response"*. Asking for a `Deferred` against a
+`Hard` need is `BuildError::UndeclaredNeed`, the same answer `BuildCx::soft` gives for the inverse
+mistake.
+
+It resolves a shape the design left between Decision 21 and §3.2's table rather than contradicting a
+decision, which is why it is here and not an amendment to one.
 
 **A-M3-3-1 — D-56's `admit` half is not expressible, and lands on the writer instead.**
 *Proposed by implementation-plan.md **M3-3**, 2026-11-05. Not applied: the protocol above reserves

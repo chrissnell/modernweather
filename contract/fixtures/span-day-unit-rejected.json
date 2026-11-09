@@ -1,6 +1,7 @@
 {
   "name": "span-day-unit-rejected",
   "description": "",
+  "class": "frozen",
   "provenance": "derived from the SQLite configuration database only",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

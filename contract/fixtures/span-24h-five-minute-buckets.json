@@ -1,6 +1,7 @@
 {
   "name": "span-24h-five-minute-buckets",
   "description": "6h < span <= 48h reads weather_5m. This is the website's default chart span.",
+  "class": "frozen",
   "provenance": "davis-emulator (cmd/davis-emulator), LOOP packets over TCP",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

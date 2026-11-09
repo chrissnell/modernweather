@@ -19,6 +19,21 @@
 //! * whether the body is newline-terminated
 //! * for plain-text error bodies: the exact bytes
 //! * for HTML and script bodies: the substrings a client or template consumer depends on
+//!
+//! # Three classes, and a deviation a target may be asked to apply
+//!
+//! Each fixture carries a `class` -- `frozen`, `coupled` or `retired` -- which is work item
+//! **N-18** and `docs/reconciliation.md` §6.4's classification. This runner **reports** it
+//! and replays every fixture regardless; what a class *means for a gate* is the gate's
+//! policy and lives in `xtask/src/conformance.rs`. The split is deliberate: the runner is a
+//! measuring instrument and a classification that narrowed the replay would be exactly the
+//! silent filter the `attempted == 70` assertion exists to prevent.
+//!
+//! A fixture may also carry a `deviation` block: a second recorded response, with an id,
+//! for a target that is **known** to differ on purpose. [`run_all`] applies one only when
+//! its id is in the enabled set, so the Go-target replay keeps asserting what shipped while
+//! the Rust-target replay asserts what the deviation says. One fixture holds both halves,
+//! which is the only arrangement under which both gates keep biting.
 
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -201,9 +216,50 @@ pub fn check_number_literals(v: &Value, path: &str, out: &mut Vec<String>) {
 
 // ---------------------------------------------------------------------------------------
 
+/// Which class a fixture's endpoint is in (`docs/reconciliation.md` §6.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Class {
+    /// One of the five endpoints the iOS client calls. A diff is a contract break.
+    Frozen,
+    /// One of the website's. A diff is a lockstep change, allowed in one PR with the
+    /// embedded JavaScript.
+    Coupled,
+    /// `/alerts`, `/api/remote-stations` or `format=msgpack`: not carried forward (D-69).
+    /// The fixture is kept so that the replay still attempts all 70.
+    Retired,
+}
+
+impl Class {
+    /// The name the fixture file carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Class::Frozen => "frozen",
+            Class::Coupled => "coupled",
+            Class::Retired => "retired",
+        }
+    }
+
+    /// Parse a fixture's `class`.
+    pub fn parse(name: &str) -> Option<Class> {
+        match name {
+            "frozen" => Some(Class::Frozen),
+            "coupled" => Some(Class::Coupled),
+            "retired" => Some(Class::Retired),
+            _ => None,
+        }
+    }
+}
+
 pub struct Fixture {
     pub name: String,
     pub description: String,
+    /// Which class this fixture's endpoint is in.
+    pub class: Class,
+    /// The work item that will implement this fixture's subject, for one no landed item
+    /// has. `None` once it has landed.
+    pub pending: Option<String>,
+    /// The deviation id this fixture carries a second recorded response for, if any.
+    pub deviation: Option<String>,
     pub json: Value,
 }
 
@@ -220,6 +276,11 @@ impl Fixture {
     }
 }
 
+/// Load every fixture in `dir`, in filename order.
+///
+/// **A fixture without a `class` is an error rather than a default.** Defaulting it would
+/// make an unclassified fixture silently gate (or silently not), which is the thing the
+/// classification exists to make visible.
 pub fn load_fixtures(dir: &Path) -> std::io::Result<Vec<Fixture>> {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -231,9 +292,26 @@ pub fn load_fixtures(dir: &Path) -> std::io::Result<Vec<Fixture>> {
         let text = std::fs::read_to_string(&p)?;
         let json: Value = serde_json::from_str(&text)
             .unwrap_or_else(|e| panic!("{}: not valid JSON: {e}", p.display()));
+        let name = json["name"].as_str().unwrap_or("<unnamed>").to_string();
+        // An error rather than a panic, so that `main` reports it and exits 2 -- the code
+        // that means "this run proved nothing" -- instead of a backtrace.
+        let class = match json["class"].as_str().and_then(Class::parse) {
+            Some(class) => class,
+            None => {
+                return Err(std::io::Error::other(format!(
+                    "{}: no `class` (frozen, coupled or retired). Work item N-18 requires \
+                     one on every fixture; `contract/tools/capture.py` declares it on the \
+                     `spec(...)` line.",
+                    p.display()
+                )))
+            }
+        };
         out.push(Fixture {
-            name: json["name"].as_str().unwrap_or("<unnamed>").to_string(),
             description: json["description"].as_str().unwrap_or("").to_string(),
+            class,
+            pending: json["pending"].as_str().map(str::to_string),
+            deviation: json["deviation"]["id"].as_str().map(str::to_string),
+            name,
             json,
         });
     }
@@ -254,11 +332,20 @@ fn header_matches(expected: &str, actual: &str) -> bool {
 
 pub struct Outcome {
     pub name: String,
+    /// Which class the fixture is in, carried through so the report can group by it.
+    pub class: Class,
     pub failures: Vec<String>,
     pub skipped: Option<String>,
+    /// The deviation id that was applied, if one was.
+    pub deviation: Option<String>,
 }
 
-pub fn run_one(base_url: &str, f: &Fixture) -> Outcome {
+/// Replay one fixture.
+///
+/// `deviations` is the set of deviation ids this target is known to differ by on purpose.
+/// When a fixture declares one of them, its `deviation.response` is compared against
+/// instead of its `response` -- see the module documentation.
+pub fn run_one(base_url: &str, f: &Fixture, deviations: &[String]) -> Outcome {
     let mut failures = Vec::new();
     let req = &f.json["request"];
     let method = req["method"].as_str().unwrap_or("GET");
@@ -286,7 +373,13 @@ pub fn run_one(base_url: &str, f: &Fixture) -> Outcome {
         Ok(resp) => resp,
         Err(ureq::Error::Status(_, resp)) => resp,
         Err(e) => {
-            return Outcome { name: f.name.clone(), failures: vec![format!("request failed: {e}")], skipped: None }
+            return Outcome {
+                name: f.name.clone(),
+                class: f.class,
+                failures: vec![format!("request failed: {e}")],
+                skipped: None,
+                deviation: None,
+            }
         }
     };
 
@@ -307,7 +400,17 @@ pub fn run_one(base_url: &str, f: &Fixture) -> Outcome {
         failures.push(format!("could not read body: {e}"));
     }
 
-    let exp = &f.json["response"];
+    // Which recording this target is measured against. The assertion SET is the fixture's
+    // either way: a deviation changes the bytes a target is expected to produce, not which
+    // properties are checked.
+    let applied = f
+        .deviation
+        .as_ref()
+        .filter(|id| deviations.iter().any(|enabled| enabled == *id));
+    let exp = match applied {
+        Some(_) => &f.json["deviation"]["response"],
+        None => &f.json["response"],
+    };
     let asrt = &f.json["assert"];
 
     if f.b(&["assert", "status"], true) {
@@ -357,8 +460,10 @@ pub fn run_one(base_url: &str, f: &Fixture) -> Outcome {
             None => {
                 return Outcome {
                     name: f.name.clone(),
+                    class: f.class,
                     failures,
                     skipped: Some("fixture stores no body to compare against".into()),
+                    deviation: applied.cloned(),
                 }
             }
             Some(want_text) => {
@@ -366,7 +471,13 @@ pub fn run_one(base_url: &str, f: &Fixture) -> Outcome {
                     Ok(v) => v,
                     Err(e) => {
                         failures.push(format!("fixture body is not valid JSON: {e}"));
-                        return Outcome { name: f.name.clone(), failures, skipped: None };
+                        return Outcome {
+                            name: f.name.clone(),
+                            class: f.class,
+                            failures,
+                            skipped: None,
+                            deviation: applied.cloned(),
+                        };
                     }
                 };
                 match serde_json::from_slice::<Value>(&body) {
@@ -402,37 +513,160 @@ pub fn run_one(base_url: &str, f: &Fixture) -> Outcome {
         }
     }
 
-    Outcome { name: f.name.clone(), failures, skipped: None }
+    Outcome {
+        name: f.name.clone(),
+        class: f.class,
+        failures,
+        skipped: None,
+        deviation: applied.cloned(),
+    }
 }
 
 pub struct Report {
     pub passed: usize,
     pub failed: usize,
     pub skipped: usize,
+    /// One entry per class, in `Frozen`, `Coupled`, `Retired` order.
+    pub by_class: Vec<ClassReport>,
+    /// Every deviation id that was applied to at least one fixture.
+    pub applied: Vec<String>,
+    /// Every fixture's verdict, for a caller that applies a policy per class.
+    pub verdicts: Vec<Verdict>,
     pub text: String,
 }
 
-pub fn run_all(base_url: &str, fixtures: &[Fixture]) -> Report {
-    let mut r = Report { passed: 0, failed: 0, skipped: 0, text: String::new() };
+/// One class's counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassReport {
+    pub class: Class,
+    pub passed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+}
+
+/// What one fixture did, reduced to what a gate's policy needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    pub name: String,
+    pub class: Class,
+    /// The work item that will implement this fixture's subject, when no landed one has.
+    pub pending: Option<String>,
+    pub passed: bool,
+    pub skipped: bool,
+}
+
+/// Replay every fixture, applying the enabled deviations.
+///
+/// Every fixture is replayed whatever its class: a class is **reported** and never a filter,
+/// which is the property `xtask`'s `attempted == 70` assertion is built on.
+pub fn run_all(base_url: &str, fixtures: &[Fixture], deviations: &[String]) -> Report {
+    let mut r = Report {
+        passed: 0,
+        failed: 0,
+        skipped: 0,
+        by_class: Vec::new(),
+        applied: Vec::new(),
+        verdicts: Vec::new(),
+        text: String::new(),
+    };
+    let mut counts: BTreeMap<Class, (usize, usize, usize)> = BTreeMap::new();
     for f in fixtures {
-        let o = run_one(base_url, f);
-        if !o.failures.is_empty() {
+        let o = run_one(base_url, f, deviations);
+        let entry = counts.entry(f.class).or_insert((0, 0, 0));
+        if let Some(id) = &o.deviation {
+            if !r.applied.iter().any(|a| a == id) {
+                r.applied.push(id.clone());
+            }
+        }
+        // The class and the applied deviation are on every line, so a reader of the log can
+        // tell a frozen-class failure from a coupled-class one without a second lookup --
+        // which is the half of N-18 that is about the report rather than the data.
+        let tag = match &o.deviation {
+            Some(id) => format!("[{} {id}]", f.class.as_str()),
+            None => format!("[{}]", f.class.as_str()),
+        };
+        let (passed, skipped) = if !o.failures.is_empty() {
             r.failed += 1;
-            let _ = writeln!(r.text, "FAIL {}", o.name);
+            entry.1 += 1;
+            let _ = writeln!(r.text, "FAIL {} {tag}", o.name);
+            if let Some(pending) = &f.pending {
+                let _ = writeln!(r.text, "     not implemented yet: {pending}");
+            }
             if !f.description.is_empty() {
                 let _ = writeln!(r.text, "     {}", f.description);
             }
             for line in &o.failures {
                 let _ = writeln!(r.text, "     - {line}");
             }
+            (false, false)
         } else if let Some(why) = o.skipped {
             r.skipped += 1;
-            let _ = writeln!(r.text, "SKIP {} ({why})", o.name);
+            entry.2 += 1;
+            let _ = writeln!(r.text, "SKIP {} {tag} ({why})", o.name);
+            (false, true)
         } else {
             r.passed += 1;
-            let _ = writeln!(r.text, "ok   {}", o.name);
+            entry.0 += 1;
+            let _ = writeln!(r.text, "ok   {} {tag}", o.name);
+            (true, false)
+        };
+        r.verdicts.push(Verdict {
+            name: o.name,
+            class: f.class,
+            pending: f.pending.clone(),
+            passed,
+            skipped,
+        });
+    }
+    r.by_class = counts
+        .into_iter()
+        .map(|(class, (passed, failed, skipped))| ClassReport {
+            class,
+            passed,
+            failed,
+            skipped,
+        })
+        .collect();
+    r.text.push('\n');
+    for c in &r.by_class {
+        // A per-class line, which is what makes a frozen-class failure visibly different
+        // from a coupled-class one (**N-18**). Deliberately NOT in the shape of the summary
+        // line below: `xtask` reads the last line matching `N passed, M failed, K skipped`
+        // and a per-class line in that shape would be read as the whole report.
+        let _ = writeln!(
+            r.text,
+            "class {:<8} {} passed / {} failed / {} skipped",
+            c.class.as_str(),
+            c.passed,
+            c.failed,
+            c.skipped
+        );
+    }
+    if !r.applied.is_empty() {
+        let _ = writeln!(r.text, "deviations applied: {}", r.applied.join(", "));
+    }
+    let _ = writeln!(
+        r.text,
+        "\n{} passed, {} failed, {} skipped",
+        r.passed, r.failed, r.skipped
+    );
+    r
+}
+
+/// Every deviation id any fixture declares.
+///
+/// `--deviation` is checked against this, so a typo is a refusal rather than a flag that
+/// silently enables nothing -- which would make the Rust target quietly assert the Go
+/// behaviour and fail for a reason that does not name itself.
+pub fn declared_deviations(fixtures: &[Fixture]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for f in fixtures {
+        if let Some(id) = &f.deviation {
+            if !out.iter().any(|a| a == id) {
+                out.push(id.clone());
+            }
         }
     }
-    let _ = writeln!(r.text, "\n{} passed, {} failed, {} skipped", r.passed, r.failed, r.skipped);
-    r
+    out.sort();
+    out
 }

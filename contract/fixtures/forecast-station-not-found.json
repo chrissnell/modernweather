@@ -1,6 +1,7 @@
 {
   "name": "forecast-station-not-found",
   "description": "404 with a completely empty body and no Content-Type.",
+  "class": "frozen",
   "provenance": "derived from the SQLite configuration database only",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

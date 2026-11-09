@@ -1,6 +1,7 @@
 {
   "name": "stationinfo-about-text-omitted",
   "description": "HAZARD: about_station_html is empty, so about_text is omitted. iOS StationInfo.aboutText is a non-optional String, so the whole decode fails.",
+  "class": "frozen",
   "provenance": "derived from the SQLite configuration database only",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {
@@ -38,5 +39,21 @@
     "trailing_newline": true,
     "body_equals": false,
     "required_substrings": []
+  },
+  "deviation": {
+    "id": "DEV-10",
+    "reason": "DEV-10 (docs/reconciliation.md O-5, option (b), the owner's answer): `about_text` and `weather_device` lose their `omitempty`. The iOS client declares both properties NON-OPTIONAL, so Go omitting either makes JSONDecoder throw keyNotFound and fail the decode of the WHOLE StationInfo object -- losing the station list, the snow device, the air-quality device and the radar token. Any portal website is permanently in that state. The Go server's response is above; this is the Rust target's, and the runner applies it only when the deviation is enabled, so the same fixture holds both halves and the Go-target replay keeps asserting what shipped.",
+    "response": {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Vary": "Accept-Encoding"
+      },
+      "body_kind": "json",
+      "body_bytes": 417,
+      "trailing_newline": true,
+      "body": "{\"website_name\":\"Minimal Station\",\"about_text\":\"\",\"stations\":[{\"id\":4,\"name\":\"aqmon\",\"type\":\"airgradient\"},{\"id\":2,\"name\":\"csi-minimal\",\"type\":\"campbellscientific\"},{\"id\":1,\"name\":\"davis-full\",\"type\":\"davis\"},{\"id\":3,\"name\":\"snowgauge\",\"type\":\"snowgauge\"},{\"id\":6,\"name\":\"snowgauge-dead\",\"type\":\"snowgauge\"},{\"id\":7,\"name\":\"snowgauge-stale\",\"type\":\"snowgauge\"}],\"weather_device\":2,\"latitude\":39.8,\"longitude\":-105.4}"
+    }
   }
 }

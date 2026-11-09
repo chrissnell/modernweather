@@ -72,19 +72,31 @@ arms_when = "crates/modernweather/Cargo.toml"
 cmd = ["cargo", "xtask", "conformance", "--target-binary", "target/debug/modernweather"]
 on_exit.1 = """
 the replay reached a verdict and the binary does not serve the frozen contract. Fixtures
-failed, and the command's output above names how many and why.
+failed, and the command's output above names how many, in which class, and which ones.
 
-UNTIL implementation-plan.md M4-2 THIS IS THE CORRECT STATE. `crates/modernweather` serves
-/metrics and a 404 fallback, so all 70 fixtures fail on the status line. M2-5 armed this
-gate precisely so that the failure is visible from Milestone 2 onward rather than
-discovered in Milestone 4 (docs/reconciliation.md G-1); M4-2's headline done-criterion is
-turning it green. Note that a green replay also requires W1 Decision 10's negative control
-to FAIL, which `cargo xtask conformance` runs on its own once the direct replay is clean."""
+**What green means here is a POLICY, not "all 70 passed."** The 70 fixtures are classified
+(docs/reconciliation.md §6.4, work item N-18) and the class is data the runner reads -- all
+70 are still attempted, which is what stops the classification being a silent filter:
+
+  frozen   the five endpoints the iOS client calls. Every one must pass; a failure is a
+           contract break, because that client is deployed independently of this server.
+  coupled  the website's. Every one must pass EXCEPT the thirteen whose subject
+           implementation-plan.md M4-3 owns, which are excused by a list declared in
+           xtask/src/conformance.rs and checked in BOTH directions -- an excused fixture
+           nobody declared and a declared one that has started passing are each exit 2.
+  retired  /alerts, /api/remote-stations and format=msgpack, which D-69 does not carry
+           forward. Reported on every run, never gating.
+
+So today's green run is `48 passed, 22 failed`, and the 22 are nine retired plus thirteen
+not-yet-implemented. A green replay also requires W1 Decision 10's negative control to
+FAIL, which `cargo xtask conformance` runs on its own once the direct replay is accepted."""
 on_exit.2 = """
 the run reached no verdict, so it proved nothing about the contract either way. A missing
 tool, a port already in use, a weather database that would not answer, a daemon that would
-not start or never asserted its database version, a fixture count that is not 70, failures
-at the transport layer, or a negative control that did not hold.
+not start or never asserted its database version, a fixture count that is not 70, a fixture
+with no `class`, a deviation no fixture declares, a seed that produced no readings, a
+disagreement between the PENDING list and what actually failed, failures at the transport
+layer, or a negative control that did not hold.
 
 Deliberately NOT exit 1: "nothing was listening" and "the rewrite does not match" produce
 the same 70 failures, and reporting the first as the second is the expensive direction for
@@ -93,9 +105,9 @@ note = """
 DESIGN.md R-3 splits into TWO checks, and this gate is only the second of them:
 
   1. fixture validity  - replay against the GO daemon, proving the fixtures describe
-                         reality. Possible today. Gate `conformance-fixtures` below.
+                         reality. Gate `conformance-fixtures` below.
   2. rewrite conformance - replay against the RUST daemon, proving the rewrite matches.
-                         Impossible until a daemon exists. This gate.
+                         This gate.
 
 W6 repointed `arms_when`. It previously named `tests/conformance/manifest.toml`, a path
 nothing was going to create: W1 shipped the runner as a standalone crate at
@@ -104,25 +116,28 @@ gate reported DEFERRED and exited 0 on every PR while the suite it guards -- who
 "done when" required it to pass -- had never run in CI. See docs/reconciliation.md G-1.
 
 It now arms on the daemon's own manifest, which is what actually makes a Rust-target
-replay possible (and is the same path ci/release.toml uses as `crate_manifest`). Arming
-it on contract/fixtures/ instead -- W3 §1.8's recommendation -- would arm it immediately
-and then fail, because `cargo xtask conformance` does not exist yet and there is no
-daemon to target. That is the mirror of the original defect, not its cure.
+replay possible (and is the same path ci/release.toml uses as `crate_manifest`).
 
 DESIGN.md D-64: a gate's arms_when must name a path that some work item's done-criteria
 require it to create. This one is created by implementation-plan.md M2-1; the xtask
 subcommand is M2-5; a green run is M4-2's headline done-criterion.
 
-M2-5 implemented that subcommand, so this gate now fails for the honest reason rather than
-for having no runner. Because it is red BY DESIGN until M4-2, M2-5 also took it out of the
-`gate` job's `needs` in .github/workflows/pr.yml: a check nobody may merge past for two
-milestones is one everybody learns to override, which is G-1 by a different route. The job
-still runs and is still visible. **M4-2 puts that line back in the same PR that turns this
-gate green**, and that is recorded in M4-2's done-criteria as well as here -- a comment in a
-workflow file is not a work item (G-5). A run needs a TimescaleDB through the standard libpq variables and
-`psql`, `sqlite3` and `python3` on PATH; it fails rather than skipping when it cannot have
-them, because a conformance check that reports green without running is the defect this
-gate exists downstream of. See xtask/src/conformance.rs and ci/conformance/README.md."""
+**M4-2 turned it green and put it back in the `gate` job's `needs` in
+.github/workflows/pr.yml**, which both this note and that item's text said would happen in
+the same PR -- a comment in a workflow file is not a work item (G-5). M2-5 had taken the
+line out because a check that is red by design for two milestones must not be the single
+required one.
+
+**The Rust target is replayed with the deviation DEV-10 enabled**, because it differs from
+the recorded Go response on two `/stationinfo` keys on purpose (docs/reconciliation.md O-5,
+the owner's answer). The two affected fixtures carry both responses, and
+`ci/conformance/go-target.sh` passes no deviation -- so each target is measured against the
+bytes it is supposed to produce and both gates keep biting.
+
+A run needs a TimescaleDB through the standard libpq variables and `psql`, `sqlite3` and
+`python3` on PATH; it fails rather than skipping when it cannot have them, because a
+conformance check that reports green without running is the defect this gate exists
+downstream of. See xtask/src/conformance.rs and ci/conformance/README.md."""
 
 [[gate]]
 id = "conformance-fixtures"

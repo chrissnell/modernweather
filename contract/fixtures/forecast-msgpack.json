@@ -1,6 +1,7 @@
 {
   "name": "forecast-msgpack",
   "description": "msgpack re-encodes the jsonb through interface{}, so every number becomes a float64.",
+  "class": "retired",
   "provenance": "seeded directly into aeris_weather_forecasts / aeris_weather_alerts (Aeris API key not available)",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

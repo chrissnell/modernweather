@@ -1,6 +1,7 @@
 {
   "name": "almanac-populated",
   "description": "Only the metrics present in almanac_cache appear; every field is omitempty, so a station with no cached extremes returns {}.",
+  "class": "coupled",
   "provenance": "almanac_cache, refreshed by migration 005/028-030 functions over emulator data",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

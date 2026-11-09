@@ -1,6 +1,7 @@
 {
   "name": "api-stations-forbidden",
   "description": "403 on a non-portal website.",
+  "class": "coupled",
   "provenance": "derived from the SQLite configuration database only",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

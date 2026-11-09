@@ -1,6 +1,7 @@
 {
   "name": "latest-snow-device-offline",
   "description": "Snow device configured but offline: last reading is older than the 10-minute window, so /latest is 404, not an empty reading.",
+  "class": "frozen",
   "provenance": "seeded directly into the weather hypertable (no Go driver exists that can be emulated here)",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

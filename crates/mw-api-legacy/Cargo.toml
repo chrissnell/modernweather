@@ -42,3 +42,8 @@ tokio.workspace = true
 # `Staleness::Degraded`'s `missing` is a `SmallVec`, so a test that asserts the degraded
 # header set has to construct one.
 smallvec.workspace = true
+# `ServiceExt::oneshot`, which is how `tests/degraded.rs` drives the real router without
+# binding a socket -- `ci/layers.toml` reserves binding for `mw-http` and scans `tests/`.
+tower.workspace = true
+# `CancellationToken`, which `Cx::new` takes.
+tokio-util.workspace = true

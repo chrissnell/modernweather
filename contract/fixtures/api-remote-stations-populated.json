@@ -1,6 +1,7 @@
 {
   "name": "api-remote-stations-populated",
   "description": "No shipped client reads this: the only in-repo consumer is the management UI, which fetches it relative to the management server, where the route does not exist.",
+  "class": "retired",
   "provenance": "remote_stations rows in the SQLite config database",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {
