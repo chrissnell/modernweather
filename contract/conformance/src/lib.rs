@@ -188,11 +188,29 @@ pub fn check_number_literals(v: &Value, path: &str, out: &mut Vec<String>) {
             };
             let abs = f.abs();
             let exponential = lit.contains('e') || lit.contains('E');
+            // **Both directions.** The rule is an iff -- Go uses an exponent exactly when the
+            // magnitude is nonzero and outside [1e-6, 1e21) -- and only the first half was
+            // checked, so a formatter that never emitted one (which is Rust's `Display`) was
+            // accepted for every value below 1e-6. `moonIllumination` genuinely enters that
+            // region around a new moon.
+            if exponential != (abs != 0.0 && !(1e-6..1e21).contains(&abs)) {
+                out.push(format!(
+                    "{path}: numeric literal {lit:?} {} exponent notation; Go's encoder uses it \
+                     exactly when the magnitude is nonzero and outside [1e-6, 1e21)",
+                    if exponential { "uses" } else { "does not use" }
+                ));
+                return;
+            }
             if exponential {
-                if abs != 0.0 && abs >= 1e-6 && abs < 1e21 {
+                // Go's exponent is signed and carries no leading zero: `9.782492e-7`, `1e+21`.
+                // `strconv` writes `e-07`, and `encoding/json` strips that zero in a post-pass,
+                // so a target that forgot the post-pass differs by one byte.
+                let (_, e) = lit.split_once(['e', 'E']).expect("it contains one");
+                if !(e.starts_with('+') || e.starts_with('-')) || e.len() > 1 && e[1..].starts_with('0')
+                {
                     out.push(format!(
-                        "{path}: numeric literal {lit:?} uses exponent notation, but Go's encoder \
-                         only does that outside [1e-6, 1e21)"
+                        "{path}: numeric literal {lit:?} spells its exponent as {e:?}; Go writes a \
+                         sign and no leading zero"
                     ));
                 }
                 return;

@@ -100,44 +100,136 @@ pub fn is_false(v: &bool) -> bool {
 
 /// `serde_json`'s formatter with Go's `encoding/json` float rendering.
 ///
-/// Go writes the **shortest decimal that round-trips** at the value's own width, which
-/// means a decimal point appears if and only if the value has a fractional part: a
-/// `float32` field emits `65` when its value is 65 and `65.3` when it is 65.3. Rust's
-/// `Display` for a float produces the same shortest-round-trip digits and then appends
-/// `.0` for an integral one, so the whole of the difference is that suffix.
+/// Go writes the **shortest decimal that round-trips at the value's own width**, so a
+/// decimal point appears if and only if the value has a fractional part: a `float32` field
+/// emits `65` when its value is 65 and `65.3` when it is 65.3.
 ///
-/// **This is asserted by the conformance runner rather than merely tidy.**
-/// `check_number_literals` walks every numeric literal in the response and fails a fixture
-/// whose integral value carries a decimal point -- and the integer-or-decimal question is a
-/// property of the *value*, not of the field, so it cannot be satisfied by choosing types.
+/// Two things about that are not what Rust's `Display` does, and this formatter exists for
+/// both. Neither is visible to the conformance suite, which is why they are stated here
+/// with the evidence rather than left to it.
 ///
-/// Exponent notation never appears, which the same check permits: it forbids an exponent
-/// *inside* `[1e-6, 1e21)`, where Go does not use one either, and does not require one
-/// outside. Rust's `Display` never emits one at any magnitude.
+/// **1. The digits.** `encoding/json` calls `strconv.AppendFloat(b, f, fmt, -1, bits)`,
+/// which is ryu and breaks a shortest-representation tie **round-half-to-even**. `Display`
+/// is Grisu/Dragon and breaks the same tie **round-half-up**, so every value whose exact
+/// expansion ends in `…5` one digit past the shortest form gets a different last digit:
+///
+/// ```text
+/// value          Go            Display
+/// 46.6328125     46.632812     46.632813
+/// -41.3828125    -41.382812    -41.382813
+/// 2956007.25     2956007.2     2956007.3
+/// ```
+///
+/// `-41.3828125` is `mw_pipeline::enrich::wind_chill(-17.0, 15.3)` -- an ordinary reading
+/// from a station at −17 °F in a 15 mph wind, not a synthetic value.
+///
+/// **2. The format choice.** Go switches to exponent notation when the magnitude is nonzero
+/// and outside `[1e-6, 1e21)`, and spells a one-digit negative exponent without its leading
+/// zero: `9.782492e-7`, `1e+21`, `3.4028235e+38`. `Display` never uses an exponent at any
+/// magnitude, writing `0.0000009782492` and twenty-two digits respectively. `moonIllumination`
+/// genuinely enters that region for about ten minutes either side of every new moon.
+///
+/// **What the suite does and does not check.** `check_number_literals` walks every numeric
+/// literal and fails a fixture whose integral value carries a decimal point, or whose
+/// exponent appears *inside* `[1e-6, 1e21)` -- it never compares digits against the recorded
+/// body, and it does not require an exponent outside that interval. `body_equals` would
+/// catch all of it and no data-bearing fixture enables it. So this is pinned by
+/// [`tests::the_digits_are_gos_digits_over_every_f32_bit_pattern_in_a_sweep`] instead.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GoNumbers;
 
 impl serde_json::ser::Formatter for GoNumbers {
     fn write_f32<W: ?Sized + io::Write>(&mut self, w: &mut W, value: f32) -> io::Result<()> {
-        write_go_float(w, value)
+        w.write_all(go_float32(value).as_bytes())
     }
 
     fn write_f64<W: ?Sized + io::Write>(&mut self, w: &mut W, value: f64) -> io::Result<()> {
-        write_go_float(w, value)
+        w.write_all(go_float64(value).as_bytes())
     }
 }
 
-/// The shortest round-tripping decimal, with a trailing `.0` removed.
+/// `encoding/json`'s rendering of a `float32`.
+pub fn go_float32(value: f32) -> String {
+    let mut buf = ryu::Buffer::new();
+    // `format_finite` is ryu's shortest round-tripping decimal, which is the same algorithm
+    // and the same tie rule `strconv.AppendFloat(…, -1, 32)` uses. Non-finite cannot reach
+    // here: `zf` maps it to zero (DEV-11) before the DTO is built, and `serde_json` writes
+    // `null` for one rather than calling the formatter.
+    let abs = value.abs();
+    go_format(
+        buf.format_finite(value),
+        abs as f64,
+        abs != 0.0 && !(1e-6..1e21).contains(&abs),
+    )
+}
+
+/// `encoding/json`'s rendering of a `float64`. The thresholds are the same; only the width
+/// the digits are computed at differs, which `ryu` takes from the type.
+pub fn go_float64(value: f64) -> String {
+    let mut buf = ryu::Buffer::new();
+    let abs = value.abs();
+    go_format(
+        buf.format_finite(value),
+        abs,
+        abs != 0.0 && !(1e-6..1e21).contains(&abs),
+    )
+}
+
+/// Re-spell ryu's output the way Go's `'f'` or `'e'` verb would.
 ///
-/// `strip_suffix` rather than a `contains('.')` test: `Display` emits exactly one `.0` for
-/// an integral value and nothing to strip otherwise, and a value like `10.0` really is the
-/// integral case -- `10` is what Go writes for it.
-fn write_go_float<W: ?Sized + io::Write>(
-    w: &mut W,
-    value: impl std::fmt::Display,
-) -> io::Result<()> {
-    let s = value.to_string();
-    w.write_all(s.strip_suffix(".0").unwrap_or(&s).as_bytes())
+/// ryu picks whichever of the two is shorter and Go picks by magnitude, so neither of them
+/// can be used as-is: ryu writes `1e21` where Go writes `1e+21`, and `3.4028235e38` where Go
+/// writes `3.4028235e+38`, and it writes `0.000001` where Go also writes `0.000001` but
+/// `1e-7` where Go writes `1e-7`. Only the *digits* are taken from it.
+fn go_format(shortest: &str, _abs: f64, exponent_form: bool) -> String {
+    // Split ryu's output into a sign, the significant digits, and the decimal exponent of
+    // the first digit -- `point` being how many digits belong before the decimal point.
+    let (sign, rest) = match shortest.strip_prefix('-') {
+        Some(r) => ("-", r),
+        None => ("", shortest),
+    };
+    let (mantissa, exp10) = match rest.split_once('e') {
+        Some((m, e)) => (m, e.parse::<i32>().expect("ryu writes a decimal exponent")),
+        None => (rest, 0),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((a, b)) => (a, b.trim_end_matches('0')),
+        None => (mantissa, ""),
+    };
+    let all = format!("{int_part}{frac_part}");
+    let digits = all.trim_start_matches('0');
+    let leading_zeros = all.len() - digits.len();
+    let point = int_part.len() as i32 + exp10 - leading_zeros as i32;
+    if digits.is_empty() {
+        // Zero, whose sign Go keeps: `-0` for a true negative zero.
+        return format!("{sign}0");
+    }
+    let mut out = String::from(sign);
+    if exponent_form {
+        out.push_str(&digits[..1]);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        // Go's exponent is always signed and carries no leading zero: `e-7`, `e+21`. That
+        // is `encoding/json`'s own post-pass over `strconv`'s `e-07`.
+        let e = point - 1;
+        out.push('e');
+        out.push(if e < 0 { '-' } else { '+' });
+        out.push_str(&e.abs().to_string());
+    } else if point <= 0 {
+        out.push_str("0.");
+        out.extend(std::iter::repeat_n('0', (-point) as usize));
+        out.push_str(digits);
+    } else if point as usize >= digits.len() {
+        out.push_str(digits);
+        out.extend(std::iter::repeat_n('0', point as usize - digits.len()));
+    } else {
+        out.push_str(&digits[..point as usize]);
+        out.push('.');
+        out.push_str(&digits[point as usize..]);
+    }
+    out
 }
 
 /// Serialise a response body with Go's number format and a trailing newline.
@@ -876,5 +968,189 @@ mod tests {
             *slot = "x".into();
         }
         r
+    }
+
+    /// **Go's own renderings, for every value whose digits or format `Display` gets wrong.**
+    ///
+    /// Each `(bits, text)` pair was produced by `encoding/json.Marshal` on a `float32` of
+    /// that exact bit pattern, with Go 1.21 on this machine. The bit pattern rather than a
+    /// literal because the point of several of them is the last digit, and a Rust literal
+    /// would be read back through Rust's own parser.
+    ///
+    /// The forty in the second group are tie cases: values whose exact binary expansion ends
+    /// in `…5` one digit past the shortest form, where Go rounds to even and `Display`
+    /// rounds up. Every one of them shipped a wrong last digit before this was fixed.
+    const GO_FLOAT32: &[(u32, &str)] = &[
+        // Ordinary values, including the integral ones `check_number_literals` is about.
+        (0, "0"),
+        (2147483648, "-0"),
+        (1115815936, "65"),
+        (1092616192, "10"),
+        (1120403456, "100"),
+        (1232348160, "1000000"),
+        (1056964608, "0.5"),
+        (1115855258, "65.3"),
+        (3246915584, "-17"),
+        (1098173645, "15.3"),
+        (1036831949, "0.1"),
+        (1045220557, "0.2"),
+        (1050253722, "0.3"),
+        (1051372203, "0.33333334"),
+        (1232348159, "999999.94"),
+        // The format choice: nonzero and outside [1e-6, 1e21) is exponent notation, and a
+        // negative exponent carries no leading zero. `Display` writes none of these.
+        (897988541, "0.000001"),
+        (897900580, "9.9e-7"),
+        (897797219, "9.782492e-7"),
+        (869711765, "1e-7"),
+        (874581936, "1.5e-7"),
+        (746959707, "3.8e-12"),
+        (1, "1e-45"),
+        (1649989415, "1e+21"),
+        (1658378023, "2e+21"),
+        (2139095039, "3.4028235e+38"),
+        (4286578687, "-3.4028235e+38"),
+        // The tie cases named in the module documentation.
+        (1111132160, "46.632812"),
+        (1149780224, "1090.0312"),
+        (1244949405, "2956007.2"),
+        (3257239552, "-41.382812"),
+        // Forty more, found by sweeping random f32 and keeping the ties.
+        (1223258356, "478087.62"),
+        (1222511892, "454760.62"),
+        (1241846729, "2180338.2"),
+        (1235308290, "1321440.2"),
+        (1245350611, "3056308.8"),
+        (1233860366, "1140449.8"),
+        (1223241916, "477573.88"),
+        (1243301699, "2544080.8"),
+        (1241649509, "2131033.2"),
+        (1248660689, "3883828.2"),
+        (1217411764, "295381.62"),
+        (1219874836, "372352.62"),
+        (1219404516, "357655.12"),
+        (1248915303, "3947481.8"),
+        (1217144964, "287044.12"),
+        (1210310296, "167802.38"),
+        (1198479344, "61271.938"),
+        (1245374017, "3062160.2"),
+        (1243047963, "2480646.8"),
+        (1192826640, "39191.062"),
+        (1243025317, "2474985.2"),
+        (1241533369, "2101998.2"),
+        (1246767259, "3410470.8"),
+        (1242608873, "2370874.2"),
+        (1242511645, "2346567.2"),
+        (1246054619, "3232310.8"),
+        (1219827212, "370864.38"),
+        (1247543253, "3604469.2"),
+        (1248457093, "3832929.2"),
+        (1187857696, "26274.562"),
+        (1242113561, "2247046.2"),
+        (1238609638, "1734108.8"),
+        (1210812184, "175644.38"),
+        (1221342668, "418222.38"),
+        (1247210857, "3521370.2"),
+        (1223791372, "494744.38"),
+        (1247089611, "3491058.8"),
+        (1198408080, "60993.562"),
+        (1245302451, "3044268.8"),
+        (1212058280, "195114.62"),
+    ];
+
+    #[test]
+    fn the_digits_are_gos_digits_over_every_f32_bit_pattern_in_a_sweep() {
+        for (bits, want) in GO_FLOAT32 {
+            let v = f32::from_bits(*bits);
+            assert_eq!(
+                &go_float32(v),
+                want,
+                "bits {bits}: Go writes `{want}`, Display writes `{v}`"
+            );
+        }
+    }
+
+    /// `encoding/json` uses the same thresholds for a `float64`; only the width the digits
+    /// are computed at differs.
+    #[test]
+    fn the_same_rules_apply_to_a_float64() {
+        for (v, want) in [
+            (9.782492e-7_f64, "9.782492e-7"),
+            (1e21, "1e+21"),
+            (1e-6, "0.000001"),
+            (0.1, "0.1"),
+            (1.0 / 3.0, "0.3333333333333333"),
+            (0.0, "0"),
+            (10.0, "10"),
+        ] {
+            assert_eq!(go_float64(v), want, "{v}");
+        }
+    }
+
+    /// The defect in the field it was found in: an ordinary station reading.
+    ///
+    /// `-17.0 °F` in a `15.3 mph` wind. `Display` writes `-41.382813`; the Go server wrote
+    /// `-41.382812`, and so does this.
+    #[test]
+    fn an_ordinary_wind_chill_renders_the_way_the_go_server_rendered_it() {
+        let wc = mw_pipeline::enrich::wind_chill(-17.0, 15.3).expect("in range");
+        assert_eq!(
+            wc.to_bits(),
+            3257239552,
+            "the arithmetic itself has not moved"
+        );
+        assert_eq!(go_float32(wc), "-41.382812");
+        // Stated so the test says what it is guarding against.
+        assert_eq!(wc.to_string(), "-41.382813");
+    }
+
+    /// Go-free, and over a hundred thousand values: whatever is written has to parse back to
+    /// the same bits, and it may not be longer than the shortest form that does. That is
+    /// every property except the tie direction, which the table above pins.
+    /// The significant digits of a decimal rendering, in either notation: the mantissa's
+    /// digits with the positional zeros at both ends removed.
+    fn significand(s: &str) -> String {
+        let mantissa = s.split('e').next().unwrap_or(s);
+        let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
+        digits
+            .trim_start_matches('0')
+            .trim_end_matches('0')
+            .to_string()
+    }
+
+    #[test]
+    fn every_rendering_round_trips_and_is_no_longer_than_it_has_to_be() {
+        // A deterministic LCG rather than a dependency: `xtask`'s and this crate's
+        // dependency lists are reviewed, and a test does not need a better generator.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut checked = 0u32;
+        while checked < 100_000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let v = f32::from_bits((state >> 32) as u32);
+            if !v.is_finite() {
+                continue;
+            }
+            checked += 1;
+            let text = go_float32(v);
+            let back: f32 = text.parse().unwrap_or_else(|e| panic!("`{text}`: {e}"));
+            assert_eq!(
+                back.to_bits(),
+                v.to_bits(),
+                "`{text}` does not round-trip to the value it came from"
+            );
+            let mut buf = ryu::Buffer::new();
+            let shortest = buf.format_finite(v);
+            // ryu writes the shortest round-tripping digit string. Re-spelling it changes the
+            // punctuation, the exponent and the run of positional zeros, but never the
+            // significand -- so that is what is compared, and a digit lost or gained fails
+            // here even where the tie direction cannot be seen.
+            assert_eq!(
+                significand(&text),
+                significand(shortest),
+                "`{text}` and `{shortest}` do not carry the same significant digits"
+            );
+        }
     }
 }

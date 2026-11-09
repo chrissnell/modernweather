@@ -30,6 +30,12 @@ axum.workspace = true
 arc-swap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# **Go's float digits, and the reason this crate is the only one that may name it.**
+# `encoding/json` formats a float with `strconv.AppendFloat(b, f, fmt, -1, bits)`, which is
+# ryu; Rust's `Display` is Grisu/Dragon and breaks a shortest-representation tie the other
+# way. The difference is one digit, on a surface whose whole premise is reproducing bytes a
+# deployed client already has -- see `dto::write_go_float`.
+ryu.workspace = true
 chrono.workspace = true
 # The station's IANA zone, which `/latest`'s `sunrise` and `sunset` are formatted in.
 chrono-tz.workspace = true
