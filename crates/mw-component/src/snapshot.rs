@@ -125,6 +125,13 @@ impl Encoding {
     /// The lazily-produced ones, in [`Snapshot`]'s cell order.
     pub const LAZY: &'static [Encoding] = &[Encoding::MsgPack, Encoding::Proto];
 
+    /// [`Encoding::ALL`] is [`Encoding::LAZY`] plus the one eager encoding — checked at
+    /// compile time, because [`Snapshot`]'s cell array is sized from `LAZY` and
+    /// [`Snapshot::alternate`] indexes it by position in `LAZY` after rejecting the eager
+    /// one. A new variant added to `ALL` and forgotten in `LAZY` is a panic at the first
+    /// request for it; this makes it a build failure instead.
+    const _ALL_IS_LAZY_PLUS_EAGER: () = assert!(Self::ALL.len() == Self::LAZY.len() + 1);
+
     /// Whether this encoding is produced when the snapshot is built rather than on demand.
     pub const fn is_eager(self) -> bool {
         matches!(self, Encoding::Json)
@@ -170,6 +177,36 @@ impl PayloadRev {
         Self(h.finish())
     }
 
+    /// Fold in the instant the window-derived values were resolved at.
+    ///
+    /// **The gap this closes.** W3 §2a.5 defines `payload_rev` as
+    /// `hash(serialiser_version, config_generation)` and calls the tag a **strong**
+    /// validator on the grounds that "the bytes for a given value are byte-identical by
+    /// construction". They are not, because the payload is also a function of the
+    /// window-derived values — wind gust, rain rate, the calendar and multi-day rain
+    /// totals, the storm total — and those are re-resolved on every fold, independently of
+    /// `observed_at`.
+    ///
+    /// So two snapshots can share a station and an `observed_at` and differ in their bytes:
+    /// a station re-reporting an instant it already sent (which is why the writer's
+    /// `ON CONFLICT (station_id, time) DO UPDATE` exists), `snapshot:warm`'s seed followed
+    /// by the same reading arriving through `OnReading`, or a `Degraded`→`Fresh` transition
+    /// on an unchanged last reading. Without this, a client that sent `If-None-Match` would
+    /// get a `304` and keep the older rain totals until the next *distinct* reading.
+    ///
+    /// Latent today — no shipped client sends `If-None-Match`, because `Cache-Control` is
+    /// frozen at `no-store` — and fixed here rather than later because M4-2 is what starts
+    /// emitting the header. **The tag's four-part shape is unchanged**; what gains an input
+    /// is `payload_rev`, which is the field §2a.5 already describes as a hash of everything
+    /// that is not the reading. Recorded as **A-M4-1-3**.
+    pub fn folding(self, windows_as_of: DateTime<Utc>) -> Self {
+        use std::hash::Hasher as _;
+        let mut h = crate::id::Fnv1a::default();
+        h.write(&self.0.to_le_bytes());
+        h.write(&windows_as_of.timestamp_millis().to_le_bytes());
+        Self(h.finish())
+    }
+
     /// The value, for the `ETag` text and for a test.
     pub const fn get(self) -> u64 {
         self.0
@@ -185,8 +222,10 @@ impl fmt::Display for PayloadRev {
 /// A **strong** entity tag over one snapshot's bytes (W3 §2a.5).
 ///
 /// `"l1-<station>-<observed_at_unix_ms>-<payload_rev>"`, quoted, strong rather than weak:
-/// the bytes for a given `(reading, configuration, serialiser)` are byte-identical by
-/// construction, which is the definition of a strong validator.
+/// the bytes for a given `(reading, windows, configuration, serialiser)` are byte-identical
+/// by construction, which is the definition of a strong validator. **`windows` is in that
+/// tuple and W3 §2a.5's own version of this sentence omits it** — see
+/// [`PayloadRev::folding`], which is where it gets folded in and why.
 ///
 /// **The website is deliberately not in the tag**, even though the snapshot is keyed by it.
 /// An entity tag is scoped to the URI it was served from, and two websites are two
@@ -206,10 +245,20 @@ pub struct ETag(Box<str>);
 
 impl ETag {
     /// The tag for one station's reading at one payload revision.
+    ///
+    /// The station key is escaped, because nothing validates its character set: a
+    /// `StationKey` wraps arbitrary text and `config.stations.station_key` is
+    /// `TEXT NOT NULL UNIQUE` with no `CHECK` on its bytes. RFC 9110's `etagc` is
+    /// `%x21 / %x23-7E / obs-text` — every printable byte except `"` — so a key containing
+    /// a quote would produce a syntactically invalid entity tag, and one containing CR or
+    /// LF would make `HeaderValue::from_str` fail in the handler. On `/latest` that is a
+    /// 5xx on a frozen route, which is the family of outcome **D-48** exists to make
+    /// unobservable. Escaping here makes it unrepresentable instead of handled.
     pub fn new(station: &StationKey, observed_at: DateTime<Utc>, rev: PayloadRev) -> Self {
         Self(
             format!(
                 "\"l1-{station}-{ms}-{rev}\"",
+                station = etagc(station.as_str()),
                 ms = observed_at.timestamp_millis(),
             )
             .into(),
@@ -223,14 +272,27 @@ impl ETag {
 
     /// Whether an `If-None-Match` value matches this tag.
     ///
-    /// `*` matches whenever a snapshot exists, which is what RFC 9110 says it means and
-    /// what W3 §2a.5 reproduces. A list is matched member by member, because
-    /// `If-None-Match: "a", "b"` is one header with two candidates.
+    /// RFC 9110 §13.1.2 as written, in three parts, because the obvious implementation gets
+    /// two of them wrong:
+    ///
+    /// 1. **Weak comparison is mandatory** — *"a recipient MUST use the weak comparison
+    ///    function when comparing entity tags for `If-None-Match`"* — so a `W/` prefix on
+    ///    either side is stripped before comparing. §8.8.1 permits a transforming proxy to
+    ///    weaken a tag it forwards, and exact string equality would make that tag never
+    ///    match, costing a `304` that was available.
+    /// 2. **`*` matches whenever a snapshot exists**, which is what W3 §2a.5 reproduces.
+    /// 3. **The list is split on commas *outside* the quoted strings.** An entity tag is a
+    ///    quoted string and may contain a comma, so `split(',')` is not a tokenizer. The
+    ///    tags this type produces cannot contain one — [`ETag::new`] escapes the station
+    ///    key — but the value being parsed came from a client, so it is not this type's
+    ///    tags that have to be comma-free.
+    ///
+    /// Every deviation fails *safe* in the same direction: a missed `304`, never a wrongly
+    /// issued one. That is why this is worth being exact about rather than approximate —
+    /// the failure a loose parser produces is invisible.
     pub fn matches(&self, if_none_match: &str) -> bool {
-        if_none_match
-            .split(',')
-            .map(str::trim)
-            .any(|candidate| candidate == "*" || candidate == self.as_str())
+        let want = strip_weak(self.as_str());
+        candidates(if_none_match).any(|c| c == "*" || strip_weak(c) == want)
     }
 }
 
@@ -238,6 +300,48 @@ impl fmt::Display for ETag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// `text`, with every byte RFC 9110's `etagc` does not permit percent-escaped.
+///
+/// `etagc = "!" / %x23-7E / obs-text`, i.e. printable ASCII except `"`, plus the high
+/// bytes. `%` itself is escaped so the mapping is injective — otherwise `a%41` and `aA`
+/// would produce the same tag, which is the one thing a validator may not do.
+fn etagc(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for b in text.bytes() {
+        match b {
+            b'%' => out.push_str("%25"),
+            b'"' => out.push_str("%22"),
+            0x21 | 0x23..=0x7e => out.push(char::from(b)),
+            other => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{other:02X}");
+            }
+        }
+    }
+    out
+}
+
+/// An entity tag with its `W/` weakness prefix removed, for RFC 9110's weak comparison.
+fn strip_weak(tag: &str) -> &str {
+    tag.strip_prefix("W/").unwrap_or(tag)
+}
+
+/// The members of an `If-None-Match` value, splitting on commas **outside** quotes.
+fn candidates(header: &str) -> impl Iterator<Item = &str> {
+    let mut in_quotes = false;
+    // `split` with a stateful closure: the quote flag flips on every `"`, so a comma seen
+    // while it is set is part of a tag rather than a separator.
+    header
+        .split(move |c: char| {
+            if c == '"' {
+                in_quotes = !in_quotes;
+            }
+            c == ',' && !in_quotes
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 /// Whether a snapshot's window-derived values are current (**D-36**).
@@ -358,7 +462,11 @@ pub struct Snapshot {
     staleness: Staleness,
     json: Payload,
     /// One cell per [`Encoding::LAZY`] member, in that order.
-    lazy: [OnceLock<Payload>; 2],
+    ///
+    /// Sized from the list rather than written as `2`, so that adding a fourth
+    /// [`Encoding`] cannot turn [`Snapshot::alternate`]'s carefully-worded `expect` into a
+    /// plain out-of-bounds panic one line later.
+    lazy: [OnceLock<Payload>; Encoding::LAZY.len()],
     render: Arc<dyn SnapshotRender>,
     source: SnapshotSource,
 }
@@ -391,6 +499,10 @@ impl Snapshot {
     ) -> Result<Self, RenderError> {
         let json = render.render(Encoding::Json, &source)?;
         let observed_at = source.reading.time;
+        // **Here rather than at the caller**, so that no component can produce a snapshot
+        // whose tag does not cover the window values it rendered from. `PayloadRev::folding`
+        // has why that matters.
+        let rev = rev.folding(source.windows.as_of());
         Ok(Self {
             etag: ETag::new(&source.key.station, observed_at, rev),
             key: source.key.clone(),
@@ -398,7 +510,7 @@ impl Snapshot {
             rendered_at,
             staleness,
             json,
-            lazy: [OnceLock::new(), OnceLock::new()],
+            lazy: [const { OnceLock::new() }; Encoding::LAZY.len()],
             render,
             source,
         })
@@ -493,8 +605,19 @@ pub trait SnapshotRender: Send + Sync + 'static {
 /// Both variants are `Fatal` and for the same reason the rest of this crate's error enums
 /// are classified at the type: each is a disagreement between the renderer and the registry
 /// or between a caller and the renderer's declared set, so the next attempt on the next
-/// reading answers the same thing. Retrying would be a component in `Backoff` forever with
-/// the reason only in `last_error`.
+/// reading answers the same thing.
+///
+/// **Known gap — the classification changes nothing on its own**, and it is worth saying
+/// rather than discovering. `From<RenderError>` into a `ComponentError` goes through
+/// `ComponentError::tick`, whose own `Classify` is unconditionally `Retryable` and
+/// deliberately does not consult the boxed source ([`crate::error`]'s comment explains
+/// why), and `mw_supervisor::task::interpret` branches only on `Ignorable`. So a component
+/// that returned one of these would be retried regardless. `snapshot:latest` therefore does
+/// **not** return it: `mw_pipeline::snapshot` counts a render failure per key and keeps the
+/// previous bytes, because taking the component down would revoke `LatestSnapshot` and
+/// unmount a frozen route table. Recorded the way [`StoreError::Rejected`] records its own
+/// identical divergence, and for the same reason: the alternative is a comment that reads
+/// as a behavioural promise.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RenderError {
     /// An encoding the renderer does not produce.
@@ -802,9 +925,10 @@ mod tests {
         assert_ne!(tag, reserialised, "so does a changed serialiser");
     }
 
-    /// `If-None-Match` matching, including the `*` form and the comma-separated list.
+    /// `If-None-Match` matching: RFC 9110 §13.1.2's weak comparison, the `*` form, and a
+    /// list split on commas outside the quotes.
     #[test]
-    fn if_none_match_handles_a_list_and_the_wildcard() {
+    fn if_none_match_handles_a_list_the_wildcard_and_weak_comparison() {
         let tag = ETag::new(
             &StationKey::new("backyard"),
             at("2026-11-07T18:30:00Z"),
@@ -815,6 +939,96 @@ mod tests {
         assert!(tag.matches(&format!("\"l1-other-1-0\", {}", tag.as_str())));
         assert!(!tag.matches("\"l1-other-1-0\""));
         assert!(!tag.matches(""), "no If-None-Match is a normal 200");
+
+        // §13.1.2: weak comparison is MANDATORY for If-None-Match, so a proxy that
+        // weakened the tag on its way out still gets its 304 back.
+        assert!(
+            tag.matches(&format!("W/{}", tag.as_str())),
+            "exact string equality would cost a 304 that was available"
+        );
+
+        // A comma inside a quoted tag is not a separator. `split(',')` would break this
+        // candidate into two halves and match neither.
+        let awkward = "\"a,b\"";
+        assert!(
+            tag.matches(&format!("{awkward}, {}", tag.as_str())),
+            "the list is tokenized, not split"
+        );
+        assert!(!tag.matches(awkward));
+    }
+
+    /// **A station key cannot produce a syntactically invalid entity tag.** RFC 9110's
+    /// `etagc` forbids `"` and the control bytes, nothing validates
+    /// `config.stations.station_key`, and an unescaped quote or CR in a header value is a
+    /// 5xx on `/latest` — which is the one family of response **D-48** forbids on a frozen
+    /// route.
+    #[test]
+    fn a_station_key_is_escaped_into_the_tag() {
+        let rev = PayloadRev::of(7, Generation::new(3));
+        let at_ = at("2026-11-07T18:30:00Z");
+        for hostile in [
+            "back\"yard",
+            "back\r\nyard",
+            "back yard",
+            "back,yard",
+            "back%yard",
+        ] {
+            let tag = ETag::new(&StationKey::new(hostile), at_, rev);
+            let body = tag
+                .as_str()
+                .strip_prefix('"')
+                .and_then(|t| t.strip_suffix('"'))
+                .expect("quoted exactly once");
+            assert!(
+                body.bytes()
+                    .all(|b| b == 0x21 || (0x23..=0x7e).contains(&b)),
+                "`{hostile}` produced a tag outside etagc: {tag}"
+            );
+            assert!(tag.matches(tag.as_str()), "and it still round-trips");
+        }
+
+        // The escape is injective, so two keys cannot collide into one tag.
+        assert_ne!(
+            ETag::new(&StationKey::new("a%41"), at_, rev),
+            ETag::new(&StationKey::new("aA"), at_, rev),
+        );
+    }
+
+    /// **The tag covers the window-derived values it renders from.** Two snapshots can
+    /// share a station and an `observed_at` and still differ in their bytes, because
+    /// `Folder::resolve` re-resolves the windows on every fold. Without this, a client that
+    /// sent `If-None-Match` would get a 304 and keep the older rain totals.
+    #[test]
+    fn two_snapshots_at_one_instant_with_different_windows_have_different_tags() {
+        let render = Counting::new(&[Encoding::Json]) as Arc<dyn SnapshotRender>;
+        let rev = PayloadRev::of(7, Generation::new(3));
+        let tags: Vec<ETag> = ["2026-11-07T18:30:00Z", "2026-11-07T18:31:00Z"]
+            .into_iter()
+            .map(|window_at| {
+                let mut src = source();
+                // The reading is identical; only the window resolution has moved.
+                src.windows = Resolved::new(at(window_at), []);
+                Snapshot::render(
+                    src,
+                    Staleness::Fresh,
+                    at("2026-11-07T18:31:05Z"),
+                    rev,
+                    Arc::clone(&render),
+                )
+                .expect("rendered")
+                .etag()
+                .clone()
+            })
+            .collect();
+        assert_eq!(
+            tags[0].to_string().split('-').count(),
+            4,
+            "the four-part shape W3 §2a.5 writes is unchanged; payload_rev gained an input"
+        );
+        assert_ne!(
+            tags[0], tags[1],
+            "a refreshed window is a new entity even at an unchanged observed_at"
+        );
     }
 
     /// `Staleness` is readable as a list, which is what `X-MW-Degraded` renders and the

@@ -502,6 +502,87 @@ mod tests {
         pool.close().await;
     }
 
+    /// The five columns the snapshot's `(website, station)` key is built from, and the
+    /// ordering its `ConfigDigest` depends on.
+    ///
+    /// This is the only new query the daemon runs on **every** boot, so a typo in a column
+    /// name here is a `ConfigDbError::Query` that fails `Config::load` and therefore the
+    /// start — and nothing else in the suite inserts a `website` row.
+    #[tokio::test]
+    async fn a_website_row_round_trips_and_the_order_is_by_id() {
+        let scratch = Scratch::new("websites");
+        let pool = open_and_migrate(&scratch.db()).await.expect("migrate");
+
+        // `from_registration` with no transport, which is the schema's shape for a station
+        // a peer forwards readings for -- and the cheapest row that satisfies
+        // `(transport_kind IS NULL) = (identity_kind = 'from_registration')`. What this test
+        // needs from them is only that the website's foreign keys resolve.
+        //
+        // Inserted out of order, so `ORDER BY id` is asserted rather than coincidental:
+        // `mw_pipeline::snapshot`'s `ConfigDigest` is built by walking this list, and an
+        // unordered `SELECT` would make the plan diff depend on SQLite's row order.
+        sqlx::query(
+            "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind)
+             VALUES ('backyard', x'07070707070707070707070707070707', 'Backyard',
+                     'weatherlink-live', 'from_registration'),
+                    ('ridge', x'07070707070707070707070707070707', 'Ridge',
+                     'campbellscientific', 'from_registration')",
+        )
+        .execute(&pool)
+        .await
+        .expect("two stations");
+        sqlx::query(
+            "INSERT INTO website (id, name, hostname, primary_station_key, snow_enabled,
+                                  snow_station_key)
+             VALUES (7, 'portal', 'portal.example.com', 'ridge', 1, 'ridge'),
+                    (2, 'suncrest', 'suncrest.example.com', 'backyard', 0, NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("two websites");
+
+        let rows = websites(&pool).await.expect("the query runs");
+        assert_eq!(
+            rows.iter().map(|w| w.id).collect::<Vec<_>>(),
+            vec![2, 7],
+            "ordered by id, not by insertion"
+        );
+        assert_eq!(
+            rows[0],
+            WebsiteRow {
+                id: 2,
+                name: "suncrest".into(),
+                primary_station_key: Some("backyard".into()),
+                snow_enabled: false,
+                // Nullable and `ON DELETE SET NULL`, so `None` has to decode as `None`
+                // rather than as an empty string -- which is what `snow_enabled = 0`
+                // means and what the table's own CHECK permits only in that pairing.
+                snow_station_key: None,
+            }
+        );
+        assert_eq!(
+            rows[1],
+            WebsiteRow {
+                id: 7,
+                name: "portal".into(),
+                primary_station_key: Some("ridge".into()),
+                snow_enabled: true,
+                snow_station_key: Some("ridge".into()),
+            }
+        );
+
+        // A website with no primary device is legal -- the column is nullable, and
+        // `ON DELETE SET NULL` can produce it at any time -- so it must not be an error.
+        sqlx::query("INSERT INTO website (id, name, hostname) VALUES (9, 'bare', 'bare.test')")
+            .execute(&pool)
+            .await
+            .expect("a bare website");
+        let bare = websites(&pool).await.expect("still reads");
+        assert_eq!(bare.len(), 3);
+        assert_eq!(bare[2].primary_station_key, None);
+        assert!(!bare[2].snow_enabled);
+    }
+
     /// The three columns M3-1 added, and the round trip the station registrar depends on.
     #[tokio::test]
     async fn a_weatherlink_live_row_round_trips_through_the_station_reader() {

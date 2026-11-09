@@ -2248,7 +2248,7 @@ A-W2-1 and A-W2-2, W2a's D-30 split, W3's A-W3-1 to A-W3-4, W4's A-W4-1 to A-W4-
 A-W5-3, W7's A-W7-1 to A-W7-4, W8's A-1 to A-4 and W9's A-W9-1 to A-W9-3. All are applied there under
 the protocol; none is edited in place. See `docs/DESIGN.md`'s `## Amendments` section.
 
-This document proposes **one** amendment of its own, which is not to a decision. Four more
+This document proposes **one** amendment of its own, which is not to a decision. Six more
 were appended later by implementation items and are marked as such.
 
 **A-M3-3-1 — D-56's `admit` half is not expressible, and lands on the writer instead.**
@@ -2378,9 +2378,27 @@ RBF smoothing, which is a body of arithmetic with its own done-criteria. M6-3 bu
 **A-M4-1-1 — `snapshot:warm` requires `ReadingStore` HARD, because a soft need seeds
 nothing.**
 *Proposed by implementation-plan.md **M4-1**, 2026-11-09. Not applied: the protocol above
-reserves that for a work item that owns the ledger. **D-37** stands as written until it is.*
+reserves that for a work item that owns the ledger. The decision stands as written until it
+is.*
 
-*What was found.* **D-37** reads: *"`snapshot:warm` is an `OnStartup` component that seeds the
+> **Which D-37.** This amends **W3 Decision 37** in
+> `docs/service-architecture.md`'s `# Decisions` list, **not** the `DESIGN.md` ledger row of
+> the same number — that one is *"the legacy external contract is frozen and new endpoints
+> are additive only"*, and `snapshot:warm` appears nowhere in `DESIGN.md`. The collision is
+> systematic across this range: ledger D-30, D-31, D-33, D-35 and D-36 are all about
+> unrelated subjects, and `implementation-plan.md`'s M4-1 paragraph disambiguates the first
+> one ("W3 D-31") and then stops. A-M3-4-1 has the same latent defect with its "D-30".
+> Stated here because this entry is the record of a deliberate spec deviation, and an agent
+> told to apply it to the ledger would otherwise find no row to amend.
+>
+> One consequence worth naming: **C-W2a-28** above attributes "starts successfully with
+> `ReadingStore` unavailable" to D-37 and therefore to `snapshot:warm`. The property **D-48**
+> actually rests on belongs to `snapshot:latest`, which provides `LatestSnapshot`, declares
+> no hard requirement at all and publishes in `build`. Without that correction a reader
+> concludes that making warm's need hard breaks D-48. It does not, and
+> `crates/modernweather/tests/snapshot_degraded.rs` asserts both halves.
+
+*What was found.* **W3 Decision 37** reads: *"`snapshot:warm` is an `OnStartup` component that seeds the
 snapshot table from the store so a restart does not 404 a station that was inside the
 10-minute window; with `ReadingStore` unavailable it finishes empty rather than refusing to
 start."* W3 §2a.6 spells the requirement `ReadingStore` **soft**.
@@ -2416,6 +2434,70 @@ supervisor with `db:postgres` planned and never publishing.
 What the change buys beyond correctness at startup: when the server comes back, the seed
 actually runs, where a soft need would have finished empty an hour earlier and never looked
 again.
+
+**A-M4-1-2 — `snapshot:latest` resolves `StationRegistry` and `WindowedView` through the
+registrar, and the declarations stay.**
+*Proposed by implementation-plan.md **M4-1**, 2026-11-09. Two departures from
+`docs/component-model.md` §4's table, neither from a `DESIGN.md` decision.*
+
+*What was found.* That table gives `snapshot:latest` `StationRegistry` **H**, `WindowedView`
+**S** and `SnowCache` **S**. The implementation declares `WindowedView` **S** and nothing
+else, and takes both handles from the registrar — which is the shape `mw_station`'s stations
+already have for `ReadingStream` (`mw_station::config`'s module documentation has the general
+argument). The two have *different* reasons and only the second was discovered by building
+it:
+
+1. **`StationRegistry` has no provider.** W2a §4.1b gives it to a `config:sqlite` component
+   and no work item in the plan creates one, so `main` owns the snapshot as a root resource —
+   which `mw_store::pg` already records for `db:postgres`. Declaring it `Hard` would be a
+   hard need nobody provides, and `plan()` refuses that configuration under **D-44**.
+2. **A soft `WindowedView` resolved off the bus is `None` for the life of every healthy
+   process.** `BuildCx::soft` resolves **once**, in `build`, and `mw_supervisor`'s
+   `reconcile` never rebuilds a `Running` component when a soft capability later arrives:
+   the `(State::Running, true)` arm refreshes the `degraded` label and returns.
+   `snapshot:latest` has no hard need, so it is built in the **first** reconcile pass, while
+   `window:rollup` cannot build until `db:postgres` has published and does not publish
+   `WindowedView` until its first completed tick. Eight of the nine window-derived values
+   would therefore be absent from `/latest` forever and every snapshot would report
+   `Staleness::Degraded`, pinning `mw_snapshot_degraded` at 1 on every key — which makes
+   **D-36**'s only operator-facing signal a constant, and is the inverse of W3 §2a.6's first
+   table row. Found by code review, and
+   `a_window_provider_that_publishes_after_the_build_is_still_read` is the regression test.
+
+*What is proposed.* The `component-model.md` §4 row gains: *a capability whose provider is a
+root resource `main` owns, or whose handle must outlive one `build`, is **declared** on the
+component and **resolved** through the registrar. The declaration is what `plan()` and
+`mw_component_state` read; the registrar is what the handle's lifetime requires.*
+
+*`SnowCache` S is dropped rather than deviated from.* Nothing provides it until M6-3, and a
+`Staleness` that could name a capability nothing can revoke would be dishonest. It comes back
+with `snow:*`, and nothing currently forces that — recorded here so that M6-3 is told.
+
+**A-M4-1-3 — the `/latest` `ETag`'s `payload_rev` folds in the window resolution's
+instant.**
+*Proposed by implementation-plan.md **M4-1**, 2026-11-09. An extension of W3 Decision 35 and
+§2a.5, not a contradiction.*
+
+*What was found.* §2a.5 defines `payload_rev` as `hash(serialiser_version,
+config_generation)` and calls the tag **strong** on the grounds that *"the bytes for a given
+value are byte-identical by construction"*. They are not. The payload is also a function of
+the window-derived values — wind gust, rain rate, the calendar and multi-day rain totals, the
+storm total — and those are re-resolved on every fold, independently of `observed_at`. Three
+reachable ways two snapshots share a station and an `observed_at` and differ in their bytes:
+a station re-reporting an instant it already sent (which is what the writer's
+`ON CONFLICT (station_id, time) DO UPDATE` exists for), `snapshot:warm`'s seed followed by
+the same reading arriving through `OnReading`, and a `Degraded`→`Fresh` transition on an
+unchanged last reading. A client that sent `If-None-Match` would get a `304` and keep the
+older rain totals until the next *distinct* reading.
+
+*What is proposed.* §2a.5 gains: *`payload_rev` is `hash(serialiser_version,
+config_generation, window_resolution_instant)`.* The tag's four-part shape is unchanged;
+what gains an input is the field §2a.5 already describes as a hash of everything that is not
+the reading, which is exactly what the window resolution is.
+
+Latent today, because `Cache-Control` is frozen at `no-store` and no shipped client sends
+`If-None-Match` — and fixed now rather than later because M4-2 is what starts emitting the
+header. Found by code review.
 
 **A-W6-1 — retire `remoteweather:docs/rewrite/`, and reference the Go repository by URL only.**
 

@@ -91,6 +91,16 @@ pub struct Config {
     /// whole of that argument.
     pub(crate) snapshot: Option<Arc<mw_pipeline::SnapshotState>>,
 
+    /// The same rollup state as [`Config::rollup`], upcast once to the capability the
+    /// snapshot components declare.
+    ///
+    /// Two fields for one object because the two consumers want two types: the rollup's own
+    /// registrar needs the concrete `RollupState` (both its writers call inherent methods),
+    /// and the snapshot's needs `Arc<dyn WindowedView>`. Upcasting here rather than in the
+    /// accessor keeps `snapshot_windows` a borrow — and keeps "these are the same object"
+    /// a fact of `set_rollup` rather than of two call sites.
+    pub(crate) snapshot_windows: Option<Arc<dyn mw_component::WindowedView>>,
+
     /// Every station and its **resolved** time zone, in station-key order.
     ///
     /// Taken from the registry snapshot rather than re-parsed, because the parse is the
@@ -122,6 +132,7 @@ impl Config {
             registry: None,
             rollup: None,
             snapshot: None,
+            snapshot_windows: None,
             station_zones: Vec::new(),
             generation: Generation::ZERO,
         })
@@ -153,7 +164,12 @@ impl Config {
     }
 
     /// Hand the configuration the maintained window values.
+    ///
+    /// Sets both views of the one object: the concrete handle the rollup's registrar plans
+    /// from, and the `WindowedView` upcast the snapshot components are given. One call, so
+    /// the two cannot disagree about which state is live.
     pub fn set_rollup(&mut self, rollup: Arc<mw_pipeline::RollupState>) {
+        self.snapshot_windows = Some(Arc::clone(&rollup) as Arc<dyn mw_component::WindowedView>);
         self.rollup = Some(rollup);
     }
 
@@ -277,6 +293,17 @@ impl mw_pipeline::SnapshotConfig for Config {
         self.registry.as_ref()
     }
 
+    /// The rollup state, upcast to the capability the snapshot declares.
+    ///
+    /// `mw_pipeline::SnapshotConfig::snapshot_windows` has why this travels through the
+    /// registrar rather than off the bus. The field is stored pre-upcast so that this is a
+    /// borrow rather than an allocation per call: the registrar asks once per `plan()`, but
+    /// a trait method that had to build an `Arc` to answer would be the kind of accessor
+    /// someone later calls in a loop.
+    fn snapshot_windows(&self) -> Option<&Arc<dyn mw_component::WindowedView>> {
+        self.snapshot_windows.as_ref()
+    }
+
     /// **`None` until M4-2.** The payload is the frozen 133-key DTO and `mw-api-legacy`
     /// exclusively owns its serialiser (W3 D-9), so there is nothing here to hand over yet
     /// and `mw_pipeline::snapshot::register` plans neither component. When M4-2 lands it is
@@ -337,6 +364,7 @@ mod tests {
             registry: None,
             rollup: None,
             snapshot: None,
+            snapshot_windows: None,
             station_zones: Vec::new(),
             listener: Listener {
                 listen_addr: addr.to_string(),

@@ -109,7 +109,8 @@ fn an_unconfigured_key_is_absent_and_unwritable() {
 #[test]
 fn the_latest_spec_has_no_hard_requirement_and_provides_the_snapshot() {
     let render = CountingRender::new() as Arc<dyn SnapshotRender>;
-    let spec = latest_spec(state(), MemoryRegistry::fixed("backyard"), render).expect("valid");
+    let spec =
+        latest_spec(state(), MemoryRegistry::fixed("backyard"), render, None).expect("valid");
     assert_eq!(spec.id.as_str(), LATEST_ID);
     match &spec.trigger {
         Trigger::OnReading {
@@ -155,7 +156,7 @@ fn the_latest_spec_has_no_hard_requirement_and_provides_the_snapshot() {
 #[test]
 fn the_warm_spec_runs_once_against_the_store_and_provides_nothing() {
     let render = CountingRender::new() as Arc<dyn SnapshotRender>;
-    let spec = warm_spec(state(), MemoryRegistry::fixed("backyard"), render).expect("valid");
+    let spec = warm_spec(state(), MemoryRegistry::fixed("backyard"), render, None).expect("valid");
     assert_eq!(spec.id.as_str(), WARM_ID);
     assert_eq!(
         spec.trigger,
@@ -182,15 +183,27 @@ fn the_warm_spec_runs_once_against_the_store_and_provides_nothing() {
 fn the_config_digest_is_the_key_set() {
     let render = CountingRender::new() as Arc<dyn SnapshotRender>;
     let registry = MemoryRegistry::fixed("backyard");
-    let a = latest_spec(state(), Arc::clone(&registry) as _, Arc::clone(&render)).expect("valid");
-    let b = latest_spec(state(), Arc::clone(&registry) as _, Arc::clone(&render)).expect("valid");
+    let a = latest_spec(
+        state(),
+        Arc::clone(&registry) as _,
+        Arc::clone(&render),
+        None,
+    )
+    .expect("valid");
+    let b = latest_spec(
+        state(),
+        Arc::clone(&registry) as _,
+        Arc::clone(&render),
+        None,
+    )
+    .expect("valid");
     assert_eq!(a.config_digest, b.config_digest);
 
     let more = Arc::new(SnapshotState::new(
         websites(),
         [key(), StationKey::new("ridge"), StationKey::new("summit")],
     ));
-    let c = latest_spec(more, registry as _, render).expect("valid");
+    let c = latest_spec(more, registry as _, render, None).expect("valid");
     assert_ne!(
         a.config_digest, c.config_digest,
         "a station added to the configuration is a new key, so the component restarts"
@@ -207,6 +220,7 @@ struct Cfg {
     state: Option<Arc<SnapshotState>>,
     registry: Option<Arc<dyn StationRegistry>>,
     render: Option<Arc<dyn SnapshotRender>>,
+    windows: Option<Arc<dyn WindowedView>>,
 }
 
 impl std::fmt::Debug for Cfg {
@@ -227,6 +241,7 @@ impl Cfg {
             state: Some(state()),
             registry: Some(MemoryRegistry::fixed("backyard") as Arc<dyn StationRegistry>),
             render: Some(CountingRender::new() as Arc<dyn SnapshotRender>),
+            windows: None,
         }
     }
 }
@@ -246,6 +261,9 @@ impl SnapshotConfig for Cfg {
     }
     fn snapshot_render(&self) -> Option<&Arc<dyn SnapshotRender>> {
         self.render.as_ref()
+    }
+    fn snapshot_windows(&self) -> Option<&Arc<dyn WindowedView>> {
+        self.windows.as_ref()
     }
 }
 
@@ -348,13 +366,21 @@ fn a_missing_root_resource_names_itself() {
 /// the same guard for the same reason, and `.github/workflows/pr.yml`'s loom job explains
 /// the flag's reach in full.
 ///
-/// **Nothing excluded here is a concurrency model, and that is worth checking rather
-/// than asserting.** This item's lock-free half is `SnapshotState`'s `ArcSwap` read-copy
-/// update, its per-key `watch` and `Snapshot`'s `OnceLock` — and the tests that pin those
-/// are the synchronous ones *above* this module (`the_key_set_is_...`,
-/// `an_unconfigured_key_is_...`) plus `mw_component::snapshot`'s own, which **do** run
-/// under loom. What is in here needs a runtime because the component bodies are `async`,
-/// not because anything in them interleaves.
+/// **Nothing excluded here is a concurrency *model* — and the lock-free half is not
+/// modelled anywhere either, which is worth saying plainly.** An earlier version of this
+/// comment claimed the synchronous tests above cover it under loom. They do not: they
+/// compile and run under `--cfg loom`, but they are single-threaded and they exercise the
+/// real `arc_swap::ArcSwap`, which is **not** loom-instrumented —
+/// `mw_supervisor::publish`'s module documentation states the consequence for its own cell,
+/// that "a model built over it would explore exactly one interleaving while reporting
+/// success". `mw_component::snapshot`'s tests are not run under loom at all; that job is
+/// scoped `-p mw-supervisor -p mw-pipeline`.
+///
+/// What does cover the one interleaving that matters — a seed racing a fold on one key — is
+/// `a_seed_racing_a_fold_can_never_move_a_key_backwards` in this module, a multi-threaded
+/// `tokio` test that the `race` job runs under ThreadSanitizer. A loom model over the
+/// publish protocol would be better and would follow `publish.rs`'s substitution pattern;
+/// it is recorded as wanted rather than claimed as done.
 #[cfg(not(loom))]
 mod driven {
     use super::*;
@@ -367,25 +393,43 @@ mod driven {
     #[derive(Debug)]
     struct FakeView {
         as_of: Mutex<DateTime<Utc>>,
-        gust: Option<f64>,
-        refuse: Option<WindowError>,
+        gust: Mutex<Option<f64>>,
+        refuse: Mutex<Option<WindowError>>,
     }
 
     impl FakeView {
         fn new(as_of: DateTime<Utc>, gust: Option<f64>) -> Arc<Self> {
             Arc::new(Self {
                 as_of: Mutex::new(as_of),
-                gust,
-                refuse: None,
+                gust: Mutex::new(gust),
+                refuse: Mutex::new(None),
             })
         }
 
         fn refusing(reason: WindowError) -> Arc<Self> {
             Arc::new(Self {
                 as_of: Mutex::new(at("2026-11-07T18:00:00Z")),
-                gust: None,
-                refuse: Some(reason),
+                gust: Mutex::new(None),
+                refuse: Mutex::new(Some(reason)),
             })
+        }
+
+        /// A provider that exists and has not ticked yet, so it answers `UnknownStation` —
+        /// which is what `RollupState::resolve` does for a station whose windows are still
+        /// the `Windows::default()` the state was constructed with.
+        fn silent() -> Arc<Self> {
+            Arc::new(Self {
+                as_of: Mutex::new(at("2026-11-07T18:00:00Z")),
+                gust: Mutex::new(None),
+                refuse: Mutex::new(Some(WindowError::UnknownStation { station: key() })),
+            })
+        }
+
+        /// The first completed tick: it stops refusing and starts answering.
+        fn start_answering(&self, as_of: DateTime<Utc>, gust: Option<f64>) {
+            *self.refuse.lock().expect("not poisoned") = None;
+            *self.as_of.lock().expect("not poisoned") = as_of;
+            *self.gust.lock().expect("not poisoned") = gust;
         }
 
         /// Freeze the provider: the handle keeps answering and its `as_of` stops moving, which
@@ -401,19 +445,22 @@ mod driven {
             _station: &StationKey,
             want: &[Declaration],
         ) -> Result<Resolved, WindowError> {
-            if let Some(reason) = &self.refuse {
-                return Err(reason.clone());
+            if let Some(reason) = self.refuse.lock().expect("not poisoned").clone() {
+                return Err(reason);
             }
             let as_of = *self.as_of.lock().expect("not poisoned");
+            let gust = *self.gust.lock().expect("not poisoned");
             Ok(Resolved::new(
                 as_of,
                 want.iter().map(|d| {
-                    let value = if d.0 == MetricKey::WindSpeed {
-                        self.gust
-                    } else {
-                        None
-                    };
-                    (*d, value)
+                    (
+                        *d,
+                        if d.0 == MetricKey::WindSpeed {
+                            gust
+                        } else {
+                            None
+                        },
+                    )
                 }),
             ))
         }
@@ -1053,6 +1100,210 @@ mod driven {
         );
     }
 
+    /// **The regression test for the defect code review found: a window provider that
+    /// publishes AFTER this component is built must still be read.**
+    ///
+    /// `snapshot:latest` has no hard requirement, so the supervisor builds it in the first
+    /// reconcile pass — before `db:postgres` has connected, therefore before
+    /// `window:rollup` can have run a tick, therefore before `WindowedView` exists on the
+    /// bus. `BuildCx::soft` resolves **once**, and `mw_supervisor`'s `reconcile` never
+    /// rebuilds a `Running` component when a soft capability later arrives: the
+    /// `(State::Running, true)` arm refreshes the `degraded` label and returns.
+    ///
+    /// So a bus-resolved soft handle would be `None` for the life of every healthy
+    /// process. Eight of the nine declarations in [`WINDOWS`] would be absent from
+    /// `/latest` forever and every snapshot would report `Degraded`, pinning
+    /// `mw_snapshot_degraded` at 1 on every key — which makes **D-36**'s only
+    /// operator-facing signal a constant, and is the inverse of W3 §2a.6's first table row.
+    ///
+    /// The fix is that the handle comes from the registrar and the declaration stays,
+    /// which is `mw_station`'s shape for `ReadingStream`. This is also the test shape the
+    /// suite was missing: every other test here hands `Folder` a view that is already
+    /// answering, which is exactly the case the defect did not occur in.
+    #[tokio::test]
+    async fn a_window_provider_that_publishes_after_the_build_is_still_read() {
+        let state = state();
+        let render = CountingRender::new();
+        let registry = MemoryRegistry::fixed("backyard") as Arc<dyn StationRegistry>;
+
+        // The live state `main` owns, handed over before `plan()` and therefore before
+        // anything has ticked. It answers `UnknownStation` until then, which is the real
+        // provider's own cold-start behaviour.
+        let view = FakeView::silent();
+        let spec = latest_spec(
+            Arc::clone(&state),
+            registry,
+            Arc::clone(&render) as Arc<dyn SnapshotRender>,
+            Some(Arc::clone(&view) as Arc<dyn WindowedView>),
+        )
+        .expect("valid");
+        let (build, _bus) = build_cx(
+            LATEST_ID,
+            vec![Need::soft(Capability::WindowedView)],
+            vec![Capability::LatestSnapshot],
+            // **Nothing on the bus**, which is the state at the first reconcile pass.
+            Vec::new(),
+        );
+        let mut body = match &spec.build {
+            mw_component::Builder::OnReading(f) => f(build).await.expect("builds"),
+            other => panic!("expected an OnReading builder, got {other:?}"),
+        };
+
+        // **Instants relative to the wall clock, not the fixed ones the rest of this
+        // module uses.** `latest_spec`'s builder constructs its own `SystemClock`, so a
+        // body built through the real builder cannot be handed a `TestClock` -- and a fixed
+        // 2026-11-07 instant would be days stale against it, which would make the second
+        // assertion below green for the wrong reason. The staleness *band* is asserted on a
+        // stopped clock by `one_late_tick_is_not_degradation`; what this test needs from
+        // the clock is only that `as_of` is recent.
+        let now = Utc::now();
+
+        // Before the provider has ticked: degraded, and the reading is served anyway.
+        body.readings(
+            ReadingBatch::new(vec![admitted("backyard", now, 29.92)]),
+            &cx(LATEST_ID),
+        )
+        .await
+        .expect("folded");
+        assert_eq!(payload(&state, 1, "backyard"), "1/backyard|29.92|-");
+        assert!(!state
+            .get(&SnapshotKey::new(WebsiteId::new(1), key()))
+            .expect("published")
+            .staleness()
+            .is_fresh());
+
+        // `window:rollup` completes its first tick and publishes. The same body, never
+        // rebuilt, must now see the values -- which is the whole assertion.
+        view.start_answering(now, Some(14.5));
+        body.readings(
+            ReadingBatch::new(vec![admitted(
+                "backyard",
+                now + chrono::Duration::seconds(2),
+                29.90,
+            )]),
+            &cx(LATEST_ID),
+        )
+        .await
+        .expect("folded");
+        assert_eq!(
+            payload(&state, 1, "backyard"),
+            "1/backyard|29.9|14.5",
+            "a handle resolved off the bus would still be None here, and the gust would \
+             still be absent for the life of the process"
+        );
+        assert!(
+            state
+                .get(&SnapshotKey::new(WebsiteId::new(1), key()))
+                .expect("published")
+                .staleness()
+                .is_fresh(),
+            "and the snapshot stops reporting Degraded, so `mw_snapshot_degraded` is a \
+             signal rather than a constant"
+        );
+    }
+
+    /// **A render failure must not take the component down.** Returning `Err` from the
+    /// fold would revoke `LatestSnapshot`, send `api:legacy` to `Waiting`, unmount its
+    /// route table and make a frozen path answer `503` for the length of the backoff —
+    /// which is the outcome **D-48** forbids, and which publishing in `build` does not by
+    /// itself prevent.
+    ///
+    /// Two properties: the batch is acknowledged, and the key keeps its previous bytes.
+    #[tokio::test]
+    async fn a_render_failure_keeps_the_previous_bytes_and_acknowledges_the_batch() {
+        let state = state();
+        let render = CountingRender::new();
+        let mut body = Fold {
+            folder: folder(&state, &render, None),
+            clock: Arc::new(TestClock::new(at("2026-11-07T18:30:02Z"))),
+        };
+        body.readings(
+            ReadingBatch::new(vec![admitted(
+                "backyard",
+                at("2026-11-07T18:30:00Z"),
+                29.92,
+            )]),
+            &cx(LATEST_ID),
+        )
+        .await
+        .expect("folded");
+        assert_eq!(payload(&state, 1, "backyard"), "1/backyard|29.92|-");
+
+        render.start_failing();
+        body.readings(
+            ReadingBatch::new(vec![admitted(
+                "backyard",
+                at("2026-11-07T18:30:04Z"),
+                30.10,
+            )]),
+            &cx(LATEST_ID),
+        )
+        .await
+        .expect(
+            "a render failure is a counted per-key non-event; an Err here would unmount \
+             the frozen route table",
+        );
+        assert_eq!(
+            payload(&state, 1, "backyard"),
+            "1/backyard|29.92|-",
+            "the last good bytes stay served, which is closer to D-36 than a 503"
+        );
+        assert_eq!(
+            state
+                .get(&SnapshotKey::new(WebsiteId::new(1), key()))
+                .expect("published")
+                .observed_at(),
+            at("2026-11-07T18:30:00Z"),
+            "and the key did not half-advance"
+        );
+    }
+
+    /// **The monotonic guard is inside the `rcu`, so it is an invariant and not a race.**
+    /// Asserted by driving the compare-and-swap directly with two concurrent writers: a
+    /// compare-then-write would let the older seed land on top of the newer fold.
+    ///
+    /// **`std::thread::scope`, not `tokio::spawn`.** `clippy.toml` denies
+    /// `tokio::task::spawn` outside `mw-supervisor` (**D-42**: a `JoinHandle` is owned only
+    /// by `TaskTable`), and nothing here needs a runtime anyway — `Folder::fold` and
+    /// `SnapshotState::store` are both synchronous, so two OS threads are the shorter and
+    /// more honest way to make them race.
+    #[test]
+    fn a_seed_racing_a_fold_can_never_move_a_key_backwards() {
+        let state = state();
+        let render = CountingRender::new();
+        let k = SnapshotKey::new(WebsiteId::new(1), key());
+        let folder = folder(&state, &render, None);
+
+        // 64 rounds, each a seed of an older instant racing a fold of a newer one on the
+        // same key. Any one round is very likely to be ordered anyway; what the repetition
+        // buys is the chance that at least one lands in the window a compare-then-write
+        // would lose — and under ThreadSanitizer, the `race` job watches all of them.
+        for round in 0..64i64 {
+            let base = at("2026-11-07T18:30:00Z") + chrono::Duration::seconds(round * 10);
+            let old = base;
+            let new = base + chrono::Duration::seconds(5);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    folder
+                        .fold(&stored("backyard", new, 29.92), &key(), new, false)
+                        .expect("rendered")
+                });
+                scope.spawn(|| {
+                    folder
+                        .fold(&stored("backyard", old, 28.00), &key(), old, true)
+                        .expect("rendered")
+                });
+            });
+
+            assert_eq!(
+                state.get(&k).expect("published").observed_at(),
+                new,
+                "round {round}: the seed is older, so whatever the interleaving the key \
+                 must hold the fold's instant"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------------------
     // The builders
     // -----------------------------------------------------------------------------------
@@ -1136,7 +1387,7 @@ mod driven {
         let state = state();
         let registry = MemoryRegistry::fixed("backyard") as Arc<dyn StationRegistry>;
         let render = CountingRender::new() as Arc<dyn SnapshotRender>;
-        let spec = latest_spec(Arc::clone(&state), registry, render).expect("valid");
+        let spec = latest_spec(Arc::clone(&state), registry, render, None).expect("valid");
 
         let (build, bus) = build_cx(
             LATEST_ID,
@@ -1173,7 +1424,7 @@ mod driven {
         let state = state();
         let registry = MemoryRegistry::fixed("backyard") as Arc<dyn StationRegistry>;
         let render = CountingRender::new() as Arc<dyn SnapshotRender>;
-        let spec = warm_spec(Arc::clone(&state), registry, render).expect("valid");
+        let spec = warm_spec(Arc::clone(&state), registry, render, None).expect("valid");
 
         let store = FakeStore::with(vec![stored("backyard", at("2026-11-07T18:29:00Z"), 29.92)]);
         let handle: Arc<dyn Store> = store as Arc<dyn Store>;

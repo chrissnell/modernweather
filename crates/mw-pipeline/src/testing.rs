@@ -178,6 +178,8 @@ pub struct CountingRender {
     calls: Mutex<Vec<(Encoding, SnapshotKey)>>,
     /// A revision the test can move, to assert that an `ETag` follows the serialiser.
     revision: Mutex<u64>,
+    /// Set by [`CountingRender::start_failing`].
+    failing: Mutex<bool>,
 }
 
 impl CountingRender {
@@ -186,6 +188,7 @@ impl CountingRender {
         Arc::new(Self {
             calls: Mutex::new(Vec::new()),
             revision: Mutex::new(1),
+            failing: Mutex::new(false),
         })
     }
 
@@ -197,6 +200,15 @@ impl CountingRender {
     /// How many times it has been asked to render.
     pub fn count(&self) -> usize {
         self.calls.lock().expect("not poisoned").len()
+    }
+
+    /// Refuse every subsequent render, so a caller's failure path is assertable.
+    ///
+    /// The real renderer fails when the DTO and the registry disagree about a metric, which
+    /// is a build defect rather than an operational condition — so this double has no way
+    /// to stop failing again, deliberately.
+    pub fn start_failing(&self) {
+        *self.failing.lock().expect("not poisoned") = true;
     }
 }
 
@@ -214,6 +226,12 @@ impl SnapshotRender for CountingRender {
             return Err(RenderError::EncodingUnsupported {
                 encoding,
                 declared: "json".to_string(),
+            });
+        }
+        if *self.failing.lock().expect("not poisoned") {
+            return Err(RenderError::NotSerialisable {
+                key: source.key.clone(),
+                reason: "the test renderer was told to refuse".to_string(),
             });
         }
         self.calls

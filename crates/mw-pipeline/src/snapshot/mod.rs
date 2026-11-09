@@ -18,6 +18,18 @@
 //! | `snapshot:latest` | `OnReading { All, Latest, 100 ms }` | `WindowedView` S | `LatestSnapshot` |
 //! | `snapshot:warm` | `OnStartup { 30 s }` | `ReadingStore` H, `WindowedView` S | — |
 //!
+//! `WindowedView` is **declared** here and **resolved through the registrar**, not off the
+//! capability bus. [`SnapshotConfig::snapshot_windows`] has the whole of why; it is the
+//! shape `mw_station` already uses for `ReadingStream`, and the reason is that a soft
+//! handle is resolved once in `build` while this component is built before `window:rollup`
+//! can have published anything.
+//!
+//! `StationRegistry` travels the same way and for a different reason — nothing in this
+//! workspace provides `Capability::StationRegistry`, because `config:sqlite` has no work
+//! item (`mw_store::pg` records the same note). `docs/component-model.md` §4's table gives
+//! `snapshot:latest` `StationRegistry` **H**; declaring it would be a hard need with no
+//! provider, which `plan()` refuses under **D-44**. Recorded as **A-M4-1-2**.
+//!
 //! # `snapshot:latest` has no hard requirement, and **D-48** is why that matters
 //!
 //! `api:legacy` declares only `LatestSnapshot` as a hard requirement (W3 §6.2), so whether
@@ -97,6 +109,7 @@ pub mod state;
 #[cfg(test)]
 mod tests;
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -158,6 +171,19 @@ pub const RECENCY: Duration = Duration::from_secs(600);
 /// otherwise tell an empty window from a provider that has stopped refreshing, and an
 /// all-`None` answer reads as "the station does not report this".
 pub const WINDOW_STALE_AFTER: Duration = Duration::from_secs(150);
+
+/// [`WINDOW_STALE_AFTER`] as a `chrono` delta, computed once.
+///
+/// The comparison in [`Folder::resolve`] used to be a fallible `Duration` conversion with a
+/// fallback arm computing the same number a second way — unreachable, and re-run on every
+/// fold. One `const` means the figure appears once and the comparison is a subtraction.
+const STALE_AFTER: chrono::TimeDelta =
+    match chrono::TimeDelta::try_seconds(WINDOW_STALE_AFTER.as_secs() as i64) {
+        Some(d) => d,
+        // `expect` is not const; 150 seconds is representable and a change that made it
+        // not would be a build failure here rather than a silent fallback.
+        None => panic!("WINDOW_STALE_AFTER must be a representable TimeDelta"),
+    };
 
 /// The window-derived values the `/latest` payload carries (W3 §2a.6's table).
 ///
@@ -241,6 +267,36 @@ pub trait SnapshotConfig {
     /// `Need::hard(Capability::StationRegistry)` here would be a hard need nobody provides.
     fn snapshot_registry(&self) -> Option<&Arc<dyn StationRegistry>>;
 
+    /// The maintained window values (**R2**), for the same reason the registry travels
+    /// this way.
+    ///
+    /// **This is the declaration's resolution, and it may not come off the bus.** Both
+    /// components declare `Need::soft(WindowedView)` and resolve **nothing** from the
+    /// capability bus, which is the shape `mw_station`'s stations already have for
+    /// `ReadingStream` (`mw_station::config`'s module documentation has the general
+    /// argument). The reason is specific and it is the supervisor's rather than the
+    /// design's: `BuildCx::soft` resolves **once**, in `build`, and
+    /// `mw_supervisor`'s `reconcile` never rebuilds a `Running` component when a soft
+    /// capability later arrives — the `(State::Running, true)` arm refreshes the
+    /// `degraded` label and nothing else.
+    ///
+    /// `snapshot:latest` has no hard need, so it is built in the **first** reconcile pass,
+    /// while `window:rollup` cannot even build until `db:postgres` has published and does
+    /// not publish `WindowedView` until its first completed tick. A bus-resolved soft
+    /// handle would therefore be `None` for the whole life of every healthy process, and
+    /// every snapshot would carry `Staleness::Degraded` forever — the exact inverse of
+    /// W3 §2a.6's first table row.
+    ///
+    /// `RollupState` is already a root resource `main` owns and already implements
+    /// `WindowedView`, and its `resolve` answers `UnknownStation` until the first tick —
+    /// which [`Folder::resolve`]'s third outcome already handles. So the handle is live
+    /// without the bus having to make it so.
+    ///
+    /// `None` is a node with no rollup at all, which is a node with no weather database.
+    /// That is the genuine no-provider case and `Staleness::Degraded` is the right answer
+    /// for it.
+    fn snapshot_windows(&self) -> Option<&Arc<dyn WindowedView>>;
+
     /// The payload renderer — M4-2's, see the module documentation. `None` plans neither
     /// component.
     fn snapshot_render(&self) -> Option<&Arc<dyn SnapshotRender>>;
@@ -287,11 +343,13 @@ pub fn register<C: SnapshotConfig + ?Sized>(
     let Some(registry) = cfg.snapshot_registry() else {
         return Err(SnapshotPlanError::NoRegistry);
     };
+    let windows = cfg.snapshot_windows().map(Arc::clone);
     if cfg.has_reading_stream() {
         out.push(latest_spec(
             Arc::clone(state),
             Arc::clone(registry),
             Arc::clone(render),
+            windows.clone(),
         )?);
     } else {
         info!(
@@ -305,6 +363,7 @@ pub fn register<C: SnapshotConfig + ?Sized>(
             Arc::clone(state),
             Arc::clone(registry),
             Arc::clone(render),
+            windows,
         )?);
     } else {
         info!(
@@ -353,6 +412,7 @@ pub fn latest_spec(
     state: Arc<SnapshotState>,
     registry: Arc<dyn StationRegistry>,
     render: Arc<dyn SnapshotRender>,
+    windows: Option<Arc<dyn WindowedView>>,
 ) -> Result<ComponentSpec, SnapshotPlanError> {
     let id = ComponentId::new(LATEST_ID).map_err(|source| SnapshotPlanError::BadId {
         id: LATEST_ID.to_string(),
@@ -375,9 +435,13 @@ pub fn latest_spec(
             let state = Arc::clone(&state);
             let registry = Arc::clone(&registry);
             let render = Arc::clone(&render);
+            // **Not `cx.soft()`.** `SnapshotConfig::snapshot_windows` has the whole of why;
+            // the short version is that a soft handle is resolved once and this component
+            // is built before `window:rollup` can possibly have published, so the bus
+            // would hand it `None` on every healthy node and never correct it.
+            let windows = windows.clone();
             async move {
                 let publisher = cx.publisher::<Arc<dyn LatestSnapshot>>()?;
-                let windows = cx.soft::<Arc<dyn WindowedView>>()?;
                 let rev = PayloadRev::of(render.revision(), cx.cx().generation());
                 // **Published in `build`, before the first fold.** D-48's precondition:
                 // a consumer whose only hard need is this capability must never be
@@ -398,8 +462,11 @@ pub fn latest_spec(
             }
         }),
     )
-    // **The only need, and it is soft.** `StationRegistry` travels through the registrar
-    // (see `SnapshotConfig::snapshot_registry`), and `ReadingStore` is deliberately absent:
+    // **The only need, and it is soft.** `StationRegistry` and `WindowedView` both travel
+    // through the registrar (see `SnapshotConfig`'s two accessors) and the declaration
+    // stays here, which is `mw_station`'s shape for `ReadingStream`: `plan()` and
+    // `mw_component_state` both read the declaration, and the handle's lifetime is the
+    // thing the bus cannot give this component. `ReadingStore` is deliberately absent:
     // `api:legacy` is handed this component's capability and never a store handle, so the
     // `/latest` handler *cannot* query (**D-35**) -- and neither can this component, which
     // is the same guarantee one level up.
@@ -413,6 +480,7 @@ pub fn warm_spec(
     state: Arc<SnapshotState>,
     registry: Arc<dyn StationRegistry>,
     render: Arc<dyn SnapshotRender>,
+    windows: Option<Arc<dyn WindowedView>>,
 ) -> Result<ComponentSpec, SnapshotPlanError> {
     let id = ComponentId::new(WARM_ID).map_err(|source| SnapshotPlanError::BadId {
         id: WARM_ID.to_string(),
@@ -428,11 +496,12 @@ pub fn warm_spec(
             let state = Arc::clone(&state);
             let registry = Arc::clone(&registry);
             let render = Arc::clone(&render);
+            // Not `cx.soft()`, for the reason above.
+            let windows = windows.clone();
             async move {
                 // The upcast to the half this component declared, as `window:rollup` does:
                 // after this line the body holds a read handle and cannot store anything.
                 let store: Arc<dyn ReadingStore> = cx.hard::<Arc<dyn Store>>()?;
-                let windows = cx.soft::<Arc<dyn WindowedView>>()?;
                 let rev = PayloadRev::of(render.revision(), cx.cx().generation());
                 Ok(Warm {
                     store,
@@ -454,12 +523,37 @@ pub fn warm_spec(
 
 /// What goes into both specs' [`ConfigDigest`].
 ///
-/// The key set, which is the whole of what either component closes over: adding a website or
-/// a station restarts them, and a change elsewhere does not.
+/// **The key set *and the contents of every `WebsiteView`*.** The key set alone is not what
+/// either component closes over, which is the mistake this function made first: [`Folder`]
+/// holds `state.websites()` and puts the whole view — name, primary station, snow binding —
+/// into every [`SnapshotSource`], where the renderer reads it.
+///
+/// With only the keys hashed, an operator who renamed a website or repointed its
+/// `snow_station_key` would leave the key set unchanged, so the digest unchanged, so the
+/// component not restarted, so the stale view still rendering — while
+/// [`mw_component::PayloadRev`] *does* move with the configuration generation. The `ETag`
+/// would change and the body would not, which is worse than not invalidating at all and is
+/// the opposite of what `payload_rev` exists for.
+///
+/// W3 §2a.4 says entries are "created and destroyed by the config watch's plan diff", and
+/// that only holds if the diff can see a content change. Config reload is M7-1's, so this
+/// is latent — and the digest is the only mechanism, so it is cheaper to be right here than
+/// to debug there.
 fn key_digest_input(state: &SnapshotState) -> String {
     let mut s = String::new();
-    for key in state.keys() {
-        s.push_str(&key.to_string());
+    for website in state.websites() {
+        let _ = write!(
+            s,
+            "w{}:{}:{}:{}:{};",
+            website.id,
+            website.name,
+            website.primary_station.as_ref().map_or("-", |k| k.as_str()),
+            website.snow_enabled,
+            website.snow_station.as_ref().map_or("-", |k| k.as_str()),
+        );
+    }
+    for station in state.stations() {
+        s.push_str(station.as_str());
         s.push(';');
     }
     s
@@ -532,16 +626,47 @@ impl Folder {
                 meta,
                 windows: windows.clone(),
             };
-            let snapshot = Arc::new(
-                Snapshot::render(
-                    source,
-                    staleness.clone(),
-                    now,
-                    self.rev,
-                    Arc::clone(&self.render),
-                )
-                .map_err(|e| ComponentError::tick("render the current conditions", e))?,
-            );
+            // **A render failure is a per-key, counted non-event — not a tick failure.**
+            //
+            // Returning `Err` here is the obvious thing and it would break the invariant
+            // this item exists to establish. The chain: `ComponentError` out of `readings`
+            // -> `Exit::Failed` -> `mw_supervisor`'s `on_exit` calls `bus.revoke_all(id)`
+            // -> `LatestSnapshot` is unavailable -> `api:legacy`'s hard need is missing ->
+            // `stop_component` + `Waiting` -> its route table is unmounted -> **a frozen
+            // path answers `503`** for the length of the backoff. Publishing in `build`
+            // makes the capability available once; it does not make it un-revokable, and
+            // **D-48** forbids the outcome however it is reached.
+            //
+            // So the previous bytes stay served, the failure is counted and logged with its
+            // class, and the batch is acknowledged. A payload that cannot be re-rendered
+            // serving its last good value is also strictly closer to **D-36** than
+            // unmounting `/latest`.
+            //
+            // The second reason, independent of D-48: a mid-loop `?` would leave the table
+            // **partially** updated — website 1's key advanced and website 2's did not — so
+            // two websites would serve different readings for one station.
+            let snapshot = match Snapshot::render(
+                source,
+                staleness.clone(),
+                now,
+                self.rev,
+                Arc::clone(&self.render),
+            ) {
+                Ok(snapshot) => Arc::new(snapshot),
+                Err(e) => {
+                    warn!(
+                        website = %website.id,
+                        %station,
+                        class = ?mw_types::Classify::class(&e),
+                        error = %mw_types::DisplayChain(&e),
+                        "this website's current-conditions payload could not be \
+                         serialised, so its previous bytes stay published; the reading \
+                         itself is durable and unaffected"
+                    );
+                    m::snapshot_render_failed(&SnapshotKey::new(website.id, station.clone()));
+                    continue;
+                }
+            };
             let key = snapshot.key().clone();
             let stored = if seed {
                 self.state.seed(snapshot)
@@ -589,11 +714,7 @@ impl Folder {
         match view.resolve(station, &WINDOWS) {
             Ok(resolved) => {
                 let age = now.signed_duration_since(resolved.as_of());
-                if age
-                    > chrono::Duration::from_std(WINDOW_STALE_AFTER).unwrap_or_else(|_| {
-                        chrono::Duration::seconds(WINDOW_STALE_AFTER.as_secs() as i64)
-                    })
-                {
+                if age > STALE_AFTER {
                     let since = resolved.as_of();
                     (
                         resolved,
@@ -614,12 +735,19 @@ impl Folder {
                 // derived columns, the sun and moon — is unaffected, which is exactly
                 // W3 §2a.6's first table row.
                 //
-                // `UnknownStation` is the expected member here and is not an error about
-                // this station: `window:rollup` maintains the stations this node
-                // *collects* for, and a station a peer forwards readings for is inventory
-                // rather than a component (`mw_station::config`). Logged at `warn` once
-                // per fold, which the dedupe layer's token bucket collapses to three and
-                // then a summary.
+                // `UnknownStation` is the expected member here, and it has **two**
+                // meanings rather than one. Its own documentation names both: a station
+                // this node does not collect for — a peer forwards its readings, so it is
+                // inventory rather than a component (`mw_station::config`) — **and** a
+                // station whose provider has not completed a tick yet. The second is
+                // routinely transient for up to a tick period after a restart, so "the
+                // same answer on the next reading" is true of the enum's classification
+                // and not of this variant.
+                //
+                // Logged at `warn` once per fold, which the dedupe layer's token bucket
+                // does collapse: the event carries a `station` field, which is `mw_obs`'s
+                // dedupe key, and no `class`, so it is not in the never-suppress set.
+                // Three, then a summary per minute.
                 warn!(
                     %station,
                     error = %mw_types::DisplayChain(&e),

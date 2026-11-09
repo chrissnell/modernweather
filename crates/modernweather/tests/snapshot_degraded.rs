@@ -270,10 +270,15 @@ async fn with_no_database_the_frozen_route_table_mounts_and_answers_from_memory(
                 Arc::clone(&state),
                 Arc::clone(&registry),
                 Arc::clone(&render),
+                // **No window view**, which is the honest shape of this outage: `main`
+                // builds the rollup state only for a node that collects, and
+                // `window:rollup` is in `Waiting { ReadingStore }` below either way. The
+                // handle being present-but-silent is covered in `mw-pipeline`'s own tests.
+                None,
             )
             .expect("a valid spec")
             .grace(GRACE),
-            mw_pipeline::snapshot::warm_spec(Arc::clone(&state), registry, render)
+            mw_pipeline::snapshot::warm_spec(Arc::clone(&state), registry, render, None)
                 .expect("a valid spec")
                 .grace(GRACE),
             api_legacy(Arc::clone(&served), asked),

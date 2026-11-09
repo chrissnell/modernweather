@@ -7,7 +7,8 @@
 //! 4. cfg = Config::load(&pool)
 //! 4a. assert the database version                 <- D-62, after the pool, before plan()
 //! 4b. open the spool                              <- the fan-out, the second root (D-30a)
-//! 4c. registry + ingress                          <- `config:sqlite` has no work item
+//! 4c. registry + rollup + snapshot table           <- `config:sqlite` has no work item
+//! 4d. ingress                                     <- needs 4b's spool
 //! 5. specs = plan(&cfg, registrars)               pure; every structural error caught here
 //! 6. supervisor = Supervisor::new(pool.schedule_store(), log_control, ...)
 //! 6a. bind the listener                           <- NOT in §3.1; see below
@@ -51,7 +52,7 @@ use mw_supervisor::{Roots, RunReport, Supervisor};
 use mw_types::Classify;
 use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::args::Args;
 use crate::config::Config;
@@ -217,8 +218,8 @@ impl Registrar<Config> for Snapshot {
     }
 }
 
-/// Build the station registry and the write end of the pipeline, and hand both to the
-/// configuration.
+/// Build the station registry, the window rollup and the snapshot table, and hand all
+/// three to the configuration.
 ///
 /// **Two things that are not in W3 §3.1's list, and the reason is the same for both: the
 /// component that should own them does not exist.** W2a §4.1b gives `StationRegistry` to a
@@ -309,8 +310,8 @@ fn attach_registry(cfg: &mut Config) -> anyhow::Result<()> {
     // it.
     let stations = mw_pipeline::RollupConfig::rollup_stations(&*cfg);
     cfg.set_rollup(Arc::new(mw_pipeline::RollupState::new(stations)));
-    // The snapshot table, over the same two sets the key is a product of (**D-31**). A
-    // fourth root resource for the rollup state's reason -- two components write it -- and
+    // The snapshot table, over the same two sets the key is a product of (**D-31**).
+    // Another root resource for the rollup state's reason -- two components write it -- and
     // built here rather than in the registrar so that both of them are handed the same
     // table.
     //
@@ -320,6 +321,13 @@ fn attach_registry(cfg: &mut Config) -> anyhow::Result<()> {
     // **any** configured device (W3 §2a.4), and a station a peer forwards readings for
     // arrives through `Ingress::accept` and has conditions to serve. Filtering here would
     // make those readings fold into no key at all.
+    //
+    // **Including the disabled ones**, which is the axis `rollup_stations` does filter on. A
+    // station with `enabled = 0` has collection switched off and can be switched back on
+    // without a restart of anything but its own component; its key answering 404 in the
+    // meantime is the same answer a station that has not reported gets. The alternative --
+    // no key at all -- would mean a re-enabled station serves nothing until the daemon
+    // restarts, because the key set is fixed at construction.
     let websites: Vec<mw_component::WebsiteView> = cfg
         .websites
         .iter()
@@ -339,7 +347,7 @@ fn attach_registry(cfg: &mut Config) -> anyhow::Result<()> {
         .iter()
         .map(|r| mw_types::StationKey::new(r.station_key.as_str()))
         .collect();
-    info!(
+    debug!(
         websites = websites.len(),
         stations = snapshot_stations.len(),
         keys = websites.len() * snapshot_stations.len(),
@@ -692,6 +700,7 @@ mod tests {
             registry: None,
             rollup: None,
             snapshot: None,
+            snapshot_windows: None,
             station_zones: Vec::new(),
             listener: Listener {
                 listen_addr: "127.0.0.1".into(),
@@ -843,6 +852,21 @@ mod tests {
         .execute(&pool)
         .await
         .expect("the node row");
+        // **A `website` row, and the test below depends on it being here.** The snapshot's
+        // key is `(website, station)`, so with no website the key set is empty and
+        // `mw_pipeline::snapshot::register` short-circuits on *that* rather than on the
+        // missing renderer. The assertion in
+        // `a_weather_database_and_a_spool_plan_the_pool_and_the_writer` would then be green
+        // for a reason that has nothing to do with M4-2, and would stay green when M4-2
+        // lands — an inert tripwire, which is worse than none.
+        //
+        // `primary_station_key` is deliberately NULL: the column is nullable and
+        // `ON DELETE SET NULL`, the station rows are added by the caller afterwards, and a
+        // website with no primary device is a configuration the daemon must accept.
+        sqlx::query("INSERT INTO website (id, name, hostname) VALUES (1, 'test', '')")
+            .execute(&pool)
+            .await
+            .expect("the website row");
         for sql in stations {
             sqlx::query(sql)
                 .execute(&pool)
@@ -1135,16 +1159,24 @@ mod tests {
             ids.contains(&"rain:rollover:suncrest:roof"),
             "one rollover per collecting station: got {ids:?}"
         );
-        // **The snapshot components are not planned, and that is this build's scope
-        // boundary rather than a gap.** `snapshot:latest` and `snapshot:warm` are
-        // implementation-plan.md M4-1's and are complete; what they need and do not have is
-        // the payload renderer, which is the frozen 133-key DTO's serialiser and belongs
-        // exclusively to `mw-api-legacy` (M4-2). `Config::snapshot_render` answers `None`,
-        // so `mw_pipeline::snapshot::register` plans neither and says so at `info`.
+        // **The snapshot components are not planned, and the renderer is the only reason.**
+        // `snapshot:latest` and `snapshot:warm` are implementation-plan.md M4-1's and are
+        // complete; what they need and do not have is the payload renderer, which is the
+        // frozen 133-key DTO's serialiser and belongs exclusively to `mw-api-legacy`
+        // (M4-2). `Config::snapshot_render` answers `None`, so
+        // `mw_pipeline::snapshot::register` plans neither and says so at `info`.
         //
-        // Asserted rather than left to the count below, so that the item which lands the
-        // renderer is told by a failing test to update this -- the same role
-        // `mw_store::pg`'s spec test plays for `SnowCache`.
+        // The fixture has a `website` row and a station row, so the key set is **not**
+        // empty and `register`'s other three conditions are all satisfied -- which is what
+        // makes this a tripwire rather than a tautology. Setting `snapshot_render` to
+        // `Some` is sufficient to fail this assertion and the count below.
+        assert!(
+            !cfg.websites.is_empty() && !cfg.stations.is_empty(),
+            "the key set must be non-empty, or this asserts the wrong thing: {} websites, \
+             {} stations",
+            cfg.websites.len(),
+            cfg.stations.len()
+        );
         assert!(
             !ids.contains(&"snapshot:latest") && !ids.contains(&"snapshot:warm"),
             "the snapshot components need M4-2's renderer; when it lands, this assertion \

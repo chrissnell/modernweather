@@ -629,6 +629,35 @@ file is not a work item (`docs/reconciliation.md` G-5):
    them, the floor the negative control must clear is a different number, and it must be measured
    rather than assumed — a control whose floor is too low is the failure mode W1 Decision 10 exists
    to prevent.
+**Constraints from M4-1**, which built `LatestSnapshot` and the half of **D-48** that does not need
+routes. Recorded here for the same reason M2-5's are, and because M4-1 deferred the rest of D-48 to
+this item: a deferral whose obligations live only in source comments is not a work item
+(`docs/reconciliation.md` G-5).
+1. **`Config::snapshot_render` must return `Some`.** `snapshot:latest` and `snapshot:warm` are
+   complete and are **not planned** in the shipping binary, because the payload is the frozen 133-key
+   DTO and this item owns its serialiser. One line in `crates/modernweather/src/config.rs` turns both
+   on; `boot.rs`'s plan test asserts they are absent today and fails the moment they are not, so the
+   tripwire will tell you.
+2. **`api:legacy`'s hard needs must be exactly `[LatestSnapshot]`.** This is the whole of D-48 and
+   **nothing currently asserts it** — M4-1's test chose the stand-in's declarations itself. A hard
+   `ReadingStore` here would make a frozen route unmountable whenever the database is down, and the
+   conformance suite cannot catch it, because it replays against a **healthy** database and a `503`
+   only appears when there is not one. Either add a plan-level test that no spec providing a
+   `RouteManifest` containing a frozen pattern has a hard need outside `{LatestSnapshot}`, or assert
+   this item's own `requires` set the way `mw_pipeline::snapshot`'s spec tests do.
+3. **D-48's byte-level half is this item's.** With the database **stopped**, each of the five frozen
+   routes must return its contract response — `/latest`'s `404 no recent weather data available for
+   this station\n` included — and never `503`. `cargo xtask gate conformance` does **not** establish
+   this: it replays against a running database, so a green conformance run does not imply D-48.
+   M4-1 tested the precondition (`crates/modernweather/tests/snapshot_degraded.rs`: a consumer whose
+   only hard need is `LatestSnapshot` reaches `Running` with `db:postgres` planned and never
+   publishing); the fixtures-with-the-database-down half arrives with the routes.
+4. **Two additive headers read `Snapshot`'s accessors**: `X-MW-Snapshot-Age` from
+   `Snapshot::age_seconds` and `X-MW-Degraded` from `Staleness::missing`, which is **D-36**'s only
+   path to a client. The staleness must not reach the frozen body.
+5. **`ETag` and `If-None-Match` are built.** `mw_component::ETag` escapes the station key into
+   `etagc` and implements RFC 9110 §13.1.2's weak comparison; the handler should use
+   `ETag::matches` rather than comparing strings, and must not "fix" `Cache-Control`.
 
 ### M4-3 — `mw-http` and `mw-web`
 **Depends on:** M4-2. **Blocks:** M5, M7.
@@ -648,6 +677,21 @@ the `GoHtmlEscaper` decision buys; the layout gate rejects `safe` and `escape("n
 **Deviations that land here:** DEV-2 (case-insensitive `Host`), DEV-3 (404 instead of directory
 listings), DEV-6 (single-label wildcard matching and the deterministic SNI miss chain). All three
 close defects; see `docs/reconciliation.md` §3.
+**Constraints from M4-1**, recorded here rather than in a source comment (`docs/reconciliation.md`
+G-5):
+1. **This item builds the thing that can emit a `503`**, which is the unmounted-declared-path
+   response W2a Decision 19 specifies. **D-48** forbids it on the five frozen patterns, and M4-1
+   established the structural precondition; this is where the response itself first exists, so the
+   route table's mounting rule is the last place the invariant can be broken. `grep` for `503` found
+   only prose before this item.
+2. **`mw_snapshot_age_seconds` and `mw_snapshot_degraded` freeze rather than climb.** Both are
+   written only when a snapshot is folded, so a station that stops reporting — the one transition
+   worth alerting on — leaves its gauge where it was. The sweep belongs on the scrape path, which is
+   this item's: recompute every key's age from `LatestSnapshot::table()` when `/metrics` is rendered.
+   Until then the honest alert is `rate(mw_snapshot_published_total)` going flat.
+3. **`web:site:*` requires `LatestSnapshot` Hard** (`docs/component-model.md` §2.6), so M4-2's
+   constraint 2 applies to the website's route tables as well: a hard need outside
+   `{LatestSnapshot, ConfigStore}` on a table carrying a frozen pattern reopens D-48.
 
 **Milestone 4 done when:** the Rust daemon serves the entire frozen surface with the conformance suite
 green against it, and the website renders byte-identically. **It is serving its own stations from its

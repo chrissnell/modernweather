@@ -461,6 +461,78 @@ mod tests {
         s.parse().expect("an RFC 3339 instant")
     }
 
+    /// **The `latest` statement's column order is the decode's index arithmetic**, and
+    /// without a database nothing else checks that they agree.
+    ///
+    /// `ReadingStore::latest`'s loop reads column `DIMENSION_COLUMNS.len() + i` for
+    /// `METRICS[i]`, so a statement that dropped a column, reordered one, or grew a
+    /// sixth dimension would shift every metric after the change — and decode a `float4`
+    /// out of an `int4` column, or a timestamp out of a text one. The only other coverage
+    /// is the `#[ignore]`d database test, which does not run in an ordinary
+    /// `cargo test`. This is the same assertion
+    /// [`the_bucket_statement_is_the_registrys_column_list_in_order`] makes ten lines down,
+    /// for the same reason.
+    #[test]
+    fn the_latest_statement_is_the_dimensions_then_the_registrys_metrics_in_order() {
+        let sql = latest_statement();
+        assert!(
+            sql.starts_with("SELECT time, station_id, stationname, stationtype, "),
+            "the four dimensions come first, in the writer's order: {}",
+            &sql[..80]
+        );
+        // Every metric column, in `METRICS` order, each one after the last.
+        let mut cursor = 0usize;
+        for m in METRICS {
+            let needle = format!(", {}", m.column);
+            let found = sql[cursor..]
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{} is missing or out of order", m.column));
+            cursor += found + needle.len();
+        }
+        // Exactly as many comma-separated selections as declared columns, so nothing rode
+        // along: a `SELECT *` or a stray column would shift the decode's indices.
+        let selections = sql
+            .trim_start_matches("SELECT ")
+            .split(" FROM ")
+            .next()
+            .expect("a FROM clause")
+            .split(',')
+            .count();
+        assert_eq!(
+            selections,
+            DIMENSION_COLUMNS.len() + METRICS.len(),
+            "216 columns today, and the number is the registry's rather than a literal"
+        );
+        // **No casts**, unlike the bucket statement: a `::float8` here would decode the
+        // eleven text and four timestamptz metrics as NULL.
+        assert!(!sql.contains("::"), "{sql}");
+        // The bound and the ordering are what make this an index seek rather than a scan
+        // back through every chunk a non-reporting station has.
+        assert!(
+            sql.contains("WHERE station_id = $1 AND time >= $2"),
+            "{sql}"
+        );
+        assert!(sql.ends_with("ORDER BY time DESC LIMIT 1"), "{sql}");
+    }
+
+    /// The dimension list this module decodes by position is the one the writer asserts
+    /// against the registry.
+    ///
+    /// `crate::writer` refuses to construct if `DIMENSIONS`' stored set and its own
+    /// `DIMENSION_COLUMNS` disagree, and `TimescaleStore::new` always builds both halves —
+    /// so that refusal gates this module too. It gates it through a link that is not
+    /// visible from here, though, and `TimescaleReader::new` alone is infallible, so the
+    /// agreement is asserted here as well rather than inherited silently.
+    #[test]
+    fn the_dimension_columns_are_the_registrys_stored_set() {
+        let declared: Vec<&str> = mw_types::DIMENSIONS
+            .iter()
+            .filter(|d| d.stored)
+            .map(|d| d.column)
+            .collect();
+        assert_eq!(declared, DIMENSION_COLUMNS);
+    }
+
     /// The bucket statement names **every** column the 1-minute level declares, in order,
     /// and nothing else. That is the property a consumer's indexing depends on: `Bucket`'s
     /// `values[i]` is `LEVELS[0].columns[i]`, and a statement that skipped a column or

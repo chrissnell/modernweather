@@ -40,6 +40,10 @@
 //! two-second-old snapshot with a ten-minute-old one — which is not a race the ordering
 //! rules out, because `OnStartup` has no hard edge to `snapshot:latest` and should not: a
 //! seed that waited for the first reading would have nothing left to do.
+//!
+//! **The comparison happens inside the `rcu`, not before it**, so it is an invariant rather
+//! than a very likely outcome. `SnapshotState::store`'s own comment has the interleaving
+//! that a compare-then-write would lose to.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -154,7 +158,7 @@ impl SnapshotState {
         self.published.load(Ordering::Relaxed)
     }
 
-    /// Replace one key's snapshot unconditionally. `snapshot:latest`'s fold.
+    /// Replace one key's snapshot. `snapshot:latest`'s fold.
     ///
     /// `false` for a key the configuration does not contain, which is a caller that built a
     /// key out of a station or website this state does not know. Reported rather than
@@ -180,22 +184,40 @@ impl SnapshotState {
         let Some(slot) = self.slots.get(snapshot.key()) else {
             return false;
         };
-        if replace == Replace::IfNewer {
-            if let Some(current) = self.table.load().get(snapshot.key()) {
-                if current.observed_at() >= snapshot.observed_at() {
-                    return false;
-                }
-            }
-        }
-        // `rcu` rather than `store`: the map is read-copy-updated, so a concurrent fold for
-        // a different key cannot lose its entry to this one's clone. There is one writer
-        // per component and two components, which is exactly the case `store` would get
-        // wrong.
+        // **The decision is inside the `rcu`, not before it.** `rcu` loads, calls the
+        // closure, and compare-exchanges; on a losing exchange it calls the closure again
+        // with the newer value. Deciding outside would be a read-then-write with a gap in
+        // the middle, and the gap is where the invariant this type documents gets lost:
+        // `snapshot:warm` loads an empty key, decides to seed its ten-minute-old row,
+        // `snapshot:latest` folds a two-second-old reading into that key, and the seed's
+        // write lands on top. `observed_at` would move **backwards**, which is the one
+        // thing the module documentation promises cannot happen.
+        //
+        // The window is microseconds and the next reading repairs it, so this was never a
+        // correctness emergency — but a documented invariant that holds "almost always" is
+        // worse than one that holds, because the next reader trusts it.
+        //
+        // `rcu` rather than `store` for the original reason too: the map is
+        // read-copy-updated, so a concurrent fold for a *different* key cannot lose its
+        // entry to this one's clone.
+        let mut wrote = false;
         self.table.rcu(|current| {
+            // Assigned unconditionally on every pass, not OR-ed: the closure may run more
+            // than once, and a pass that loses the exchange must not leave `true` behind
+            // from an earlier attempt that would now decide differently.
+            wrote = replace == Replace::Always
+                || current
+                    .get(snapshot.key())
+                    .is_none_or(|c| c.observed_at() < snapshot.observed_at());
             let mut next = SnapshotTable::clone(current);
-            next.insert(Arc::clone(&snapshot));
+            if wrote {
+                next.insert(Arc::clone(&snapshot));
+            }
             next
         });
+        if !wrote {
+            return false;
+        }
         self.published.fetch_add(1, Ordering::Relaxed);
         // After the table, so a subscriber woken by this never reads a table that does not
         // have it. `send_replace` rather than `send`: a key with no subscriber is the
@@ -208,9 +230,24 @@ impl SnapshotState {
 /// Whether a write may move a key backwards in time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Replace {
-    /// `snapshot:latest`: the newest reading wins because it *is* the newest reading.
+    /// `snapshot:latest`: arrival order wins.
+    ///
+    /// **Not "the newest reading wins", which is what this said and is not what it does.**
+    /// A fold writes whatever arrived most recently, and arrival order is not timestamp
+    /// order: an NTP correction that steps a station's clock backwards, or a peer's
+    /// forwarded replay interleaving with local admits, produces a reading whose `time` is
+    /// earlier than the one already published. `Always` accepts it, deliberately — the
+    /// station's own notion of now has moved, and `/latest`'s job is to report what the
+    /// station last said rather than to adjudicate its clock. `Snapshot::age_seconds`
+    /// reports a negative age for the same reason.
+    ///
+    /// The consequence worth knowing: `observed_at` and the `ETag` can move backwards on a
+    /// clock step, and if the step is larger than ten minutes W1's recency rule will 404 a
+    /// station that is live. That is a station whose clock is wrong, and
+    /// `mw_snapshot_age_seconds` going negative is the signal for it.
     Always,
-    /// `snapshot:warm`: a seed never overwrites something fresher.
+    /// `snapshot:warm`: a seed never overwrites something fresher. Enforced inside the
+    /// `rcu`, so it is a real invariant rather than a race.
     IfNewer,
 }
 
