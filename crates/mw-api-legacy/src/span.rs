@@ -131,7 +131,7 @@ pub async fn handle(h: &Handlers, host: &str, span: &str, params: &Params) -> Re
             station = %station.key,
             "the reading store is unavailable, so /span answers with an empty array"
         );
-        return body(&[], None, DEFAULT_MAX_AGE, &station.name, &station.kind);
+        return body(&[], &[], DEFAULT_MAX_AGE, &station.name, &station.kind);
     };
 
     let key = CacheKey {
@@ -175,47 +175,65 @@ pub async fn handle(h: &Handlers, host: &str, span: &str, params: &Params) -> Re
         Some(entry) => entry,
         None => {
             let entry = Prefix::render(&answer.prefix, &station.name, &station.kind);
-            h.span_cache.put(key, entry.clone());
+            // **Only a COMPLETE prefix is cached**, and that is D-54's own guarantee rather
+            // than a precaution. The key does not move until the bucket does, so caching a
+            // prefix the aggregate had not caught up to pinned the gap for the whole TTL:
+            // at the one-minute level a request 1.0s after a boundary cached 59 buckets
+            // ending at `B-2min` and every response for the next 60 seconds omitted
+            // `B-1min` — a hole one element before the live point, on every chart, renewed
+            // every minute. Uncached it closed 2.2 seconds later, when the policy ran.
+            //
+            // Complete means "ends at the bucket before the tail". `backfill` being empty is
+            // exactly that test, and the store computes it from the data rather than from
+            // the clock. An incomplete prefix simply misses the cache, which `/span` can
+            // afford: a station that has stopped reporting is the only steady-state case,
+            // and the response is correct either way.
+            if answer.backfill.is_empty() {
+                h.span_cache.put(key, entry.clone());
+            }
             entry
         }
     };
 
-    let max_age = max_age_for(&prefix, answer.tail.as_ref(), level);
+    // Everything after the cacheable prefix, oldest first: the closed buckets the aggregate
+    // has not reached, then the still-filling one.
+    let trailing: Vec<&SpanBucket> = answer.after_prefix().collect();
+    let max_age = max_age_for(&prefix, trailing.first().copied(), level);
     body(
         &prefix.elements,
-        answer.tail.as_ref(),
+        &trailing,
         max_age,
         &station.name,
         &station.kind,
     )
 }
 
-/// The response: a JSON array of the prefix's elements with the tail appended.
+/// The response: a JSON array of the prefix's elements with the trailing buckets appended.
 ///
 /// Assembled from the cached prefix text rather than re-serialised, which is what makes the
 /// cache worth having: the prefix is up to 576 elements of 72 keys each.
 fn body(
     elements: &[String],
-    tail: Option<&SpanBucket>,
+    trailing: &[&SpanBucket],
     max_age: u32,
     name: &str,
     kind: &str,
 ) -> Response<Body> {
-    let tail_text = match tail {
-        None => None,
-        Some(bucket) => match render_one(bucket, name, kind) {
-            Ok(text) => Some(text),
+    let mut trailing_text = Vec::with_capacity(trailing.len());
+    for bucket in trailing {
+        match render_one(bucket, name, kind) {
+            Ok(text) => trailing_text.push(text),
             Err(()) => {
                 return reply::text(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "error fetching weather data",
                 )
             }
-        },
-    };
+        }
+    }
     let mut out = String::with_capacity(elements.iter().map(|e| e.len() + 1).sum::<usize>() + 64);
     out.push('[');
-    for (i, element) in elements.iter().chain(tail_text.iter()).enumerate() {
+    for (i, element) in elements.iter().chain(trailing_text.iter()).enumerate() {
         if i > 0 {
             out.push(',');
         }
@@ -236,11 +254,12 @@ fn body(
 /// one width, and the Go handler takes the difference it sees (Q-9's missing buckets are
 /// what produce that). The runner compares `max-age=<n>` as a pattern, so the exact number
 /// is not asserted -- it is reproduced because a client may cache on it.
-fn max_age_for(prefix: &Prefix, tail: Option<&SpanBucket>, level: BucketLevel) -> u32 {
-    let first_two = match (prefix.first_two, prefix.last, tail) {
+fn max_age_for(prefix: &Prefix, next: Option<&SpanBucket>, level: BucketLevel) -> u32 {
+    let first_two = match (prefix.first_two, prefix.only, next) {
         (Some(pair), _, _) => Some(pair),
-        // One prefix bucket and a tail: the pair is the prefix's bucket and the tail's.
-        (None, Some(first), Some(tail)) => Some((first, tail.bucket)),
+        // One prefix bucket and something after it: the pair is that bucket and the first
+        // of the trailing ones, which is the next element the response actually carries.
+        (None, Some(first), Some(next)) => Some((first, next.bucket)),
         _ => None,
     };
     let Some((a, b)) = first_two else {
@@ -304,8 +323,12 @@ struct Prefix {
     elements: Vec<String>,
     /// The first two buckets' instants, for `max-age`.
     first_two: Option<(DateTime<Utc>, DateTime<Utc>)>,
-    /// The first bucket's instant, when there is only one.
-    last: Option<DateTime<Utc>>,
+    /// The one bucket's instant, when there is only one.
+    ///
+    /// Named for what it is. It was `last` and set from `buckets.first()`, which read as a
+    /// bug every time the file was opened -- it is only consulted when the prefix holds a
+    /// single element, where first and last are the same bucket.
+    only: Option<DateTime<Utc>>,
 }
 
 impl Prefix {
@@ -326,7 +349,7 @@ impl Prefix {
                 [a, b, ..] => Some((a.bucket, b.bucket)),
                 _ => None,
             },
-            last: buckets.first().map(|b| b.bucket),
+            only: buckets.first().map(|b| b.bucket),
         }
     }
 }
@@ -889,14 +912,14 @@ mod tests {
         let prefix = Prefix {
             elements: vec![String::new(), String::new()],
             first_two: Some((at(0), at(300))),
-            last: Some(at(0)),
+            only: Some(at(0)),
         };
         assert_eq!(max_age_for(&prefix, None, BucketLevel::FiveMinute), 299);
 
         let hourly = Prefix {
             elements: vec![String::new(), String::new()],
             first_two: Some((at(0), at(3600))),
-            last: Some(at(0)),
+            only: Some(at(0)),
         };
         assert_eq!(max_age_for(&hourly, None, BucketLevel::Hour), 3599);
 
@@ -904,7 +927,7 @@ mod tests {
         let empty = Prefix {
             elements: Vec::new(),
             first_two: None,
-            last: None,
+            only: None,
         };
         assert_eq!(
             max_age_for(&empty, None, BucketLevel::FiveMinute),
@@ -915,7 +938,7 @@ mod tests {
         let one = Prefix {
             elements: vec![String::new()],
             first_two: None,
-            last: Some(at(0)),
+            only: Some(at(0)),
         };
         let tail = SpanBucket {
             bucket: at(60),
@@ -966,7 +989,7 @@ mod tests {
         let prefix = Prefix {
             elements: vec!["{}".into()],
             first_two: None,
-            last: Some(at(0)),
+            only: Some(at(0)),
         };
         assert!(cache.get(&key(0)).is_none(), "empty");
         cache.put(key(0), prefix.clone());

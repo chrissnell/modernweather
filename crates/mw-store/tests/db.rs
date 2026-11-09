@@ -1962,3 +1962,117 @@ async fn a_span_over_a_station_with_no_wind_direction_returns_zero_rather_than_f
     )
     .await;
 }
+
+/// **A closed bucket the refresh policy has not reached is still in the response.**
+///
+/// Every level is `materialized_only = true`, and each policy runs on a schedule -- one
+/// minute at `1m` and `5m`, five at `1h`, **thirty** at `1d`. So between a bucket closing
+/// and its policy running, that bucket is inside the prefix's range and absent from the
+/// view. The tail used to be exactly one bucket wide starting at `floor(now)`, which put
+/// that bucket in neither half: `/span/720h` dropped *yesterday* for the first half hour of
+/// every UTC day, and the Go server cannot reproduce it because its views are
+/// `materialized_only = false`.
+///
+/// This is the state constructed directly: ten minutes of readings, the aggregate refreshed
+/// over the first seven only, and a query whose window covers all ten.
+///
+/// **No gate in the tree could fail on this before.** `ci/conformance/rust-seed/03-refresh.sql`
+/// refreshes every level over `(NULL, NULL)` before the replay and every test above calls
+/// `materialise` by hand, so every one of them sees a fully materialised prefix.
+#[tokio::test]
+#[ignore = "needs a real TimescaleDB; run `cargo xtask db-tests`"]
+async fn a_closed_bucket_the_aggregate_has_not_caught_up_to_is_still_returned() {
+    let station = "db-tests:refresh-lag";
+    let pool = prepare(&[station]).await;
+    let w = writer(&pool, station);
+    let reader = TimescaleReader::new(pool.clone());
+
+    // 2026-01-19T00:00:00Z, away from every other test's window.
+    let base = 1_768_780_800i64;
+    let mut batch: Vec<Envelope> = Vec::new();
+    for minute in 0..10i64 {
+        batch.push(envelope(
+            station,
+            at(base + minute * 60),
+            (minute + 1) as u64,
+            Reading {
+                out_temp: Some(10.0 + minute as f32),
+                ..Reading::default()
+            },
+        ));
+    }
+    w.store(&batch).await.expect("the readings are stored");
+
+    // The policy has reached minute 7 and no further, which is the ordinary steady state
+    // for the few seconds after a bucket closes -- and for half an hour at the `1d` level.
+    materialise(&pool, at(base), at(base + 7 * 60)).await;
+
+    let query = mw_component::SpanQuery {
+        station: StationKey::new(station),
+        level: mw_component::BucketLevel::Minute,
+        since: at(base),
+        // Minute 10 is the still-filling bucket; minutes 0..=9 are closed.
+        tail_start: at(base + 10 * 60),
+        columns: vec![(MetricKey::OutTemp, Agg::Mean)],
+        limit: 64,
+    };
+    let span = reader.span(query.clone()).await.expect("the query runs");
+
+    assert_eq!(
+        span.prefix.len(),
+        7,
+        "the view holds minutes 0..=6, which is what the policy was told to materialise"
+    );
+    assert_eq!(
+        span.backfill.len(),
+        3,
+        "minutes 7, 8 and 9 are closed and not in the view, and used to be in neither half \
+         of the answer: {:?}",
+        span.backfill.iter().map(|b| b.bucket).collect::<Vec<_>>()
+    );
+    assert!(
+        span.tail.is_none(),
+        "no reading landed in minute 10, so the still-filling bucket is absent rather than \
+         a row of zeros"
+    );
+
+    // **The response is continuous, and the backfilled buckets carry the right values** --
+    // the same expression set the view uses, grouped on the same grid, so a backfilled
+    // bucket is the one the policy will later materialise.
+    let all: Vec<_> = span.buckets().collect();
+    assert_eq!(all.len(), 10, "ten minutes in, ten buckets out");
+    for (minute, bucket) in all.iter().enumerate() {
+        assert_eq!(
+            bucket.bucket,
+            at(base + minute as i64 * 60),
+            "bucket {minute} is on the grid and in order"
+        );
+        assert_eq!(
+            bucket.values[0],
+            Some(f64::from(10.0 + minute as f32)),
+            "bucket {minute}'s mean"
+        );
+    }
+
+    // And the cache-hit shape (**D-54**): `since == tail_start` asks for everything after a
+    // prefix the caller already holds, which is the tail alone -- the prefix the handler
+    // cached was complete by construction, because it only caches one that is.
+    let hit = reader
+        .span(mw_component::SpanQuery {
+            since: at(base + 10 * 60),
+            ..query
+        })
+        .await
+        .expect("the query runs");
+    assert!(hit.prefix.is_empty(), "the caller holds the prefix");
+    assert!(
+        hit.backfill.is_empty(),
+        "a hit asks for nothing before the tail, because a cached prefix is a complete one"
+    );
+
+    touched(
+        &pool,
+        "a_closed_bucket_the_aggregate_has_not_caught_up_to_is_still_returned",
+    )
+    .await;
+}

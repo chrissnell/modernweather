@@ -77,7 +77,23 @@ use sqlx::{PgPool, Row};
 /// the shape that turns an outage into an allocation failure.
 const MAX_ROWS: usize = 10_000;
 
-/// The raw hypertable, which [`TimescaleReader::latest`] is the only read of.
+/// How many closed-but-unmaterialised buckets `span` will aggregate from raw.
+///
+/// **A bound on the raw scan, not a tuning knob.** The buckets it covers are the ones a
+/// refresh policy has not reached yet, and the slowest policy in `migrations/` runs every
+/// **thirty minutes** (`observations_1d`; the others are one and five). Four buckets is
+/// therefore more than any level needs: two hours at the `1h` level and four days at `1d`.
+///
+/// The bound matters because the unbounded case is real and is the scan the continuous
+/// aggregates exist to prevent -- a station with no materialised rows at all over a
+/// 720-hour window would otherwise aggregate a month of raw rows per request. Past the
+/// bound a bucket stays absent until its policy runs, which is where this started; the
+/// difference is that it is now absent for seconds at the levels anyone watches rather than
+/// for half an hour at the level nobody notices.
+const MAX_BACKFILL_BUCKETS: i32 = 4;
+
+/// The raw hypertable, which [`TimescaleReader::latest`] and `span`'s trailing buckets are
+/// the only reads of.
 const OBSERVATIONS: &str = "observations";
 
 /// The four stored dimension columns of `observations`, in the order the writer declares
@@ -324,36 +340,79 @@ impl ReadingStore for TimescaleReader {
                 }
             }
 
-            // The tail, from raw. One bucket wide, bounded above by the bucket's own
-            // extent rather than left open: a station whose clock is ahead of this one
-            // would otherwise pull a reading from the *next* bucket into this one, and a
-            // frozen response is not the place to discover a clock skew.
-            let tail_end = q.tail_start
-                + chrono::Duration::from_std(q.level.span())
-                    .map_err(|e| StoreError::rejected(std::io::Error::other(e.to_string())))?;
-            let sql = tail_statement(&resolved);
-            let row = sqlx::query(&sql)
-                .bind(q.station.as_str())
-                .bind(q.tail_start)
-                .bind(tail_end)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(classify)?;
-            // Column 0 is `count(*)`: an aggregate over no rows still returns one row, and
-            // every value in it is NULL -- which is indistinguishable from a bucket whose
-            // every metric was unreported. The frozen contract needs the difference,
-            // because an empty trailing bucket must not appear in the array at all.
-            let rows_in_tail: i64 = row.try_get(0).map_err(StoreError::rejected)?;
-            let tail = if rows_in_tail == 0 {
-                None
+            // From raw: every bucket after the materialised prefix, bounded above by the
+            // trailing bucket's own extent rather than left open -- a station whose clock is
+            // ahead of this one would otherwise pull a reading from the *next* bucket into
+            // this one, and a frozen response is not the place to discover a clock skew.
+            let width = chrono::Duration::from_std(q.level.span())
+                .map_err(|e| StoreError::rejected(std::io::Error::other(e.to_string())))?;
+            let tail_end = q.tail_start + width;
+
+            // **Where the raw aggregation starts, and why it is not always `tail_start`.**
+            //
+            // Every level is `materialized_only = true` and each refresh policy runs on a
+            // schedule, so a bucket that has closed may not be in the view yet: the prefix's
+            // range covers it and the view has no row for it. Reading the tail from
+            // `tail_start` alone put that bucket in neither half, and `/span/720h` dropped
+            // yesterday for the first half hour of every UTC day.
+            //
+            // So the boundary comes from the DATA rather than the clock: the first bucket
+            // after the newest one the prefix actually holds. Bounded by
+            // `MAX_BACKFILL_BUCKETS`, because the unbounded case -- a station with no
+            // materialised rows at all over a 720-hour window -- is the raw scan the
+            // aggregates exist to avoid, and no refresh policy here is more than thirty
+            // minutes behind.
+            let from = if q.since >= q.tail_start {
+                // The caller holds a cached prefix and asked for the rest. The cache only
+                // stores a prefix that ends at `tail_start - width` (`mw_api_legacy::span`),
+                // so there is nothing between it and the tail.
+                q.tail_start
             } else {
-                Some(SpanBucket {
-                    bucket: q.tail_start,
-                    values: read_values(&row, 1, resolved.len())?,
-                })
+                let after_prefix = prefix.last().map(|b| b.bucket + width);
+                let floor = q.tail_start - width * MAX_BACKFILL_BUCKETS;
+                after_prefix
+                    .unwrap_or(q.since)
+                    .max(floor.max(q.since))
+                    .min(q.tail_start)
             };
 
-            Ok(Span { prefix, tail })
+            let sql = tail_statement(&resolved, q.level);
+            let rows = sqlx::query(&sql)
+                .bind(q.station.as_str())
+                .bind(from)
+                .bind(tail_end)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(classify)?;
+
+            // Column 0 is the bucket and column 1 is `count(*)`: an aggregate over no rows
+            // still returns one row with every value NULL -- indistinguishable from a bucket
+            // whose every metric was unreported. The frozen contract needs the difference,
+            // because an empty bucket must not appear in the array at all. With a
+            // `GROUP BY` there is no row for an empty bucket, so the count is belt and
+            // braces rather than the only guard it was.
+            let mut backfill = Vec::new();
+            let mut tail = None;
+            for row in rows {
+                let bucket: chrono::DateTime<chrono::Utc> =
+                    row.try_get(0).map_err(StoreError::rejected)?;
+                let count: i64 = row.try_get(1).map_err(StoreError::rejected)?;
+                if count == 0 {
+                    continue;
+                }
+                let values = read_values(&row, 2, resolved.len())?;
+                if bucket >= q.tail_start {
+                    tail = Some(SpanBucket { bucket, values });
+                } else {
+                    backfill.push(SpanBucket { bucket, values });
+                }
+            }
+
+            Ok(Span {
+                prefix,
+                backfill,
+                tail,
+            })
         })
     }
 
@@ -554,17 +613,39 @@ fn prefix_statement(level: BucketLevel, columns: &[SpanExpr]) -> String {
 /// different expression here would make the last element of a `/span` response discontinuous
 /// with the ones before it. `ci/db/measure/35-trailing-bucket.sql` measured this statement's
 /// cost at 0.44-6.89 ms, which is what **D-54** cites.
-fn tail_statement(columns: &[SpanExpr]) -> String {
-    let mut sql = String::with_capacity(96 + columns.len() * 96);
-    sql.push_str("SELECT count(*)");
+fn tail_statement(columns: &[SpanExpr], level: BucketLevel) -> String {
+    let mut sql = String::with_capacity(128 + columns.len() * 96);
+    // `time_bucket` with the level's own width, so the raw rows are grouped onto exactly the
+    // grid the view uses -- which is what makes a backfilled bucket identical to the one the
+    // policy will later materialise. The width is a literal from `BucketLevel` and not from
+    // the request.
+    let _ = write!(
+        sql,
+        "SELECT time_bucket(INTERVAL '{}', time) AS bucket, count(*)",
+        bucket_interval(level)
+    );
     for c in columns {
         let _ = write!(sql, ", {}", c.tail);
     }
     let _ = write!(
         sql,
-        " FROM {OBSERVATIONS} WHERE station_id = $1 AND time >= $2 AND time < $3"
+        " FROM {OBSERVATIONS} WHERE station_id = $1 AND time >= $2 AND time < $3 \
+         GROUP BY bucket ORDER BY bucket"
     );
     sql
+}
+
+/// The level's bucket width as a PostgreSQL interval literal.
+///
+/// A `match` rather than a formatted `Duration`, so the string is a constant the statement
+/// builder cannot get wrong and `clippy` can see is exhaustive.
+const fn bucket_interval(level: BucketLevel) -> &'static str {
+    match level {
+        BucketLevel::Minute => "1 minute",
+        BucketLevel::FiveMinute => "5 minutes",
+        BucketLevel::Hour => "1 hour",
+        BucketLevel::Day => "1 day",
+    }
 }
 
 /// The 1-minute level's declared columns, in the order a [`Bucket`]'s values are in.
@@ -996,19 +1077,31 @@ mod tests {
             "SELECT bucket, mw_mean(outtemp_sum, outtemp_count) FROM observations_5m \
              WHERE station_id = $1 AND bucket >= $2 AND bucket < $3 ORDER BY bucket LIMIT $4"
         );
-        let tail = tail_statement(&columns);
-        assert!(
-            tail.starts_with("SELECT count(*), mw_mean(sum(outtemp"),
-            "{tail}"
+        let tail = tail_statement(&columns, BucketLevel::FiveMinute);
+        // **Grouped on the level's own grid**, which is what makes a bucket aggregated from
+        // raw identical to the one the refresh policy will later materialise -- and what
+        // lets one statement serve both the still-filling bucket and the closed ones the
+        // policy has not reached. The interval is a literal from `BucketLevel`, never from
+        // the request.
+        assert_eq!(
+            tail,
+            "SELECT time_bucket(INTERVAL '5 minutes', time) AS bucket, count(*), \
+             mw_mean(sum(outtemp::double precision), nullif(count(outtemp), 0)) FROM \
+             observations \
+             WHERE station_id = $1 AND time >= $2 AND time < $3 GROUP BY bucket ORDER BY bucket"
         );
-        assert!(
-            tail.ends_with("FROM observations WHERE station_id = $1 AND time >= $2 AND time < $3"),
-            "{tail}"
-        );
-        assert!(
-            !tail.contains("GROUP BY"),
-            "the WHERE is the bucket, so there is nothing to group: {tail}"
-        );
+        // One literal per level, and no level reaches the raw table with any other width.
+        for (level, interval) in [
+            (BucketLevel::Minute, "1 minute"),
+            (BucketLevel::FiveMinute, "5 minutes"),
+            (BucketLevel::Hour, "1 hour"),
+            (BucketLevel::Day, "1 day"),
+        ] {
+            assert!(
+                tail_statement(&[], level).contains(&format!("INTERVAL '{interval}'")),
+                "{level:?}"
+            );
+        }
     }
 
     /// `Agg::Sum` is the registry's `total` and there is no sixth strategy (**D-50**).

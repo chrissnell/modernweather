@@ -577,6 +577,7 @@ mod driven {
         ) -> BoxFuture<'a, Result<mw_component::Span, StoreError>> {
             Box::pin(async {
                 Ok(mw_component::Span {
+                    backfill: Vec::new(),
                     prefix: Vec::new(),
                     tail: None,
                 })

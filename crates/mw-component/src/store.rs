@@ -546,20 +546,40 @@ pub struct SpanBucket {
     pub values: Vec<Option<f64>>,
 }
 
-/// What one [`ReadingStore::span`] answered: the materialised prefix and the trailing
-/// partial bucket.
+/// What one [`ReadingStore::span`] answered: the materialised prefix, the closed buckets
+/// the aggregate has not caught up to yet, and the trailing partial bucket.
 ///
-/// Two fields rather than one concatenated list, because the caller caches exactly one of
-/// them (**D-54**). Concatenating here would make the cacheable half unrecoverable without
-/// the caller re-deriving the boundary it supplied.
-#[derive(Debug, Clone, PartialEq)]
+/// **Three fields rather than one concatenated list**, because the caller caches exactly one
+/// of them (**D-54**). Concatenating here would make the cacheable half unrecoverable
+/// without the caller re-deriving the boundary it supplied.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Span {
     /// The closed, materialised buckets in `[since, tail_start)`, oldest first.
     ///
     /// A **gap is a missing bucket**, not a zero row: the continuous aggregate produces no
     /// row for a bucket no reading fell in and this does not gap-fill, which is the frozen
     /// contract's Q-9 and the reason a client may not assume a constant interval.
+    ///
+    /// **Cacheable, and complete** — the only half that is either. It ends at
+    /// `tail_start - width` whenever the station has data there, which is what lets a cache
+    /// hit ask for everything after it.
     pub prefix: Vec<SpanBucket>,
+    /// Closed buckets the continuous aggregate has not materialised yet, aggregated from
+    /// raw, oldest first.
+    ///
+    /// **Not cacheable**, and usually empty. Every level is `materialized_only = true`
+    /// (W4's own note on why: TimescaleDB cannot build an aggregate on a real-time view, so
+    /// the levels cannot be stacked otherwise), and each refresh policy runs on a schedule
+    /// — one minute at the two lower levels, five minutes at `1h`, **thirty** at `1d`. So
+    /// between a bucket closing and its policy running, that bucket is in the view's range
+    /// and not in the view. Without this field it was in neither half of the answer and
+    /// simply absent from the response: `/span/720h` dropped *yesterday* for the first half
+    /// hour of every UTC day, and the Go server cannot reproduce that because its views are
+    /// `materialized_only = false`.
+    ///
+    /// Bounded, because an unbounded raw fill is the scan the aggregates exist to avoid —
+    /// see `mw_store`'s `MAX_BACKFILL_BUCKETS`.
+    pub backfill: Vec<SpanBucket>,
     /// The still-filling bucket at `tail_start`, aggregated from raw.
     ///
     /// `None` when no raw reading has landed in it, which is the ordinary case for a
@@ -569,10 +589,20 @@ pub struct Span {
 }
 
 impl Span {
-    /// The prefix and the tail as one sequence, oldest first — what a response body is
-    /// rendered from.
+    /// Every bucket as one sequence, oldest first — what a response body is rendered from.
     pub fn buckets(&self) -> impl Iterator<Item = &SpanBucket> {
-        self.prefix.iter().chain(self.tail.iter())
+        self.prefix
+            .iter()
+            .chain(self.backfill.iter())
+            .chain(self.tail.iter())
+    }
+
+    /// The buckets after the cacheable prefix, oldest first.
+    ///
+    /// What a cache **hit** needs: the prefix came from the cache, and this is everything
+    /// the store was asked for on top of it.
+    pub fn after_prefix(&self) -> impl Iterator<Item = &SpanBucket> {
+        self.backfill.iter().chain(self.tail.iter())
     }
 }
 
