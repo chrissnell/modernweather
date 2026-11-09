@@ -202,12 +202,20 @@ pub fn manifest() -> RouteManifest {
     )
 }
 
-/// The frozen path patterns, for the plan-level check that none of them is claimed by a
-/// component whose hard needs reach outside `{LatestSnapshot}` (**D-48**).
+/// The frozen path patterns.
 ///
 /// The **five** of **D-68**, not all seven: `/almanac` and `/api/stations` are coupled
 /// rather than frozen, so a `503` on either is a website that renders an empty panel and
 /// not a shipped client that stops working.
+///
+/// **There is no plan-level check over these yet**, and this comment used to say there was
+/// -- "for the plan-level check that none of them is claimed by a component whose hard needs
+/// reach outside `{LatestSnapshot}`". Nothing does that: the constant is used by
+/// [`manifest`] and its test, and it is not re-exported from `lib.rs`, so no other crate
+/// could. The check belongs to `implementation-plan.md` M4-3, which is the item that mounts
+/// a second component on these paths; until then the assertion that matters is this
+/// component's own hard-need set, which `the_hard_needs_are_exactly_the_latest_snapshot`
+/// pins. Describing enforcement that does not exist is the shape of G-1.
 pub const FROZEN_PATTERNS: [&str; 5] = [
     "/latest",
     "/span/{span}",

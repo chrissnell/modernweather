@@ -9,7 +9,7 @@
 //! | Shape | `Content-Type` | Body | Where |
 //! |---|---|---|---|
 //! | plain text | `text/plain; charset=utf-8` | the message, newline-terminated | every endpoint's `400`/`403`/`404`/`500` |
-//! | JSON labelled as text | `text/plain; charset=utf-8` | `{"error":…}` + `\n` | `/forecast`'s bad `period` and unknown station **name** (Q-10) |
+//! | JSON labelled as text | `text/plain; charset=utf-8` | `{"error":…}` + `\n` | six `/forecast` bodies (Q-10) — the bad `period`, a period that is not a number, a bad `station_id`, an unknown station **name**, a document that will not parse, and a period out of range (`handlers.go:662/668/687/714/740/747`) |
 //! | empty | **absent** | zero bytes | three `/forecast` paths (Q-11) |
 //! | JSON | `application/json` | `{"error":…,"message":…}` + `\n` | the `503` when no website resolves on `/span`, `/stationinfo`, `/api/stations`, `/almanac` |
 //!

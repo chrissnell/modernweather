@@ -344,8 +344,14 @@ needles = [
   "unwrap_or(0.",
   "unwrap_or(0f32",
   "unwrap_or(0_f32",
+  "unwrap_or(0f64",
+  "unwrap_or(0_f64",
+  "unwrap_or_else(|| 0.",
   "map_or(0.",
   "map_or(0f32",
+  "map_or(0_f32",
+  "map_or(0f64",
+  "map_or(0_f64",
 ]
 only = ["mw-api-legacy"]
 reason = """
@@ -358,10 +364,21 @@ would be a zero in the database that nothing can distinguish from a reading.
 
 The needles are prefixes on purpose: `unwrap_or(0.` is `unwrap_or(0.0)`, `unwrap_or(0.)` and
 `unwrap_or(0.0f32)` in one line, and the gate reports one violation per offending line however
-many of them match. `unwrap_or_default()` is the same mistake with no literal to match at all,
-so it is handled where it would do damage -- `forbidden_source` on `mw-store` and
-`mw-pipeline` -- rather than banned workspace-wide, where it is often the right call on an
-`Option<String>`."""
+many of them match.
+
+The `f64` and `map_or` spellings were added by M4-2's code review, which pointed out that the
+`f32` forms were listed for both combinators and the `f64` forms for neither -- an asymmetry
+with no reason behind it, and `zf64` exists precisely because this surface has `f64` fields.
+`unwrap_or_else(|| 0.` is the closure spelling, which no literal prefix would have caught.
+Nothing in the tree violated any of them; this is the gate catching the next one rather than
+the last one.
+
+`unwrap_or_default()` is the same mistake with no literal to match at all, so it is handled
+where it would do damage -- `forbidden_source` on `mw-store` and `mw-pipeline` -- rather than
+banned workspace-wide, where it is often the right call on an `Option<String>`. That leaves
+`mw-output` and `mw-aprs` free to zero-fill an `Option<f32>` on its way to CWOP, which is the
+same confusion one layer sideways; it is not this item's surface, and it is recorded here so
+the next reader does not have to rediscover the hole."""
 
 [[source_rule]]
 id = "no-stdout-logging"

@@ -109,10 +109,21 @@ pub fn handle(h: &Handlers, host: &str, params: &Params, headers: &HeaderMap) ->
             // `304` carries the validators and no body, and keeps the frozen
             // `Cache-Control` so that a conditional request answers the same way an
             // unconditional one does.
+            //
+            // **And CORS, for the same reason.** `reply::json` puts
+            // `Access-Control-Allow-Origin: *` on the `200`; a `304` without it is a
+            // response a browser `fetch` would reject after revalidating, which is a
+            // different answer to the same question. Unreachable while `no-store` holds --
+            // a client honouring it never sends `If-None-Match` -- and one header away from
+            // correct, so it is set rather than reasoned about.
             return builder
                 .header(
                     axum::http::header::CACHE_CONTROL,
                     axum::http::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+                )
+                .header(
+                    axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                    axum::http::HeaderValue::from_static("*"),
                 )
                 .header(
                     axum::http::header::VARY,

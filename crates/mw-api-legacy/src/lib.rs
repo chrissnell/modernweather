@@ -46,7 +46,8 @@
 //!
 //! **D-48 is why that matters and why it cannot be violated here.** `api:legacy`'s only
 //! hard need is `LatestSnapshot`, whose provider has no hard need of its own, so the
-//! component is built in the first reconcile pass and the table is never unmounted on a
+//! component is built in the SECOND reconcile pass -- `snapshot:latest` publishes in its own
+//! build, which is the first -- and the table is never unmounted on a
 //! healthy process -- with the database down, every frozen route still answers its contract
 //! response. The three read stores are `Soft` and resolved through
 //! [`mw_component::Deferred`], which is what makes "degrade per request" real rather than a

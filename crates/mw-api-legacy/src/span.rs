@@ -55,7 +55,7 @@
 //! `extrafloat1` here, which is what a station that is not a snow gauge already got.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -189,7 +189,7 @@ pub async fn handle(h: &Handlers, host: &str, span: &str, params: &Params) -> Re
     let prefix = match cached {
         Some(entry) => entry,
         None => {
-            let entry = Prefix::render(&answer.prefix, &station.name, &station.kind);
+            let entry = Arc::new(Prefix::render(&answer.prefix, &station.name, &station.kind));
             // **Only a COMPLETE prefix is cached**, and that is D-54's own guarantee rather
             // than a precaution. The key does not move until the bucket does, so caching a
             // prefix the aggregate had not caught up to pinned the gap for the whole TTL:
@@ -204,7 +204,7 @@ pub async fn handle(h: &Handlers, host: &str, span: &str, params: &Params) -> Re
             // afford: a station that has stopped reporting is the only steady-state case,
             // and the response is correct either way.
             if answer.backfill.is_empty() {
-                h.span_cache.put(key, entry.clone());
+                h.span_cache.put(key, Arc::clone(&entry));
             }
             entry
         }
@@ -213,7 +213,7 @@ pub async fn handle(h: &Handlers, host: &str, span: &str, params: &Params) -> Re
     // Everything after the cacheable prefix, oldest first: the closed buckets the aggregate
     // has not reached, then the still-filling one.
     let trailing: Vec<&SpanBucket> = answer.after_prefix().collect();
-    let max_age = max_age_for(&prefix, trailing.first().copied(), level);
+    let max_age = max_age_for(&prefix, trailing.first().copied());
     body(
         &prefix.elements,
         &trailing,
@@ -269,7 +269,7 @@ fn body(
 /// one width, and the Go handler takes the difference it sees (Q-9's missing buckets are
 /// what produce that). The runner compares `max-age=<n>` as a pattern, so the exact number
 /// is not asserted -- it is reproduced because a client may cache on it.
-fn max_age_for(prefix: &Prefix, next: Option<&SpanBucket>, level: BucketLevel) -> u32 {
+fn max_age_for(prefix: &Prefix, next: Option<&SpanBucket>) -> u32 {
     let first_two = match (prefix.first_two, prefix.only, next) {
         (Some(pair), _, _) => Some(pair),
         // One prefix bucket and something after it: the pair is that bucket and the first
@@ -284,11 +284,10 @@ fn max_age_for(prefix: &Prefix, next: Option<&SpanBucket>, level: BucketLevel) -
     match u32::try_from(seconds) {
         Ok(n) if n > 0 => n,
         // A non-positive or absurd interval -- two buckets at the same instant, which the
-        // view's own primary key makes impossible -- falls back rather than wrapping.
-        _ => {
-            let _ = level;
-            DEFAULT_MAX_AGE
-        }
+        // view's own primary key makes impossible -- falls back rather than wrapping. The
+        // fallback is Go's own default of 60 and not the level's bucket width, which is why
+        // this function never needed the level it used to take.
+        _ => DEFAULT_MAX_AGE,
     }
 }
 
@@ -660,7 +659,11 @@ struct CacheKey {
 /// a query.
 #[derive(Debug, Default)]
 pub struct SpanCache {
-    entries: Mutex<HashMap<CacheKey, (Instant, Prefix)>>,
+    /// `Arc<Prefix>`, so a hit is a pointer copy rather than a deep clone **inside the
+    /// critical section**. A 5-minute prefix is up to 288 rendered elements of 72 keys
+    /// each; cloning that under the lock serialised concurrent `/span` requests behind an
+    /// allocation the cache exists to avoid.
+    entries: Mutex<HashMap<CacheKey, (Instant, Arc<Prefix>)>>,
 }
 
 impl SpanCache {
@@ -670,14 +673,14 @@ impl SpanCache {
     }
 
     /// The cached prefix for an exact range, if it is inside the TTL.
-    fn get(&self, key: &CacheKey) -> Option<Prefix> {
+    fn get(&self, key: &CacheKey) -> Option<Arc<Prefix>> {
         let entries = self.entries.lock().ok()?;
         let (at, prefix) = entries.get(key)?;
-        (at.elapsed() < CACHE_TTL).then(|| prefix.clone())
+        (at.elapsed() < CACHE_TTL).then(|| Arc::clone(prefix))
     }
 
     /// Cache a prefix, dropping expired entries when the map is at its bound.
-    fn put(&self, key: CacheKey, prefix: Prefix) {
+    fn put(&self, key: CacheKey, prefix: Arc<Prefix>) {
         let Ok(mut entries) = self.entries.lock() else {
             // A poisoned mutex means a previous holder panicked inside the critical
             // section, which is a hash insert. Serving without the cache is the right
@@ -765,6 +768,16 @@ pub fn parse_go_duration(text: &str) -> Option<Duration> {
     if !nanos.is_finite() || nanos < 0.0 {
         return None;
     }
+    // **Go's `Duration` is an `i64` of nanoseconds, and `ParseDuration` REFUSES a value
+    // that will not fit**: `2562047h` parses and `2562048h` is
+    // `time: invalid duration "2562048h"`. Saturating at `u64::MAX` instead made
+    // `/span/3000000h` answer `time span exceeds maximum allowed duration of 1 year` where
+    // the Go server answers `error: invalid span duration` -- the same status and a
+    // different body, on a frozen endpoint, because the overflow was silently turned into
+    // an enormous-but-valid span.
+    if nanos > i64::MAX as f64 {
+        return None;
+    }
     Some(Duration::from_nanos(nanos as u64))
 }
 
@@ -816,6 +829,23 @@ mod tests {
         assert_eq!(aqi(Some(0.6), Some(12.0), compute), 1.0);
         // No stored value and no particulate is the zero-fill, as before.
         assert_eq!(aqi(None, None, compute), 0.0);
+    }
+
+    /// Go's own overflow bound: a `Duration` is an `i64` of nanoseconds, so `2562047h`
+    /// parses and one hour more is `time: invalid duration`.
+    ///
+    /// Verified against `time.ParseDuration` at Go 1.21. It matters because the two
+    /// outcomes have different bodies: a refusal is `error: invalid span duration` and a
+    /// saturated enormous span is `time span exceeds maximum allowed duration of 1 year`.
+    #[test]
+    fn a_duration_too_large_for_gos_int64_is_refused_rather_than_saturated() {
+        assert_eq!(
+            parse_go_duration("2562047h"),
+            Some(Duration::from_secs(2_562_047 * 3_600))
+        );
+        assert_eq!(parse_go_duration("2562048h"), None);
+        assert_eq!(parse_go_duration("3000000h"), None);
+        assert_eq!(parse_go_duration("9999999999h"), None);
     }
 
     /// Go's grammar, including the three cases the fixtures assert.
@@ -967,14 +997,14 @@ mod tests {
             first_two: Some((at(0), at(300))),
             only: Some(at(0)),
         };
-        assert_eq!(max_age_for(&prefix, None, BucketLevel::FiveMinute), 299);
+        assert_eq!(max_age_for(&prefix, None), 299);
 
         let hourly = Prefix {
             elements: vec![String::new(), String::new()],
             first_two: Some((at(0), at(3600))),
             only: Some(at(0)),
         };
-        assert_eq!(max_age_for(&hourly, None, BucketLevel::Hour), 3599);
+        assert_eq!(max_age_for(&hourly, None), 3599);
 
         // Fewer than two buckets: the default, which is what `span-empty` recorded.
         let empty = Prefix {
@@ -982,10 +1012,7 @@ mod tests {
             first_two: None,
             only: None,
         };
-        assert_eq!(
-            max_age_for(&empty, None, BucketLevel::FiveMinute),
-            DEFAULT_MAX_AGE
-        );
+        assert_eq!(max_age_for(&empty, None), DEFAULT_MAX_AGE);
 
         // One prefix bucket and a tail: the pair is those two.
         let one = Prefix {
@@ -997,7 +1024,7 @@ mod tests {
             bucket: at(60),
             values: Vec::new(),
         };
-        assert_eq!(max_age_for(&one, Some(&tail), BucketLevel::Minute), 59);
+        assert_eq!(max_age_for(&one, Some(&tail)), 59);
     }
 
     /// The bucket grid is a fixed interval from the epoch, including at the day level.
@@ -1045,14 +1072,14 @@ mod tests {
             only: Some(at(0)),
         };
         assert!(cache.get(&key(0)).is_none(), "empty");
-        cache.put(key(0), prefix.clone());
+        cache.put(key(0), Arc::new(prefix.clone()));
         assert!(cache.get(&key(0)).is_some(), "the same range hits");
         assert!(cache.get(&key(300)).is_none(), "a different range misses");
 
         // The bound holds: more distinct ranges than `CACHE_ENTRIES` does not grow without
         // limit.
         for i in 0..(CACHE_ENTRIES as i64 * 3) {
-            cache.put(key(i * 300), prefix.clone());
+            cache.put(key(i * 300), Arc::new(prefix.clone()));
         }
         let len = cache.entries.lock().expect("not poisoned").len();
         assert!(len <= CACHE_ENTRIES, "{len} entries");

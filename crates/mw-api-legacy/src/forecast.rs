@@ -255,6 +255,13 @@ fn element(stored: &str, index: i64) -> Result<String, PeriodError> {
 ///
 /// The fraction is Go's `.999999999`: trailing zeros removed, and the whole fraction gone
 /// when it is zero.
+///
+/// **`+0000 UTC` is hard-coded, and that is a deployment-shaped limit rather than a code
+/// one.** Go renders `record.UpdatedAt.String()` in the zone the driver's session is in, and
+/// `pkg/config/provider.go` puts `TimeZone=` in the DSN -- so a deployment configured
+/// `TimeZone=America/Denver` emits `2026-10-28 09:45:12.482913 -0600 MDT`. W1's rig sets
+/// none, so the fixture recorded UTC and this reproduces the fixture. Recorded so the next
+/// reader does not take the literal for an oversight.
 fn go_time_string(t: chrono::DateTime<chrono::Utc>) -> String {
     use chrono::Timelike;
     let date = t.format("%Y-%m-%d %H:%M:%S");

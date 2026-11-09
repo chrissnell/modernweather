@@ -31,6 +31,13 @@
 -- `ADD COLUMN` of a nullable column is **D-9** and costs 11.6 ms; recreating a table whose
 -- primary key is already the right one would not be cheaper.
 
+-- **A note for the item that writes this table (M6-3).** `updated_at` has a DEFAULT and no
+-- trigger, so an `ON CONFLICT ... DO UPDATE SET data = ...` that forgets to set it leaves the
+-- contract-visible `lastUpdated` at the row's first-insert time -- a forecast that refreshes
+-- hourly and reports yesterday. gorm managed this field automatically on the Go side, so the
+-- writer will not expect to have to. DEV-13 also makes `updated_at` the tiebreak for an
+-- unqualified `/forecast`, so a stale value changes WHICH row is served as well as what it
+-- claims.
 CREATE TABLE forecasts (
     -- The station the forecast was fetched for. `text` referencing the read-side
     -- projection, exactly as `almanac_cache` and `snow_totals_cache` do -- the frozen
@@ -59,6 +66,13 @@ COMMENT ON TABLE forecasts IS
     'components (implementation-plan.md M6-3). data::text is served byte for byte.';
 
 -- `/forecast/{span}` with no station names only the span, and the frozen handler answers
--- with any station's row for it. Without this index that is a scan of the table; with it,
--- the same index also serves the station-and-span lookup's second column.
+-- with the most recently updated row for it (DEV-13). Without this index that is a scan of
+-- the table; with it, the same index also serves the station-and-span lookup's second
+-- column.
+--
+-- It does **not** satisfy the `ORDER BY updated_at DESC` that DEV-13 adds, so that query
+-- still sorts. At this table's size -- one row per station per span, so single digits --
+-- the sort is free, and an index on `(span_hours, updated_at DESC)` would be a second index
+-- to maintain for a plan nobody can measure. Stated because the comment used to claim the
+-- index served the read and it only serves half of it.
 CREATE INDEX forecasts_span_hours ON forecasts (span_hours, station_id);

@@ -92,7 +92,14 @@ pub async fn handle(h: &Handlers, host: &str, params: &Params) -> Response<Body>
         // path -- so the contract's all-zero `200` is what a gauge with nothing cached
         // already produces, and that is what an unavailable cache produces too. The
         // `X-MW-Degraded` header is where the difference is visible.
-        return render(h, gauge, None, None, &[mw_component::Capability::SnowCache]);
+        return render(
+            h,
+            gauge,
+            None,
+            None,
+            None,
+            &[mw_component::Capability::SnowCache],
+        );
     };
 
     // Two reads, because Q-8 says the depth and the totals can come from two stations. One
@@ -114,7 +121,7 @@ pub async fn handle(h: &Handlers, host: &str, params: &Params) -> Response<Body>
         // The same station, so the row already read carries the depth.
         _ => totals,
     };
-    render(h, gauge, totals, depth, &[])
+    render(h, gauge, totals, depth, depth_station.map(|s| &s.key), &[])
 }
 
 /// The gauge's key, when the website's binding resolves to a configured station.
@@ -128,6 +135,8 @@ fn render(
     gauge: Option<&StationView>,
     totals: Option<SnowTotals>,
     depth: Option<SnowTotals>,
+    // Whose `snowdepth` this response carries, which Q-8 lets differ from the gauge.
+    depth_station: Option<&mw_types::StationKey>,
     missing: &[mw_component::Capability],
 ) -> Response<Body> {
     let totals = totals.unwrap_or_default();
@@ -161,8 +170,16 @@ fn render(
     let Some(station) = gauge else {
         return response;
     };
+    // **The depth may come from a different station (Q-8), so it is in the tag.** A
+    // validator has to be unique per representation (RFC 9110 §8.8.3), and
+    // `/snow?station=X` and `/snow` can differ in `snowdepth` while sharing the gauge's
+    // `computed_at`. Harmless in practice -- a cache keys on the full URL and
+    // `Cache-Control: no-store` is set -- and wrong as a tag, which is enough.
+    let depth_key = depth_station
+        .map(mw_types::StationKey::as_str)
+        .unwrap_or("");
     let etag = ETag::new(
-        &station.key,
+        &mw_types::StationKey::new(format!("{}|{depth_key}", station.key.as_str()).as_str()),
         totals.computed_at,
         PayloadRev::of(
             h.renderer.revision_for_etag(),
@@ -177,17 +194,22 @@ fn render(
             since: chrono::Utc::now(),
         }
     };
-    let (mut parts, body) = response.into_parts();
-    if let Ok(additive) = reply::additive(
-        Response::builder(),
-        &etag,
+    // **The age is only meaningful when a row was read.** With the cache absent, `totals`
+    // is `SnowTotals::default()` and `computed_at` is the Unix epoch, so this went out as
+    // `X-MW-Snapshot-Age: 1794873000` -- a header whose value is nonsense being worse than
+    // no header, and `X-MW-Degraded` already carries the fact. Zero suppresses it in
+    // `reply::additive`'s own formatting; the degraded flag does not depend on it.
+    let age_seconds = if missing.is_empty() {
         chrono::Utc::now()
             .signed_duration_since(totals.computed_at)
             .num_milliseconds() as f64
-            / 1000.0,
-        &staleness,
-    )
-    .body(())
+            / 1000.0
+    } else {
+        0.0
+    };
+    let (mut parts, body) = response.into_parts();
+    if let Ok(additive) =
+        reply::additive(Response::builder(), &etag, age_seconds, &staleness).body(())
     {
         for (name, value) in additive.headers() {
             parts.headers.insert(name, value.clone());
