@@ -118,14 +118,116 @@ const MANGLE_PORT: u16 = 18081;
 /// accounts for.
 const MIN_MANGLED_BROKEN: usize = 20;
 
-/// The deviation this target is known to differ by on purpose.
+/// The same floor, over the `frozen` class alone.
+///
+/// **Measured at 20** on the same run: every one of the 23 broken responses bar three
+/// `/almanac` and `/api/stations` bodies is a frozen one. Fifteen leaves five of slack, the
+/// same proportion the total floor carries.
+///
+/// This exists because the total floor stops binding on its own. Six coupled fixtures pass
+/// directly today, so a total of 20 cannot be reached without the frozen ones -- but
+/// `implementation-plan.md` **M4-3** makes all 19 coupled pass, and 19 + 1 would then clear
+/// it while the control said nothing about the five endpoints `D-68` freezes. A floor that
+/// only holds until the next work item is not a floor.
+const MIN_FROZEN_MANGLED_BROKEN: usize = 15;
+
+/// The deviation this target is known to differ by on purpose, and **which fixtures may
+/// declare it**.
 ///
 /// `docs/reconciliation.md` **O-5**, answered by the owner as option (b): `/stationinfo`
 /// emits `about_text` and `weather_device` unconditionally, because the iOS client declares
 /// both properties non-optional and an absent key fails the decode of the whole object. The
 /// two affected fixtures carry a `deviation` block holding the Rust target's response beside
 /// the Go server's, so `ci/conformance/go-target.sh` keeps asserting what shipped.
-const DEVIATIONS: [&str; 1] = ["DEV-10"];
+///
+/// The fixture list is the point, and it is the same reasoning as [`PENDING`]'s. A
+/// deviation is "compare against bytes the author wrote instead of the bytes the Go server
+/// produced", so an id enabled target-wide is an unbounded excuse: a `deviation` block
+/// added to `latest-full-complement` would be applied, would print `ok`, and would turn the
+/// 133-key DTO into whatever its author typed. Naming the fixtures here makes widening it a
+/// reviewable line in the gate, and [`judge_direct`] asserts the set the runner actually
+/// applied it to equals this one.
+const DEVIATIONS: [(&str, &[&str]); 1] = [(
+    "DEV-10",
+    &[
+        "stationinfo-about-text-omitted",
+        "stationinfo-no-weather-device",
+    ],
+)];
+
+/// Every `frozen`-class fixture, by name.
+///
+/// **The class is per-fixture JSON, so on its own it is a filter anybody could widen by
+/// editing one file** -- the same objection [`PENDING`]'s own documentation raises about the
+/// `pending` field, and it applies with more force here, because moving a fixture out of
+/// `frozen` is what stops it gating at all. The `cargo test` pin on the class *totals* does
+/// not close it: a compensating move keeps 42/19/9 exact.
+///
+/// So the gate carries the roster and [`judge_direct`] asserts every reported fixture's
+/// class against it. A reclassification is then a line in this file, next to the policy it
+/// changes, rather than a one-word edit in a fixture.
+const FROZEN: [&str; 42] = [
+    "forecast-24-hourly-periods",
+    "forecast-240-ten-daily-periods",
+    "forecast-by-station-name",
+    "forecast-empty-data",
+    "forecast-period-not-a-number",
+    "forecast-period-out-of-range",
+    "forecast-single-period",
+    "forecast-span-not-found",
+    "forecast-span-too-many-digits",
+    "forecast-station-name-not-found",
+    "forecast-station-not-found",
+    "latest-air-quality-device",
+    "latest-by-station-id",
+    "latest-default-station",
+    "latest-full-complement",
+    "latest-invalid-station-id",
+    "latest-minimal-complement",
+    "latest-no-recent-data",
+    "latest-snow-device-offline",
+    "latest-snow-device",
+    "latest-station-id-not-found",
+    "latest-station-not-found",
+    "snow-by-station-id",
+    "snow-device-never-reported",
+    "snow-device-stale",
+    "snow-disabled-for-website",
+    "snow-reporting",
+    "snow-station-param-overrides-depth-only",
+    "span-1h-one-minute-buckets",
+    "span-24h-five-minute-buckets",
+    "span-720h-daily",
+    "span-72h-hourly-with-gap",
+    "span-day-unit-rejected",
+    "span-empty",
+    "span-exceeds-one-year",
+    "span-invalid-duration",
+    "span-missing-station",
+    "span-snow-device-with-station-id",
+    "span-station-not-found",
+    "stationinfo-about-text-omitted",
+    "stationinfo-full",
+    "stationinfo-no-weather-device",
+];
+
+/// Every `retired`-class fixture, by name. [`FROZEN`]'s reasoning, in the direction that
+/// matters more: `retired` never gates, so a fixture moved into it stops being checked.
+///
+/// `/alerts`, `/api/remote-stations` and `format=msgpack` -- the three subjects
+/// `docs/reconciliation.md` §6.3 does not carry forward, which **D-69** disposes of by
+/// deleting them rather than by porting them.
+const RETIRED: [&str; 9] = [
+    "alerts-active",
+    "alerts-empty",
+    "alerts-invalid-station-id",
+    "alerts-missing-station-id",
+    "api-remote-stations-forbidden",
+    "api-remote-stations-populated",
+    "forecast-msgpack",
+    "latest-msgpack",
+    "snow-msgpack",
+];
 
 /// The fixtures whose subject no landed work item implements, and who owns each.
 ///
@@ -240,9 +342,11 @@ pub fn main(args: &[String]) -> Result<ExitCode, String> {
     let runner = build_runner(&opts)?;
 
     // The accepted replay. `CONFORMANCE_FORCE_MANGLE=1` sends it through the proxy instead,
-    // which is how `ci/conformance/README.md` says to watch this gate go red on demand. It
-    // changes nothing today — the replay is already red — and it is here so that the knob
-    // keeps working when M4-2 turns the direct replay green.
+    // which is how `ci/conformance/README.md` says to watch this gate go red on demand. Now
+    // that M4-2 has turned the direct replay green, it does change the verdict — and the
+    // verdict it produces is deliberately **exit 2** rather than exit 1 below: the binary is
+    // fine and the transport was corrupted on purpose, which is "this run proved nothing
+    // about the contract" and not "the rewrite does not match".
     let forced = std::env::var_os("CONFORMANCE_FORCE_MANGLE").is_some_and(|v| v == "1");
     let mut direct_url = format!("http://127.0.0.1:{REST_PORT}");
     if forced {
@@ -257,6 +361,19 @@ pub fn main(args: &[String]) -> Result<ExitCode, String> {
 
     match judge_direct(&direct, EXPECTED_FIXTURES) {
         Direct::Inconclusive(why) => Ok(report(2, &why)),
+        // A deliberately corrupted transport is not a contract verdict. Both halves of
+        // CONFORMANCE_FORCE_MANGLE are exit 2 for the same reason: the knob exists to show
+        // the instrument can move, and either outcome says something about the instrument
+        // rather than about the binary.
+        Direct::NotConforming(why) if forced => Ok(report(
+            2,
+            &format!(
+                "CONFORMANCE_FORCE_MANGLE=1 sent the accepted replay through \
+                 mangle_proxy.py, so this is the proxy biting and not a contract break. \
+                 The suite can be made to fail, which is what the knob is for (W1 Decision \
+                 10); the run proved nothing about the binary.\n  {why}"
+            ),
+        )),
         Direct::NotConforming(why) => {
             // A verdict, so `--keep-running` applies: a red replay is exactly when somebody
             // wants the daemon left up to curl it, and until M4-2 every replay is red. A
@@ -290,7 +407,13 @@ pub fn main(args: &[String]) -> Result<ExitCode, String> {
                 "mangled",
             )?;
             println!("    {}", control.summary_line());
-            match judge_control(&direct, &control, EXPECTED_FIXTURES, MIN_MANGLED_BROKEN) {
+            match judge_control(
+                &direct,
+                &control,
+                EXPECTED_FIXTURES,
+                MIN_MANGLED_BROKEN,
+                MIN_FROZEN_MANGLED_BROKEN,
+            ) {
                 Control::Held(note) => {
                     say(&format!(
                         "conformance: green. {} against the Rust binary, {note}",
@@ -343,6 +466,12 @@ pub struct Fixture {
     pub passed: bool,
     /// Whether it was skipped, which is neither a pass nor a failure.
     pub skipped: bool,
+    /// The deviation id the runner applied to it, if any — the second word of the tag.
+    ///
+    /// Read back so that [`judge_direct`] can assert *where* a deviation was applied and
+    /// not merely that something declared it. Without this the gate cannot tell a deviated
+    /// verdict from an ordinary one.
+    pub deviation: Option<String>,
 }
 
 impl Summary {
@@ -374,9 +503,13 @@ impl Summary {
                     .to_string()
             })?;
         Ok(Summary {
+            // The runner's own indented failure detail, not merely the substring: a
+            // fixture whose recorded body or description contained `request failed:` would
+            // otherwise turn a verdict into exit 2. Fail-safe in the right direction, but
+            // the prefix is free.
             transport: output
                 .lines()
-                .filter(|l| l.contains("request failed:"))
+                .filter(|l| l.trim_start().starts_with("- request failed:"))
                 .count(),
             fixtures: output.lines().filter_map(parse_fixture_line).collect(),
             ..summary
@@ -386,13 +519,33 @@ impl Summary {
     /// The names of the fixtures in `class` that did not pass and were not skipped.
     ///
     /// A `SKIP` is "the fixture stores no body to compare against" and not "the fixture did
-    /// not run", so it is neither -- the same distinction the counts make.
+    /// not run", so it is neither -- the same distinction the counts make. It is also not a
+    /// pass, which is why [`judge_direct`] refuses one in a gating class rather than
+    /// reading this list and finding it empty.
     fn failed_in(&self, class: &str) -> Vec<&str> {
         self.fixtures
             .iter()
             .filter(|f| f.class == class && !f.passed && !f.skipped)
             .map(|f| f.name.as_str())
             .collect()
+    }
+
+    /// The names of the fixtures in `class` the runner SKIPPED.
+    fn skipped_in(&self, class: &str) -> Vec<&str> {
+        self.fixtures
+            .iter()
+            .filter(|f| f.class == class && f.skipped)
+            .map(|f| f.name.as_str())
+            .collect()
+    }
+
+    /// How many fixtures in `class` passed. The control's floor is measured per class, so
+    /// "the proxy broke 20 responses" cannot be satisfied entirely by the website's.
+    fn passed_in(&self, class: &str) -> usize {
+        self.fixtures
+            .iter()
+            .filter(|f| f.class == class && f.passed)
+            .count()
     }
 }
 
@@ -419,11 +572,20 @@ fn parse_fixture_line(line: &str) -> Option<Fixture> {
         .strip_prefix('[')?
         .trim_end_matches(']')
         .to_string();
+    // The tag's optional second word, which is a deviation id. Taken rather than discarded
+    // because the gate asserts which fixtures a deviation was applied to, and a verdict
+    // that does not say cannot be checked. Anything after it -- `SKIP`'s parenthesised
+    // reason -- is not part of the tag.
+    let deviation = words
+        .next()
+        .filter(|w| w.starts_with("DEV-"))
+        .map(|w| w.trim_end_matches(']').to_string());
     Some(Fixture {
         name,
         class,
         passed,
         skipped,
+        deviation,
     })
 }
 
@@ -517,6 +679,105 @@ pub fn judge_direct(s: &Summary, expected: usize) -> Direct {
         ));
     }
 
+    // **The excuses below key on the name, so the names have to be unique.** `PENDING`'s
+    // lookup is a `find`, and a fixture renamed onto a pending name would be excused by a
+    // list that never meant it -- with the class totals, the `pending` fields and the count
+    // all still exact.
+    let mut seen: Vec<&str> = Vec::new();
+    for f in &s.fixtures {
+        if seen.contains(&f.name.as_str()) {
+            return Direct::Inconclusive(format!(
+                "`{}` was reported twice, so a name does not identify a fixture and the                  PENDING list cannot be read.\n                   Two files in contract/fixtures/ carry the same `name`; the unit test in                  this file pins a name to its filename for exactly this reason.",
+                f.name
+            ));
+        }
+        seen.push(f.name.as_str());
+    }
+
+    // **The class is data in the fixture, so the roster is checked here.** Without this the
+    // gate's whole policy is one word in one JSON file: `latest-full-complement` moved to
+    // `retired` stops gating, keeps the totals exact if something else moves the other way,
+    // and goes green while a frozen `/latest` body contradicts the server.
+    let mut misclassified: Vec<String> = Vec::new();
+    for f in &s.fixtures {
+        let declared = if FROZEN.contains(&f.name.as_str()) {
+            "frozen"
+        } else if RETIRED.contains(&f.name.as_str()) {
+            "retired"
+        } else {
+            "coupled"
+        };
+        if f.class != declared {
+            misclassified.push(format!(
+                "`{}` is {} and this gate says {declared}",
+                f.name, f.class
+            ));
+        }
+    }
+    if !misclassified.is_empty() {
+        return Direct::Inconclusive(format!(
+            "{} fixture(s) carry a class this gate does not declare: {}.\n               FROZEN and RETIRED in xtask/src/conformance.rs are the roster, and everything              else is coupled. Reclassifying a fixture changes whether it gates at all, so it              is a line in the gate rather than a word in a fixture -- and if the move is              right, this list is where it is recorded.",
+            misclassified.len(),
+            misclassified.join(", ")
+        ));
+    }
+
+    // **A deviation is "compare against bytes the author wrote", so where it was applied is
+    // the whole of its safety.** `main.rs` refuses an id no fixture declares, which is the
+    // typo direction; this is the other one -- a `deviation` block added to a fixture the
+    // owner never signed off on would print `ok` and the gate would read it as an ordinary
+    // pass, because the id is in the tag and nothing compared it to anything.
+    for (id, fixtures) in DEVIATIONS {
+        let applied: Vec<&str> = s
+            .fixtures
+            .iter()
+            .filter(|f| f.deviation.as_deref() == Some(id))
+            .map(|f| f.name.as_str())
+            .collect();
+        let undeclared: Vec<&str> = applied
+            .iter()
+            .copied()
+            .filter(|n| !fixtures.contains(n))
+            .collect();
+        if !undeclared.is_empty() {
+            return Direct::Inconclusive(format!(
+                "`{id}` was applied to {} fixture(s) this gate does not declare it for: {}.\n                   A deviated fixture is measured against a response its author wrote instead                  of the bytes the Go server produced, so the fixture list in DEVIATIONS is                  the signature on it (docs/reconciliation.md §3). Add it there, with the                  reason, or remove the deviation block.",
+                undeclared.len(),
+                undeclared.join(", ")
+            ));
+        }
+        let missing: Vec<&str> = fixtures
+            .iter()
+            .copied()
+            .filter(|n| !applied.contains(n))
+            .collect();
+        if !missing.is_empty() {
+            return Direct::Inconclusive(format!(
+                "`{id}` is declared for {} fixture(s) the runner did not apply it to: {}.\n                   Either the fixture lost its deviation block -- in which case it is now                  being measured against the Go bytes and the entry is stale -- or it was                  renamed. Both make this gate's record of what shipped wrong.",
+                missing.len(),
+                missing.join(", ")
+            ));
+        }
+    }
+
+    // **A SKIP in a gating class is not a pass.** `contract/conformance` skips a fixture
+    // that stores no body, and the counts put it in neither bucket -- so without this a
+    // `frozen` fixture whose recorded body went missing goes green with the 133-key DTO,
+    // both duplicate pairs and every `omitempty` decision uncompared. The all-skipped check
+    // above only catches losing every body at once, which is the easy case.
+    //
+    // `retired` may skip: nothing gates on it either way.
+    for class in ["frozen", "coupled"] {
+        let skipped = s.skipped_in(class);
+        if !skipped.is_empty() {
+            return Direct::Inconclusive(format!(
+                "{} {class}-class fixture(s) were SKIPPED, so their bodies were never                  compared: {}.\n                   A skip means the fixture stores no body to compare against. The status line                  and the headers still matched, which is why this is not a failure -- and                  why it must not be read as a pass either. Re-capture them with                  contract/tools/capture.py.",
+                skipped.len(),
+                skipped.join(", ")
+            ));
+        }
+    }
+
     let frozen = s.failed_in("frozen");
     if !frozen.is_empty() {
         return Direct::NotConforming(format!(
@@ -598,7 +859,13 @@ pub enum Control {
 /// part a daemon that died between the replays fails all 70, clears a bare floor, and
 /// reports a control that held while having mangled nothing -- and against this target a
 /// proxy that mangled nothing clears a failure floor of 22 on its own.
-pub fn judge_control(direct: &Summary, s: &Summary, expected: usize, min_broken: usize) -> Control {
+pub fn judge_control(
+    direct: &Summary,
+    s: &Summary,
+    expected: usize,
+    min_broken: usize,
+    min_frozen_broken: usize,
+) -> Control {
     // The same precondition the direct replay has. It holds by construction today -- one
     // runner, one fixture set, two base URLs -- and asserting it here costs nothing and
     // stops the control from being judged on a subset if that ever stops being true.
@@ -649,10 +916,32 @@ pub fn judge_control(direct: &Summary, s: &Summary, expected: usize, min_broken:
             direct.passed, direct.failed
         ));
     }
+    // **And a floor on the FROZEN half.** The total floor is strong today only by accident:
+    // six coupled fixtures pass directly, so most of the 20 must be frozen. Once M4-3 lands
+    // all 19 coupled pass, and 19 coupled + 1 frozen would clear a total of 20 while the
+    // control proved almost nothing about the five endpoints the iOS client calls. The
+    // floor that matters is therefore per class, and it has to be stated now rather than
+    // discovered when the total stops binding.
+    let frozen_broken = direct
+        .passed_in("frozen")
+        .saturating_sub(s.passed_in("frozen"));
+    if frozen_broken < min_frozen_broken {
+        return Control::Broken(format!(
+            "the negative control broke only {frozen_broken} of the {} FROZEN-class \
+             responses the target serves, expected at least {min_frozen_broken}.\n  \
+             {broken} responses were broken in total, which clears the overall floor -- but \
+             the five frozen endpoints are the ones deployed clients call, so a control that \
+             only breaks the website's responses is not asserting the thing this suite \
+             exists for.",
+            direct.passed_in("frozen")
+        ));
+    }
     Control::Held(format!(
-        "{broken} of the {} responses the target serves were broken by the proxy and {} \
-         fixtures still passed",
-        direct.passed, s.passed
+        "{broken} of the {} responses the target serves were broken by the proxy \
+         ({frozen_broken} of {} frozen) and {} fixtures still passed",
+        direct.passed,
+        direct.passed_in("frozen"),
+        s.passed
     ))
 }
 
@@ -1128,27 +1417,49 @@ fn seed_weather_database(opts: &Options) -> Result<(), String> {
     // column name is caught by `ON_ERROR_STOP`, but a `WHERE` or a `generate_series` that
     // excluded everything is not -- would make every data-bearing fixture fail on an empty
     // body and read as a contract failure.
-    let readings = psql_query(opts, &target, "select count(*) from observations")?;
-    let buckets = psql_query(opts, &target, "select count(*) from observations_5m")?;
-    let caches = psql_query(
-        opts,
-        &target,
-        "select (select count(*) from almanac_cache) || '/' \
-             || (select count(*) from snow_totals_cache) || '/' \
-             || (select count(*) from forecasts)",
-    )?;
-    println!(
-        "    {readings} readings, {buckets} five-minute buckets, \
-         {caches} almanac/snow/forecast rows"
-    );
-    if readings == "0" || buckets == "0" {
+    // **Every relation a frozen endpoint reads, not just the first two.** The two that were
+    // asserted here are the ones whose absence a fixture would notice loudly; the others are
+    // the dangerous ones, because an empty table and a correct answer are the same bytes:
+    //
+    //   - `snow_totals_cache` -- all five `/snow` fixtures carry the same eight keys, and
+    //     `snow-device-never-reported` is specifically the all-zeros no-row case. The
+    //     comparator checks shape and numeric convention, and `0` satisfies both, so an
+    //     empty cache leaves four FROZEN fixtures green against a `/snow` serving zeros for
+    //     every station.
+    //   - `observations_1h` / `observations_1d` -- `03-refresh.sql`'s order is load-bearing
+    //     because each level reads the one below. A level that materialised nothing leaves
+    //     `/span/72h` and `/span/720h` answering with D-55's trailing raw bucket alone: one
+    //     element, of the right shape, which passes.
+    //   - `almanac_cache` and `forecasts` are caught today -- `{}` and a 404 differ in shape
+    //     -- and are asserted anyway, because that is a property of the fixtures rather than
+    //     of the seed.
+    let counts = [
+        ("observations", "readings"),
+        ("observations_5m", "five-minute buckets"),
+        ("observations_1h", "hourly buckets"),
+        ("observations_1d", "daily buckets"),
+        ("almanac_cache", "almanac rows"),
+        ("snow_totals_cache", "snow rows"),
+        ("forecasts", "forecast rows"),
+    ];
+    let mut empty: Vec<&str> = Vec::new();
+    for (relation, label) in counts {
+        let n = psql_query(opts, &target, &format!("select count(*) from {relation}"))?;
+        println!("    {n} {label}");
+        if n == "0" {
+            empty.push(relation);
+        }
+    }
+    if !empty.is_empty() {
         return Err(format!(
-            "the seed produced {readings} readings and {buckets} five-minute buckets, so \
-             this run would measure a daemon with no data.\n  \
-             Every frozen endpoint reads, so a green replay against an empty database \
-             would mean nothing -- which is the state M2-5 left and this item's seed \
-             exists to leave. Check ci/conformance/rust-seed/02-weather.sql and \
-             03-refresh.sql."
+            "the seed left {} empty, so this run would measure a daemon with no data for \
+             the endpoints that read {}.\n  \
+             Every frozen endpoint reads something, and for `/snow` an empty cache and a \
+             correct answer are the same bytes -- the fixtures assert shape and numeric \
+             convention, and all-zeros satisfies both. Check \
+             ci/conformance/rust-seed/02-weather.sql, 03-refresh.sql and 04-caches.sql.",
+            empty.join(", "),
+            if empty.len() == 1 { "it" } else { "them" }
         ));
     }
 
@@ -1360,14 +1671,22 @@ fn start_daemon(opts: &Options, config_db: &Path, procs: &mut Processes) -> Resu
     let log = opts.log_dir.join("modernweather.log");
 
     await_for("the REST server", Duration::from_secs(60), || {
-        // `http_ok` first: a daemon that answered is ready whatever it does next, and
-        // `exited` is the give-up rather than a second condition on readiness. A port
-        // answering is not evidence that THIS daemon is answering it, which is what the
-        // liveness half is for.
-        if http_ok(REST_PORT, "/metrics") {
-            Wait::Ready
-        } else if procs.exited(daemon) {
+        // **Liveness first, readiness second.** A port answering is not evidence that THIS
+        // daemon is answering it, and probing `http_ok` first meant the child's status was
+        // never consulted on the success path -- so the liveness half the comment here used
+        // to claim did not exist. `ports_free` runs in preflight, before a multi-minute
+        // build, so the window is real: anything that takes 18080 during the build, a daemon
+        // a previous `--keep-running` left included, would have been measured instead.
+        //
+        // Unreachable today by boot order in another file -- `boot.rs` binds before the
+        // supervisor runs, so a child that lost the bind never logs SNAPSHOT_WARM and
+        // `await_logged` below gives up -- but `boot.rs` records that M4-3 builds
+        // `http:listener` as a component, after which the bind follows the OnStartup
+        // components and that accident stops saving this.
+        if procs.exited(daemon) {
             Wait::GiveUp("the daemon exited during startup".to_string())
+        } else if http_ok(REST_PORT, "/metrics") {
+            Wait::Ready
         } else {
             Wait::Pending
         }
@@ -1481,7 +1800,19 @@ fn replay(opts: &Options, runner: &Path, base_url: &str, tag: &str) -> Result<Su
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let mut command = Command::new(runner);
     command.args(["--base-url", base_url]);
-    for id in DEVIATIONS {
+    // **Named, not inherited.** `count_fixtures` validated `<root>/contract/fixtures` and
+    // `judge_direct` rests on `attempted == 70`; the runner defaults its directory from
+    // `CONFORMANCE_FIXTURES`, so an exported variable -- the knob
+    // `ci/conformance/README.md` documents -- had the gate validating one directory and
+    // measuring another. Any 70 files satisfied the assertion. Passing the path and
+    // clearing the variables makes the two the same directory by construction.
+    command.args([
+        "--fixtures",
+        &opts.root.join("contract/fixtures").to_string_lossy(),
+    ]);
+    command.env_remove("CONFORMANCE_FIXTURES");
+    command.env_remove("CONFORMANCE_BASE_URL");
+    for (id, _) in DEVIATIONS {
         command.args(["--deviation", id]);
     }
     let status = command
@@ -1848,10 +2179,34 @@ mod tests {
         }
     }
 
+    /// The deviation the shipped policy declares for `name`, if any. The helpers below
+    /// apply it, because [`judge_direct`] now asserts the runner applied each declared
+    /// deviation to exactly the fixtures that declare it -- so a synthetic report that
+    /// omitted it would be rejected for the wrong reason.
+    fn declared_deviation(name: &str) -> Option<String> {
+        DEVIATIONS
+            .iter()
+            .find(|(_, fixtures)| fixtures.contains(&name))
+            .map(|(id, _)| (*id).to_string())
+    }
+
+    fn verdict(name: &str, class: &str, passed: bool, skipped: bool) -> Fixture {
+        Fixture {
+            name: name.to_string(),
+            class: class.to_string(),
+            passed,
+            skipped,
+            deviation: declared_deviation(name),
+        }
+    }
+
     /// A summary whose per-fixture detail says what the classes did.
     ///
-    /// `frozen` fixtures are named `frozen-N` and so on, except for the ones named
-    /// explicitly -- which is how a test says "these exact coupled fixtures failed".
+    /// The frozen and retired fixtures are drawn from [`FROZEN`] and [`RETIRED`] **in
+    /// order**, rather than being named `frozen-N`: the gate now asserts every reported
+    /// fixture's class against those rosters, so a synthetic name would be rejected as a
+    /// misclassification. Coupled fixtures keep synthetic names, which is correct -- the
+    /// roster's rule is that anything in neither list is coupled.
     fn classified(
         frozen_ok: usize,
         coupled_ok: usize,
@@ -1859,37 +2214,17 @@ mod tests {
         failed: &[(&str, &str)],
     ) -> Summary {
         let mut fixtures = Vec::new();
-        for i in 0..frozen_ok {
-            fixtures.push(Fixture {
-                name: format!("frozen-{i}"),
-                class: "frozen".into(),
-                passed: true,
-                skipped: false,
-            });
+        for name in FROZEN.iter().take(frozen_ok) {
+            fixtures.push(verdict(name, "frozen", true, false));
         }
         for i in 0..coupled_ok {
-            fixtures.push(Fixture {
-                name: format!("coupled-{i}"),
-                class: "coupled".into(),
-                passed: true,
-                skipped: false,
-            });
+            fixtures.push(verdict(&format!("coupled-{i}"), "coupled", true, false));
         }
-        for i in 0..retired_failed {
-            fixtures.push(Fixture {
-                name: format!("retired-{i}"),
-                class: "retired".into(),
-                passed: false,
-                skipped: false,
-            });
+        for name in RETIRED.iter().take(retired_failed) {
+            fixtures.push(verdict(name, "retired", false, false));
         }
         for (name, class) in failed {
-            fixtures.push(Fixture {
-                name: (*name).to_string(),
-                class: (*class).to_string(),
-                passed: false,
-                skipped: false,
-            });
+            fixtures.push(verdict(name, class, false, false));
         }
         let passed = fixtures.iter().filter(|f| f.passed).count();
         let failed_count = fixtures.iter().filter(|f| !f.passed && !f.skipped).count();
@@ -1942,18 +2277,23 @@ deviations applied: DEV-10
                     class: "frozen".into(),
                     passed: false,
                     skipped: false,
+                    deviation: None,
                 },
+                // The tag's second word, which the gate asserts the declared set against.
                 Fixture {
                     name: "stationinfo-full".into(),
                     class: "frozen".into(),
                     passed: true,
                     skipped: false,
+                    deviation: Some("DEV-10".into()),
                 },
+                // `SKIP`'s parenthesised reason is not a deviation id.
                 Fixture {
                     name: "alerts-empty".into(),
                     class: "retired".into(),
                     passed: false,
                     skipped: true,
+                    deviation: None,
                 },
             ]
         );
@@ -1983,6 +2323,17 @@ deviations applied: DEV-10
                 class: "coupled".into(),
                 passed: true,
                 skipped: false,
+                deviation: None,
+            })
+        );
+        assert_eq!(
+            parse_fixture_line("FAIL stationinfo-full [frozen DEV-10]"),
+            Some(Fixture {
+                name: "stationinfo-full".into(),
+                class: "frozen".into(),
+                passed: false,
+                skipped: false,
+                deviation: Some("DEV-10".into()),
             })
         );
     }
@@ -2018,12 +2369,51 @@ deviations applied: DEV-10
             let name = field("name").unwrap_or_else(|| panic!("{}: no name", path.display()));
             let class = field("class")
                 .unwrap_or_else(|| panic!("{}: no class (work item N-18)", path.display()));
+            // **A name identifies a fixture, so it is pinned to the file that holds it.**
+            // Every excuse this gate grants keys on the name: PENDING's lookup is a `find`,
+            // and a fixture renamed onto a pending name would be excused by an entry that
+            // never meant it -- with the class totals, the `pending` fields and the count of
+            // 70 all still exact. Tying the name to the filename makes the collision
+            // impossible rather than merely detected.
+            let stem = path
+                .file_stem()
+                .expect("a fixture file has a stem")
+                .to_string_lossy();
+            assert_eq!(
+                name,
+                stem,
+                "{}'s `name` is `{name}`. A fixture's name is what PENDING and DEVIATIONS \
+                 key on, so it has to be the filename.",
+                path.display()
+            );
+            assert!(
+                !names.contains(&name),
+                "two fixtures are named `{name}`, so a name does not identify one"
+            );
             if field("pending").is_some() {
                 pending_in_files.push(name.clone());
             }
-            *classes.entry(class).or_default() += 1;
+            *classes.entry(class.clone()).or_default() += 1;
+            // And the roster the gate carries, against the class the file declares -- the
+            // other half of judge_direct's check, so a reclassification fails here too and
+            // names the file.
+            let declared = if FROZEN.contains(&name.as_str()) {
+                "frozen"
+            } else if RETIRED.contains(&name.as_str()) {
+                "retired"
+            } else {
+                "coupled"
+            };
+            assert_eq!(
+                class,
+                declared,
+                "{} is class `{class}` and FROZEN/RETIRED in this file say `{declared}`",
+                path.display()
+            );
             names.push(name);
         }
+        assert_eq!(FROZEN.len(), 42);
+        assert_eq!(RETIRED.len(), 9);
         assert_eq!(
             classes.get("frozen").copied().unwrap_or(0),
             42,
@@ -2061,24 +2451,37 @@ deviations applied: DEV-10
     /// Every deviation this gate enables has to be one a fixture declares, or the runner
     /// refuses the run -- so the constant and the fixtures are checked here rather than
     /// three minutes into a gate.
+    ///
+    /// **Both directions, by name.** The id alone was not enough: a deviation is a licence
+    /// to compare against bytes the fixture's author wrote, so the question is not whether
+    /// *something* declares it but whether exactly the fixtures this gate signed off on do.
     #[test]
-    fn every_enabled_deviation_is_declared_by_a_fixture() {
+    fn every_enabled_deviation_is_declared_by_exactly_the_fixtures_it_names() {
         let dir = crate::repo_root().join("contract/fixtures");
-        let mut declared: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(&dir).expect("readable").flatten() {
-            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
-            for id in DEVIATIONS {
-                if text.contains(&format!("\"id\": \"{id}\"")) && !declared.iter().any(|d| d == id)
-                {
-                    declared.push(id.to_string());
+        for (id, named) in DEVIATIONS {
+            let mut declaring: Vec<String> = Vec::new();
+            for entry in std::fs::read_dir(&dir).expect("readable").flatten() {
+                let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                if text.contains(&format!("\"id\": \"{id}\"")) {
+                    declaring.push(
+                        entry
+                            .path()
+                            .file_stem()
+                            .expect("a fixture file has a stem")
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
                 }
             }
-        }
-        for id in DEVIATIONS {
-            assert!(
-                declared.iter().any(|d| d == id),
-                "this gate enables `{id}` and no fixture declares it, so the runner would \
-                 refuse the run"
+            declaring.sort();
+            let mut want: Vec<String> = named.iter().map(|n| (*n).to_string()).collect();
+            want.sort();
+            assert_eq!(
+                declaring, want,
+                "`{id}` is declared by {declaring:?} and this gate names {want:?}. A \
+                 deviation applied to a fixture nobody signed off on measures it against \
+                 whatever its author typed; one named here and no longer declared is a \
+                 stale record of what shipped."
             );
         }
     }
@@ -2136,9 +2539,15 @@ deviations applied: DEV-10
     #[test]
     fn a_frozen_class_failure_is_a_contract_break_and_exits_1() {
         let mut s = green();
-        // One frozen fixture regresses, which is the whole of a contract break.
-        s.fixtures[0].name = "latest-full-complement".into();
-        s.fixtures[0].passed = false;
+        // One frozen fixture regresses, which is the whole of a contract break. Found by
+        // name rather than renamed into place: green() draws its frozen fixtures from the
+        // FROZEN roster now, so a rename would collide with the real entry.
+        let i = s
+            .fixtures
+            .iter()
+            .position(|f| f.name == "latest-full-complement")
+            .expect("it is a frozen fixture");
+        s.fixtures[i].passed = false;
         s.passed -= 1;
         s.failed += 1;
         match judge_direct(&s, EXPECTED_FIXTURES) {
@@ -2213,12 +2622,8 @@ deviations applied: DEV-10
         // Missing: a declared fixture the runner did not report, which is a rename.
         let mut s = green();
         s.fixtures.retain(|f| f.name != stale);
-        s.fixtures.push(Fixture {
-            name: "html-renamed".into(),
-            class: "coupled".into(),
-            passed: false,
-            skipped: false,
-        });
+        s.fixtures
+            .push(verdict("html-renamed", "coupled", false, false));
         match judge_direct(&s, EXPECTED_FIXTURES) {
             Direct::NotConforming(why) => {
                 // The rename is caught as an unexcused coupled failure first, which names
@@ -2257,10 +2662,16 @@ deviations applied: DEV-10
         assert_eq!(judge_direct(&green(), EXPECTED_FIXTURES), Direct::Conforms);
     }
 
+    /// A SKIP is "the fixture stores no body", not "the fixture did not run", so it is part
+    /// of the 70 and it is not a failure -- **and it is not a pass either**.
+    ///
+    /// This test asserted `Conforms` until the body-comparison hole was found. It was the
+    /// hole: the counts put a skip in neither bucket and `failed_in` filters it out, so one
+    /// `frozen` fixture losing its recorded body took the 133-key DTO, both duplicate key
+    /// pairs and every `omitempty` decision out of the comparison and the gate still printed
+    /// green. The all-skipped check only catches losing every body at once.
     #[test]
-    fn skipped_fixtures_count_as_attempted() {
-        // A SKIP is "the fixture stores no body", not "the fixture did not run", so it is
-        // part of the 70 and not a failure.
+    fn a_skipped_frozen_fixture_is_not_a_pass() {
         let mut s = green();
         for i in 0..2 {
             s.fixtures[i].passed = false;
@@ -2268,25 +2679,184 @@ deviations applied: DEV-10
         }
         s.passed -= 2;
         s.skipped += 2;
+        match judge_direct(&s, EXPECTED_FIXTURES) {
+            Direct::Inconclusive(why) => {
+                assert!(
+                    why.contains("frozen-class fixture(s) were SKIPPED"),
+                    "{why}"
+                );
+                assert!(why.contains(FROZEN[0]), "it names which: {why}");
+            }
+            other => panic!("a frozen body nobody compared is not a verdict; got {other:?}"),
+        }
+        // Still counted in the 70, which is the half of the original claim that was right.
+        assert_eq!(s.attempted(), EXPECTED_FIXTURES);
+    }
+
+    /// The same skip in `retired`, which is allowed: nothing gates on those either way, and
+    /// three of them are `format=msgpack` responses D-69 does not carry forward at all.
+    #[test]
+    fn a_skipped_retired_fixture_is_fine() {
+        let mut s = green();
+        let i = s
+            .fixtures
+            .iter()
+            .position(|f| f.class == "retired")
+            .expect("green() has retired fixtures");
+        s.fixtures[i].passed = false;
+        s.fixtures[i].skipped = true;
+        s.failed -= 1;
+        s.skipped += 1;
         assert_eq!(judge_direct(&s, EXPECTED_FIXTURES), Direct::Conforms);
     }
 
+    /// The roster, in the direction that matters: a frozen fixture moved to `retired` stops
+    /// gating, and the class totals can be kept exact by moving something back the other
+    /// way. Without the roster check the gate reads one word in one JSON file.
+    #[test]
+    fn a_frozen_fixture_relabelled_retired_is_refused() {
+        let mut s = green();
+        s.fixtures[0].class = "retired".into();
+        match judge_direct(&s, EXPECTED_FIXTURES) {
+            Direct::Inconclusive(why) => {
+                assert!(why.contains("class this gate does not declare"), "{why}");
+                assert!(why.contains(FROZEN[0]), "it names which: {why}");
+            }
+            other => panic!("a reclassification must not be silent; got {other:?}"),
+        }
+    }
+
+    /// Two fixtures reporting one name makes [`PENDING`]'s `find` ambiguous, so an
+    /// unrelated failure can be excused by an entry that never meant it.
+    #[test]
+    fn a_duplicate_fixture_name_is_refused() {
+        let mut s = green();
+        s.fixtures[1].name = s.fixtures[0].name.clone();
+        match judge_direct(&s, EXPECTED_FIXTURES) {
+            Direct::Inconclusive(why) => assert!(why.contains("was reported twice"), "{why}"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// A deviation applied where this gate does not declare it means the fixture was
+    /// measured against bytes its author wrote. `main.rs` catches the typo direction; this
+    /// is the one that would ship.
+    #[test]
+    fn a_deviation_applied_to_an_undeclared_fixture_is_refused() {
+        let mut s = green();
+        let i = s
+            .fixtures
+            .iter()
+            .position(|f| f.name == "latest-full-complement")
+            .expect("green() has it");
+        s.fixtures[i].deviation = Some("DEV-10".into());
+        match judge_direct(&s, EXPECTED_FIXTURES) {
+            Direct::Inconclusive(why) => {
+                assert!(why.contains("this gate does not declare it for"), "{why}");
+                assert!(why.contains("latest-full-complement"), "{why}");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// And the other way: a declared deviation the runner did not apply means the fixture
+    /// lost its deviation block, so the entry is now stale and the record of what shipped is
+    /// wrong.
+    #[test]
+    fn a_declared_deviation_that_was_not_applied_is_refused() {
+        let mut s = green();
+        let i = s
+            .fixtures
+            .iter()
+            .position(|f| f.name == "stationinfo-about-text-omitted")
+            .expect("green() has it");
+        s.fixtures[i].deviation = None;
+        match judge_direct(&s, EXPECTED_FIXTURES) {
+            Direct::Inconclusive(why) => {
+                assert!(why.contains("did not apply it to"), "{why}");
+                assert!(why.contains("stationinfo-about-text-omitted"), "{why}");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// A replay with per-class detail: the first `frozen_ok` of [`FROZEN`] and `coupled_ok`
+    /// coupled fixtures passing, everything else in the 70 failing. The control's floor is
+    /// now per class, so a summary carrying only counts cannot be judged.
+    fn control_shape(frozen_ok: usize, coupled_ok: usize) -> Summary {
+        let mut fixtures = Vec::new();
+        for (i, name) in FROZEN.iter().enumerate() {
+            fixtures.push(verdict(name, "frozen", i < frozen_ok, false));
+        }
+        for i in 0..19 {
+            fixtures.push(verdict(
+                &format!("coupled-{i}"),
+                "coupled",
+                i < coupled_ok,
+                false,
+            ));
+        }
+        for name in RETIRED {
+            fixtures.push(verdict(name, "retired", false, false));
+        }
+        let passed = fixtures.iter().filter(|f| f.passed).count();
+        Summary {
+            passed,
+            failed: fixtures.len() - passed,
+            skipped: 0,
+            transport: 0,
+            fixtures,
+        }
+    }
+
     /// The measured shape: 48 of the 70 served directly, 25 still passing through the
-    /// proxy, so 23 broken.
+    /// proxy, so 23 broken -- 20 of them frozen.
     #[test]
     fn a_negative_control_that_holds_is_what_makes_a_green_run_green() {
-        let direct = summary(48, 22, 0, 0);
+        let direct = control_shape(42, 6);
+        assert_eq!((direct.passed, direct.failed), (48, 22));
         match judge_control(
             &direct,
-            &summary(25, 45, 0, 0),
+            &control_shape(22, 3),
             EXPECTED_FIXTURES,
             MIN_MANGLED_BROKEN,
+            MIN_FROZEN_MANGLED_BROKEN,
         ) {
             Control::Held(note) => {
                 assert!(note.contains("23 of the 48"), "{note}");
+                assert!(note.contains("20 of 42 frozen"), "{note}");
                 assert!(note.contains("25 fixtures still passed"), "{note}");
             }
             other => panic!("got {other:?}"),
+        }
+    }
+
+    /// **The floor that will matter next.** `implementation-plan.md` M4-3 makes all 19
+    /// coupled fixtures pass, after which a proxy that breaks the website's responses and
+    /// leaves the five frozen endpoints alone clears a total floor of 20 while asserting
+    /// nothing about the contract deployed clients depend on. Stated now rather than
+    /// discovered when the total stops binding.
+    #[test]
+    fn a_control_that_only_broke_the_websites_responses_is_rejected() {
+        // The post-M4-3 shape: 42 frozen and all 19 coupled served.
+        let direct = control_shape(42, 19);
+        // The proxy broke all 19 coupled and exactly one frozen: 20 broken, which clears
+        // the overall floor on its own.
+        match judge_control(
+            &direct,
+            &control_shape(41, 0),
+            EXPECTED_FIXTURES,
+            MIN_MANGLED_BROKEN,
+            MIN_FROZEN_MANGLED_BROKEN,
+        ) {
+            Control::Broken(why) => {
+                assert!(why.contains("FROZEN-class"), "{why}");
+                assert!(
+                    why.contains("clears the overall floor"),
+                    "the message has to say the total was not the problem: {why}"
+                );
+            }
+            other => panic!("a control blind to the frozen half must not hold; got {other:?}"),
         }
     }
 
@@ -2296,13 +2866,14 @@ deviations applied: DEV-10
     /// a failure floor and prove nothing. Measuring what the proxy BROKE is what rejects it.
     #[test]
     fn a_proxy_that_mangled_nothing_is_rejected_even_though_twenty_two_fixtures_failed() {
-        let direct = summary(48, 22, 0, 0);
+        let direct = control_shape(42, 6);
         // The proxy forwarded faithfully: exactly the same verdicts as the direct replay.
         match judge_control(
             &direct,
-            &summary(48, 22, 0, 0),
+            &control_shape(42, 6),
             EXPECTED_FIXTURES,
             MIN_MANGLED_BROKEN,
+            MIN_FROZEN_MANGLED_BROKEN,
         ) {
             Control::Broken(why) => {
                 assert!(why.contains("broke only 0"), "{why}");
@@ -2320,10 +2891,11 @@ deviations applied: DEV-10
     #[test]
     fn a_control_that_fixed_responses_is_rejected() {
         match judge_control(
-            &summary(48, 22, 0, 0),
-            &summary(50, 20, 0, 0),
+            &control_shape(42, 6),
+            &control_shape(42, 8),
             EXPECTED_FIXTURES,
             MIN_MANGLED_BROKEN,
+            MIN_FROZEN_MANGLED_BROKEN,
         ) {
             Control::Broken(why) => assert!(why.contains("FIXED responses"), "{why}"),
             other => panic!("got {other:?}"),
@@ -2335,19 +2907,23 @@ deviations applied: DEV-10
         // Every one of these is a run that would print "the control held" under a bare
         // "at least 26 failed" floor, which is the defect the three-part assertion exists
         // to close. None of them may be reachable from a green gate.
-        let direct = summary(48, 22, 0, 0);
+        let direct = control_shape(42, 6);
         let cases = [
+            // Everything passed through the proxy, which fires before either floor.
             (summary(70, 0, 0, 0), "PASSED"),
             (summary(0, 70, 0, 70), "transport failures"),
-            (
-                summary(0, 70, 0, 0),
-                "including the ones it does not mangle",
-            ),
-            (summary(46, 24, 0, 0), "broke only 2"),
+            (control_shape(0, 0), "including the ones it does not mangle"),
+            (control_shape(40, 6), "broke only 2"),
             (summary(10, 26, 0, 0), "attempted 36 fixtures"),
         ];
         for (s, expected) in cases {
-            match judge_control(&direct, &s, EXPECTED_FIXTURES, MIN_MANGLED_BROKEN) {
+            match judge_control(
+                &direct,
+                &s,
+                EXPECTED_FIXTURES,
+                MIN_MANGLED_BROKEN,
+                MIN_FROZEN_MANGLED_BROKEN,
+            ) {
                 Control::Broken(why) => assert!(why.contains(expected), "{s:?}: {why}"),
                 Control::Held(note) => panic!("{s:?} must not hold: {note}"),
             }

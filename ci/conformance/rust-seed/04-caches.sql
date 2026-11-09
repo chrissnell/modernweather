@@ -6,8 +6,12 @@
 -- endpoints' only data source, so a seed that omitted them would make four fixtures fail on
 -- an empty body rather than on the contract.
 --
--- The third is `forecasts`, which `/forecast` reads verbatim. The rows below are W1's own
--- captured Aeris payloads, carried over from `contract/tools/rig/aeris.sql`.
+-- The third is `forecasts`, which `/forecast` reads verbatim. The 240-hour row is W1's own
+-- captured Aeris payload, carried over from `contract/tools/rig/aeris.sql`; the 24-hour row is
+-- rebuilt here with `jsonb_build_object` and is shape-identical rather than byte-identical --
+-- its `windDir` is `'N'` for all 24 periods where the capture cycles the compass (its own
+-- `windDirDEG` does cycle). The fixtures that read it assert shape and numeric convention, so
+-- the difference is invisible to them; it is recorded here so nobody reads the row as a capture.
 
 BEGIN;
 

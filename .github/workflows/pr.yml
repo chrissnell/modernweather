@@ -410,11 +410,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: conformance
-          # `cache-on-failure` defaults to false, and THIS JOB IS DESIGNED TO FAIL until
-          # M4-2 -- so without this line nothing is ever saved under the key above, nothing
-          # is ever restored, and every PR cold-builds the root workspace, the daemon and
-          # contract/conformance. A gate that is red on purpose for two milestones must not
-          # also be the most expensive job in the file.
+          # `cache-on-failure` defaults to false, and this job was DESIGNED TO FAIL until
+          # M4-2 -- so without this line nothing was ever saved under the key above, nothing
+          # was ever restored, and every PR cold-built the root workspace, the daemon and
+          # contract/conformance. M4-2 turned it green, and the line stays: this is still the
+          # most expensive job in the file, and a red run is exactly when the next push wants
+          # a warm cache.
           cache-on-failure: true
           # Two workspaces, for the same reason conformance-fixtures names two: the root one
           # builds xtask and the daemon, and contract/conformance is standalone on purpose

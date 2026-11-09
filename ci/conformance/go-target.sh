@@ -5,8 +5,12 @@
 # This is the half of DESIGN.md R-3 that has been possible since W1 landed and had never run:
 # pointing contract/conformance/ at the server the fixtures were captured from proves the 70
 # fixtures describe reality rather than describing what the rewrite happens to do. The other
-# half -- replaying against the Rust daemon -- is the `conformance` gate, still deferred until
-# crates/modernweather/Cargo.toml exists.
+# half -- replaying against the Rust daemon -- is the `conformance` gate, which M4-2 turned
+# green.
+#
+# This half demands 70 passed, 0 failed, 0 skipped and passes NO --deviation: the Go daemon is
+# what shipped, so it is measured against the bytes it produced. The Rust half applies DEV-10
+# and judges per class. Two targets, two recordings, both gates biting.
 #
 # The existence of this file arms the `conformance-fixtures` gate in ci/gates.toml.
 #

@@ -61,7 +61,7 @@ DELETE FROM stations;
 -- produces), so seven stations with transports would be seven station components dialling
 -- ports nothing listens on for the length of the run. A station with no transport is
 -- inventory -- one a peer forwards readings for -- which is exactly what these seven are:
--- their readings are inserted by `03-observations.sql` and no driver in this process
+-- their readings are inserted by `02-weather.sql` and no driver in this process
 -- produces any.
 --
 -- The schema makes the pairing explicit: `CHECK ((transport_kind IS NULL) =

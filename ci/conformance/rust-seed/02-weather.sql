@@ -27,7 +27,7 @@
 -- Every level is `materialized_only` -- three of the four are the source of another, so
 -- none may serve a bucket the next one up has not seen -- and the refresh policies run on
 -- their own schedule. A replay that started before the first refresh would read empty
--- views and `/span` would be `[]` for every station. `04-refresh.sql` is that refresh, as a
+-- views and `/span` would be `[]` for every station. `03-refresh.sql` is that refresh, as a
 -- separate file so that the order is visible in the harness rather than implied.
 
 BEGIN;

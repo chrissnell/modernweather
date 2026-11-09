@@ -217,7 +217,7 @@ MIN_MANGLED_FAILURES=99    cargo xtask gate conformance-fixtures   # negative co
 The Rust target's equivalents, each watched against a real run rather than reasoned about:
 
 ```sh
-CONFORMANCE_FORCE_MANGLE=1        cargo xtask conformance   # 20 frozen-class failures, exit 1
+CONFORMANCE_FORCE_MANGLE=1        cargo xtask conformance   # the proxy bites: 20 frozen-class failures, exit 2
 CONFORMANCE_FIXTURES=/some/subset cargo xtask conformance   # "attempted 3 fixtures, expected 70", exit 2
 PATH=/usr/bin:/bin                cargo xtask conformance   # "missing required tool(s): psql, sqlite3", exit 2
 PGDATABASE=weather                cargo xtask conformance   # "refusing to drop `weather`", exit 2
@@ -225,13 +225,26 @@ PGDATABASE=weather                cargo xtask conformance   # "refusing to drop 
 
 All four were run against this tree on 2026-11-09. `CONFORMANCE_FORCE_MANGLE=1` is the one that
 matters now that the gate is green: it sends the **accepted** replay through the proxy and the gate
-reports twenty frozen-class failures by name and exits 1, which is a gate being watched to fail
-rather than reasoned about.
+reports twenty frozen-class failures by name, which is a gate being watched to fail rather than
+reasoned about.
+
+It exits **2**, not 1, and the distinction is the point. Exit 1 means "the replay reached a verdict
+and the binary does not serve the contract"; here the binary is fine and the transport was corrupted
+on purpose, so the run proved nothing about the contract either way. Both outcomes of this knob are
+exit 2 — a replay that still conformed *through* the proxy is the other one, and it means the proxy
+mangled nothing.
 
 A subset now fails on the **deviation** check first unless it happens to include one of the two
 deviated fixtures — `--deviation DEV-10` against a fixture set that declares none is a refusal, so
 that a typo cannot silently make the Rust target assert the Go bytes. Include a deviated fixture and
 the `attempted 3 fixtures, expected 70` message is what comes back.
+
+`CONFORMANCE_FIXTURES` reaches the runner and **not** the gate: `cargo xtask gate conformance` names
+`contract/fixtures` on the runner's command line and clears the variable, because the gate validates
+that directory's file count and then rests on `attempted == 70`. Reading the variable here had the
+two talking about different directories, and any directory holding 70 files satisfied the assertion.
+Point the runner at a subset directly — `legacy-conformance --fixtures <dir>` — to see the message
+above.
 
 A fixture with no `class` is the other new exit 2: `error: cannot read <dir>: … no `class` (frozen,
 coupled or retired)`.
@@ -241,9 +254,7 @@ A daemon that dies at startup is the other one worth knowing: it ends the wait a
 report a timeout instead — watched both ways with a `--target-binary` that exits on its second
 invocation.
 
-`CONFORMANCE_FORCE_MANGLE=1` does not change the Rust target's verdict today — the direct replay is
-already red — but it is the one knob that exercises the proxy, the port it listens on and the second
-replay before M4-2 needs them. Occupying 18080 before a run produces the preflight's other exit 2.
+Occupying 18080 before a run produces the preflight's other exit 2.
 
 The transport-failure guard was watched failing the same way, against real runner output: point
 `legacy-conformance` at a port nothing is listening on and it emits 70 `FAIL` lines, every one of
