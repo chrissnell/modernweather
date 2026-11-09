@@ -65,7 +65,7 @@ use crate::spool;
 /// One line per component crate, which is §1.3 rule 2: adding a component crate adds a line
 /// here and edits nothing else -- the shape `managers/controller.go` could not take, down to
 /// its `if con.Type == "management" { continue }`.
-const REGISTRARS: &[&dyn Registrar<Config>] = &[&Stations, &Database];
+const REGISTRARS: &[&dyn Registrar<Config>] = &[&Stations, &Database, &Rollup];
 
 /// `mw-station`'s registrar.
 ///
@@ -160,6 +160,34 @@ impl Registrar<Config> for Database {
     }
 }
 
+/// `window:rollup` and one `rain:rollover:<station>` per collecting station.
+///
+/// An adapter here for `Stations`' reason: `Registrar` is `mw-supervisor`'s and
+/// `mw-pipeline` is in the same layer, so the trait is implemented in the binary over
+/// `mw_pipeline::rollup::register`, which is the pure function that does the work.
+///
+/// Conditional on the same thing `writer:timescale` is — a `weather_database` row, because
+/// without one there is no `db:postgres` to provide `ReadingStore` (**D-44**) — and
+/// additionally on this node collecting for at least one station. `mw_pipeline::rollup`
+/// owns both choices and this adapter makes neither.
+#[derive(Debug)]
+struct Rollup;
+
+impl Registrar<Config> for Rollup {
+    fn name(&self) -> &'static str {
+        "mw-pipeline (window:rollup and the rainfall rollovers)"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        mw_pipeline::rollup::register(cfg, out)
+            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
+    }
+}
+
 /// Build the station registry and the write end of the pipeline, and hand both to the
 /// configuration.
 ///
@@ -213,9 +241,45 @@ fn attach_registry(cfg: &mut Config) -> anyhow::Result<()> {
              clear `ingest_secret_hash` for a station that does not need it."
         );
     }
+    // **The validation the W4 migration's comment claimed the writer did.** The writer
+    // copies `config.stations.timezone` and substitutes `'UTC'` for a NULL or blank one
+    // (`mw_store::writer`), so a typo becomes a `stations.timezone` of `Amercia/Denver` and
+    // a rollover that silently happens in UTC. A SQL `CHECK` cannot catch it either --
+    // `now() AT TIME ZONE x` is `STABLE`, so it is not an expression a constraint may
+    // contain -- and `RegistrySnapshot::new` is where the column is already read and
+    // already normalised, so it is where the parse goes.
+    //
+    // **A refusal rather than a warning**, and the difference matters: a station whose zone
+    // does not resolve has no boundary for its rainfall day to accumulate from, so carrying
+    // on means serving a `dayrain` that resets at the database server's midnight -- which
+    // is exactly the defect implementation-plan.md M3-4 exists to close. This is a
+    // configuration error, not an unavailable dependency, so it is not the D-27 carve-out
+    // that lets a down database be started past.
+    if !snapshot.zone_problems().is_empty() {
+        let mut chain = String::new();
+        for problem in snapshot.zone_problems() {
+            if !chain.is_empty() {
+                chain.push_str("; ");
+            }
+            chain.push_str(&mw_types::DisplayChain(problem).to_string());
+        }
+        anyhow::bail!("{chain}");
+    }
+    let zones: Vec<(mw_types::StationKey, Option<mw_component::Zone>)> = snapshot
+        .zones()
+        .map(|(key, zone)| (key.clone(), zone))
+        .collect();
     cfg.set_registry(
-        Arc::new(mw_store::ConfigRegistry::new(snapshot)) as Arc<dyn mw_component::StationRegistry>
+        Arc::new(mw_store::ConfigRegistry::new(snapshot)) as Arc<dyn mw_component::StationRegistry>,
+        zones,
     );
+    // The maintained window values, over the same station set the registrar plans from --
+    // read through the trait rather than rebuilt here, so the state's keys and the
+    // components' ids cannot disagree about which stations exist. A root resource `main`
+    // owns, for the reason `crate::config`'s `rollup` field records: two components write
+    // it.
+    let stations = mw_pipeline::RollupConfig::rollup_stations(&*cfg);
+    cfg.set_rollup(Arc::new(mw_pipeline::RollupState::new(stations)));
     Ok(())
 }
 
@@ -556,6 +620,8 @@ mod tests {
             declared_stations: Vec::new(),
             ingress: None,
             registry: None,
+            rollup: None,
+            station_zones: Vec::new(),
             listener: Listener {
                 listen_addr: "127.0.0.1".into(),
                 http_port: 8080,
@@ -718,12 +784,17 @@ mod tests {
     /// A broadcasting WeatherLink Live, as an operator would configure one.
     fn broadcast_station(key: &str, serial: &str, port: u16) -> String {
         format!(
+            // `timezone` is set, and it has to be: every collecting station gets a
+            // `rain:rollover:<station>` whose `Calendar` schedules in the station's own
+            // zone, and `plan()` refuses one with no valid zone rather than rolling over in
+            // the server's (`mw_pipeline::rollup::register`). A fixture without it would be
+            // a configuration the daemon correctly declines to start on.
             "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind,
                                    presented_key, transport_kind, transport_port,
-                                   transport_host, wll_sensor_mapping)
+                                   transport_host, wll_sensor_mapping, timezone)
              VALUES ('{key}', x'07070707070707070707070707070707', '{key}',
                      'weatherlink-live', 'from_payload', '{serial}', 'udp_in', {port},
-                     '192.168.1.50', '{MAPPING}')"
+                     '192.168.1.50', '{MAPPING}', 'America/Denver')"
         )
     }
 
@@ -985,9 +1056,17 @@ mod tests {
             ids.contains(&"writer:timescale"),
             "and so must the writer, which is the branch nothing covered: got {ids:?}"
         );
+        // The read path's two, which arrive with the pool rather than with the spool:
+        // `window:rollup` maintains the windows R2 keeps out of SQL, and one
+        // `rain:rollover:<station>` per collecting station moves its local day boundary.
+        assert!(ids.contains(&"window:rollup"), "got {ids:?}");
+        assert!(
+            ids.contains(&"rain:rollover:suncrest:roof"),
+            "one rollover per collecting station: got {ids:?}"
+        );
         // The listener, its re-arm (the fixture's station has a `transport_host`), the
-        // pool and the writer.
-        assert_eq!(ids.len(), 4, "got {ids:?}");
+        // pool, the writer, the rollup and the rollover.
+        assert_eq!(ids.len(), 6, "got {ids:?}");
         assert!(
             ids.iter().any(|id| id.starts_with("station:wll:udp:")),
             "got {ids:?}"
@@ -1065,10 +1144,11 @@ mod tests {
                 format!(
                     "INSERT INTO stations (station_key, owning_node_id, name, type,
                                            identity_kind, transport_kind, transport_url,
-                                           wll_sensor_mapping, wll_poll_interval_seconds)
+                                           wll_sensor_mapping, wll_poll_interval_seconds,
+                                           timezone)
                      VALUES ('suncrest:field', x'07070707070707070707070707070707', 'field',
                              'weatherlink-live', 'fixed', 'http_out', 'http://192.168.1.51',
-                             '{MAPPING}', 30)"
+                             '{MAPPING}', 30, 'America/Denver')"
                 ),
             ],
         )

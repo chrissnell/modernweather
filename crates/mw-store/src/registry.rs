@@ -40,7 +40,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use mw_component::{
-    ComponentId, FrameMeta, IdentitySource, Reject, StationMeta, StationProjection, StationRegistry,
+    ComponentId, FrameMeta, IdentitySource, Reject, StationMeta, StationProjection,
+    StationRegistry, Zone, ZoneError,
 };
 use mw_types::StationKey;
 
@@ -78,6 +79,46 @@ pub struct StationEntry {
     /// Carried on the entry rather than looked up separately, because both are a copy of
     /// the same row and a second map keyed the same way is a second thing to keep in step.
     pub projection: StationProjection,
+    /// `config.stations.timezone`, **resolved** (W2a Decision 11's parse-is-the-validation).
+    ///
+    /// `None` when the column is absent, blank, or not an IANA name — and which of those it
+    /// was is in [`RegistrySnapshot::zone_problems`], because the three need different
+    /// things said about them. Resolved here rather than at each reader so that the string
+    /// is parsed **once**: `rain:rollover:<station>`'s `TzSource` and `window:rollup`'s
+    /// calendar boundaries both need it, and a second parse is a second answer to "which
+    /// midnight does this station's day begin at".
+    pub zone: Option<Zone>,
+}
+
+/// A declared time zone that is not one.
+///
+/// Reported rather than ignored, because nothing else would notice. **The W4 migration's
+/// comment on `stations.timezone` says the column is "an IANA name, validated by the writer
+/// rather than by a CHECK" — and the writer does not validate it.** It copies the column
+/// and substitutes `'UTC'` for a NULL or blank one (`mw_store::writer`), so an operator's
+/// typo becomes a `stations.timezone` of `Amercia/Denver` and a rollover that happens in
+/// UTC. A SQL `CHECK` genuinely cannot do it: `now() AT TIME ZONE x` is `STABLE`, so it is
+/// not an expression a constraint may contain.
+///
+/// So this is the check, and `crates/modernweather/src/boot.rs` makes it a **startup
+/// refusal naming the station**. A station with no zone at all is not reported here: that is
+/// a `PlanError::MissingTimeZone` from `plan()`, which names the component as well, and
+/// reporting it twice would make the louder message the less precise one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "station `{station}` declares the time zone `{declared}`, which is not usable: \
+     {source}. Its rainfall day, month and year roll over at its own local midnight (W3 \
+     D-24), so the value has to be an `Area/Location` IANA name -- `America/Denver`, not \
+     `MST` and not `-0700`. Fix `config.stations.timezone` for it."
+)]
+pub struct ZoneProblem {
+    /// Which station.
+    pub station: StationKey,
+    /// What the column held.
+    pub declared: String,
+    /// Why it is not a zone.
+    #[source]
+    pub source: ZoneError,
 }
 
 /// One immutable view of `config.stations`, as the gate reads it.
@@ -93,6 +134,8 @@ pub struct RegistrySnapshot {
     by_claim: BTreeMap<String, StationEntry>,
     /// Receiving component to station, for a `Fixed` identity.
     by_receiver: BTreeMap<ComponentId, StationEntry>,
+    /// Declared time zones that are not zones, in station-key order.
+    zone_problems: Vec<ZoneProblem>,
     /// Station key to entry, for the two lookups that are **not** authentication.
     ///
     /// Keyed by the station's own key rather than by a claim or a receiver, because
@@ -114,14 +157,37 @@ impl RegistrySnapshot {
     ) -> Self {
         let mut entries: BTreeMap<&str, StationEntry> = BTreeMap::new();
         let mut by_claim = BTreeMap::new();
+        let mut zone_problems = Vec::new();
         for row in rows {
             // A column value its own `CHECK` would reject means this build and its schema
             // disagree. `Fixed` is the safe reading: it is the strategy that resolves by
             // receiver, so the row simply never matches a presented claim.
             let identity = IdentitySource::from_schema_name(&row.identity_kind)
                 .unwrap_or(IdentitySource::Fixed);
+            // The parse is the validation (W2a Decision 11). A blank column is absent
+            // rather than a problem -- `StationProjection`'s own normalisation below does
+            // the same thing, for the same reason -- and a non-blank value that does not
+            // resolve is a problem with the station named.
+            let declared = row
+                .timezone
+                .as_deref()
+                .map(str::trim)
+                .filter(|z| !z.is_empty());
+            let zone = match declared.map(Zone::new) {
+                None => None,
+                Some(Ok(zone)) => Some(zone),
+                Some(Err(source)) => {
+                    zone_problems.push(ZoneProblem {
+                        station: StationKey::new(row.station_key.as_str()),
+                        declared: declared.unwrap_or("").to_string(),
+                        source,
+                    });
+                    None
+                }
+            };
             let entry = StationEntry {
                 station: StationKey::new(row.station_key.as_str()),
+                zone,
                 enabled: row.enabled,
                 identity,
                 has_secret: row
@@ -174,7 +240,23 @@ impl RegistrySnapshot {
             by_claim,
             by_receiver,
             by_station,
+            zone_problems,
         }
+    }
+
+    /// Every station and its resolved zone, in key order.
+    ///
+    /// What the rollup's registrar plans from: one `rain:rollover:<station>` per station,
+    /// carrying the zone its `TzSource::Station` resolves. A station whose zone is `None`
+    /// still gets a component, and `plan()` then refuses it by name — `mw_pipeline::rollup`
+    /// has the whole of why skipping it would be worse.
+    pub fn zones(&self) -> impl Iterator<Item = (&StationKey, Option<Zone>)> {
+        self.by_station.values().map(|e| (&e.station, e.zone))
+    }
+
+    /// Declared time zones that are not zones. Empty is the expected case.
+    pub fn zone_problems(&self) -> &[ZoneProblem] {
+        &self.zone_problems
     }
 
     /// How many stations can be resolved by a claim.
@@ -550,5 +632,104 @@ mod tests {
             at(),
         );
         assert_eq!(registry.resolve(&old), Err(Reject::UnknownStation));
+    }
+
+    /// **The validation the W4 migration's comment claimed the writer did.** A typo in
+    /// `config.stations.timezone` is reported with the station and the value named, and the
+    /// entry's resolved zone is `None` rather than a silent `UTC` — which is what the
+    /// writer substitutes today and what makes the column decorative.
+    #[test]
+    fn a_declared_zone_that_is_not_a_zone_is_reported_with_the_station_named() {
+        let mut rows = vec![
+            row("suncrest:backyard", Some("001D0A700002")),
+            row("suncrest:roof", Some("001D0A700003")),
+        ];
+        rows[0].timezone = Some("Amercia/Denver".into());
+        rows[1].timezone = Some("MST".into());
+        let snapshot = RegistrySnapshot::new(&rows, []);
+
+        let problems = snapshot.zone_problems();
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        let backyard = problems
+            .iter()
+            .find(|p| p.station.as_str() == "suncrest:backyard")
+            .expect("reported");
+        assert_eq!(backyard.declared, "Amercia/Denver");
+        let text = mw_types::DisplayChain(backyard).to_string();
+        assert!(text.contains("suncrest:backyard"), "{text}");
+        assert!(text.contains("Amercia/Denver"), "{text}");
+        assert!(text.contains("config.stations.timezone"), "{text}");
+        // `MST` is a zone abbreviation: one fixed offset, so a station in it cannot have a
+        // DST transition at all (W2a Decision 11). Rejected for a different reason from a
+        // typo and with the same loudness.
+        assert!(problems.iter().any(|p| p.declared == "MST"));
+
+        // And no station resolved a zone, so nothing will roll over in the wrong one.
+        let zones: Vec<(&str, Option<&'static str>)> = snapshot
+            .zones()
+            .map(|(k, z)| (k.as_str(), z.map(|z| z.name())))
+            .collect();
+        assert_eq!(
+            zones,
+            vec![("suncrest:backyard", None), ("suncrest:roof", None)]
+        );
+    }
+
+    /// A blank or absent column is **absent**, not a problem — the same normalisation the
+    /// projection already made, and for the same reason: `chrono-tz` would reject `""` at
+    /// the calendar trigger. It is still not a zone, so `plan()` refuses the station's
+    /// rollover by name; what it is not is a *typo*, and conflating the two would make the
+    /// louder message the less precise one.
+    #[test]
+    fn a_blank_or_absent_zone_is_absent_rather_than_a_typo() {
+        let mut rows = vec![
+            row("suncrest:backyard", Some("001D0A700002")),
+            row("suncrest:roof", Some("001D0A700003")),
+        ];
+        rows[0].timezone = None;
+        rows[1].timezone = Some("   ".into());
+        let snapshot = RegistrySnapshot::new(&rows, []);
+        assert!(snapshot.zone_problems().is_empty());
+        assert!(snapshot.zones().all(|(_, z)| z.is_none()));
+        // The projection normalises the same way, so the two cannot disagree about whether
+        // this station has a zone.
+        for (_, entry) in snapshot.by_station.iter() {
+            assert_eq!(entry.projection.timezone, None);
+        }
+    }
+
+    /// The ordinary case, and the one the rollup plans from: a valid name resolves once,
+    /// here, and both readers of it get the same `Zone`.
+    #[test]
+    fn a_valid_zone_is_parsed_once_and_carried_on_the_entry() {
+        let snapshot = RegistrySnapshot::new(
+            &[row("suncrest:backyard", Some("001D0A700002")), {
+                let mut r = row("suncrest:roof", Some("001D0A700003"));
+                r.timezone = Some("Asia/Kathmandu".into());
+                r
+            }],
+            [],
+        );
+        assert!(snapshot.zone_problems().is_empty());
+        let zones: Vec<(&str, Option<&'static str>)> = snapshot
+            .zones()
+            .map(|(k, z)| (k.as_str(), z.map(|z| z.name())))
+            .collect();
+        assert_eq!(
+            zones,
+            vec![
+                ("suncrest:backyard", Some("America/Denver")),
+                ("suncrest:roof", Some("Asia/Kathmandu"))
+            ],
+            "in station-key order, which is what makes a plan deterministic"
+        );
+        // The projection still carries the text, because `stations.timezone` is a text
+        // column and the writer copies it.
+        let entry = snapshot
+            .by_station
+            .get("suncrest:roof")
+            .expect("configured");
+        assert_eq!(entry.projection.timezone.as_deref(), Some("Asia/Kathmandu"));
+        assert_eq!(entry.zone.map(|z| z.name()), Some("Asia/Kathmandu"));
     }
 }
