@@ -40,9 +40,8 @@ use crate::dto::{go_rfc3339, to_json_line, zf, Almanac, AlmanacRecord};
 use crate::params::Params;
 use crate::reply::{self, Cache};
 
-/// `Weather data is not available until at least one weather website is configured`.
-const NO_WEBSITE: &str =
-    "Weather data is not available until at least one weather website is configured";
+/// The `503` this endpoint gives when no website resolves: `/almanac` (`handlers.go:1330`).
+const NO_WEBSITE: reply::NoWebsite = reply::NO_WEBSITE_ALMANAC;
 
 /// One hour, which is this endpoint's frozen `Cache-Control`.
 const MAX_AGE: u32 = 3600;

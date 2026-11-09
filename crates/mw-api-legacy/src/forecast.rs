@@ -51,9 +51,9 @@ use crate::dto::GoNumbers;
 use crate::params::Params;
 use crate::reply::{self, Cache};
 
-/// `Forecast data is not available until at least one weather website is configured`.
-const NO_WEBSITE: &str =
-    "Forecast data is not available until at least one weather website is configured";
+/// The `503` this endpoint gives when no website resolves: `/forecast`, whose message is its own and whose content type is sniffed
+/// (`handlers.go:615`).
+const NO_WEBSITE: reply::NoWebsite = reply::NO_WEBSITE_FORECAST;
 
 /// Serve `/forecast/{span}`.
 pub async fn handle(h: &Handlers, host: &str, span: &str, params: &Params) -> Response<Body> {
@@ -141,15 +141,20 @@ pub async fn handle(h: &Handlers, host: &str, span: &str, params: &Params) -> Re
         Ok(Some(record)) => record,
         // **The empty 404** (Q-11): no `Content-Type`, no body, no newline.
         Ok(None) => return reply::empty(StatusCode::NOT_FOUND),
+        // **Also the empty 404, not a 500.** Go never inspects `result.Error`: it tests
+        // `result.RowsAffected == 0` and answers `w.WriteHeader(404)` with no body
+        // (`handlers.go:722-726`). A query that failed has `RowsAffected == 0`, so a
+        // transient connection loss produced the same bytes as a missing record. The `500`
+        // this used to give is the wrong convention twice over -- it is `text/plain` with a
+        // message where Go sends nothing, and a `500` on a frozen route is D-48's subject.
+        // `error encoding forecast data` is what Go emits for a failed *encode*
+        // (`handlers.go:772`), which is a different event.
         Err(e) => {
             tracing::warn!(
                 err = %mw_types::DisplayChain(&e),
-                "the forecast could not be read"
+                "the forecast could not be read, so /forecast answers its no-record 404"
             );
-            return reply::text(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "error encoding forecast data",
-            );
+            return reply::empty(StatusCode::NOT_FOUND);
         }
     };
 
@@ -164,14 +169,20 @@ pub async fn handle(h: &Handlers, host: &str, span: &str, params: &Params) -> Re
                 )
             }
             Err(PeriodError::OutOfRange { len }) => {
+                // **Signed, so an empty array really does say `0--1`.** Go formats
+                // `len(data)-1` as an `int` (`handlers.go:748`), and the column's default is
+                // `'[]'` -- `ci/conformance/rust-seed/04-caches.sql` stores exactly that for
+                // `csi-minimal`, so the state is in the rig. `saturating_sub` said `0-0`,
+                // which is a different byte string and a range that contains the rejected
+                // index.
+                let last = len as i64 - 1;
                 return reply::json_as_text(
                     StatusCode::BAD_REQUEST,
                     &format!(
                         "{{\"error\":\"period {index} exceeds available periods \
-                         (valid range: 0-{})\"}}",
-                        len.saturating_sub(1)
+                         (valid range: 0-{last})\"}}"
                     ),
-                )
+                );
             }
         },
     };
@@ -342,10 +353,36 @@ mod tests {
             element(&stored, 99),
             Err(PeriodError::OutOfRange { len: 10 })
         );
-        // An empty array: `0-(-1)` in Go's arithmetic, which `saturating_sub` renders as
-        // `0-0`. No fixture covers it, and a panic on an underflow would be worse than a
-        // message that reads oddly.
+        // An empty array, which the rig really stores (`04-caches.sql`'s `csi-minimal`
+        // 240-hour row) and which the column's own default produces.
         assert_eq!(element("[]", 0), Err(PeriodError::OutOfRange { len: 0 }));
+    }
+
+    /// The out-of-range body, end to end, for the empty array Go renders as `0--1`.
+    ///
+    /// Go computes `len(data)-1` in a signed `int`, so the message really does carry two
+    /// minus signs. `saturating_sub` said `0-0` instead -- a different byte string, and a
+    /// range that contains the index it is rejecting.
+    #[tokio::test]
+    async fn an_empty_forecast_reports_gos_negative_range() {
+        let r = match element("[]", 0) {
+            Err(PeriodError::OutOfRange { len }) => reply::json_as_text(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "{{\"error\":\"period 0 exceeds available periods (valid range: 0-{})\"}}",
+                    len as i64 - 1
+                ),
+            ),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(r.into_body(), 4096)
+            .await
+            .expect("small");
+        assert_eq!(
+            String::from_utf8(body.to_vec()).expect("utf-8"),
+            "{\"error\":\"period 0 exceeds available periods (valid range: 0--1)\"}\n"
+        );
     }
 
     #[test]

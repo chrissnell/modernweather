@@ -104,21 +104,21 @@ impl Handlers {
     /// The website a request resolves to, or the `503` the contract gives when none is
     /// configured.
     ///
-    /// The message differs per endpoint in the Go tree -- `Weather data is not
-    /// available…` on `/latest`, `/span` and `/snow`, `Forecast data is not available…` on
-    /// `/forecast` -- so the caller supplies it. The *error* string is the same on all of
-    /// them and lives in [`crate::reply::no_website`].
+    /// **The response differs per endpoint in the Go tree**, in both the message and the
+    /// content type, so the caller names which of the seven it is: see
+    /// [`crate::reply::NoWebsite`]. The `error` string is the one thing all seven share.
+    ///
     /// `Box`ed on the error side because an `axum::Response` is 128 bytes and every
     /// handler returns this `Result` by value -- `clippy::result_large_err`, and it is
     /// right: the error arm is the rare one.
     pub fn website(
         &self,
         host: &str,
-        message: &str,
+        which: crate::reply::NoWebsite,
     ) -> Result<&crate::config::WebsiteView, Box<Response<Body>>> {
         self.directory
             .website_for_host(host)
-            .ok_or_else(|| Box::new(crate::reply::no_website(message)))
+            .ok_or_else(|| Box::new(crate::reply::no_website(which)))
     }
 
     /// The read half of the store, or `None` while the database is unavailable.

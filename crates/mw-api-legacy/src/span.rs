@@ -65,9 +65,8 @@ use crate::dto::{to_json_line, zf, LegacyWeatherReading};
 use crate::params::Params;
 use crate::reply::{self, Cache};
 
-/// `Weather data is not available until at least one weather website is configured`.
-const NO_WEBSITE: &str =
-    "Weather data is not available until at least one weather website is configured";
+/// The `503` this endpoint gives when no website resolves: `/span`, which sets `Content-Type` first (`handlers.go:115`).
+const NO_WEBSITE: reply::NoWebsite = reply::NO_WEBSITE_SPAN;
 
 /// The ceiling, which is a `400` rather than a truncation.
 const MAX_SPAN: Duration = Duration::from_secs(365 * 24 * 3600);

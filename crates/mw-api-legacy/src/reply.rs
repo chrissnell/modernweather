@@ -11,7 +11,14 @@
 //! | plain text | `text/plain; charset=utf-8` | the message, newline-terminated | every endpoint's `400`/`403`/`404`/`500` |
 //! | JSON labelled as text | `text/plain; charset=utf-8` | `{"error":…}` + `\n` | `/forecast`'s bad `period` and unknown station **name** (Q-10) |
 //! | empty | **absent** | zero bytes | three `/forecast` paths (Q-11) |
-//! | JSON | `application/json` | `{"error":…,"message":…}` + `\n` | the `503` when no website resolves |
+//! | JSON | `application/json` | `{"error":…,"message":…}` + `\n` | the `503` when no website resolves on `/span`, `/stationinfo`, `/api/stations`, `/almanac` |
+//!
+//! The `503` is **two** of those shapes rather than one, and a fifth exists. `/latest`,
+//! `/snow` and `/forecast` reach it through `formatter.WriteResponse` *after*
+//! `w.WriteHeader(503)`, so their JSON body is labelled `text/plain; charset=utf-8` -- the
+//! second convention, by the same Q-10 mechanism. None of the seven call sites carries CORS.
+//! And [`crate::component`]'s unmounted table answers an empty `503`, which is the third
+//! convention at a status the table above does not list. See [`NoWebsite`].
 //!
 //! The second is not a mistake to tidy. `w.WriteHeader(400)` runs **before**
 //! `formatter.WriteResponse`, so Go has already committed the content type its sniffer
@@ -141,28 +148,98 @@ pub fn empty(status: StatusCode) -> Response<Body> {
         .unwrap_or_else(|_| fallback(status))
 }
 
-/// The `503` for a request that resolves to no website at all.
+/// The `503` for a request that resolves to no website at all, as one endpoint gives it.
 ///
-/// A JSON body with two keys, and the only `503` the frozen surface has. **It is
-/// unreachable on a configured node and that is D-48's subject**: this fires when
+/// **There is no single shape.** The Go tree has seven of these call sites and they differ
+/// in both the message and the content type, because two of them write `Content-Type`
+/// before `WriteHeader` and three go through `formatter.WriteResponse` afterwards -- the
+/// same Q-10 mechanism `json_as_text` exists for, reached by a different route. Carrying one
+/// shape for all seven put `/latest`'s message on `/snow` and `/stationinfo` and
+/// `application/json` on three responses the Go server labels `text/plain`.
+///
+/// None of the seven carries CORS: the four that set `Content-Type` early call
+/// `json.NewEncoder(w)` directly and never touch the formatter, and the three that use the
+/// formatter have already committed their headers by the time it sets it.
+///
+/// Every message and content type below was read off
+/// `internal/controllers/restserver/handlers.go` at `c3ec9f7`, line numbers in each
+/// constant. **No fixture covers the no-website case** (`docs/implementation-plan.md`
+/// records that), so this is pinned by this module's own tests instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoWebsite {
+    /// The `message` key's value.
+    pub message: &'static str,
+    /// Whether Go had committed `Content-Type: application/json` before `WriteHeader`.
+    ///
+    /// `false` means it had not, so Go's sniffer labelled the JSON body
+    /// `text/plain; charset=utf-8` -- which is what the client sees.
+    pub labelled_json: bool,
+}
+
+/// `/latest` -- `handlers.go:205-213`. `formatter.WriteResponse` after `WriteHeader`, so the
+/// content type is sniffed.
+pub const NO_WEBSITE_LATEST: NoWebsite = NoWebsite {
+    message: "Weather data is not available until at least one weather website is configured",
+    labelled_json: false,
+};
+
+/// `/span` -- `handlers.go:115-127`. `Content-Type` set first, then `json.NewEncoder`.
+pub const NO_WEBSITE_SPAN: NoWebsite = NoWebsite {
+    message: "Weather data is not available until at least one weather website is configured",
+    labelled_json: true,
+};
+
+/// `/snow` -- `handlers.go:405-415`. Its own message, and sniffed.
+pub const NO_WEBSITE_SNOW: NoWebsite = NoWebsite {
+    message: "Snow data is not available until at least one weather website is configured",
+    labelled_json: false,
+};
+
+/// `/forecast` -- `handlers.go:615-625`. Its own message, and sniffed.
+pub const NO_WEBSITE_FORECAST: NoWebsite = NoWebsite {
+    message: "Forecast data is not available until at least one weather website is configured",
+    labelled_json: false,
+};
+
+/// `/stationinfo` and `/api/stations` -- `handlers.go:1098-1110` and `985-999`. A different
+/// message again, and labelled.
+pub const NO_WEBSITE_STATIONS: NoWebsite = NoWebsite {
+    message: "The REST server is running but no weather websites have been configured yet",
+    labelled_json: true,
+};
+
+/// `/almanac` -- `handlers.go:1330-1343`. `/latest`'s message, labelled.
+pub const NO_WEBSITE_ALMANAC: NoWebsite = NoWebsite {
+    message: "Weather data is not available until at least one weather website is configured",
+    labelled_json: true,
+};
+
+/// Render one of the seven.
+///
+/// **It is unreachable on a configured node and that is D-48's subject**: this fires when
 /// `config.website` is empty, which is a configuration with no public website rather than a
 /// database that is down. A `503` because a *capability* is missing is the response D-48
 /// forbids on these paths, and the component's declarations are what make it unreachable.
-///
-/// The message differs per endpoint in the Go tree (`Weather data is not available…` on
-/// `/latest` and `/span`, `Forecast data is not available…` on `/forecast`), which the
-/// caller supplies.
-pub fn no_website(message: &str) -> Response<Body> {
-    // Two keys, in this order, assembled rather than serialised: the body is three string
-    // literals and a message, and the only escaping it can need is of a message this crate
-    // chose.
-    let body =
-        format!("{{\"error\":\"No weather websites configured\",\"message\":\"{message}\"}}\n");
-    json(
-        StatusCode::SERVICE_UNAVAILABLE,
-        Cache::Unset,
-        body.into_bytes(),
-    )
+pub fn no_website(which: NoWebsite) -> Response<Body> {
+    // Two keys, in this order, assembled rather than serialised: Go marshals a
+    // `map[string]string`, which sorts its keys, and `error` precedes `message`. The body is
+    // three string literals and a message this crate chose, so there is no escaping to do.
+    let body = format!(
+        "{{\"error\":\"No weather websites configured\",\"message\":\"{}\"}}\n",
+        which.message
+    );
+    let content_type = if which.labelled_json {
+        "application/json"
+    } else {
+        // Go's sniffer on a body beginning `{` picks text/plain, not application/json: the
+        // sniff is `http.DetectContentType`, which only recognises a handful of signatures
+        // and falls back to this one.
+        "text/plain; charset=utf-8"
+    };
+    vary(Response::builder().status(StatusCode::SERVICE_UNAVAILABLE))
+        .header(header::CONTENT_TYPE, HeaderValue::from_static(content_type))
+        .body(Body::from(body.into_bytes()))
+        .unwrap_or_else(|_| fallback(StatusCode::SERVICE_UNAVAILABLE))
 }
 
 /// Attach the additive headers a snapshot-backed response carries (**DEV-1**, **DEV-5**).
@@ -299,17 +376,79 @@ mod tests {
 
     #[tokio::test]
     async fn the_no_website_reply_is_json_with_two_keys_in_order() {
-        let r = no_website(
-            "Weather data is not available until at least one weather website is configured",
-        );
+        let r = no_website(NO_WEBSITE_SPAN);
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(headers(&r)[header::CONTENT_TYPE], "application/json");
         let body = body_of(r).await;
-        assert!(
-            body.starts_with("{\"error\":\"No weather websites configured\",\"message\":\""),
-            "{body}"
+        assert_eq!(
+            body,
+            "{\"error\":\"No weather websites configured\",\"message\":\"Weather data is not \
+             available until at least one weather website is configured\"}\n"
         );
-        assert!(body.ends_with("}\n"), "{body}");
+    }
+
+    /// **All seven call sites, against the Go source.** Carrying one shape for all of them
+    /// put `/latest`'s message on `/snow` and `/stationinfo` and `application/json` on the
+    /// three responses Go labels `text/plain` -- and no fixture covers the no-website case,
+    /// so this test is the only thing between those bytes and a client.
+    ///
+    /// The content type is the Q-10 mechanism again: `/latest`, `/snow` and `/forecast` call
+    /// `formatter.WriteResponse` *after* `w.WriteHeader(503)`, so the
+    /// `Content-Type: application/json` it sets is discarded and Go's sniffer labels the body
+    /// `text/plain`. The other four set the header before and keep it.
+    #[tokio::test]
+    async fn each_endpoints_no_website_reply_is_the_one_the_go_server_sent() {
+        let weather =
+            "Weather data is not available until at least one weather website is configured";
+        let cases = [
+            (
+                "/latest",
+                NO_WEBSITE_LATEST,
+                weather,
+                "text/plain; charset=utf-8",
+            ),
+            ("/span", NO_WEBSITE_SPAN, weather, "application/json"),
+            (
+                "/snow",
+                NO_WEBSITE_SNOW,
+                "Snow data is not available until at least one weather website is configured",
+                "text/plain; charset=utf-8",
+            ),
+            (
+                "/forecast",
+                NO_WEBSITE_FORECAST,
+                "Forecast data is not available until at least one weather website is configured",
+                "text/plain; charset=utf-8",
+            ),
+            (
+                "/stationinfo and /api/stations",
+                NO_WEBSITE_STATIONS,
+                "The REST server is running but no weather websites have been configured yet",
+                "application/json",
+            ),
+            ("/almanac", NO_WEBSITE_ALMANAC, weather, "application/json"),
+        ];
+        for (endpoint, which, message, content_type) in cases {
+            let r = no_website(which);
+            assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE, "{endpoint}");
+            let h = headers(&r);
+            assert_eq!(h[header::CONTENT_TYPE], content_type, "{endpoint}");
+            assert_eq!(h[header::VARY], "Accept-Encoding", "{endpoint}");
+            // **No CORS on any of the seven.** The four that label the body call
+            // `json.NewEncoder(w)` directly and never reach the formatter; the three that
+            // use it have already committed their headers.
+            assert!(
+                !h.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                "{endpoint} must not carry CORS: Go sets it after WriteHeader, or not at all"
+            );
+            assert_eq!(
+                body_of(r).await,
+                format!(
+                    "{{\"error\":\"No weather websites configured\",\"message\":\"{message}\"}}\n"
+                ),
+                "{endpoint}"
+            );
+        }
     }
 
     /// **DEV-5**: the two `X-MW-*` headers appear only when the snapshot is degraded, and

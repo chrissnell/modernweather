@@ -578,7 +578,7 @@ storage because the only `unwrap_or(0.0)` in the workspace is `mw_api_legacy::zf
 enforced by the layout gate.
 `/span` per **D-54** and **D-55**: `ReadingStore::span` returns the materialised prefix plus the
 trailing bucket aggregated from raw, and the 60-second cache holds the **prefix only**.
-`/forecast` caches the stored `jsonb` text byte for byte and splices it between a prefix and a suffix
+`/forecast` reads the stored `jsonb` text byte for byte and splices it between a prefix and a suffix
 (D-39) — nothing parses or re-emits it, which is how Postgres's whitespace and the missing trailing
 newline survive.
 **Constraint inherited from M3-3 (DEV-9): `windch` and `heatidx` are RECOMPUTED here, never read

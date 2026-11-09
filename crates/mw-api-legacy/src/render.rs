@@ -241,14 +241,27 @@ impl Renderer {
         dto.rainfall_storm = window(w, MetricKey::RainIncremental, Window::Storm, Agg::Sum);
 
         // Recomputed, never read from their columns -- see the module documentation.
-        dto.wind_chill = match (r.out_temp, r.wind_speed) {
-            (Some(temp), Some(speed)) => zf(mw_pipeline::enrich::wind_chill(temp, speed)),
-            _ => zf(None),
-        };
-        dto.heat_index = match (r.out_temp, r.out_humidity) {
-            (Some(temp), Some(humidity)) => zf(mw_pipeline::enrich::heat_index(temp, humidity)),
-            _ => zf(None),
-        };
+        //
+        // **Zero-filled BEFORE the formula, not after**, which is what `/span` already does
+        // (`span.rs`'s own call) and what Go does by accident of its types. Go guards on
+        // `latest.OutTemp <= 50 && latest.WindSpeed >= 3` over a struct GORM scanned a NULL
+        // column into as `0`, so a station with a working anemometer and no outdoor
+        // thermometer satisfies `0 <= 50` and gets `CalculateWindChill(0, 10)`. Guarding on
+        // `Option` presence instead returned `0` there, which is a different number and a
+        // different key: `-15.934471` against `0` for `out_temp` NULL and `wind_speed` 10,
+        // and `82.38399` against `0` for `out_temp` 85 with `out_humidity` NULL.
+        //
+        // That state is the normal one for a sensor a station lacks, because **D-26** has the
+        // store write NULL for an unreported metric rather than zero -- so the two endpoints
+        // disagreeing was reachable from the ordinary case.
+        dto.wind_chill = zf(mw_pipeline::enrich::wind_chill(
+            zf(r.out_temp),
+            zf(r.wind_speed),
+        ));
+        dto.heat_index = zf(mw_pipeline::enrich::heat_index(
+            zf(r.out_temp),
+            zf(r.out_humidity),
+        ));
 
         self.sun_and_moon(&mut dto, r.time, &source.key.station, meta, zone);
         dto
@@ -305,9 +318,16 @@ impl Renderer {
         // tell a moon phase ten minutes out from one that is not.
         let moon = sun::moon(at, position);
         dto.moon_phase_name = moon.phase_name.to_string();
-        dto.moon_illumination = moon.illumination as f32;
-        dto.moon_age = moon.age_days as f32;
-        dto.moon_crescent_angle = moon.crescent_angle as f32;
+        // Through `zf` like every other float on the body, which makes **DEV-11**
+        // structural rather than a property of this file. The arithmetic in `sun::moon` is
+        // bounded trig over `atan2`, so a non-finite is not reachable -- but these were the
+        // only three floats on the frozen surface that could have reached `serde_json`
+        // directly, where a non-finite becomes `null` and fails the iOS decode of the whole
+        // object. `is_zero_f32` would not have omitted it either, because `NaN == 0.0` is
+        // false.
+        dto.moon_illumination = zf(Some(moon.illumination as f32));
+        dto.moon_age = zf(Some(moon.age_days as f32));
+        dto.moon_crescent_angle = zf(Some(moon.crescent_angle as f32));
     }
 }
 
@@ -537,6 +557,53 @@ mod tests {
         );
         // Heat index does not apply below 80 °F, so the Go read path leaves it at zero.
         assert_eq!(dto.heat_index, 0.0);
+    }
+
+    /// **One input absent is not both.** Go guards on the *values* of a struct GORM scanned
+    /// NULL into as zero, so a station with a working anemometer and no outdoor thermometer
+    /// gets `CalculateWindChill(0, 10)` and a real number. Guarding on `Option` presence
+    /// returned `0` instead -- and `/span` already did it Go's way, so the two endpoints
+    /// disagreed with each other.
+    ///
+    /// The expected values are `CalculateWindChill`/`CalculateHeatIndex` at `c3ec9f7`, run
+    /// here: `windchill(0, 10) = -15.934471`, `heatindex(85, 0) = 82.38399`.
+    #[test]
+    fn a_reading_missing_one_of_the_two_inputs_is_computed_the_way_go_computed_it() {
+        // An anemometer and no thermometer: `out_temp` NULL zero-fills to 0, which is
+        // `<= 50`, so the formula applies.
+        let dto = Renderer::default().reading(&source(
+            Reading {
+                out_temp: None,
+                wind_speed: Some(10.0),
+                ..Reading::default()
+            },
+            resolved(),
+        ));
+        assert_eq!(dto.wind_chill.to_bits(), 3246322584, "{}", dto.wind_chill);
+
+        // A thermometer and no hygrometer: `out_humidity` NULL zero-fills to 0, and 85 °F
+        // is `>= 80`, so the regression applies at zero humidity.
+        let dto = Renderer::default().reading(&source(
+            Reading {
+                out_temp: Some(85.0),
+                out_humidity: None,
+                ..Reading::default()
+            },
+            resolved(),
+        ));
+        assert_eq!(dto.heat_index.to_bits(), 1118094490, "{}", dto.heat_index);
+
+        // And the thresholds still bite on a zero-filled input: no wind means `wind_speed`
+        // is 0, which is below 3, so Go returns 0 and so does this.
+        let dto = Renderer::default().reading(&source(
+            Reading {
+                out_temp: Some(20.0),
+                wind_speed: None,
+                ..Reading::default()
+            },
+            resolved(),
+        ));
+        assert_eq!(dto.wind_chill, 0.0);
     }
 
     /// Q-4: millimetres on `/latest`, passed through from the column the enrich stage

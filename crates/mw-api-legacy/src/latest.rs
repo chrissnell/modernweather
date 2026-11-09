@@ -35,9 +35,9 @@ use crate::component::Handlers;
 use crate::params::Params;
 use crate::reply::{self, Cache};
 
-/// `Weather data is not available until at least one weather website is configured`.
-const NO_WEBSITE: &str =
-    "Weather data is not available until at least one weather website is configured";
+/// The `503` this endpoint gives when no website resolves: `/latest`, which reaches this through `formatter.WriteResponse` after
+/// `WriteHeader`, so Go labels the JSON body `text/plain` (`handlers.go:205`).
+const NO_WEBSITE: reply::NoWebsite = reply::NO_WEBSITE_LATEST;
 
 /// Serve `/latest`.
 pub fn handle(h: &Handlers, host: &str, params: &Params, headers: &HeaderMap) -> Response<Body> {

@@ -33,9 +33,8 @@ use crate::component::Handlers;
 use crate::dto::{to_json_line, zf64, StationInfo, StationInfoItem};
 use crate::reply::{self, Cache};
 
-/// The `503` message, which is `/latest`'s.
-const NO_WEBSITE: &str =
-    "Weather data is not available until at least one weather website is configured";
+/// The `503` this endpoint gives when no website resolves: `/stationinfo` (`handlers.go:1098`).
+const NO_WEBSITE: reply::NoWebsite = reply::NO_WEBSITE_STATIONS;
 
 /// Serve `/stationinfo`.
 pub fn handle(h: &Handlers, host: &str) -> Response<Body> {
