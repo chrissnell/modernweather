@@ -15,10 +15,12 @@
 
 /// The configuration store and its migrations (D-8, A-W6-2).
 pub mod config_db;
+/// `ForecastStore` and `SnowCache`: the frozen REST surface's own two reads.
+pub mod frozen;
 /// `db:postgres`: the weather pool, its version assertion and its publish/revoke loop.
 pub mod pg;
-/// `window:rollup`'s three reads over the aggregate hierarchy -- the read half of
-/// `ReadingStore`.
+/// The read half of `ReadingStore`: the roll-up's three reads, the snapshot seed, and
+/// `/span` and `/almanac`.
 pub mod reader;
 /// `StationRegistry` over a published snapshot of `config.stations` -- W2a §4a.6's single
 /// identity-resolution gate.
@@ -33,6 +35,7 @@ pub mod version;
 /// `writer:timescale`'s batch `INSERT` and **D-56**'s read-side projections.
 pub mod writer;
 
+pub use crate::frozen::FrozenReads;
 pub use crate::reader::TimescaleReader;
 pub use crate::registry::{ConfigRegistry, RegistrySnapshot, StationEntry, ZoneProblem};
 pub use crate::schedule::SqliteScheduleStore;

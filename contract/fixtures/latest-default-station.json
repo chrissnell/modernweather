@@ -1,6 +1,7 @@
 {
   "name": "latest-default-station",
   "description": "No station parameter: falls back to the website's primary device.",
+  "class": "frozen",
   "provenance": "davis-emulator (cmd/davis-emulator), LOOP packets over TCP",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

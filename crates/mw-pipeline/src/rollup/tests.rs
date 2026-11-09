@@ -352,6 +352,30 @@ mod driven {
                 .push(format!("latest {}", q.station));
             Box::pin(async { Ok(None) })
         }
+
+        /// `/span` and `/almanac` have no caller in this module -- both are
+        /// `api:legacy`'s. Answered as empty rather than `unimplemented!`, so a future
+        /// caller gets a wrong answer it can see instead of a panic inside a component
+        /// tick.
+        fn span<'a>(
+            &'a self,
+            _q: mw_component::SpanQuery,
+        ) -> BoxFuture<'a, Result<mw_component::Span, StoreError>> {
+            Box::pin(async {
+                Ok(mw_component::Span {
+                    backfill: Vec::new(),
+                    prefix: Vec::new(),
+                    tail: None,
+                })
+            })
+        }
+
+        fn almanac<'a>(
+            &'a self,
+            _q: mw_component::AlmanacQuery,
+        ) -> BoxFuture<'a, Result<Vec<mw_component::AlmanacRecord>, StoreError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     /// A bucket with the named 1-minute columns set, looked up through the registry.
@@ -735,6 +759,30 @@ mod driven {
                 _q: mw_component::LatestQuery,
             ) -> BoxFuture<'a, Result<Option<mw_types::Reading>, StoreError>> {
                 Box::pin(async move { Ok(None) })
+            }
+
+            /// `/span` and `/almanac` have no caller in this module -- both are
+            /// `api:legacy`'s. Answered as empty rather than `unimplemented!`, so a future
+            /// caller gets a wrong answer it can see instead of a panic inside a component
+            /// tick.
+            fn span<'a>(
+                &'a self,
+                _q: mw_component::SpanQuery,
+            ) -> BoxFuture<'a, Result<mw_component::Span, StoreError>> {
+                Box::pin(async {
+                    Ok(mw_component::Span {
+                        backfill: Vec::new(),
+                        prefix: Vec::new(),
+                        tail: None,
+                    })
+                })
+            }
+
+            fn almanac<'a>(
+                &'a self,
+                _q: mw_component::AlmanacQuery,
+            ) -> BoxFuture<'a, Result<Vec<mw_component::AlmanacRecord>, StoreError>> {
+                Box::pin(async { Ok(Vec::new()) })
             }
         }
 

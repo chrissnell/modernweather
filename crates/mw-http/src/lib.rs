@@ -12,9 +12,21 @@
 //!
 //! # What exists so far
 //!
-//! One listener and one route: `/metrics`. Nothing else in this crate yet, and that is a
-//! scope boundary rather than a stub -- the router, `RouteTable` mounting, host routing
-//! and the SNI resolver are implementation-plan.md M4-3, which is two milestones away.
+//! One listener, `/metrics`, and **one place to merge a route table into it**. The router
+//! proper -- host routing, `ArcSwap` rebuilds, N sockets, the SNI resolver -- is
+//! implementation-plan.md M4-3 and is not here.
+//!
+//! [`bind`] takes an `Option<Router>` because M4-2 has a table to serve and no component to
+//! mount it from: `api:legacy`'s routes are built by the binary over a state slot the
+//! component fills while it runs, so what this crate needs from that item is one `merge`
+//! and nothing else. The alternative -- giving this crate the route table type -- would
+//! mean naming the surface crates it is forbidden to name, and the alternative to *that* --
+//! bringing M4-3's `RouteTable` forward -- is a router rebuild, a host table and an
+//! `ArcSwap` for one caller that needs none of them.
+//!
+//! **The merged table owns the fallback.** `Router::merge` of two routers each with a
+//! fallback is a panic, so the caller's table must not declare one; this crate's is the
+//! single 404 (DEV-3) and stays that way.
 //!
 //! What forces a socket to exist now is M2-4's own done-criteria: the daemon has to serve
 //! `/metrics`, §5.10 puts it on **an additive route on the one listener**, and §1.4 says
@@ -201,8 +213,16 @@ impl Bound {
     }
 }
 
-/// Bind the listener.
-pub async fn bind(addr: SocketAddr, metrics: MetricsRoute) -> Result<Bound, HttpError> {
+/// Bind the listener, optionally merging one additional route table into it.
+///
+/// `routes` is `None` for a node with no surface to serve -- which is no node today, and is
+/// the shape a test that only wants `/metrics` uses. See the module documentation for why
+/// the parameter is an `axum::Router` rather than a type this crate owns.
+pub async fn bind(
+    addr: SocketAddr,
+    metrics: MetricsRoute,
+    routes: Option<Router>,
+) -> Result<Bound, HttpError> {
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|source| HttpError::Bind { addr, source })?;
@@ -213,12 +233,21 @@ pub async fn bind(addr: SocketAddr, metrics: MetricsRoute) -> Result<Bound, Http
         .map_err(|source| HttpError::Bind { addr, source })?;
     Ok(Bound {
         listener,
-        router: router(metrics),
+        router: router(metrics, routes),
         addr,
     })
 }
 
-fn router(metrics: MetricsRoute) -> Router {
+fn router(metrics: MetricsRoute, routes: Option<Router>) -> Router {
+    let mounted = match routes {
+        Some(routes) => routes,
+        None => Router::new(),
+    };
+    mounted.merge(base(metrics))
+}
+
+/// `/metrics` and the one fallback.
+fn base(metrics: MetricsRoute) -> Router {
     Router::new()
         .route(
             "/metrics",

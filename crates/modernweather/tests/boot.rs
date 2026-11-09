@@ -93,6 +93,7 @@ async fn free_port() -> u16 {
     let probe = mw_http::bind(
         "127.0.0.1:0".parse().expect("a literal address"),
         mw_http::MetricsRoute::new(std::sync::Arc::new(String::new), mw_obs::CONTENT_TYPE),
+        None,
     )
     .await
     .expect("a loopback port is available");
@@ -233,6 +234,30 @@ async fn an_empty_configuration_starts_converges_notifies_serves_and_stops() {
         metrics.contains("mw_build_info"),
         "the payload is not empty before anything has been counted: {metrics}"
     );
+
+    // **And the five frozen paths fall through to `mw-http`'s 404 rather than a `503`.**
+    //
+    // An empty configuration plans no `api:legacy` -- no stations, no websites, no spool --
+    // and `mw_pipeline::snapshot`'s documentation says such a node therefore gets no frozen
+    // route table. It did not: the table was merged whenever the state slot existed, which
+    // `attach_registry` creates unconditionally, so the slot was never filled and
+    // `unmounted()` answered a permanent body-less `503` on every frozen path. That is the
+    // response **D-48** declares unobservable, and it is what a deployed iOS client would
+    // have received from a node whose database URL had not been written yet.
+    for path in [
+        "/latest",
+        "/span/24h",
+        "/snow",
+        "/stationinfo",
+        "/forecast/24",
+    ] {
+        let response = get(port, path).await;
+        assert!(
+            response.starts_with("HTTP/1.1 404"),
+            "{path} on an unconfigured node must fall through to the bare 404, not a 503: \
+             {response}"
+        );
+    }
 
     // 5: SIGTERM, cleanly, inside the grace.
     terminate(&child);

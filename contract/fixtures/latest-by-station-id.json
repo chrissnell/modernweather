@@ -1,6 +1,7 @@
 {
   "name": "latest-by-station-id",
   "description": "station_id form, the parameter the iOS app and the website both prefer.",
+  "class": "frozen",
   "provenance": "davis-emulator (cmd/davis-emulator), LOOP packets over TCP",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

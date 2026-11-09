@@ -1,6 +1,7 @@
 {
   "name": "span-empty",
   "description": "No data in the window: an empty JSON array, not 404.",
+  "class": "frozen",
   "provenance": "derived from the SQLite configuration database only",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

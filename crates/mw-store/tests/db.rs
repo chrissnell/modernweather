@@ -50,7 +50,9 @@ use mw_component::{
 };
 use mw_store::config_db::StationRow;
 use mw_store::{version, ConfigRegistry, RegistrySnapshot, TimescaleReader, TimescaleWriter};
-use mw_types::{Envelope, OriginId, Provenance, Reading, Seq, StationKey, DIMENSIONS, METRICS};
+use mw_types::{
+    Agg, Envelope, MetricKey, OriginId, Provenance, Reading, Seq, StationKey, DIMENSIONS, METRICS,
+};
 use sqlx::{PgPool, Row};
 
 /// The connection string, or a failure that names the gate.
@@ -178,6 +180,7 @@ async fn touched(pool: &PgPool, test: &str) {
 /// A `config.stations` row with coordinates, for the projection.
 fn row(key: &str) -> StationRow {
     StationRow {
+        id: 1,
         station_key: key.into(),
         name: format!("{key} (configured)"),
         kind: "weatherlink-live".into(),
@@ -1814,4 +1817,262 @@ async fn the_newest_reading_in_the_window_is_read_back_whole() {
     assert!(unknown.is_none());
 
     touched(&pool, "the_newest_reading_in_the_window_is_read_back_whole").await;
+}
+
+/// **W1-BUG-1 stays dead, end to end**: `/span` for a station that has never reported a
+/// wind direction returns a bucket with `winddir = 0`, not an error.
+///
+/// `ci/db/schema-assertions.sql` A-3 asserts the finaliser in isolation --
+/// `mw_circular_mean(NULL, NULL, NULL)` is `0` and not a division by zero. This asserts the
+/// **query the frozen endpoint actually issues**, over a station whose `winddir` column is
+/// NULL in every row, through `ReadingStore::span`. The two are different failures: the Go
+/// bug is `SQLSTATE 22012` from `circular_avg_final` dividing by an accumulator that stayed
+/// zero, and it is a *query* failure rather than a wrong number -- so a finaliser that was
+/// right and a `SELECT` that called it with the wrong arguments would pass A-3 and `500`
+/// here.
+///
+/// It is latent in the Go tree only because the Go writer inserts its whole reading struct,
+/// zeros included. **This** writer stores `NULL` for an unreported metric (**D-26**), which
+/// makes the defect live -- so the regression test belongs to the item that first issues
+/// the query, which is M4-2.
+///
+/// `windd` is `"swift_optional": false` in `contract/legacy-v1.json`, so returning NULL
+/// instead of `0` would fail the iOS decode of the whole `/span` response rather than one
+/// field. W4 **D-8** chose zero for that reason.
+#[tokio::test]
+#[ignore = "needs a real TimescaleDB; run `cargo xtask db-tests`"]
+async fn a_span_over_a_station_with_no_wind_direction_returns_zero_rather_than_failing() {
+    let station = "db-tests:w1-bug-1";
+    let pool = prepare(&[station]).await;
+    let w = writer(&pool, station);
+    let reader = TimescaleReader::new(pool.clone());
+
+    // 2026-01-12T00:00:00Z, away from every other test's window.
+    let base = 1_768_176_000i64;
+    let mut batch: Vec<Envelope> = Vec::new();
+    for minute in 0..10i64 {
+        batch.push(envelope(
+            station,
+            at(base + minute * 60),
+            (minute + 1) as u64,
+            Reading {
+                out_temp: Some(40.0 + minute as f32),
+                wind_speed: Some(3.0),
+                // **No `wind_dir`.** Which is the whole test: the column is NULL in every
+                // row, so the aggregate's sine sum, cosine sum and direction count are all
+                // NULL and the Go finaliser divides by zero.
+                ..Reading::default()
+            },
+        ));
+    }
+    w.store(&batch).await.expect("the readings are stored");
+    materialise(&pool, at(base), at(base + 600)).await;
+
+    let columns = vec![
+        (MetricKey::OutTemp, Agg::Mean),
+        (MetricKey::WindDir, Agg::CircularMean),
+        (MetricKey::WindSpeed, Agg::Mean),
+    ];
+    let span = reader
+        .span(mw_component::SpanQuery {
+            station: StationKey::new(station),
+            level: mw_component::BucketLevel::Minute,
+            since: at(base),
+            // The whole window is closed, so the prefix is all ten buckets and the tail is
+            // the minute after them -- which has no readings and must come back `None`
+            // rather than as a row of NULLs.
+            tail_start: at(base + 600),
+            columns,
+            limit: 64,
+        })
+        .await
+        .expect("the query RUNS, which is the half W1-BUG-1 is about");
+
+    assert_eq!(span.prefix.len(), 10, "ten one-minute buckets");
+    assert!(
+        span.tail.is_none(),
+        "the trailing bucket has no readings in it, so it is absent from the response \
+         rather than a row of zeros"
+    );
+    for (i, bucket) in span.prefix.iter().enumerate() {
+        assert_eq!(
+            bucket.values[1],
+            Some(0.0),
+            "bucket {i}: a station that never reported a direction gets 0, not NULL -- \
+             `windd` is a non-optional Swift Double and a missing key fails the decode of \
+             the whole /span response"
+        );
+        assert_eq!(
+            bucket.values[0],
+            Some(f64::from(40.0 + i as f32)),
+            "bucket {i}: the metrics it did report are unaffected"
+        );
+        assert_eq!(bucket.values[2], Some(3.0), "bucket {i}");
+    }
+
+    // And the converse, so that the zero above is not simply what this column always
+    // returns: a station that *does* report a direction gets the vector mean of it.
+    let reporting = "db-tests:w1-bug-1-reporting";
+    let pool = prepare(&[reporting]).await;
+    let w = writer(&pool, reporting);
+    let reader = TimescaleReader::new(pool.clone());
+    w.store(&[
+        envelope(
+            reporting,
+            at(base),
+            1,
+            Reading {
+                wind_dir: Some(80.0),
+                ..Reading::default()
+            },
+        ),
+        envelope(
+            reporting,
+            at(base + 10),
+            2,
+            Reading {
+                wind_dir: Some(100.0),
+                ..Reading::default()
+            },
+        ),
+    ])
+    .await
+    .expect("stores");
+    materialise(&pool, at(base), at(base + 60)).await;
+    let span = reader
+        .span(mw_component::SpanQuery {
+            station: StationKey::new(reporting),
+            level: mw_component::BucketLevel::Minute,
+            since: at(base),
+            tail_start: at(base + 60),
+            columns: vec![(MetricKey::WindDir, Agg::CircularMean)],
+            limit: 8,
+        })
+        .await
+        .expect("the query runs");
+    let got = span.prefix[0].values[0].expect("a direction was reported");
+    assert!(
+        (got - 90.0).abs() < 1e-6,
+        "the vector mean of 80 and 100 degrees is 90, got {got}"
+    );
+
+    touched(
+        &pool,
+        "a_span_over_a_station_with_no_wind_direction_returns_zero_rather_than_failing",
+    )
+    .await;
+}
+
+/// **A closed bucket the refresh policy has not reached is still in the response.**
+///
+/// Every level is `materialized_only = true`, and each policy runs on a schedule -- one
+/// minute at `1m` and `5m`, five at `1h`, **thirty** at `1d`. So between a bucket closing
+/// and its policy running, that bucket is inside the prefix's range and absent from the
+/// view. The tail used to be exactly one bucket wide starting at `floor(now)`, which put
+/// that bucket in neither half: `/span/720h` dropped *yesterday* for the first half hour of
+/// every UTC day, and the Go server cannot reproduce it because its views are
+/// `materialized_only = false`.
+///
+/// This is the state constructed directly: ten minutes of readings, the aggregate refreshed
+/// over the first seven only, and a query whose window covers all ten.
+///
+/// **No gate in the tree could fail on this before.** `ci/conformance/rust-seed/03-refresh.sql`
+/// refreshes every level over `(NULL, NULL)` before the replay and every test above calls
+/// `materialise` by hand, so every one of them sees a fully materialised prefix.
+#[tokio::test]
+#[ignore = "needs a real TimescaleDB; run `cargo xtask db-tests`"]
+async fn a_closed_bucket_the_aggregate_has_not_caught_up_to_is_still_returned() {
+    let station = "db-tests:refresh-lag";
+    let pool = prepare(&[station]).await;
+    let w = writer(&pool, station);
+    let reader = TimescaleReader::new(pool.clone());
+
+    // 2026-01-19T00:00:00Z, away from every other test's window.
+    let base = 1_768_780_800i64;
+    let mut batch: Vec<Envelope> = Vec::new();
+    for minute in 0..10i64 {
+        batch.push(envelope(
+            station,
+            at(base + minute * 60),
+            (minute + 1) as u64,
+            Reading {
+                out_temp: Some(10.0 + minute as f32),
+                ..Reading::default()
+            },
+        ));
+    }
+    w.store(&batch).await.expect("the readings are stored");
+
+    // The policy has reached minute 7 and no further, which is the ordinary steady state
+    // for the few seconds after a bucket closes -- and for half an hour at the `1d` level.
+    materialise(&pool, at(base), at(base + 7 * 60)).await;
+
+    let query = mw_component::SpanQuery {
+        station: StationKey::new(station),
+        level: mw_component::BucketLevel::Minute,
+        since: at(base),
+        // Minute 10 is the still-filling bucket; minutes 0..=9 are closed.
+        tail_start: at(base + 10 * 60),
+        columns: vec![(MetricKey::OutTemp, Agg::Mean)],
+        limit: 64,
+    };
+    let span = reader.span(query.clone()).await.expect("the query runs");
+
+    assert_eq!(
+        span.prefix.len(),
+        7,
+        "the view holds minutes 0..=6, which is what the policy was told to materialise"
+    );
+    assert_eq!(
+        span.backfill.len(),
+        3,
+        "minutes 7, 8 and 9 are closed and not in the view, and used to be in neither half \
+         of the answer: {:?}",
+        span.backfill.iter().map(|b| b.bucket).collect::<Vec<_>>()
+    );
+    assert!(
+        span.tail.is_none(),
+        "no reading landed in minute 10, so the still-filling bucket is absent rather than \
+         a row of zeros"
+    );
+
+    // **The response is continuous, and the backfilled buckets carry the right values** --
+    // the same expression set the view uses, grouped on the same grid, so a backfilled
+    // bucket is the one the policy will later materialise.
+    let all: Vec<_> = span.buckets().collect();
+    assert_eq!(all.len(), 10, "ten minutes in, ten buckets out");
+    for (minute, bucket) in all.iter().enumerate() {
+        assert_eq!(
+            bucket.bucket,
+            at(base + minute as i64 * 60),
+            "bucket {minute} is on the grid and in order"
+        );
+        assert_eq!(
+            bucket.values[0],
+            Some(f64::from(10.0 + minute as f32)),
+            "bucket {minute}'s mean"
+        );
+    }
+
+    // And the cache-hit shape (**D-54**): `since == tail_start` asks for everything after a
+    // prefix the caller already holds, which is the tail alone -- the prefix the handler
+    // cached was complete by construction, because it only caches one that is.
+    let hit = reader
+        .span(mw_component::SpanQuery {
+            since: at(base + 10 * 60),
+            ..query
+        })
+        .await
+        .expect("the query runs");
+    assert!(hit.prefix.is_empty(), "the caller holds the prefix");
+    assert!(
+        hit.backfill.is_empty(),
+        "a hit asks for nothing before the tail, because a cached prefix is a complete one"
+    );
+
+    touched(
+        &pool,
+        "a_closed_bucket_the_aggregate_has_not_caught_up_to_is_still_returned",
+    )
+    .await;
 }

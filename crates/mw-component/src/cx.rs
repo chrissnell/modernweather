@@ -262,6 +262,99 @@ impl<H: CapabilityHandle> Additive<H> {
     }
 }
 
+/// A **soft, exclusive** capability's handle, read when it is used rather than when the
+/// component was built.
+///
+/// # The defect this type exists to close
+///
+/// [`BuildCx::soft`] borrows the slot once and returns what is in it. For a component whose
+/// hard needs are satisfied in the first reconcile pass that is almost always `None`, and it
+/// stays `None` for the life of the process: `mw_supervisor`'s reconcile does not rebuild a
+/// `Running` component when a soft capability later arrives — the `(State::Running, true)`
+/// arm refreshes the `degraded` label and returns. M4-1's code review found
+/// `snapshot:latest` in exactly that state against `WindowedView`, with every snapshot
+/// `Degraded` forever; `snapshot:latest`'s answer was to take the handle from the registrar,
+/// which works because `RollupState` is a root resource `main` owns.
+///
+/// **`api:legacy` has no such answer, and that is the whole reason this type is here.** Its
+/// three read stores — `ReadingStore`, `ForecastStore` and `SnowCache` — are published by
+/// `db:postgres`, whose pool does not exist until its own task has connected and asserted
+/// **D-62** ([`crate::Store`]'s module documentation has why that cannot be a root
+/// resource). So the handle genuinely arrives after the build, and a once-only read makes
+/// `/span`, `/almanac` and `/forecast` permanently empty on a healthy process.
+///
+/// # Why this is not the hole [`Additive`] declines to open
+///
+/// [`BuildCx::additive`] refuses an exclusive capability, on the grounds that a component
+/// able to watch its database being revoked would decide for itself what that means — W2a
+/// Decision 21's "no error branch in business logic". This type is **restricted to a `Soft`
+/// need**, and a `Soft` need is the declaration that the component *does* degrade in a
+/// defined way: `docs/component-model.md` §3.2's table says so for this exact component and
+/// capability — *"`api:legacy` `/forecast` | failing query | `Running { degraded:
+/// [ForecastStore] }`, defined stale/empty response"*. Decision 21 is about `Hard` needs,
+/// where absence means `Waiting` and there is nothing to decide. Asking for this against a
+/// `Hard` need is [`BuildError::UndeclaredNeed`], the same answer [`BuildCx::soft`] gives
+/// for the inverse mistake.
+///
+/// Recorded as **A-M4-2-1** in `docs/reconciliation.md`'s *Proposed amendments*: it resolves
+/// a shape the design left between Decision 21 and §3.2's table rather than contradicting a
+/// decision.
+pub struct Deferred<H: CapabilityHandle> {
+    rx: watch::Receiver<Arc<CapabilitySlot>>,
+    _handle: PhantomData<fn() -> H>,
+}
+
+impl<H: CapabilityHandle> fmt::Debug for Deferred<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Deferred")
+            .field("capability", &H::CAPABILITY)
+            .field("available", &self.rx.borrow().is_available())
+            .finish()
+    }
+}
+
+impl<H: CapabilityHandle> Clone for Deferred<H> {
+    fn clone(&self) -> Self {
+        Self {
+            rx: self.rx.clone(),
+            _handle: PhantomData,
+        }
+    }
+}
+
+impl<H: CapabilityHandle> Deferred<H> {
+    /// The handle, if a provider has published one.
+    ///
+    /// `None` is the degraded state the `Soft` need declared, not an error. A handle
+    /// published under a type this consumer does not resolve is **also** `None` and is
+    /// logged, for [`Additive::load`]'s reason: the supervisor moves it as an
+    /// `Arc<dyn Any>` and never learns what it should have been, so without this line the
+    /// affected endpoints would serve the empty response forever with nothing saying why.
+    pub fn load(&self) -> Option<H> {
+        let slot = self.rx.borrow();
+        let published = slot.sole()?;
+        match published.handle.downcast_ref::<H>() {
+            Some(h) => Some(h.clone()),
+            None => {
+                tracing::warn!(
+                    provider = %published.provider,
+                    capability = %H::CAPABILITY,
+                    expected = std::any::type_name::<H>(),
+                    "a published handle is not the type this consumer resolves; the \
+                     capability reads as unavailable and the consumer will degrade"
+                );
+                None
+            }
+        }
+    }
+
+    /// Whether a provider has published anything at all, for a log field and for
+    /// `X-MW-Degraded`. Does not check the handle's type; [`Deferred::load`] does.
+    pub fn is_available(&self) -> bool {
+        self.rx.borrow().is_available()
+    }
+}
+
 /// What a component's body is handed: identity, cancellation, and the configuration
 /// generation it was built from.
 ///
@@ -440,6 +533,33 @@ impl BuildCx {
         })
     }
 
+    /// A handle for a **soft** requirement, read at use rather than at build.
+    ///
+    /// [`Deferred`]'s own documentation has the whole of why this exists and why it is not
+    /// the hole [`BuildCx::additive`] declines to open. Two refusals, each with a distinct
+    /// name: the capability was not declared (rule 3), or it was declared `Hard` — for
+    /// which [`BuildCx::hard`] is the right call and absence means `Waiting` rather than
+    /// degradation.
+    pub fn deferred<H: CapabilityHandle>(&self) -> Result<Deferred<H>, BuildError> {
+        let need = self.require_declared(H::CAPABILITY)?;
+        if need.strength != Strength::Soft {
+            return Err(BuildError::UndeclaredNeed {
+                capability: H::CAPABILITY,
+            });
+        }
+        let rx = self
+            .access
+            .slot(H::CAPABILITY)
+            .ok_or(BuildError::Unavailable {
+                capability: H::CAPABILITY,
+            })?
+            .clone();
+        Ok(Deferred {
+            rx,
+            _handle: PhantomData,
+        })
+    }
+
     fn require_declared(&self, capability: Capability) -> Result<&Need, BuildError> {
         self.access
             .declared(capability)
@@ -547,6 +667,118 @@ mod tests {
                 handle,
             }],
         }
+    }
+
+    /// A `BuildCx` whose slot sender the test keeps, so it can publish **after** the build.
+    ///
+    /// That is the whole point of [`Deferred`] and the one thing a forgotten sender cannot
+    /// express: `BuildCx::soft` reads its slot once, and the supervisor never rebuilds a
+    /// `Running` component when a soft capability arrives later, so a `soft` handle taken
+    /// at build time is `None` for the life of every process whose database connects after
+    /// the consumer starts.
+    fn deferred_cx() -> (BuildCx, watch::Sender<Arc<CapabilitySlot>>) {
+        let (_gen_tx, gen_rx) = watch::channel(Generation::ZERO);
+        std::mem::forget(_gen_tx);
+        let cx = Cx::new(
+            id("api:legacy"),
+            CancellationToken::new(),
+            Generation::ZERO,
+            gen_rx,
+        );
+        let (tx, rx) = watch::channel(Arc::new(CapabilitySlot {
+            providers: Vec::new(),
+        }));
+        let access = CapabilityAccess::new(
+            vec![Need::soft(Capability::ReadingStore)].into(),
+            Vec::new().into(),
+            vec![(Capability::ReadingStore, rx)],
+            Arc::new(RecordingBus::default()),
+        );
+        (BuildCx::new(cx, access), tx)
+    }
+
+    /// **The defect `Deferred` exists for, as a test.** The handle is taken at build time
+    /// and read per request, so a provider that publishes after the build is seen.
+    #[test]
+    fn a_deferred_handle_resolves_after_the_build() {
+        let (cx, tx) = deferred_cx();
+        let store = cx.deferred::<FakeStore>().expect("declared soft");
+        assert!(store.load().is_none(), "nothing is published yet");
+        assert!(!store.is_available());
+
+        tx.send(Arc::new(slot_with(
+            "db:postgres",
+            Arc::new(FakeStore("pool")),
+        )))
+        .expect("the receiver is alive");
+        assert_eq!(
+            store.load().expect("published after the build").0,
+            "pool",
+            "a Deferred that cached its first read would be None forever"
+        );
+        assert!(store.is_available());
+
+        // And revocation is seen the same way, which is what makes the degraded response
+        // reachable again rather than sticky.
+        tx.send(Arc::new(CapabilitySlot {
+            providers: Vec::new(),
+        }))
+        .expect("the receiver is alive");
+        assert!(store.load().is_none(), "a revoked slot reads as absent");
+    }
+
+    /// A provider that publishes a handle under a type this consumer does not resolve reads
+    /// as unavailable rather than panicking -- `Additive::load`'s reasoning, and the only
+    /// answer a frozen route can take (**D-48**).
+    #[test]
+    fn a_deferred_handle_of_the_wrong_type_reads_as_absent() {
+        let (cx, tx) = deferred_cx();
+        let store = cx.deferred::<FakeStore>().expect("declared soft");
+        tx.send(Arc::new(slot_with("db:postgres", Arc::new(FakeRoutes))))
+            .expect("the receiver is alive");
+        assert!(store.load().is_none(), "the downcast fails, so it degrades");
+        // `is_available` deliberately does not check the type: it answers "somebody
+        // published", which is the field `X-MW-Degraded` and the log line want.
+        assert!(store.is_available());
+    }
+
+    /// §1.3 rule 3 again, on the deferred path: a need nobody declared cannot be resolved
+    /// even when a provider has published it.
+    #[test]
+    fn an_undeclared_need_cannot_be_deferred_either() {
+        let cx = build_cx(
+            vec![Need::hard(Capability::LatestSnapshot)],
+            vec![],
+            vec![(
+                Capability::ReadingStore,
+                slot_with("db:postgres", Arc::new(FakeStore("pool"))),
+            )],
+            Arc::new(RecordingBus::default()),
+        );
+        assert!(matches!(
+            cx.deferred::<FakeStore>(),
+            Err(BuildError::UndeclaredNeed { .. })
+        ));
+    }
+
+    /// A `Deferred` over a need declared **hard** is also a refusal: a hard need is resolved
+    /// once because the supervisor guarantees it for the component's whole life, and
+    /// deferring it would be asking for a guarantee to be re-checked.
+    #[test]
+    fn a_hard_need_cannot_be_deferred() {
+        let cx = build_cx(
+            vec![Need::hard(Capability::ReadingStore)],
+            vec![],
+            vec![(
+                Capability::ReadingStore,
+                slot_with("db:postgres", Arc::new(FakeStore("pool"))),
+            )],
+            Arc::new(RecordingBus::default()),
+        );
+        assert!(
+            cx.deferred::<FakeStore>().is_err(),
+            "a hard need is not a deferred one"
+        );
     }
 
     #[test]

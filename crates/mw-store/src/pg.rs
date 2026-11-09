@@ -35,8 +35,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mw_component::{
-    Builder, Capability, ComponentError, ComponentId, ComponentSpec, Cx, Provision, Publisher,
-    Serve, StationRegistry, Store, Trigger,
+    Builder, Capability, ComponentError, ComponentId, ComponentSpec, Cx, ForecastStore, Provision,
+    Publisher, Serve, SnowCache, StationRegistry, Store, Trigger,
 };
 use mw_types::{Class, Classify, DisplayChain};
 use secrecy::ExposeSecret as _;
@@ -44,6 +44,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 
+use crate::frozen::FrozenReads;
 use crate::store::TimescaleStore;
 use crate::version::{self, VersionError};
 
@@ -103,17 +104,35 @@ pub fn spec(
             let registry = Arc::clone(&registry);
             async move {
                 let publisher = cx.publisher::<Arc<dyn Store>>()?;
+                let forecasts = cx.publisher::<Arc<dyn ForecastStore>>()?;
+                let snow = cx.publisher::<Arc<dyn SnowCache>>()?;
                 Ok(Pool {
                     url,
                     registry,
                     publisher,
+                    forecasts,
+                    snow,
                 })
             }
         }),
     )
     // No needs at all: W2a §4.1's table gives `db:postgres` none, which is what makes it a
     // root of the ordering graph and therefore unable to participate in a cycle.
-    .provides([Provision::of(Capability::ReadingStore)])
+    // Three capabilities, one pool. W2a §4.1's table gives `db:postgres` `ReadingStore`;
+    // §2.1 gives `ForecastStore`, `AlertStore` and `SnowCache` the same provider, and two
+    // of the three have a consumer as of the frozen REST surface. `AlertStore` is still
+    // absent, because `/alerts` is not carried forward (**D-69**) and a capability with no
+    // consumer is a handle trait nobody has checked against a query.
+    //
+    // Publishing them from one component rather than three is not a convenience: the
+    // probe loop below is what decides whether the pool is usable, and a second component
+    // over the same URL would be a second answer to that -- which is exactly the split
+    // W2a §4.1 made between `db:postgres` and `writer:timescale` and for the same reason.
+    .provides([
+        Provision::of(Capability::ReadingStore),
+        Provision::of(Capability::ForecastStore),
+        Provision::of(Capability::SnowCache),
+    ])
     // The URL is the only configuration this component closes over, so it is the whole of
     // the digest: a re-plan after the operator points the daemon at another server
     // restarts it, and a re-plan that changed something else does not.
@@ -142,6 +161,8 @@ struct Pool {
     url: secrecy::SecretString,
     registry: Arc<dyn StationRegistry>,
     publisher: Publisher<Arc<dyn Store>>,
+    forecasts: Publisher<Arc<dyn ForecastStore>>,
+    snow: Publisher<Arc<dyn SnowCache>>,
 }
 
 impl std::fmt::Debug for Pool {
@@ -188,6 +209,12 @@ impl Pool {
             "the weather database is usable"
         );
         self.publisher.publish(Arc::new(store) as Arc<dyn Store>);
+        // The frozen surface's own two reads, over the same pool and published in the same
+        // breath: a consumer that resolved one and not the other would degrade an endpoint
+        // for a reason that is not about the database.
+        let (forecasts, snow) = Arc::new(FrozenReads::new(pool.clone())).handles();
+        self.forecasts.publish(forecasts);
+        self.snow.publish(snow);
 
         // The probe loop. W2a §3.4's worked example is explicit about where this ends:
         // `db:postgres` "probe fails -> revokes ReadingStore ... -> **Failed -> Backoff**",
@@ -232,6 +259,18 @@ impl Pool {
                              §3.4). Readings keep spooling and nothing is lost; \
                              writer:timescale moves to Waiting and resumes on its own.",
                         );
+                        // **Revoke before closing, the same order the cancel path takes
+                        // below and for the same reason.** Closing first and leaving
+                        // `revoke_all` to the supervisor's `on_exit` left a window in which
+                        // `Deferred::load()` still handed out a closed pool, so `/span`,
+                        // `/snow` and `/forecast` answered their `500` instead of the
+                        // degraded response the absent handle produces -- deterministically
+                        // rather than by timing. §3.6's "a consumer must never observe a
+                        // revoked capability" is the supervisor's ordering; this is the half
+                        // this component owes it, and it owes it on both exits.
+                        self.publisher.revoke();
+                        self.forecasts.revoke();
+                        self.snow.revoke();
                         pool.close().await;
                         return Err(ComponentError::tick(
                             "keep the weather database pool usable",
@@ -257,6 +296,8 @@ impl Pool {
         // never observe a revoked capability" is the supervisor's ordering, and this is
         // the half this component owes it.
         self.publisher.revoke();
+        self.forecasts.revoke();
+        self.snow.revoke();
         pool.close().await;
         info!("the weather database pool is closed");
         Ok(())
@@ -409,13 +450,23 @@ mod tests {
         );
         let access = CapabilityAccess::new(
             Arc::from(Vec::<mw_component::Need>::new()),
-            Arc::from(vec![Capability::ReadingStore]),
+            Arc::from(vec![
+                Capability::ReadingStore,
+                Capability::ForecastStore,
+                Capability::SnowCache,
+            ]),
             Vec::new(),
             Arc::clone(&bus) as Arc<dyn CapabilityPublisher>,
         );
         let build = mw_component::BuildCx::new(cx.clone(), access);
         let publisher = build
             .publisher::<Arc<dyn Store>>()
+            .expect("the spec declares this provision");
+        let forecasts = build
+            .publisher::<Arc<dyn ForecastStore>>()
+            .expect("the spec declares this provision");
+        let snow = build
+            .publisher::<Arc<dyn SnowCache>>()
             .expect("the spec declares this provision");
         (
             Box::new(Pool {
@@ -424,6 +475,8 @@ mod tests {
                     crate::RegistrySnapshot::default(),
                 )),
                 publisher,
+                forecasts,
+                snow,
             }),
             bus,
             cx,
@@ -494,9 +547,13 @@ mod tests {
         assert!(spec.requires.is_empty(), "a root of the ordering graph");
         assert_eq!(
             spec.provides,
-            vec![Provision::of(Capability::ReadingStore)],
-            "W2a §4.1 also gives it ForecastStore, AlertStore and SnowCache; those arrive \
-             with the items that read them (M5, M6-3)"
+            vec![
+                Provision::of(Capability::ReadingStore),
+                Provision::of(Capability::ForecastStore),
+                Provision::of(Capability::SnowCache),
+            ],
+            "W2a §4.1 also gives it AlertStore; that one has no consumer, because /alerts \
+             is not carried forward (D-69)"
         );
         assert!(matches!(spec.trigger, Trigger::Service));
         assert!(

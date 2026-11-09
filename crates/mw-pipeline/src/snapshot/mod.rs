@@ -375,6 +375,45 @@ pub fn register<C: SnapshotConfig + ?Sized>(
     Ok(())
 }
 
+/// Whether this configuration will contain a `LatestSnapshot` provider.
+///
+/// **The question `api:legacy` has to ask before it declares a hard need.** `plan()` refuses
+/// a configuration whose hard need nobody provides, so a surface that requires
+/// `LatestSnapshot` -- which **D-48** requires it to -- can only be planned when one of the
+/// two components below will be. The alternative is a daemon that refuses to start on a
+/// configuration with no stations in it.
+///
+/// Exported from here rather than reimplemented by the consumer because the conditions are
+/// [`register`]'s and there must be one copy of them.
+/// [`tests::the_predicate_agrees_with_what_register_plans`] is the anti-drift check, over
+/// every combination the conditions produce. It is the mechanism rather than a comment, and
+/// it was not written the first time: the predicate ended `(has_reading_stream() ||
+/// has_weather_database())`, which is **not** what [`register`] does. Only [`latest_spec`]
+/// provides the capability and it is pushed only on `has_reading_stream()`; [`warm_spec`]
+/// writes the table and provides nothing, because the capability is `Exclusive` and two
+/// providers would be a plan error. So a node with a weather database and no spool --
+/// W7 §8.2's serve-only node, which [`register`]'s own log line advertises as supported --
+/// answered `true` here, got `api:legacy` planned with a hard need nobody provides, and
+/// exited with `PlanError::Unprovided` before `READY=1`. Under `Restart=always` that is a
+/// crash loop.
+///
+/// **One consequence worth stating rather than discovering**: a node whose snapshot key set
+/// is empty -- no website, or no station -- gets no `LatestSnapshot` provider and therefore
+/// no frozen route table, so a request to it is `mw-http`'s bare `404` rather than the
+/// contract's `503 {"error":"No weather websites configured",...}` (W3 §6.3). That body is
+/// reachable only on a node that has a station and at least one website whose `Host` the
+/// request does not match. No fixture covers the no-website case, and the node it describes
+/// is a fresh install nothing is pointed at yet. `crates/modernweather/src/boot.rs` is what
+/// makes the `404` half true rather than a permanent `503`: it mounts the frozen table only
+/// when the plan contains `api:legacy`, which is this predicate's answer.
+pub fn provides_latest_snapshot<C: SnapshotConfig>(cfg: &C) -> bool {
+    cfg.snapshot_render().is_some()
+        && cfg.snapshot_state().is_some_and(|state| !state.is_empty())
+        && cfg.snapshot_registry().is_some()
+        // `has_reading_stream` alone: `warm_spec` provides nothing. See above.
+        && cfg.has_reading_stream()
+}
+
 /// Why a configuration does not produce a snapshot plan.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SnapshotPlanError {

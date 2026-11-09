@@ -1,6 +1,7 @@
 {
   "name": "span-invalid-duration",
   "description": "The span segment is parsed by Go's time.ParseDuration, so '30d' is also invalid; only ns/us/ms/s/m/h units exist.",
+  "class": "frozen",
   "provenance": "derived from the SQLite configuration database only",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

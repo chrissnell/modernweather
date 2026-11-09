@@ -1,6 +1,7 @@
 {
   "name": "forecast-240-ten-daily-periods",
   "description": "Ten daily periods. The data value is Postgres jsonb passed through verbatim, so key order is jsonb-normalised (length then bytewise) and numeric text is whatever was stored -- note snowIN: 0.0, not 0.",
+  "class": "frozen",
   "provenance": "seeded directly into aeris_weather_forecasts / aeris_weather_alerts (Aeris API key not available)",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

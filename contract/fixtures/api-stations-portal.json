@@ -1,6 +1,7 @@
 {
   "name": "api-stations-portal",
   "description": "Portal-only. Devices without a location are excluded; disabled devices are included with enabled: false.",
+  "class": "coupled",
   "provenance": "derived from the SQLite configuration database only",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

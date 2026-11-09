@@ -1,6 +1,7 @@
 {
   "name": "stationinfo-full",
   "description": "Every optional field populated, including radar_enabled/radar_token and the device location.",
+  "class": "frozen",
   "provenance": "derived from the SQLite configuration database only",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

@@ -191,6 +191,33 @@ pub trait ReadingStore: Send + Sync + 'static {
     /// level holds `_sum`/`_count` pairs rather than values (**D-11**), so finalising one
     /// into a reading would mean serving a station's last minute as a mean of itself.
     fn latest<'a>(&'a self, q: LatestQuery) -> BoxFuture<'a, Result<Option<Reading>, StoreError>>;
+
+    /// `/span`'s range: the materialised buckets plus the trailing partial one.
+    ///
+    /// **One method returning both halves is D-55.** The tail is aggregated from raw
+    /// because every level is `materialized_only` — three of the four are the source of
+    /// another, so none may serve a bucket the next one up has not seen — and a caller that
+    /// had to remember to ask for it separately would eventually not. [`SpanQuery`] has how
+    /// the 60-second prefix cache of **D-54** is expressed without a second method.
+    ///
+    /// `Err` for a column the level does not declare, which is a property of the
+    /// *request*: a `(metric, agg)` the registry gives no column for is a declaration to
+    /// fix, and `Fatal` because the next call asks the same thing.
+    fn span<'a>(&'a self, q: SpanQuery) -> BoxFuture<'a, Result<Span, StoreError>>;
+
+    /// One station's cached extremes, for `/almanac`.
+    ///
+    /// Every row the table holds, in no promised order: the frozen response's key order is
+    /// the DTO's field order and the handler places each row by name, so an order here
+    /// would be a second place that decided it.
+    ///
+    /// An empty `Vec` is a station with no cached extremes, which `/almanac` renders as
+    /// `{}` — the shipped empty-cache behaviour, reproduced by the table's shape rather
+    /// than by a branch (W1 assumption 12).
+    fn almanac<'a>(
+        &'a self,
+        q: AlmanacQuery,
+    ) -> BoxFuture<'a, Result<Vec<AlmanacRecord>, StoreError>>;
 }
 
 /// Both halves of the reading store, as the one handle `db:postgres` publishes.
@@ -455,6 +482,265 @@ impl From<StoreError> for crate::error::ComponentError {
     fn from(e: StoreError) -> Self {
         crate::error::ComponentError::tick("store a batch of readings", e)
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// `/span` — D-54 and D-55
+// ---------------------------------------------------------------------------------------
+
+/// One column of a `/span` row: a metric and how the bucket's state is combined into a
+/// value.
+///
+/// `(MetricKey, Agg)` rather than `mw_types::Declaration`'s triple, because the window is
+/// the bucket and the level already says how wide it is. The caller lists the columns the
+/// frozen DTO needs; the store resolves each against the level's declared strategies, so a
+/// column the registry does not carry is an error about the *request* rather than a
+/// silently absent key ([`total_column`]'s reasoning in `mw_store::reader`, generalised).
+pub type SpanColumn = (mw_types::MetricKey, mw_types::Agg);
+
+/// Which buckets and which columns [`ReadingStore::span`] should return.
+///
+/// # `tail_start` is the whole of **D-54**
+///
+/// The materialised prefix is the buckets strictly **before** `tail_start`; the tail is
+/// raw readings at or after it, aggregated into one bucket. The split is a parameter rather
+/// than something the store computes, for the reason [`TotalsQuery`]'s pieces carry their
+/// own level: only the caller knows where it put the boundary last time, which is what lets
+/// it cache the prefix for 60 seconds and re-ask only for the tail.
+///
+/// **A cache hit is this query with `since == tail_start`.** The prefix range is then empty
+/// by construction and the answer is the tail alone — so there is one method, the tail
+/// always comes back with it (**D-55**: "no caller can forget it"), and the cache still
+/// holds the prefix only (**D-54**).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanQuery {
+    /// Whose.
+    pub station: mw_types::StationKey,
+    /// Which level's buckets. `/span`'s band selection is the caller's: `<= 6h` reads the
+    /// 1-minute level, `<= 48h` the 5-minute, `<= 14d` the hour, and anything longer the
+    /// day (`docs/legacy-api-contract.md` §2).
+    pub level: BucketLevel,
+    /// The oldest bucket wanted, inclusive.
+    pub since: chrono::DateTime<chrono::Utc>,
+    /// The first instant **not** in the materialised prefix, and the first instant that is
+    /// in the tail. Bucket-aligned at `level`; see the type documentation.
+    pub tail_start: chrono::DateTime<chrono::Utc>,
+    /// The columns, answered in this order.
+    pub columns: Vec<SpanColumn>,
+    /// How many prefix buckets to return at most. Bounded for [`BucketQuery::limit`]'s
+    /// reason — a year of 1-minute buckets is 525,600 rows, and the caller's own band
+    /// selection is what keeps the number sane.
+    pub limit: usize,
+}
+
+/// One `/span` bucket, finalised.
+///
+/// `values` is one entry per [`SpanQuery::columns`] member, in that order. `None` is a
+/// column no reading in the bucket carried — **D-26** — and the frozen contract's zero for
+/// it is produced one layer later, at the DTO.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpanBucket {
+    /// The bucket's start instant.
+    pub bucket: chrono::DateTime<chrono::Utc>,
+    /// One value per requested column, in request order.
+    pub values: Vec<Option<f64>>,
+}
+
+/// What one [`ReadingStore::span`] answered: the materialised prefix, the closed buckets
+/// the aggregate has not caught up to yet, and the trailing partial bucket.
+///
+/// **Three fields rather than one concatenated list**, because the caller caches exactly one
+/// of them (**D-54**). Concatenating here would make the cacheable half unrecoverable
+/// without the caller re-deriving the boundary it supplied.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Span {
+    /// The closed, materialised buckets in `[since, tail_start)`, oldest first.
+    ///
+    /// A **gap is a missing bucket**, not a zero row: the continuous aggregate produces no
+    /// row for a bucket no reading fell in and this does not gap-fill, which is the frozen
+    /// contract's Q-9 and the reason a client may not assume a constant interval.
+    ///
+    /// **Cacheable, and complete** — the only half that is either. It ends at
+    /// `tail_start - width` whenever the station has data there, which is what lets a cache
+    /// hit ask for everything after it.
+    pub prefix: Vec<SpanBucket>,
+    /// Closed buckets the continuous aggregate has not materialised yet, aggregated from
+    /// raw, oldest first.
+    ///
+    /// **Not cacheable**, and usually empty. Every level is `materialized_only = true`
+    /// (W4's own note on why: TimescaleDB cannot build an aggregate on a real-time view, so
+    /// the levels cannot be stacked otherwise), and each refresh policy runs on a schedule
+    /// — one minute at the two lower levels, five minutes at `1h`, **thirty** at `1d`. So
+    /// between a bucket closing and its policy running, that bucket is in the view's range
+    /// and not in the view. Without this field it was in neither half of the answer and
+    /// simply absent from the response: `/span/720h` dropped *yesterday* for the first half
+    /// hour of every UTC day, and the Go server cannot reproduce that because its views are
+    /// `materialized_only = false`.
+    ///
+    /// Bounded, because an unbounded raw fill is the scan the aggregates exist to avoid —
+    /// see `mw_store`'s `MAX_BACKFILL_BUCKETS`.
+    pub backfill: Vec<SpanBucket>,
+    /// The still-filling bucket at `tail_start`, aggregated from raw.
+    ///
+    /// `None` when no raw reading has landed in it, which is the ordinary case for a
+    /// station that has stopped reporting — and is why it is an `Option` rather than a row
+    /// of `None`s: an empty bucket must not appear in the response at all.
+    pub tail: Option<SpanBucket>,
+}
+
+impl Span {
+    /// Every bucket as one sequence, oldest first — what a response body is rendered from.
+    pub fn buckets(&self) -> impl Iterator<Item = &SpanBucket> {
+        self.prefix
+            .iter()
+            .chain(self.backfill.iter())
+            .chain(self.tail.iter())
+    }
+
+    /// The buckets after the cacheable prefix, oldest first.
+    ///
+    /// What a cache **hit** needs: the prefix came from the cache, and this is everything
+    /// the store was asked for on top of it.
+    pub fn after_prefix(&self) -> impl Iterator<Item = &SpanBucket> {
+        self.backfill.iter().chain(self.tail.iter())
+    }
+}
+
+/// Which station's cached extremes [`ReadingStore::almanac`] should return.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlmanacQuery {
+    /// Whose.
+    pub station: mw_types::StationKey,
+}
+
+/// One row of `almanac_cache`: the extreme, when it happened, and the wind direction at
+/// the time where the record carries one.
+///
+/// `f32` rather than `f64` because the column is `real` and the contract serialises both
+/// numbers as a Go `float32` — widening would change the digits Go emits for a value that
+/// is not exactly representable in 24 bits of mantissa, which a frozen API cannot do (the
+/// column's own comment in `migrations/`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlmanacRecord {
+    /// The frozen `/almanac` JSON key this row populates — `high_temp`, `low_barometer`.
+    /// The table's `CHECK` is the permitted set.
+    pub record: String,
+    /// The extreme.
+    pub value: f32,
+    /// When it was observed.
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+    /// The wind direction at the time, for the records that carry one. `None` is an absent
+    /// key rather than a null (`AlmanacRecord.wind_dir` is `omitempty`).
+    pub wind_dir: Option<f32>,
+}
+
+/// Aeris forecast rows — `Capability::ForecastStore`.
+///
+/// Its own capability rather than a method on [`ReadingStore`], because the design gives it
+/// one (`docs/component-model.md` §2.1) and because the two degrade independently: `/span`
+/// failing and `/forecast` failing are different rows of §3.2's table, and `api:legacy`
+/// declares both `Soft` so that either can be absent without the other.
+///
+/// # The response is a byte string, and that is **D-39**
+///
+/// `/forecast` returns `{"lastUpdated": <string>, "data": <the stored jsonb>}` with the
+/// `jsonb` written back **verbatim** — key order is jsonb-normalised (key length, then
+/// bytewise) and the numeric text is whatever was stored, so the same contract contains both
+/// `0` and `0.0` (Q-13). Nothing in this program parses or re-emits it, which is how
+/// PostgreSQL's own whitespace and the missing trailing newline survive. So the handle
+/// returns the text and not a parsed document.
+pub trait ForecastStore: Send + Sync + 'static {
+    /// The newest forecast for one span, optionally for one station.
+    ///
+    /// `None` is "no record matched", which the frozen handler turns into a `404` with an
+    /// **empty body and no `Content-Type`** (Q-11) — not an error.
+    fn forecast<'a>(
+        &'a self,
+        q: ForecastQuery,
+    ) -> BoxFuture<'a, Result<Option<Forecast>, StoreError>>;
+}
+
+impl CapabilityHandle for Arc<dyn ForecastStore> {
+    const CAPABILITY: Capability = Capability::ForecastStore;
+}
+
+/// Which forecast [`ForecastStore::forecast`] should return.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForecastQuery {
+    /// The station, when the request named one. `None` means "any station's forecast for
+    /// this span", which is what the frozen handler does when neither `station_id` nor
+    /// `station` is given — `First()` over a `forecast_span_hours` filter with no station
+    /// predicate.
+    pub station: Option<mw_types::StationKey>,
+    /// `forecast_span_hours`: 24 is the hourly forecast and 240 the ten-day one. **Not a
+    /// duration** — the path segment is a count of hours of total span (the endpoint's own
+    /// grammar, `^\d{1,4}$`).
+    pub span_hours: u32,
+}
+
+/// One stored forecast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forecast {
+    /// `updated_at`, which the wrapper renders with Go's `time.Time.String()` layout.
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// The `data` column's text, exactly as PostgreSQL rendered it. See the trait
+    /// documentation: this is not re-encoded anywhere.
+    pub data: String,
+}
+
+/// The snow depth, event and smoothing cache rows — `Capability::SnowCache`.
+///
+/// One row per station and every column `NOT NULL DEFAULT 0`, because `/snow` emits all
+/// seven numbers unconditionally and a configured-but-never-reporting gauge returns an
+/// all-zero object with status 200 (fixture `snow-device-never-reported`). There is
+/// deliberately **no recency filter**: an offline gauge returns its last known depth
+/// indefinitely, which is part of the contract (fixture `snow-device-stale`).
+pub trait SnowCache: Send + Sync + 'static {
+    /// One station's cached snow figures, or `None` for a station with no row.
+    ///
+    /// `None` and an all-zero row are different facts and the handler treats them the same
+    /// way, which is the contract's: both render as seven zeros. They are distinguished
+    /// here anyway, because "the gauge has a row of zeros" and "nothing has ever written a
+    /// row" are different operational states and collapsing them in the handle would make
+    /// the second unobservable.
+    fn totals<'a>(
+        &'a self,
+        station: &'a mw_types::StationKey,
+    ) -> BoxFuture<'a, Result<Option<SnowTotals>, StoreError>>;
+}
+
+impl CapabilityHandle for Arc<dyn SnowCache> {
+    const CAPABILITY: Capability = Capability::SnowCache;
+}
+
+/// One `snow_totals_cache` row.
+///
+/// **Inches**, which is the `/snow` contract's unit — not the millimetres `snowdepth`
+/// carries on `/latest` (Q-4, and the table's own `COMMENT`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SnowTotals {
+    /// `computed_at`: when the `snow:*` components last wrote this row.
+    ///
+    /// Not part of the frozen body -- `/snow` has no field for it -- and read because it is
+    /// the identity of the bytes, which is what **DEV-1**'s additive `ETag` on this
+    /// endpoint needs. `source_through` is the other staleness column and is deliberately
+    /// **not** read: `/snow` has no recency filter and must not acquire one (fixture
+    /// `snow-device-stale`), so a value nothing may act on is a value nothing should carry.
+    pub computed_at: chrono::DateTime<chrono::Utc>,
+    /// `snowdepth`, inches.
+    pub depth: f32,
+    /// `snowtoday`.
+    pub today: f32,
+    /// `snowlast24`.
+    pub last24: f32,
+    /// `snowlast72`.
+    pub last72: f32,
+    /// `snowseason`.
+    pub season: f32,
+    /// `snowstorm`.
+    pub storm: f32,
+    /// `snowfallrate`.
+    pub fall_rate: f32,
 }
 
 #[cfg(test)]

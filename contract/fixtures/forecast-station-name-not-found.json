@@ -1,6 +1,7 @@
 {
   "name": "forecast-station-name-not-found",
   "description": "A fourth error-body convention on this one endpoint: a JSON {\"error\"} object written by json.NewEncoder after WriteHeader, so the Content-Type is the sniffed text/plain.",
+  "class": "frozen",
   "provenance": "derived from the SQLite configuration database only",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

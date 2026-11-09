@@ -92,10 +92,20 @@ const DECLARED: &[&str] = &[
     "a_ten_minute_mean_over_the_rolled_up_buckets_equals_the_mean_from_raw",
     "a_range_stitched_across_three_levels_totals_the_same_as_raw",
     "an_hourly_rain_series_is_read_in_order_with_dry_hours_absent",
+    // implementation-plan.md M4-2, found by its code review: a closed bucket the refresh
+    // policy has not reached was in neither the materialised prefix nor the one-bucket
+    // tail, so `/span/720h` dropped yesterday for the first half hour of every UTC day.
+    // The only test in the tree that does NOT materialise the whole window first.
+    "a_closed_bucket_the_aggregate_has_not_caught_up_to_is_still_returned",
     // implementation-plan.md M4-1's one database-shaped claim: `ReadingStore::latest`
     // reads 216 real columns back into a `Reading` in the types they hold, which the
     // snapshot tests over a fake store cannot say anything about.
     "the_newest_reading_in_the_window_is_read_back_whole",
+    // implementation-plan.md M4-2's named regression test: W1-BUG-1, end to end. The
+    // finaliser is asserted in isolation by ci/db/schema-assertions.sql A-3; this asserts
+    // the query `/span` actually issues, which is a different failure -- the Go bug is a
+    // SQLSTATE rather than a wrong number.
+    "a_span_over_a_station_with_no_wind_direction_returns_zero_rather_than_failing",
 ];
 
 /// The panic messages `crates/mw-store/tests/db.rs`'s own harness produces when the

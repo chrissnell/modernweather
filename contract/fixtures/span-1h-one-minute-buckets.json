@@ -1,6 +1,7 @@
 {
   "name": "span-1h-one-minute-buckets",
   "description": "span <= 6h reads weather_1m.",
+  "class": "frozen",
   "provenance": "campbell-emulator (cmd/campbell-emulator), JSON records over TCP",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

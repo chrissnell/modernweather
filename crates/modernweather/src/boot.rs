@@ -66,7 +66,7 @@ use crate::spool;
 /// One line per component crate, which is §1.3 rule 2: adding a component crate adds a line
 /// here and edits nothing else -- the shape `managers/controller.go` could not take, down to
 /// its `if con.Type == "management" { continue }`.
-const REGISTRARS: &[&dyn Registrar<Config>] = &[&Stations, &Database, &Rollup, &Snapshot];
+const REGISTRARS: &[&dyn Registrar<Config>] = &[&Stations, &Database, &Rollup, &Snapshot, &Legacy];
 
 /// `mw-station`'s registrar.
 ///
@@ -218,6 +218,34 @@ impl Registrar<Config> for Snapshot {
     }
 }
 
+/// `api:legacy` -- the frozen REST surface.
+///
+/// An adapter here for `Rollup`'s reason. `mw_api_legacy::register` makes every decision,
+/// and there is only one: a node whose boot sequence built the route state slot plans the
+/// component, and one that did not is a wiring mistake rather than a configuration.
+///
+/// **Unconditional on the configuration**, which is deliberate and is the opposite of the
+/// three registrars above it. There is no configuration under which the frozen table should
+/// be absent: a node with no `website` row serves the contract's `503` from the handlers
+/// (§6.3), not a `404` from a route that is not there, and those are different bytes.
+#[derive(Debug)]
+struct Legacy;
+
+impl Registrar<Config> for Legacy {
+    fn name(&self) -> &'static str {
+        "mw-api-legacy (the frozen REST surface)"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        mw_api_legacy::register(cfg, out)
+            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
+    }
+}
+
 /// Build the station registry, the window rollup and the snapshot table, and hand all
 /// three to the configuration.
 ///
@@ -357,6 +385,42 @@ fn attach_registry(cfg: &mut Config) -> anyhow::Result<()> {
         websites,
         snapshot_stations,
     )));
+    // The frozen surface's two root resources: the route table's state slot, which the
+    // listener reads and `api:legacy` fills, and the DTO's serialiser, which both snapshot
+    // components render through. Built together because the slot without the renderer is a
+    // configuration that plans `api:legacy` and no snapshot for it to read, and the
+    // renderer without the slot is one that refuses to plan `api:legacy` at all.
+    //
+    // **The zones come from the station rows rather than from `station_zones`**, which is
+    // the registry's resolved list and covers only the stations it resolved a zone for.
+    // `mw_api_legacy::register` parses them itself, from the column, and skips one that is
+    // not an IANA name with a warning -- see its own note on why a cosmetic field may not
+    // take the frozen table down.
+    let zones: std::collections::BTreeMap<mw_types::StationKey, mw_component::Zone> = cfg
+        .station_zones
+        .iter()
+        .filter_map(|(key, zone)| zone.map(|z| (key.clone(), z)))
+        .collect();
+    // The coordinates, for the same table: `/latest`'s `moonCrescentAngle` is computed at
+    // the **website's primary** station rather than at the station the request named
+    // (`handlers.go:387`), so the renderer needs a position the snapshot does not carry.
+    let positions: std::collections::BTreeMap<mw_types::StationKey, (f64, f64)> = cfg
+        .stations
+        .iter()
+        .filter_map(|row| {
+            let (lat, lon) = (row.latitude?, row.longitude?);
+            Some((
+                mw_types::StationKey::new(row.station_key.as_str()),
+                (lat, lon),
+            ))
+        })
+        .collect();
+    let renderer = Arc::new(mw_api_legacy::Renderer::new(zones, positions));
+    info!(
+        zones = renderer.zones(),
+        "the frozen DTO's serialiser is built, so the snapshot components are planned"
+    );
+    cfg.set_legacy(Arc::new(mw_api_legacy::RouteState::new()), renderer);
     Ok(())
 }
 
@@ -575,13 +639,39 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     // port already in use is a startup failure rather than a daemon that reports itself
     // ready and serves nothing.
     let metrics = obs.metrics();
+    // The frozen REST surface, merged into the one listener. The router is built over the
+    // state slot `attach_registry` created; the slot is empty until `api:legacy` reaches
+    // `Running`, at which point every frozen path answers its contract response -- see
+    // that component's own note on why an empty slot is not a state D-48 is about.
+    //
+    // **Mounted on the PLAN, not on the slot.** `attach_registry` sets `legacy_routes`
+    // unconditionally, so merging on its presence mounted the table on nodes where
+    // `register` deliberately planned no component -- and then nothing ever filled the
+    // slot, so `unmounted()` answered a permanent body-less `503` on all five frozen
+    // paths. That is the response **D-48** declares unobservable, and
+    // `mw_pipeline::snapshot`'s own documentation says such a node gets `mw-http`'s bare
+    // `404`. It did not; the fall-through worked and the frozen paths never reached it.
+    //
+    // The shape is ordinary: websites and stations configured, no spool and no weather
+    // database yet -- a staged rollout, or a serve-only node before its database URL is
+    // written.
+    let legacy = plan
+        .ids()
+        .any(|id| id.as_str() == mw_api_legacy::ID)
+        .then(|| {
+            cfg.legacy_routes
+                .as_ref()
+                .map(|state| mw_api_legacy::routes(Arc::clone(state)))
+        })
+        .flatten();
     let bound = mw_http::bind(
         cfg.listen_addr()?,
         mw_http::MetricsRoute::new(Arc::new(move || metrics.render()), mw_obs::CONTENT_TYPE),
+        legacy,
     )
     .await
     .context("binding the listener")?;
-    info!(addr = %bound.local_addr(), "serving /metrics");
+    info!(addr = %bound.local_addr(), "serving /metrics and the frozen REST surface");
 
     // Step 7. Four concurrent jobs, one task: the supervisor's own tasks are spawned by
     // `mw_supervisor::task`, which is the only module in the workspace allowed to spawn
@@ -691,11 +781,24 @@ mod tests {
     use mw_store::config_db::{Listener, WeatherDatabase};
     use secrecy::SecretString;
 
+    /// A hand-built configuration, with the two root resources `attach_registry` gives a
+    /// real one.
+    ///
+    /// Without them `plan()` refuses: `api:legacy` is planned unconditionally and needs
+    /// both the route state slot and the DTO's serialiser, and a configuration that has
+    /// neither is a boot sequence that has not reached step 4c rather than a shape worth
+    /// planning (`mw_api_legacy::LegacyPlanError`). That refusal has its own test in that
+    /// crate; here it would only mean every plan assertion below asserted the refusal.
     fn config(with_database: bool) -> Config {
-        Config {
+        let mut cfg = Config {
             stations: Vec::new(),
             declared_stations: Vec::new(),
             websites: Vec::new(),
+            legacy_websites: Vec::new(),
+            legacy_stations: Vec::new(),
+            legacy_routes: None,
+            legacy_render: None,
+            snapshot_render: None,
             ingress: None,
             registry: None,
             rollup: None,
@@ -715,7 +818,22 @@ mod tests {
             }),
             node: None,
             generation: Generation::ZERO,
-        }
+        };
+        // The three root resources `attach_registry` builds, over this fixture's empty
+        // station and website sets. The snapshot's key set is therefore empty, which is one
+        // of `mw_pipeline::snapshot::register`'s four reasons to plan neither component --
+        // so the plans below are about the pool and the writer, which is what these tests
+        // are for.
+        cfg.set_rollup(Arc::new(mw_pipeline::RollupState::new(Vec::new())));
+        cfg.set_snapshot(Arc::new(mw_pipeline::SnapshotState::new(
+            Vec::new(),
+            Vec::new(),
+        )));
+        cfg.set_legacy(
+            Arc::new(mw_api_legacy::RouteState::new()),
+            Arc::new(mw_api_legacy::Renderer::default()),
+        );
+        cfg
     }
 
     fn observed(pg: u32, ts: &str) -> Observed {
@@ -973,6 +1091,14 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                // The frozen REST surface, which is planned unconditionally: a node with
+                // no `website` row serves the contract's `503` from the handlers and not
+                // a `404` from a route that is not there (`mw_api_legacy::register`).
+                "api:legacy",
+                // And the snapshot it reads, which needs a reading stream and not a
+                // database -- this node has a spool and no `weather_database` row, so
+                // `snapshot:warm` is absent and `snapshot:latest` is not.
+                "snapshot:latest",
                 "station:wll:suncrest:roof:rearm",
                 &format!("station:wll:udp:{port}")[..],
             ],
@@ -1159,17 +1285,17 @@ mod tests {
             ids.contains(&"rain:rollover:suncrest:roof"),
             "one rollover per collecting station: got {ids:?}"
         );
-        // **The snapshot components are not planned, and the renderer is the only reason.**
-        // `snapshot:latest` and `snapshot:warm` are implementation-plan.md M4-1's and are
-        // complete; what they need and do not have is the payload renderer, which is the
-        // frozen 133-key DTO's serialiser and belongs exclusively to `mw-api-legacy`
-        // (M4-2). `Config::snapshot_render` answers `None`, so
-        // `mw_pipeline::snapshot::register` plans neither and says so at `info`.
+        // **The snapshot components are planned, and the renderer is the only reason they
+        // were not.** `snapshot:latest` and `snapshot:warm` are implementation-plan.md
+        // M4-1's and were complete; what they needed and did not have was the payload
+        // renderer, which is the frozen 133-key DTO's serialiser and belongs exclusively to
+        // `mw-api-legacy`. `attach_registry` now builds one, so
+        // `Config::snapshot_render` answers `Some` and `mw_pipeline::snapshot::register`
+        // plans both.
         //
-        // The fixture has a `website` row and a station row, so the key set is **not**
-        // empty and `register`'s other three conditions are all satisfied -- which is what
-        // makes this a tripwire rather than a tautology. Setting `snapshot_render` to
-        // `Some` is sufficient to fail this assertion and the count below.
+        // The fixture has a `website` row and a station row, so the key set is non-empty
+        // and `register`'s other three conditions are satisfied -- which is what makes this
+        // an assertion about the renderer rather than about the key set.
         assert!(
             !cfg.websites.is_empty() && !cfg.stations.is_empty(),
             "the key set must be non-empty, or this asserts the wrong thing: {} websites, \
@@ -1178,13 +1304,15 @@ mod tests {
             cfg.stations.len()
         );
         assert!(
-            !ids.contains(&"snapshot:latest") && !ids.contains(&"snapshot:warm"),
-            "the snapshot components need M4-2's renderer; when it lands, this assertion \
-             inverts and the count below becomes 8: got {ids:?}"
+            ids.contains(&"snapshot:latest") && ids.contains(&"snapshot:warm"),
+            "both snapshot components plan once the renderer exists: got {ids:?}"
         );
+        // And the surface that reads them, planned unconditionally.
+        assert!(ids.contains(&"api:legacy"), "got {ids:?}");
         // The listener, its re-arm (the fixture's station has a `transport_host`), the
-        // pool, the writer, the rollup and the rollover.
-        assert_eq!(ids.len(), 6, "got {ids:?}");
+        // pool, the writer, the rollup, the rollover, the two snapshot components and
+        // `api:legacy`.
+        assert_eq!(ids.len(), 9, "got {ids:?}");
         assert!(
             ids.iter().any(|id| id.starts_with("station:wll:udp:")),
             "got {ids:?}"
@@ -1214,11 +1342,18 @@ mod tests {
         };
         let ctx = PlanContext::new(Generation::ZERO).with_roots(roots.capabilities());
         let planned = plan(&cfg, REGISTRARS, &ctx).expect("a node that serves but does not ingest");
-        let ids: Vec<&str> = planned
+        let mut ids: Vec<&str> = planned
             .ids()
             .map(mw_component::ComponentId::as_str)
             .collect();
-        assert_eq!(ids, vec!["db:postgres"]);
+        ids.sort_unstable();
+        // `writer:timescale` is absent, which is this test's subject. Neither snapshot
+        // component is planned either, and for a different reason: this fixture has no
+        // website and no station, so the `(website, station)` key set is empty and there
+        // is nothing to fold into (`mw_pipeline::snapshot::register`). `api:legacy` goes
+        // with them, because its hard `LatestSnapshot` would then be a need nobody
+        // provides and `plan()` refuses the whole configuration for one.
+        assert_eq!(ids, vec!["db:postgres"], "got {ids:?}");
     }
 
     /// No weather database: neither component, and that is not an error (**D-44**).
@@ -1290,6 +1425,8 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "api:legacy",
+                "snapshot:latest",
                 "station:wll:suncrest:barn:rearm",
                 "station:wll:suncrest:field",
                 "station:wll:suncrest:roof:rearm",

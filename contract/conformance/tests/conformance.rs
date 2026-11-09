@@ -18,7 +18,11 @@ fn legacy_contract_is_satisfied() {
     );
     let fixtures = load_fixtures(&dir).expect("fixtures directory is readable");
     assert!(!fixtures.is_empty(), "no fixtures found in {}", dir.display());
-    let report = run_all(&base, &fixtures);
+    // No deviations: this wrapper exists for a CI job that points at whatever
+    // `CONFORMANCE_BASE_URL` names, and enabling one would make it assert the Rust
+    // target's bytes against an unknown server. `cargo xtask conformance` is the entry
+    // point that knows which target it started.
+    let report = run_all(&base, &fixtures, &[]);
     print!("{}", report.text);
     assert_eq!(report.failed, 0, "{} fixtures failed against {base}", report.failed);
 }

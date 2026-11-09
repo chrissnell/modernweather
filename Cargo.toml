@@ -105,7 +105,11 @@ protox = "0.10"
 # (§1.7).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rmp-serde = "1"
+# Go's float digits. `encoding/json` renders a float with `strconv.AppendFloat(…, -1, bits)`,
+# which is ryu and breaks a shortest-representation tie round-half-to-EVEN; Rust's `Display`
+# breaks the same tie round-half-up. `mw_api_legacy::dto` is the only crate that may name
+# this, because it is the only one that has to produce Go's bytes (ci/layers.toml).
+ryu = "1"
 
 # Time. `chrono::DateTime<Utc>` is what the generator emits and what `sqlx` maps (§1.6);
 # `chrono-tz` is needed for the calendar trigger's time zones.

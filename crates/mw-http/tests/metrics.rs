@@ -36,9 +36,13 @@ async fn metrics_is_served_on_the_bound_port_and_everything_else_is_a_404() {
     let payload = "mw_readings_ingested_total{station=\"backyard\"} 7\n";
     let route = MetricsRoute::new(Arc::new(move || payload.to_string()), CONTENT_TYPE);
     // Port 0: the kernel chooses, so two tests on one machine cannot collide.
-    let bound = bind("127.0.0.1:0".parse().expect("a literal address"), route)
-        .await
-        .expect("the port is bindable");
+    let bound = bind(
+        "127.0.0.1:0".parse().expect("a literal address"),
+        route,
+        None,
+    )
+    .await
+    .expect("the port is bindable");
     let addr = bound.local_addr();
     assert_ne!(addr.port(), 0, "the bound port is read back, not echoed");
 
@@ -78,9 +82,13 @@ async fn the_payload_is_rendered_per_request_rather_than_once() {
         }),
         CONTENT_TYPE,
     );
-    let bound = bind("127.0.0.1:0".parse().expect("a literal address"), route)
-        .await
-        .expect("bindable");
+    let bound = bind(
+        "127.0.0.1:0".parse().expect("a literal address"),
+        route,
+        None,
+    )
+    .await
+    .expect("bindable");
     let addr = bound.local_addr();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let server = bound.serve(async move {
@@ -104,11 +112,17 @@ async fn a_port_already_held_is_reported_with_the_address() {
     let first = bind(
         "127.0.0.1:0".parse().expect("a literal address"),
         MetricsRoute::new(Arc::new(String::new), CONTENT_TYPE),
+        None,
     )
     .await
     .expect("bindable");
     let addr = first.local_addr();
-    let again = bind(addr, MetricsRoute::new(Arc::new(String::new), CONTENT_TYPE)).await;
+    let again = bind(
+        addr,
+        MetricsRoute::new(Arc::new(String::new), CONTENT_TYPE),
+        None,
+    )
+    .await;
     let error = again.expect_err("the port is held");
     assert!(
         error.to_string().contains(&addr.to_string()),
@@ -124,9 +138,13 @@ async fn a_client_that_never_finishes_its_request_cannot_hold_the_drain_open() {
     // unauthenticated main port, which is what made that a remote problem rather than a
     // developer's.
     let route = MetricsRoute::new(Arc::new(String::new), CONTENT_TYPE);
-    let bound = bind("127.0.0.1:0".parse().expect("a literal address"), route)
-        .await
-        .expect("bindable");
+    let bound = bind(
+        "127.0.0.1:0".parse().expect("a literal address"),
+        route,
+        None,
+    )
+    .await
+    .expect("bindable");
     let addr = bound.local_addr();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     // A short deadline so the test asserts the deadline exists rather than its value.
@@ -158,4 +176,56 @@ async fn a_client_that_never_finishes_its_request_cannot_hold_the_drain_open() {
     .await
     .expect("the listener abandons the drain instead of waiting for the client");
     served.expect("an abandoned drain is a warning, not an error");
+}
+
+/// **The merged table, which nothing in this crate exercised.**
+///
+/// `bind` takes an `Option<Router>` and merges it with `/metrics` and the one fallback, and
+/// every case here passed `None` -- so neither "`/metrics` survives the merge" nor the
+/// module's own rule, "the merged table must not declare a fallback, or `merge` panics", was
+/// asserted anywhere in the crate that owns them. It was covered incidentally by
+/// `crates/modernweather/tests/boot.rs`, which is a long way from the rule.
+#[tokio::test]
+async fn a_merged_table_keeps_metrics_and_the_fallback() {
+    let payload = "mw_build_info 1\n";
+    let route = MetricsRoute::new(Arc::new(move || payload.to_string()), CONTENT_TYPE);
+    // A table shaped like the frozen surface's: one route, no fallback of its own.
+    let mounted = axum::Router::new().route(
+        "/latest",
+        axum::routing::any(|| async { "the frozen surface\n" }),
+    );
+    let bound = bind(
+        "127.0.0.1:0".parse().expect("a literal address"),
+        route,
+        Some(mounted),
+    )
+    .await
+    .expect("the port is bindable");
+    let addr = bound.local_addr();
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = bound.serve(async move {
+        let _ = stopped.await;
+    });
+    let client = async move {
+        // The merged route answers.
+        let latest = request(addr, "/latest").await;
+        assert!(latest.starts_with("HTTP/1.1 200 OK"), "{latest}");
+        assert!(latest.ends_with("the frozen surface\n"), "{latest}");
+        // **And `/metrics` survives the merge**, which is the half that would break
+        // silently: a scraper getting the fallback's 404 looks like a dead target.
+        let metrics = request(addr, "/metrics").await;
+        assert!(metrics.starts_with("HTTP/1.1 200 OK"), "{metrics}");
+        assert!(metrics.contains("mw_build_info 1"), "{metrics}");
+        // And the fallback still covers everything else.
+        let nope = request(addr, "/nope").await;
+        assert!(nope.starts_with("HTTP/1.1 404"), "{nope}");
+        let _ = stop.send(());
+    };
+    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(server, client)
+    })
+    .await
+    .expect("the exchange finishes well inside the deadline");
+    outcome.expect("the accept loop ends cleanly");
 }

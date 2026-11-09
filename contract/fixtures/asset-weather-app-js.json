@@ -1,6 +1,8 @@
 {
   "name": "asset-weather-app-js",
   "description": "js/weather-app.js.tmpl rendered through text/template. Content-Type is text/javascript with NO charset, unlike the static JS the file server returns.",
+  "class": "coupled",
+  "pending": "implementation-plan.md M4-3",
   "provenance": "derived from the SQLite configuration database only",
   "captured_at": "2026-10-28T16:56:42Z",
   "request": {

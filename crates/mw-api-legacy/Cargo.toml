@@ -15,11 +15,41 @@ workspace = true
 # Workspace crates, by layer (ci/layers.toml).
 mw-component.workspace = true
 mw-types.workspace = true
+# **DEV-9's constraint, as a dependency.** `windch`, `heatidx` and the two AQI keys are
+# recomputed on every request rather than read from their columns, and the formulae have to
+# be the SAME ones the enrich stage stores with -- asserted bit-for-bit against the Go
+# arithmetic in `mw_pipeline::enrich`'s own tests. A second copy here is exactly the defect
+# that constraint exists to prevent. `mw-pipeline` is a lower layer (`service`), so this is
+# a permitted edge; it is declared with a reason because an API crate depending on the
+# pipeline is a surprising one.
+mw-pipeline.workspace = true
 
 axum.workspace = true
+# The route table's state slot: one atomic load per request, no lock on the read path
+# (**D-28**, **D-32**).
+arc-swap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rmp-serde.workspace = true
+# **Go's float digits, and the reason this crate is the only one that may name it.**
+# `encoding/json` formats a float with `strconv.AppendFloat(b, f, fmt, -1, bits)`, which is
+# ryu; Rust's `Display` is Grisu/Dragon and breaks a shortest-representation tie the other
+# way. The difference is one digit, on a surface whose whole premise is reproducing bytes a
+# deployed client already has -- see `dto::write_go_float`.
+ryu.workspace = true
 chrono.workspace = true
+# The station's IANA zone, which `/latest`'s `sunrise` and `sunset` are formatted in.
+chrono-tz.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# `#[tokio::test]` for the handler tests, which drive the real `axum` router.
+tokio.workspace = true
+# `Staleness::Degraded`'s `missing` is a `SmallVec`, so a test that asserts the degraded
+# header set has to construct one.
+smallvec.workspace = true
+# `ServiceExt::oneshot`, which is how `tests/degraded.rs` drives the real router without
+# binding a socket -- `ci/layers.toml` reserves binding for `mw-http` and scans `tests/`.
+tower.workspace = true
+# `CancellationToken`, which `Cx::new` takes.
+tokio-util.workspace = true

@@ -1,4 +1,13 @@
-//! `window:rollup`'s half of the pool: the three reads that feed `WindowedView`.
+//! The read half of the pool: `window:rollup`'s three reads, `snapshot:warm`'s one, and
+//! the frozen REST surface's two.
+//!
+//! Six methods, and the module doc on [`mw_component::ReadingStore`] has the table of what
+//! each one answers and why it cannot be one of the others. `buckets`, `totals` and
+//! `series` feed `WindowedView`; `latest` seeds the snapshot after a restart; `span` and
+//! `almanac` serve `/span` and `/almanac`, and arrived with the item that wrote their
+//! queries. Nothing here is on the `/latest` path -- `api:legacy` is handed
+//! `LatestSnapshot` and never this trait, which is what makes that handler's zero queries
+//! structural rather than a rule (**D-35**).
 //!
 //! # The column list is the registry's, and the casts are the reason it is one statement
 //!
@@ -50,11 +59,12 @@ use std::fmt::Write as _;
 
 use chrono::{DateTime, Utc};
 use mw_component::{
-    BoxFuture, Bucket, BucketLevel, BucketQuery, Bucketed, LatestQuery, Piece, ReadingStore,
-    SeriesQuery, StoreError, TotalsQuery,
+    AlmanacQuery, AlmanacRecord, BoxFuture, Bucket, BucketLevel, BucketQuery, Bucketed,
+    LatestQuery, Piece, ReadingStore, SeriesQuery, Span, SpanBucket, SpanColumn, SpanQuery,
+    StoreError, TotalsQuery,
 };
 use mw_types::{
-    AggregateColumn, MetricKey, MetricValue, Reading, SqlType, Strategy, LEVELS, METRICS,
+    Agg, AggregateColumn, MetricKey, MetricValue, Reading, SqlType, Strategy, LEVELS, METRICS,
 };
 use sqlx::{PgPool, Row};
 
@@ -67,7 +77,23 @@ use sqlx::{PgPool, Row};
 /// the shape that turns an outage into an allocation failure.
 const MAX_ROWS: usize = 10_000;
 
-/// The raw hypertable, which [`TimescaleReader::latest`] is the only read of.
+/// How many closed-but-unmaterialised buckets `span` will aggregate from raw.
+///
+/// **A bound on the raw scan, not a tuning knob.** The buckets it covers are the ones a
+/// refresh policy has not reached yet, and the slowest policy in `migrations/` runs every
+/// **thirty minutes** (`observations_1d`; the others are one and five). Four buckets is
+/// therefore more than any level needs: two hours at the `1h` level and four days at `1d`.
+///
+/// The bound matters because the unbounded case is real and is the scan the continuous
+/// aggregates exist to prevent -- a station with no materialised rows at all over a
+/// 720-hour window would otherwise aggregate a month of raw rows per request. Past the
+/// bound a bucket stays absent until its policy runs, which is where this started; the
+/// difference is that it is now absent for seconds at the levels anyone watches rather than
+/// for half an hour at the level nobody notices.
+const MAX_BACKFILL_BUCKETS: i32 = 4;
+
+/// The raw hypertable, which [`TimescaleReader::latest`] and `span`'s trailing buckets are
+/// the only reads of.
 const OBSERVATIONS: &str = "observations";
 
 /// The four stored dimension columns of `observations`, in the order the writer declares
@@ -279,6 +305,347 @@ impl ReadingStore for TimescaleReader {
                 .collect()
         })
     }
+
+    fn span<'a>(&'a self, q: SpanQuery) -> BoxFuture<'a, Result<Span, StoreError>> {
+        Box::pin(async move {
+            // Resolved before either statement runs, so a column the level does not
+            // declare is one error naming the column rather than two half-run queries.
+            let resolved = q
+                .columns
+                .iter()
+                .map(|c| resolve_span_column(q.level, *c))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // The materialised prefix. Empty by construction when the caller passed
+            // `since == tail_start`, which is how **D-54**'s 60-second cache hit asks for
+            // the tail alone (`SpanQuery`'s own documentation).
+            let mut prefix = Vec::new();
+            if q.since < q.tail_start {
+                let sql = prefix_statement(q.level, &resolved);
+                let limit = i64::try_from(q.limit.min(MAX_ROWS)).unwrap_or(i64::from(i32::MAX));
+                let rows = sqlx::query(&sql)
+                    .bind(q.station.as_str())
+                    .bind(q.since)
+                    .bind(q.tail_start)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(classify)?;
+                prefix.reserve(rows.len());
+                for row in rows {
+                    prefix.push(SpanBucket {
+                        bucket: row.try_get(0).map_err(StoreError::rejected)?,
+                        values: read_values(&row, 1, resolved.len())?,
+                    });
+                }
+            }
+
+            // From raw: every bucket after the materialised prefix, bounded above by the
+            // trailing bucket's own extent rather than left open -- a station whose clock is
+            // ahead of this one would otherwise pull a reading from the *next* bucket into
+            // this one, and a frozen response is not the place to discover a clock skew.
+            let width = chrono::Duration::from_std(q.level.span())
+                .map_err(|e| StoreError::rejected(std::io::Error::other(e.to_string())))?;
+            let tail_end = q.tail_start + width;
+
+            // **Where the raw aggregation starts, and why it is not always `tail_start`.**
+            //
+            // Every level is `materialized_only = true` and each refresh policy runs on a
+            // schedule, so a bucket that has closed may not be in the view yet: the prefix's
+            // range covers it and the view has no row for it. Reading the tail from
+            // `tail_start` alone put that bucket in neither half, and `/span/720h` dropped
+            // yesterday for the first half hour of every UTC day.
+            //
+            // So the boundary comes from the DATA rather than the clock: the first bucket
+            // after the newest one the prefix actually holds. Bounded by
+            // `MAX_BACKFILL_BUCKETS`, because the unbounded case -- a station with no
+            // materialised rows at all over a 720-hour window -- is the raw scan the
+            // aggregates exist to avoid, and no refresh policy here is more than thirty
+            // minutes behind.
+            let from = if q.since >= q.tail_start {
+                // The caller holds a cached prefix and asked for the rest. The cache only
+                // stores a prefix that ends at `tail_start - width` (`mw_api_legacy::span`),
+                // so there is nothing between it and the tail.
+                q.tail_start
+            } else {
+                let after_prefix = prefix.last().map(|b| b.bucket + width);
+                let floor = q.tail_start - width * MAX_BACKFILL_BUCKETS;
+                after_prefix
+                    .unwrap_or(q.since)
+                    .max(floor.max(q.since))
+                    .min(q.tail_start)
+            };
+
+            let sql = tail_statement(&resolved, q.level);
+            let rows = sqlx::query(&sql)
+                .bind(q.station.as_str())
+                .bind(from)
+                .bind(tail_end)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(classify)?;
+
+            // Column 0 is the bucket and column 1 is `count(*)`: an aggregate over no rows
+            // still returns one row with every value NULL -- indistinguishable from a bucket
+            // whose every metric was unreported. The frozen contract needs the difference,
+            // because an empty bucket must not appear in the array at all. With a
+            // `GROUP BY` there is no row for an empty bucket, so the count is belt and
+            // braces rather than the only guard it was.
+            let mut backfill = Vec::new();
+            let mut tail = None;
+            for row in rows {
+                let bucket: chrono::DateTime<chrono::Utc> =
+                    row.try_get(0).map_err(StoreError::rejected)?;
+                let count: i64 = row.try_get(1).map_err(StoreError::rejected)?;
+                if count == 0 {
+                    continue;
+                }
+                let values = read_values(&row, 2, resolved.len())?;
+                if bucket >= q.tail_start {
+                    tail = Some(SpanBucket { bucket, values });
+                } else {
+                    backfill.push(SpanBucket { bucket, values });
+                }
+            }
+
+            Ok(Span {
+                prefix,
+                backfill,
+                tail,
+            })
+        })
+    }
+
+    fn almanac<'a>(
+        &'a self,
+        q: AlmanacQuery,
+    ) -> BoxFuture<'a, Result<Vec<AlmanacRecord>, StoreError>> {
+        Box::pin(async move {
+            let rows = sqlx::query(
+                "SELECT record, value, observed_at, wind_dir FROM almanac_cache \
+                 WHERE station_id = $1",
+            )
+            .bind(q.station.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(classify)?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(AlmanacRecord {
+                        record: row.try_get(0).map_err(StoreError::rejected)?,
+                        value: row.try_get(1).map_err(StoreError::rejected)?,
+                        observed_at: row.try_get(2).map_err(StoreError::rejected)?,
+                        wind_dir: row.try_get(3).map_err(StoreError::rejected)?,
+                    })
+                })
+                .collect()
+        })
+    }
+}
+
+/// `n` consecutive `float8` columns from `at`, as the values of one [`SpanBucket`].
+///
+/// One decode path for every strategy, which is [`buckets_statement`]'s property for
+/// [`prefix_statement`]'s reason: both statements cast, and the module documentation has
+/// why that is lossless.
+fn read_values(
+    row: &sqlx::postgres::PgRow,
+    at: usize,
+    n: usize,
+) -> Result<Vec<Option<f64>>, StoreError> {
+    let mut values = Vec::with_capacity(n);
+    for i in 0..n {
+        values.push(
+            row.try_get::<Option<f64>, _>(at + i)
+                .map_err(StoreError::rejected)?,
+        );
+    }
+    Ok(values)
+}
+
+/// One `/span` column, as the two expressions that compute it.
+///
+/// Two, because the prefix and the tail are read from different relations with different
+/// contents: the view holds composable state and is finalised by `mw_mean` /
+/// `mw_circular_mean`, and the raw table holds values and is aggregated *into* that state
+/// and finalised in the same expression. Resolving both together is what keeps them from
+/// drifting -- a column that is a mean on one side and a maximum on the other would produce
+/// a response whose last element means something different from the rest of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpanExpr {
+    /// Over `LEVELS[level].view`.
+    prefix: String,
+    /// Over `observations`, grouped into one bucket by the statement's `WHERE`.
+    tail: String,
+}
+
+/// Which registry strategy an [`Agg`] reads.
+///
+/// `Agg::Sum` maps onto the registry's `total` -- the same strategy under two names
+/// (**D-50**), kept because `Sum` is what a protocol specification says and `total` is what
+/// the column is called.
+const fn strategy_of(agg: Agg) -> Strategy {
+    match agg {
+        Agg::Mean => Strategy::Mean,
+        Agg::Min => Strategy::Min,
+        Agg::Max => Strategy::Max,
+        Agg::Sum => Strategy::Total,
+        Agg::CircularMean => Strategy::CircularMean,
+    }
+}
+
+/// Resolve one `(metric, agg)` against a level, into the prefix and tail expressions.
+///
+/// The aggregate column names are matched by **suffix** rather than by position within the
+/// metric's group. Both are a coupling to the generator; this one fails loudly and names
+/// what is missing, where a positional read of a two-column group would silently swap a
+/// mean's numerator and denominator if the generator ever emitted them the other way round.
+/// `ci/db/schema-assertions.sql` A-1 and A-2 pin the same four suffixes against a real
+/// server, so the coupling is checked at both ends.
+fn resolve_span_column(level: BucketLevel, column: SpanColumn) -> Result<SpanExpr, StoreError> {
+    let (metric, agg) = column;
+    let strategy = strategy_of(agg);
+    let declared: Vec<&AggregateColumn> = LEVELS
+        .iter()
+        .find(|l| l.name == level.as_str())
+        .map(|l| l.columns)
+        .unwrap_or(&[])
+        .iter()
+        .filter(|c| c.metric == metric && c.strategy == strategy)
+        .collect();
+    let find = |suffix: &str| -> Result<&'static str, StoreError> {
+        declared
+            .iter()
+            .map(|c| c.column)
+            .find(|name| name.ends_with(suffix))
+            .ok_or_else(|| missing_column(metric, agg, level, suffix))
+    };
+    // The raw column, for the tail. Every metric has exactly one, and a metric whose key
+    // is not in `METRICS` cannot be constructed -- `MetricKey` is generated.
+    let raw = METRICS
+        .iter()
+        .find(|m| m.key == metric)
+        .map(|m| m.column)
+        .ok_or_else(|| missing_column(metric, agg, level, "a raw column"))?;
+    Ok(match strategy {
+        Strategy::Mean => SpanExpr {
+            prefix: format!("mw_mean({}, {})", find("_sum")?, find("_count")?),
+            tail: format!("mw_mean(sum({raw}::double precision), nullif(count({raw}), 0))"),
+        },
+        Strategy::Min => SpanExpr {
+            prefix: format!("{}::float8", find("_min")?),
+            tail: format!("min({raw})::float8"),
+        },
+        Strategy::Max => SpanExpr {
+            prefix: format!("{}::float8", find("_max")?),
+            tail: format!("max({raw})::float8"),
+        },
+        Strategy::Total => SpanExpr {
+            prefix: format!("{}::float8", find("_total")?),
+            tail: format!("sum({raw}::double precision)"),
+        },
+        Strategy::CircularMean => SpanExpr {
+            prefix: format!(
+                "mw_circular_mean({}, {}, {})",
+                find("_sin_sum")?,
+                find("_cos_sum")?,
+                find("_dir_count")?
+            ),
+            tail: format!(
+                "mw_circular_mean(sum(sind({raw}::double precision)), \
+                 sum(cosd({raw}::double precision)), nullif(count({raw}), 0))"
+            ),
+        },
+    })
+}
+
+/// The error a `(metric, agg)` the registry does not carry at this level produces.
+///
+/// `Fatal` for [`total_column`]'s reason: it is a property of the request, and the next
+/// call asks the same thing.
+fn missing_column(metric: MetricKey, agg: Agg, level: BucketLevel, suffix: &str) -> StoreError {
+    StoreError::rejected(std::io::Error::other(format!(
+        "metrics/registry.toml declares no `{suffix}` column for {metric:?} with \
+         {agg:?} at the {level} level, so there is nothing to read. Add the strategy to \
+         that metric's `aggregates` and re-run `cargo xtask codegen`, or ask for one it \
+         already declares."
+    )))
+}
+
+/// `SELECT bucket, <finalised columns> FROM <view> WHERE station_id = $1 AND bucket >= $2
+/// AND bucket < $3 ORDER BY bucket LIMIT $4`.
+///
+/// `bucket < $3` is **D-54**'s boundary: the prefix stops where the still-filling bucket
+/// starts, so the materialised half of the answer is a function of `(since, tail_start)`
+/// alone and is therefore cacheable for as long as the caller's TTL says.
+///
+/// The `LIMIT` orders **ascending**, so a truncated answer loses the newest buckets rather
+/// than the oldest. That is the wrong half to lose for this caller and it is a bound it
+/// cannot reach: the widest band the frozen endpoint serves is just under 48 hours of
+/// 5-minute buckets, 576 rows, against a [`MAX_ROWS`] of 10,000. The bound is here for the
+/// reason [`BucketQuery::limit`]'s is -- a `Vec` sized by a caller's arithmetic mistake.
+fn prefix_statement(level: BucketLevel, columns: &[SpanExpr]) -> String {
+    let mut sql = String::with_capacity(96 + columns.len() * 64);
+    sql.push_str("SELECT bucket");
+    for c in columns {
+        let _ = write!(sql, ", {}", c.prefix);
+    }
+    let _ = write!(
+        sql,
+        " FROM {view} WHERE station_id = $1 AND bucket >= $2 AND bucket < $3 \
+         ORDER BY bucket LIMIT $4",
+        view = view(level),
+    );
+    sql
+}
+
+/// `SELECT count(*), <aggregated-and-finalised columns> FROM observations WHERE
+/// station_id = $1 AND time >= $2 AND time < $3`.
+///
+/// No `GROUP BY`: the `WHERE` **is** the bucket, one bucket wide, so the aggregate is over
+/// the whole result and returns exactly one row. `count(*)` is what distinguishes that one
+/// row from a bucket that really has no readings in it -- see [`ReadingStore::span`].
+///
+/// This is the expression set the 1-minute level's own view computes from raw (the
+/// generated SQL for it, which `ci/layers.toml` forbids this crate from naming by path),
+/// which is not a coincidence and is the only shape that can be right: the tail has to be
+/// the bucket the 1-minute level *would* have materialised had it refreshed, and a
+/// different expression here would make the last element of a `/span` response discontinuous
+/// with the ones before it. `ci/db/measure/35-trailing-bucket.sql` measured this statement's
+/// cost at 0.44-6.89 ms, which is what **D-54** cites.
+fn tail_statement(columns: &[SpanExpr], level: BucketLevel) -> String {
+    let mut sql = String::with_capacity(128 + columns.len() * 96);
+    // `time_bucket` with the level's own width, so the raw rows are grouped onto exactly the
+    // grid the view uses -- which is what makes a backfilled bucket identical to the one the
+    // policy will later materialise. The width is a literal from `BucketLevel` and not from
+    // the request.
+    let _ = write!(
+        sql,
+        "SELECT time_bucket(INTERVAL '{}', time) AS bucket, count(*)",
+        bucket_interval(level)
+    );
+    for c in columns {
+        let _ = write!(sql, ", {}", c.tail);
+    }
+    let _ = write!(
+        sql,
+        " FROM {OBSERVATIONS} WHERE station_id = $1 AND time >= $2 AND time < $3 \
+         GROUP BY bucket ORDER BY bucket"
+    );
+    sql
+}
+
+/// The level's bucket width as a PostgreSQL interval literal.
+///
+/// A `match` rather than a formatted `Duration`, so the string is a constant the statement
+/// builder cannot get wrong and `clippy` can see is exhaustive.
+const fn bucket_interval(level: BucketLevel) -> &'static str {
+    match level {
+        BucketLevel::Minute => "1 minute",
+        BucketLevel::FiveMinute => "5 minutes",
+        BucketLevel::Hour => "1 hour",
+        BucketLevel::Day => "1 day",
+    }
 }
 
 /// The 1-minute level's declared columns, in the order a [`Bucket`]'s values are in.
@@ -443,7 +810,7 @@ fn totals_statement(
 /// read that succeeds on the next tick, and a statement the server rejected is a build that
 /// disagrees with its schema and will be rejected identically forever. `window:rollup`
 /// keeps its last good state either way (W3 §2a.6) — what the class buys is the log line.
-fn classify(e: sqlx::Error) -> StoreError {
+pub(crate) fn classify(e: sqlx::Error) -> StoreError {
     match &e {
         sqlx::Error::Database(_)
         | sqlx::Error::ColumnNotFound(_)
@@ -630,6 +997,121 @@ mod tests {
             assert_eq!(c.column, "rainincremental_total");
             assert_eq!(c.strategy, Strategy::Total);
         }
+    }
+
+    /// `/span`'s four strategies resolve to the finaliser calls the generated views are
+    /// built to be read with, and the tail's expressions are the ones the 1-minute level
+    /// computes from raw.
+    ///
+    /// Asserted as strings because that is what is actually at risk: the SQL is assembled
+    /// here and executed against a server the unit tests do not have, so a `_sum` paired
+    /// with the wrong `_count` would be caught by nothing until `gate conformance`.
+    /// `ci/db/schema-assertions.sql` A-1 and A-2 are the other end of the same check.
+    #[test]
+    fn a_span_column_resolves_to_the_levels_finaliser_and_the_raw_aggregate() {
+        let mean = resolve_span_column(BucketLevel::FiveMinute, (MetricKey::OutTemp, Agg::Mean))
+            .expect("out_temp declares a mean at every level");
+        assert_eq!(mean.prefix, "mw_mean(outtemp_sum, outtemp_count)");
+        assert_eq!(
+            mean.tail,
+            "mw_mean(sum(outtemp::double precision), nullif(count(outtemp), 0))"
+        );
+
+        let dir = resolve_span_column(BucketLevel::Hour, (MetricKey::WindDir, Agg::CircularMean))
+            .expect("wind_dir declares a circular mean");
+        assert_eq!(
+            dir.prefix,
+            "mw_circular_mean(winddir_sin_sum, winddir_cos_sum, winddir_dir_count)"
+        );
+        assert!(
+            dir.tail.contains("sind(winddir::double precision)"),
+            "{}",
+            dir.tail
+        );
+        assert!(
+            dir.tail.contains("cosd(winddir::double precision)"),
+            "{}",
+            dir.tail
+        );
+
+        let total = resolve_span_column(BucketLevel::Day, (MetricKey::RainIncremental, Agg::Sum))
+            .expect("rain_incremental declares a total at every level");
+        assert_eq!(total.prefix, "rainincremental_total::float8");
+        assert_eq!(total.tail, "sum(rainincremental::double precision)");
+
+        let max = resolve_span_column(BucketLevel::Minute, (MetricKey::WindSpeed, Agg::Max))
+            .expect("wind_speed declares a max");
+        assert_eq!(max.prefix, "windspeed_max::float8");
+        assert_eq!(max.tail, "max(windspeed)::float8");
+    }
+
+    /// A `(metric, agg)` the registry does not carry is a named refusal rather than a
+    /// column expression that fails at the server. `windspeed` declares `mean` and `max`
+    /// and no `min`, which is the real case this protects.
+    #[test]
+    fn a_span_column_the_registry_does_not_carry_names_what_is_missing() {
+        use mw_types::{Class, Classify};
+        let e = resolve_span_column(BucketLevel::Minute, (MetricKey::WindSpeed, Agg::Min))
+            .expect_err("wind_speed declares mean and max, not min");
+        let chain = mw_types::DisplayChain(&e).to_string();
+        assert!(chain.contains("WindSpeed"), "{chain}");
+        assert!(chain.contains("_min"), "{chain}");
+        assert!(chain.contains("1m"), "{chain}");
+        assert_eq!(e.class(), Class::Fatal);
+    }
+
+    /// The two statements, so that the prefix's exclusive upper bound and the tail's
+    /// `count(*)` are pinned: the first is **D-54**'s boundary and the second is the only
+    /// thing that distinguishes an empty trailing bucket from one whose every metric was
+    /// unreported.
+    #[test]
+    fn the_prefix_stops_where_the_tail_starts_and_the_tail_counts_its_rows() {
+        let columns =
+            vec![
+                resolve_span_column(BucketLevel::FiveMinute, (MetricKey::OutTemp, Agg::Mean))
+                    .expect("declared"),
+            ];
+        let prefix = prefix_statement(BucketLevel::FiveMinute, &columns);
+        assert_eq!(
+            prefix,
+            "SELECT bucket, mw_mean(outtemp_sum, outtemp_count) FROM observations_5m \
+             WHERE station_id = $1 AND bucket >= $2 AND bucket < $3 ORDER BY bucket LIMIT $4"
+        );
+        let tail = tail_statement(&columns, BucketLevel::FiveMinute);
+        // **Grouped on the level's own grid**, which is what makes a bucket aggregated from
+        // raw identical to the one the refresh policy will later materialise -- and what
+        // lets one statement serve both the still-filling bucket and the closed ones the
+        // policy has not reached. The interval is a literal from `BucketLevel`, never from
+        // the request.
+        assert_eq!(
+            tail,
+            "SELECT time_bucket(INTERVAL '5 minutes', time) AS bucket, count(*), \
+             mw_mean(sum(outtemp::double precision), nullif(count(outtemp), 0)) FROM \
+             observations \
+             WHERE station_id = $1 AND time >= $2 AND time < $3 GROUP BY bucket ORDER BY bucket"
+        );
+        // One literal per level, and no level reaches the raw table with any other width.
+        for (level, interval) in [
+            (BucketLevel::Minute, "1 minute"),
+            (BucketLevel::FiveMinute, "5 minutes"),
+            (BucketLevel::Hour, "1 hour"),
+            (BucketLevel::Day, "1 day"),
+        ] {
+            assert!(
+                tail_statement(&[], level).contains(&format!("INTERVAL '{interval}'")),
+                "{level:?}"
+            );
+        }
+    }
+
+    /// `Agg::Sum` is the registry's `total` and there is no sixth strategy (**D-50**).
+    #[test]
+    fn every_agg_maps_onto_one_registry_strategy() {
+        assert_eq!(strategy_of(Agg::Mean), Strategy::Mean);
+        assert_eq!(strategy_of(Agg::Min), Strategy::Min);
+        assert_eq!(strategy_of(Agg::Max), Strategy::Max);
+        assert_eq!(strategy_of(Agg::Sum), Strategy::Total);
+        assert_eq!(strategy_of(Agg::CircularMean), Strategy::CircularMean);
     }
 
     /// A dead connection is retried and a rejected statement is not, which is the split
