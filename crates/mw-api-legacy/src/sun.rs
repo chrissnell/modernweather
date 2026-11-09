@@ -122,32 +122,42 @@ where
     if utc_minutes < 0 {
         return String::new();
     }
-    let hours = utc_minutes / 60;
-    let minutes = utc_minutes % 60;
+    // **The hour may be 24, and that is a real value rather than a guard to add.**
+    // `sunrise_sunset` returns `wrap(...).round()` over `[0, 1440)`, so a true event in the
+    // last half-minute before midnight UTC rounds to exactly 1440. Go's
+    // `time.Date(y, m, d, 24, minutes, …)` normalises that into the next day; chrono's
+    // `and_hms_opt(24, …)` returns `None`, so all three offsets below used to `continue`,
+    // the fallback returned the same `None`, and `format_sun_time` produced the empty
+    // string -- which `skip_serializing_if = "String::is_empty"` then turns into an **absent
+    // `sunset` key**. A scan over latitude 39.9 and every longitude found 896 (day,
+    // longitude) pairs that land on it, so for a fixed station it is roughly twice a year.
+    //
+    // Carried into the date rather than clamped, which is what `time.Date` does.
+    let carry = i64::from(utc_minutes / 1440);
+    let hours = u32::try_from((utc_minutes / 60) % 24).unwrap_or(0);
+    let minutes = u32::try_from(utc_minutes % 60).unwrap_or(0);
     let local_date = on.with_timezone(zone).date_naive();
     for offset in [0_i64, 1, -1] {
-        let day = local_date + chrono::Duration::days(offset);
-        let Some(naive) = day.and_hms_opt(
-            u32::try_from(hours).unwrap_or(0),
-            u32::try_from(minutes).unwrap_or(0),
-            0,
-        ) else {
+        let Some(day) = local_date.checked_add_signed(chrono::Duration::days(offset + carry))
+        else {
+            continue;
+        };
+        let Some(naive) = day.and_hms_opt(hours, minutes, 0) else {
             continue;
         };
         let utc = naive.and_utc();
         let local = utc.with_timezone(zone);
+        // Compared against the date the event belongs to, which the carry does not move:
+        // Go's loop tests `local.Date() == (y, m, d)` with `d` the un-normalised local day.
         if local.date_naive() == local_date {
             return twelve_hour(local.hour(), local.minute());
         }
     }
     // Unreachable for a valid input: one of the three offsets always maps back, because a
     // zone's offset is within a day of UTC. The Go function has the same fallback.
-    let naive = local_date.and_hms_opt(
-        u32::try_from(hours).unwrap_or(0),
-        u32::try_from(minutes).unwrap_or(0),
-        0,
-    );
-    naive
+    local_date
+        .checked_add_signed(chrono::Duration::days(carry))
+        .and_then(|day| day.and_hms_opt(hours, minutes, 0))
         .map(|n| {
             let local = n.and_utc().with_timezone(zone);
             twelve_hour(local.hour(), local.minute())
@@ -442,6 +452,66 @@ mod tests {
         assert_eq!(format_sun_time(-1, day, &Utc), "", "polar: no key at all");
     }
 
+    /// **Minute 1440, which `sunrise_sunset` really returns.** It is `wrap(...).round()`
+    /// over `[0, 1440)`, so a true event in the last half-minute before midnight UTC rounds
+    /// to exactly 1440 and the hour is 24.
+    ///
+    /// `chrono`'s `and_hms_opt(24, …)` is `None`, so this produced the empty string -- and
+    /// `skip_serializing_if = "String::is_empty"` turns that into an **absent `sunset`
+    /// key**, on a frozen endpoint, for a whole day. Go's `time.Date(y, m, d, 24, …)`
+    /// normalises into the next day instead.
+    ///
+    /// Every expectation here is `solar.FormatSunTime` at `c3ec9f7`, run against the same
+    /// inputs.
+    #[test]
+    fn the_last_minute_of_the_utc_day_carries_into_the_next_one() {
+        let denver: chrono_tz::Tz = "America/Denver".parse().expect("an IANA name");
+        let la: chrono_tz::Tz = "America/Los_Angeles".parse().expect("an IANA name");
+        let day = at(2026, 1, 1, 12, 0);
+
+        assert_eq!(format_sun_time(1440, day, &denver), "5:00 PM");
+        assert_eq!(format_sun_time(1440, day, &la), "4:00 PM");
+        assert_eq!(format_sun_time(1440, day, &Utc), "12:00 AM");
+        // The neighbours, so the carry cannot be the only thing that works.
+        assert_eq!(format_sun_time(1439, day, &denver), "4:59 PM");
+        assert_eq!(format_sun_time(0, day, &denver), "5:00 PM");
+        assert_eq!(format_sun_time(1, day, &denver), "5:01 PM");
+        assert_eq!(format_sun_time(1380, day, &denver), "4:00 PM");
+
+        // A DST transition date, and 29 February: the two cases the carry could have got
+        // wrong by arithmetic rather than by type.
+        let dst = at(2026, 3, 8, 12, 0);
+        assert_eq!(format_sun_time(1440, dst, &denver), "6:00 PM");
+        assert_eq!(format_sun_time(800, dst, &denver), "7:20 AM");
+        assert_eq!(format_sun_time(1300, dst, &denver), "3:40 PM");
+        assert_eq!(
+            format_sun_time(1440, at(2028, 2, 29, 12, 0), &denver),
+            "5:00 PM"
+        );
+    }
+
+    /// The boundary and the pole, as values rather than as `is_none`.
+    ///
+    /// Every expectation is `solar.CalculateSunriseSunset` at `c3ec9f7`, run here. The
+    /// Arctic Circle in January still has a short day; latitude 90 is `None` because
+    /// `tan(PI/2)` is finite rather than `NaN`, which is the one way this could have been an
+    /// unwrap rather than a branch.
+    ///
+    /// `(1, 39.9, -109.9)` is the pair that motivated the carry in `format_sun_time`: its
+    /// sunset is minute **1440**.
+    #[test]
+    fn the_arctic_circle_still_has_a_sunrise_and_the_pole_does_not() {
+        assert_eq!(sunrise_sunset(1, 66.5, 0.0), Some((677, 770)));
+        assert_eq!(sunrise_sunset(1, 39.9, -109.9), Some((887, 1440)));
+        assert_eq!(sunrise_sunset(172, 0.0, 0.0), Some((362, 1082)));
+        assert!(sunrise_sunset(172, 90.0, 0.0).is_none(), "the north pole");
+        assert!(sunrise_sunset(355, 90.0, 0.0).is_none(), "and in winter");
+        assert!(
+            sunrise_sunset(172, -90.0, 0.0).is_none(),
+            "and the south pole"
+        );
+    }
+
     /// The case the three-offset search exists for: sunset in a western zone falls on the
     /// **next** UTC date, and naive formatting would report the wrong local day.
     #[test]
@@ -453,8 +523,20 @@ mod tests {
         assert_eq!(rendered, "6:07 PM");
     }
 
-    /// Against values produced by running `pkg/lunar.Calculate`. The illumination
-    /// tolerance is the stated accuracy of the term set (~0.5-1%), not slack.
+    /// **Against the numbers `pkg/lunar` produces, not against bounds.**
+    ///
+    /// This test asserted `illumination ∈ [0,1]`, `age ∈ [0, SYNODIC_MONTH)` and
+    /// `rotation ∈ [-360,360]` -- properties that hold by construction -- while its name
+    /// claimed an oracle it did not have. A term dropped from any of the three series would
+    /// have passed it, in the file most likely to break that way, and the conformance suite
+    /// cannot see it either: the data-bearing `/latest` fixtures assert shape, key order and
+    /// numeric convention, never values.
+    ///
+    /// The three expectations are `lunar.Calculate` and `lunar.CalculateCrescentAngle` at
+    /// `c3ec9f7`, run against this instant and narrowed to `f32` the way `handlers.go:385`
+    /// does. Note which field each legacy key reads: `moonIllumination` and `moonAge` come
+    /// from `Calculate`, and `moonCrescentAngle` from `CalculateCrescentAngle().Rotation` --
+    /// whose own `Illumination` is a different number (0.9133 here) and is not served.
     #[test]
     fn the_moon_phase_is_the_go_value() {
         // 2026-10-28T16:56:42Z, the instant `latest-full-complement` was captured at.
@@ -463,30 +545,17 @@ mod tests {
             .single()
             .expect("a real instant");
         let m = moon(t, Some((39.900, -105.500)));
-        assert!(
-            (0.0..=1.0).contains(&m.illumination),
-            "an illuminated fraction: {}",
-            m.illumination
-        );
-        assert!(
-            (0.0..SYNODIC_MONTH).contains(&m.age_days),
-            "an age inside one synodic month: {}",
-            m.age_days
-        );
-        assert!(
-            (-360.0..=360.0).contains(&m.crescent_angle),
-            "a rotation in degrees: {}",
-            m.crescent_angle
-        );
-        // The phase name follows the illumination and the direction, and the two have to
-        // agree: an age under half a month is waxing.
-        let waxing = m.age_days < SYNODIC_MONTH / 2.0;
-        assert!(
-            m.phase_name.starts_with("Waxing") || !waxing,
-            "{} at {} days",
-            m.phase_name,
-            m.age_days
-        );
+        assert_eq!(m.phase_name, "Waning Gibbous");
+        assert_eq!((m.illumination as f32).to_string(), "0.9148452");
+        assert_eq!((m.age_days as f32).to_string(), "17.548801");
+        assert_eq!((m.crescent_angle as f32).to_string(), "-121.45631");
+
+        // The geocentric fallback, which is what the Go function does for its `(0, 0)`
+        // sentinel and what a station with no coordinates gets.
+        let geocentric = moon(t, None);
+        assert_eq!((geocentric.crescent_angle as f32).to_string(), "-163.63496");
+        // The phase name follows the direction, and the two have to agree.
+        assert!(m.age_days > SYNODIC_MONTH / 2.0, "waning at {}", m.age_days);
     }
 
     /// The eight names, driven from the two inputs that choose them.
