@@ -1672,3 +1672,146 @@ async fn an_hourly_rain_series_is_read_in_order_with_dry_hours_absent() {
     )
     .await;
 }
+
+// ---------------------------------------------------------------------------------------
+// `ReadingStore::latest` — the newest raw reading, read back whole
+// ---------------------------------------------------------------------------------------
+
+/// **The one half `crates/mw-pipeline/src/snapshot/tests.rs` cannot assert.** Those tests
+/// drive `snapshot:warm` over a fake store, so they check what the component does with a
+/// `Reading`; this one checks that a `Reading` comes back out of 216 real columns in the
+/// types the columns hold.
+///
+/// Three properties, and each has its own way of failing silently:
+///
+/// 1. **Every declared type survives the round trip.** The decode is one arm per
+///    `sql_type` and the placement is the generated `Reading::set`, so a column whose
+///    SQL type and whose generated field disagree would read back as `None` — a sensor
+///    that looks like it stopped reporting. `float4`, `int4`, `int8`, `text` and
+///    `timestamptz` are all asserted, because `buckets`' float8 cast — which is correct
+///    there — would turn the last two into NULL here.
+/// 2. **An unreported metric comes back `None`, not `0.0`** (**D-26**). The write path's
+///    own test asserts the column is NULL; this asserts the read path does not fill it in.
+/// 3. **The `since` bound is W1 Decision 15's ten minutes and it is in the statement.** A
+///    row outside the window is not returned at all, which is what makes `/latest`'s
+///    documented 404 a property of the query rather than of a filter a caller might
+///    forget.
+#[tokio::test]
+#[ignore = "needs a real TimescaleDB; run `cargo xtask db-tests`"]
+async fn the_newest_reading_in_the_window_is_read_back_whole() {
+    let station = "db-tests:latest";
+    let pool = prepare(&[station]).await;
+    let w = writer(&pool, station);
+    let reader = TimescaleReader::new(pool.clone());
+
+    // Three rows: one well outside the recency window, and two inside it.
+    let stale = at(1_767_300_000);
+    let older = at(1_767_311_940);
+    let newest = at(1_767_312_000);
+    let reported = at(1_767_311_000);
+    w.store(&[
+        envelope(
+            station,
+            stale,
+            1,
+            Reading {
+                barometer: Some(28.00),
+                ..Reading::default()
+            },
+        ),
+        envelope(
+            station,
+            older,
+            2,
+            Reading {
+                barometer: Some(29.00),
+                out_temp: Some(40.0),
+                ..Reading::default()
+            },
+        ),
+        envelope(
+            station,
+            newest,
+            3,
+            Reading {
+                // float4
+                barometer: Some(29.9375),
+                // int4
+                lightning_day: Some(17),
+                // int8, past 2^32 so a column narrowed to int4 fails rather than
+                // truncating quietly.
+                date_utc: Some(4_294_967_296),
+                // text
+                extra_text1: Some("a note from the station".into()),
+                // timestamptz
+                storm_start: Some(reported),
+                ..Reading::default()
+            },
+        ),
+    ])
+    .await
+    .expect("stores");
+
+    // 1 + 2. The newest row inside the window, in the types the columns hold.
+    let got = reader
+        .latest(mw_component::LatestQuery {
+            station: StationKey::new(station),
+            since: newest - chrono::Duration::seconds(600),
+        })
+        .await
+        .expect("the query runs")
+        .expect("one row is inside the ten-minute window");
+    assert_eq!(got.time, newest, "the newest, not the first or the oldest");
+    assert_eq!(got.station_id, station);
+    assert_eq!(got.barometer, Some(29.9375), "float4");
+    assert_eq!(got.lightning_day, Some(17), "int4");
+    assert_eq!(got.date_utc, Some(4_294_967_296), "int8");
+    assert_eq!(
+        got.extra_text1.as_deref(),
+        Some("a note from the station"),
+        "text -- which a float8 cast would have turned into NULL"
+    );
+    assert_eq!(got.storm_start, Some(reported), "timestamptz, likewise");
+    assert_eq!(
+        got.out_temp, None,
+        "the previous row reported an outdoor temperature and this one did not, so the \
+         field is None rather than 0.0 (D-26) -- and rather than the earlier row's value, \
+         which is what a read that merged rows would produce"
+    );
+    // Every other metric is absent, which is the whole point of storing NULL: a snapshot
+    // rendered from this reading emits nothing for them rather than a zero.
+    let reported_metrics = METRICS
+        .iter()
+        .filter(|m| got.value(m.key).is_some())
+        .count();
+    assert_eq!(
+        reported_metrics, 5,
+        "exactly the five metrics this row carried"
+    );
+
+    // 3. The recency bound is in the statement.
+    let outside = reader
+        .latest(mw_component::LatestQuery {
+            station: StationKey::new(station),
+            since: newest + chrono::Duration::seconds(1),
+        })
+        .await
+        .expect("the query runs");
+    assert!(
+        outside.is_none(),
+        "a station whose newest row is outside the window has no reading to seed, which \
+         is the 404 `contract/fixtures/latest-no-recent-data` pins -- got {outside:?}"
+    );
+
+    // A station that has never reported is the same answer, by a different route.
+    let unknown = reader
+        .latest(mw_component::LatestQuery {
+            station: StationKey::new("db-tests:latest-nobody"),
+            since: newest - chrono::Duration::seconds(600),
+        })
+        .await
+        .expect("the query runs");
+    assert!(unknown.is_none());
+
+    touched(&pool, "the_newest_reading_in_the_window_is_read_back_whole").await;
+}

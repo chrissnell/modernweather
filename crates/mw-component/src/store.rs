@@ -62,7 +62,7 @@
 
 use std::sync::Arc;
 
-use mw_types::Envelope;
+use mw_types::{Envelope, Reading};
 
 use crate::body::BoxFuture;
 use crate::capability::Capability;
@@ -125,12 +125,19 @@ pub trait ReadingSink: Send + Sync + 'static {
 /// | [`ReadingStore::buckets`] | the recent 1-minute buckets, whole | the ring resolves *any* declared `(metric, agg)`, so it needs every column — but only ever an hour of them |
 /// | [`ReadingStore::totals`] | one sum per `(level, range)` | a year of 1-minute buckets is 525,600 rows; summed server-side at the level that tiles the range it is ~530 |
 /// | [`ReadingStore::series`] | one `total` per bucket, in order | a **gap** is not expressible as a sum, and the storm's start is the far side of a dry gap |
+/// | [`ReadingStore::latest`] | the newest **raw** reading, whole | the three above read aggregate state, and a snapshot is rendered from a reading |
 ///
-/// `span`, `latest` and `almanac` (W3 §2a.1) are absent because nothing calls them yet:
-/// `snapshot:warm` needs `latest` (M4-1) and `/span` and `/almanac` need the other two
-/// (M4-2). They are additions to this trait when those items land, which is the same rule
-/// [`crate::StationRegistry`] grew under — a method with no caller is a signature nobody
-/// has checked against a query.
+/// `latest` is M4-1's addition and has exactly one caller: `snapshot:warm`, the
+/// `OnStartup` component that seeds the snapshot table so a restart does not 404 a station
+/// that was inside the 10-minute window (**D-37**). **It is not on a request path** —
+/// `api:legacy` is handed `LatestSnapshot` and never this trait, which is what makes
+/// `/latest`'s zero queries structural (**D-35**) — and W3 §2a.1 says so in the signature's
+/// own comment.
+///
+/// `span` and `almanac` (W3 §2a.1) are still absent because nothing calls them yet: both
+/// are M4-2's. They are additions to this trait when that item lands, which is the same
+/// rule [`crate::StationRegistry`] grew under — a method with no caller is a signature
+/// nobody has checked against a query.
 pub trait ReadingStore: Send + Sync + 'static {
     /// Every 1-minute aggregate bucket for one station at or after `since`, oldest first.
     ///
@@ -167,6 +174,23 @@ pub trait ReadingStore: Send + Sync + 'static {
     /// `calculate_storm_rainfall` gives up and defines the storm as "any rainfall in the
     /// last 24 hours" with a comment saying `-- Simple approach`.
     fn series<'a>(&'a self, q: SeriesQuery) -> BoxFuture<'a, Result<Vec<Bucketed>, StoreError>>;
+
+    /// The newest **raw** reading for one station at or after `since`, whole.
+    ///
+    /// `since` rather than "the newest, ever", because the one caller's question is W1's
+    /// recency rule: `snapshot:warm` wants the reading that would make `/latest` answer
+    /// 200, which is one inside the last ten minutes. Pushing the bound into the statement
+    /// is also what keeps it an index seek on a hypertable rather than a scan that finds a
+    /// row from last March and has it discarded.
+    ///
+    /// `None` is a station with nothing in the window — a station that is offline, or one
+    /// that has never reported. Not an error, for [`ReadingStore::totals`]'s reason: the
+    /// absence of a reading is a fact about the station and not a failure of the query.
+    ///
+    /// **Raw, not aggregated.** A snapshot is rendered from a reading, and the 1-minute
+    /// level holds `_sum`/`_count` pairs rather than values (**D-11**), so finalising one
+    /// into a reading would mean serving a station's last minute as a mean of itself.
+    fn latest<'a>(&'a self, q: LatestQuery) -> BoxFuture<'a, Result<Option<Reading>, StoreError>>;
 }
 
 /// Both halves of the reading store, as the one handle `db:postgres` publishes.
@@ -317,6 +341,18 @@ pub struct TotalsQuery {
     pub metric: mw_types::MetricKey,
     /// The pieces, each answered in this order.
     pub pieces: Vec<Piece>,
+}
+
+/// Which reading [`ReadingStore::latest`] should return.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatestQuery {
+    /// Whose.
+    pub station: mw_types::StationKey,
+    /// The oldest reading that would do, inclusive.
+    ///
+    /// W1 Decision 15's ten minutes, computed by the caller: the recency rule belongs to
+    /// the contract and the store should not have a copy of it.
+    pub since: chrono::DateTime<chrono::Utc>,
 }
 
 /// Which series [`ReadingStore::series`] should return.

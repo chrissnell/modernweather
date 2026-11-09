@@ -337,6 +337,21 @@ mod driven {
                 .collect();
             Box::pin(async move { Ok(out) })
         }
+
+        /// `window:rollup` never calls this -- the raw hypertable is the writer's business
+        /// and this component reads composable aggregate state (`mw_component::store`).
+        /// Recorded in `asked` rather than panicking, so that a tick which started reading
+        /// raw rows fails an assertion here instead of aborting the test process.
+        fn latest<'a>(
+            &'a self,
+            q: mw_component::LatestQuery,
+        ) -> BoxFuture<'a, Result<Option<mw_types::Reading>, StoreError>> {
+            self.asked
+                .lock()
+                .expect("not poisoned")
+                .push(format!("latest {}", q.station));
+            Box::pin(async { Ok(None) })
+        }
     }
 
     /// A bucket with the named 1-minute columns set, looked up through the registry.
@@ -713,6 +728,13 @@ mod driven {
                 _q: SeriesQuery,
             ) -> BoxFuture<'a, Result<Vec<Bucketed>, StoreError>> {
                 Box::pin(async move { Ok(Vec::new()) })
+            }
+            /// Not reachable from this component; see `FakeStore`'s own note.
+            fn latest<'a>(
+                &'a self,
+                _q: mw_component::LatestQuery,
+            ) -> BoxFuture<'a, Result<Option<mw_types::Reading>, StoreError>> {
+                Box::pin(async move { Ok(None) })
             }
         }
 

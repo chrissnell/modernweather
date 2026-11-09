@@ -25,7 +25,7 @@
 use std::sync::Arc;
 
 use mw_component::{Generation, Ingress, Zone};
-use mw_store::config_db::{self, ConfigDbError, Listener, Node, WeatherDatabase};
+use mw_store::config_db::{self, ConfigDbError, Listener, Node, WeatherDatabase, WebsiteRow};
 use mw_types::StationKey;
 use sqlx::SqlitePool;
 
@@ -42,6 +42,13 @@ pub struct Config {
     /// built from these, because it needs `ingest_secret_hash` -- which is not a station
     /// *driver's* concern and is deliberately absent from the row below.
     pub stations: Vec<config_db::StationRow>,
+
+    /// Every `config.website` row, in id order.
+    ///
+    /// The left half of the snapshot's `(website, station)` key (**D-31**). Only the five
+    /// columns a payload depends on; the hostname router and the website renderer read the
+    /// rest and both are M4-3's.
+    pub websites: Vec<WebsiteRow>,
 
     /// The same rows in the shape `mw-station` plans from.
     ///
@@ -76,6 +83,24 @@ pub struct Config {
     /// whole of that argument.
     pub(crate) rollup: Option<Arc<mw_pipeline::RollupState>>,
 
+    /// The published snapshot table, once `main` has built it.
+    ///
+    /// A root resource for the reason the rollup state is one: **two** components write it,
+    /// `snapshot:latest` and `snapshot:warm`, and the capability bus holds one handle
+    /// *type* per provider. `mw_pipeline::snapshot::state`'s module documentation has the
+    /// whole of that argument.
+    pub(crate) snapshot: Option<Arc<mw_pipeline::SnapshotState>>,
+
+    /// The same rollup state as [`Config::rollup`], upcast once to the capability the
+    /// snapshot components declare.
+    ///
+    /// Two fields for one object because the two consumers want two types: the rollup's own
+    /// registrar needs the concrete `RollupState` (both its writers call inherent methods),
+    /// and the snapshot's needs `Arc<dyn WindowedView>`. Upcasting here rather than in the
+    /// accessor keeps `snapshot_windows` a borrow — and keeps "these are the same object"
+    /// a fact of `set_rollup` rather than of two call sites.
+    pub(crate) snapshot_windows: Option<Arc<dyn mw_component::WindowedView>>,
+
     /// Every station and its **resolved** time zone, in station-key order.
     ///
     /// Taken from the registry snapshot rather than re-parsed, because the parse is the
@@ -102,9 +127,12 @@ impl Config {
             node: config_db::node(pool).await?,
             declared_stations: stations.iter().map(declare).collect(),
             stations,
+            websites: config_db::websites(pool).await?,
             ingress: None,
             registry: None,
             rollup: None,
+            snapshot: None,
+            snapshot_windows: None,
             station_zones: Vec::new(),
             generation: Generation::ZERO,
         })
@@ -136,8 +164,18 @@ impl Config {
     }
 
     /// Hand the configuration the maintained window values.
+    ///
+    /// Sets both views of the one object: the concrete handle the rollup's registrar plans
+    /// from, and the `WindowedView` upcast the snapshot components are given. One call, so
+    /// the two cannot disagree about which state is live.
     pub fn set_rollup(&mut self, rollup: Arc<mw_pipeline::RollupState>) {
+        self.snapshot_windows = Some(Arc::clone(&rollup) as Arc<dyn mw_component::WindowedView>);
         self.rollup = Some(rollup);
+    }
+
+    /// Hand the configuration the published snapshot table.
+    pub fn set_snapshot(&mut self, snapshot: Arc<mw_pipeline::SnapshotState>) {
+        self.snapshot = Some(snapshot);
     }
 
     /// The address the one listener binds, and therefore where `/metrics` is served.
@@ -187,7 +225,9 @@ impl std::fmt::Debug for Config {
             .field("stations", &self.stations.len())
             .field("ingress", &self.ingress.is_some())
             .field("registry", &self.registry.is_some())
+            .field("websites", &self.websites.len())
             .field("rollup", &self.rollup.is_some())
+            .field("snapshot", &self.snapshot.is_some())
             .field("generation", &self.generation)
             .finish()
     }
@@ -231,6 +271,46 @@ impl mw_pipeline::RollupConfig for Config {
             .filter(|(key, _)| collecting.contains(key.as_str()))
             .map(|(key, zone)| (key.clone(), *zone))
             .collect()
+    }
+}
+
+impl mw_pipeline::SnapshotConfig for Config {
+    fn has_weather_database(&self) -> bool {
+        self.weather_database.is_some()
+    }
+
+    /// `Trigger::OnReading` is validated against the root `ReadingStream`, and this node has
+    /// one exactly when it has a spool — which is when it has a `node` row (W7 §8.2).
+    fn has_reading_stream(&self) -> bool {
+        self.ingress.is_some()
+    }
+
+    fn snapshot_state(&self) -> Option<&Arc<mw_pipeline::SnapshotState>> {
+        self.snapshot.as_ref()
+    }
+
+    fn snapshot_registry(&self) -> Option<&Arc<dyn mw_component::StationRegistry>> {
+        self.registry.as_ref()
+    }
+
+    /// The rollup state, upcast to the capability the snapshot declares.
+    ///
+    /// `mw_pipeline::SnapshotConfig::snapshot_windows` has why this travels through the
+    /// registrar rather than off the bus. The field is stored pre-upcast so that this is a
+    /// borrow rather than an allocation per call: the registrar asks once per `plan()`, but
+    /// a trait method that had to build an `Arc` to answer would be the kind of accessor
+    /// someone later calls in a loop.
+    fn snapshot_windows(&self) -> Option<&Arc<dyn mw_component::WindowedView>> {
+        self.snapshot_windows.as_ref()
+    }
+
+    /// **`None` until M4-2.** The payload is the frozen 133-key DTO and `mw-api-legacy`
+    /// exclusively owns its serialiser (W3 D-9), so there is nothing here to hand over yet
+    /// and `mw_pipeline::snapshot::register` plans neither component. When M4-2 lands it is
+    /// a `mw_api_legacy::Renderer` built in [`crate::boot`] beside the registry, and this
+    /// is the one line that changes.
+    fn snapshot_render(&self) -> Option<&Arc<dyn mw_component::SnapshotRender>> {
+        None
     }
 }
 
@@ -279,9 +359,12 @@ mod tests {
         Config {
             stations: Vec::new(),
             declared_stations: Vec::new(),
+            websites: Vec::new(),
             ingress: None,
             registry: None,
             rollup: None,
+            snapshot: None,
+            snapshot_windows: None,
             station_zones: Vec::new(),
             listener: Listener {
                 listen_addr: addr.to_string(),
