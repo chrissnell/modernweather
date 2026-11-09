@@ -69,6 +69,7 @@ const TILING: [BucketLevel; 3] = [BucketLevel::Day, BucketLevel::Hour, BucketLev
 /// |---|---|---|
 /// | `1d` | 30 minutes | 45 minutes |
 /// | `1h` | 5 minutes | 7.5 minutes |
+/// | `5m` | 1 minute | 90 seconds |
 /// | `1m` | 1 minute, phased 3 s past the boundary | **none** |
 ///
 /// The 1-minute level has none because it is the floor: there is nothing finer to fall back
