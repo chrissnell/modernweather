@@ -97,6 +97,9 @@ pub struct Bound {
     grpc: (TcpListener, SocketAddr),
     router: Router,
     redirect_to: Option<u16>,
+    /// The host table, for the redirector's one use of it: refusing a `Location` built from
+    /// a hostname nothing is configured to serve.
+    hosts: Arc<crate::host::HostTable>,
 }
 
 impl std::fmt::Debug for Bound {
@@ -159,6 +162,26 @@ pub async fn bind(
     router: Router,
     resolver: Option<Arc<SniResolver>>,
 ) -> Result<Bound, HttpError> {
+    bind_with_hosts(
+        listen,
+        router,
+        resolver,
+        Arc::new(crate::host::HostTable::default()),
+    )
+    .await
+}
+
+/// [`bind`] with the host table the redirector validates against.
+///
+/// Two functions rather than one parameter on every caller: the redirector is the only
+/// consumer, it exists only when a TLS port is configured, and a test that binds a plaintext
+/// pair has no host table to hand. `crate::component` passes the real one.
+pub async fn bind_with_hosts(
+    listen: &Listen,
+    router: Router,
+    resolver: Option<Arc<SniResolver>>,
+    hosts: Arc<crate::host::HostTable>,
+) -> Result<Bound, HttpError> {
     let main = match listen.https_port {
         Some(_) => {
             let resolver = resolver.ok_or(HttpError::NoCertificate {
@@ -169,9 +192,21 @@ pub async fn bind(
                     addr: listen.main(),
                 });
             }
-            let mut config = ServerConfig::builder()
-                .with_no_client_auth()
-                .with_cert_resolver(resolver);
+            // **The provider is named, not defaulted.** `ServerConfig::builder()` resolves
+            // one from rustls's crate features and `expect`s the result, so a future
+            // dependency enabling `aws-lc-rs` would turn `bind()` into a panic. `ring` is
+            // what **A-W8-3** chose and what this crate already names in
+            // `crate::sni::certified_key`, so it is named here too.
+            let mut config = ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .map_err(|source| HttpError::Tls {
+                addr: listen.main(),
+                source,
+            })?
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
             config.alpn_protocols = ALPN.iter().map(|p| p.to_vec()).collect();
             let (listener, addr) = listen_on(listen.main()).await?;
             Either::Tls {
@@ -201,6 +236,7 @@ pub async fn bind(
         // redirect to nowhere. Reading it back from the socket is the same reason
         // `local_addr` is read back rather than echoed.
         redirect_to: listen.https_port.map(|_| main_addr.port()),
+        hosts,
     })
 }
 
@@ -296,10 +332,11 @@ impl Bound {
             let rx = signal.clone();
             let redirect = self.redirect;
             let to = self.redirect_to;
+            let hosts = Arc::clone(&self.hosts);
             async move {
                 match (redirect, to) {
                     (Some((listener, addr)), Some(port)) => {
-                        serve_one(listener, redirector(port), addr, wait(rx)).await
+                        serve_one(listener, redirector(port, hosts), addr, wait(rx)).await
                     }
                     _ => Ok(()),
                 }
@@ -363,39 +400,43 @@ where
 /// The port appears in the `Location` only when it is not 443, which is what a browser
 /// would elide anyway and what keeps the common case's `Location` identical to the request
 /// a user typed.
-fn redirector(https_port: u16) -> Router {
-    Router::new().fallback(move |req: Request<Body>| async move {
-        let host = req
-            .headers()
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(crate::host::normalise)
-            .unwrap_or_default();
-        if host.is_empty() {
-            // Nothing to redirect to. An HTTP/1.1 request without a `Host` is already
-            // malformed, so this is the one case with no better answer than the listener's
-            // own 404.
-            return crate::not_found();
-        }
-        let tail = req
-            .uri()
-            .path_and_query()
-            .map(|p| p.as_str().to_string())
-            .unwrap_or_else(|| "/".to_string());
-        let location = if https_port == 443 {
-            format!("https://{host}{tail}")
-        } else {
-            format!("https://{host}:{https_port}{tail}")
-        };
-        match HeaderValue::try_from(location) {
-            Ok(value) => Response::builder()
-                .status(StatusCode::MOVED_PERMANENTLY)
-                .header(header::LOCATION, value)
-                .body(Body::empty())
-                .unwrap_or_else(|_| crate::not_found()),
-            // A `Host` with a byte no header value may carry. `Uri`'s own parse would
-            // reject it too; a 404 is the honest answer rather than a 500.
-            Err(_) => crate::not_found(),
+fn redirector(https_port: u16, hosts: Arc<crate::host::HostTable>) -> Router {
+    Router::new().fallback(move |req: Request<Body>| {
+        let hosts = Arc::clone(&hosts);
+        async move {
+            // `of_request` rather than the `Host` header: `hyper-util`'s auto builder accepts
+            // HTTP/2 with prior knowledge on a plaintext socket (§6.6), so a peer can reach
+            // this port with no `Host` at all.
+            let host = crate::host::of_request(req.uri(), req.headers());
+            // **A configured hostname, not whatever the client sent.** M4-3's code review found
+            // this the one host-consuming path in the listener that did not consult the host
+            // table, so any `Host` became a `Location` -- not header injection
+            // (`HeaderValue::try_from` rejects CR and LF and the error arm 404s) and not an open
+            // proxy, but a caching intermediary in front of this port could be made to serve
+            // one client's `Location` to another. An unknown host gets the 404 instead.
+            if host.is_empty() || !hosts.resolves_exactly(&host) {
+                return crate::not_found();
+            }
+            let tail = req
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string());
+            let location = if https_port == 443 {
+                format!("https://{host}{tail}")
+            } else {
+                format!("https://{host}:{https_port}{tail}")
+            };
+            match HeaderValue::try_from(location) {
+                Ok(value) => Response::builder()
+                    .status(StatusCode::MOVED_PERMANENTLY)
+                    .header(header::LOCATION, value)
+                    .body(Body::empty())
+                    .unwrap_or_else(|_| crate::not_found()),
+                // A `Host` with a byte no header value may carry. `Uri`'s own parse would
+                // reject it too; a 404 is the honest answer rather than a 500.
+                Err(_) => crate::not_found(),
+            }
         }
     })
 }
@@ -434,11 +475,21 @@ impl axum::serve::Listener for TlsListener {
                 // The accept loop must not exit on a per-connection error -- a descriptor
                 // limit or a peer that reset between the SYN and the accept is not a reason
                 // to stop listening. The pause is what stops a tight loop from burning a
-                // core while the condition lasts; `axum`'s own `TcpListener` impl does the
-                // same for the same reason.
+                // core while the condition lasts.
+                //
+                // **`axum`'s own impl splits these two cases and this does not**, which
+                // M4-3's code review pointed out and which is corrected here rather than in
+                // the comment: a connection-level error (`ECONNABORTED` and friends) is
+                // retried immediately, because the next `accept` is a different connection,
+                // and anything else -- `EMFILE` is the one that happens -- waits a second,
+                // because retrying it at 20 Hz only fills the log. The previous 50 ms for
+                // every error logged `EMFILE` twenty times a second.
                 Err(e) => {
-                    warn!(error = %e, "accept failed; retrying");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if is_connection_error(&e) {
+                        continue;
+                    }
+                    warn!(error = %e, "accept failed; retrying in 1s");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
         }
@@ -447,6 +498,20 @@ impl axum::serve::Listener for TlsListener {
     fn local_addr(&self) -> io::Result<Self::Addr> {
         self.listener.local_addr()
     }
+}
+
+/// Whether an accept error belongs to the connection rather than to the listener.
+///
+/// `axum`'s own `Listener` impl makes the same split for the same reason: these are errors
+/// the *peer* caused between the SYN and the accept, so the next call is a different
+/// connection and waiting helps nobody.
+fn is_connection_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    )
 }
 
 type Handshake = Pin<Box<dyn Future<Output = io::Result<TlsStream<TcpStream>>> + Send>>;
@@ -646,11 +711,19 @@ mod tests {
 
     /// The redirector, driven directly: the path and query survive and the port is elided
     /// at 443.
+    /// A host table that serves the names the tests below redirect for.
+    fn redirect_hosts() -> Arc<crate::host::HostTable> {
+        Arc::new(crate::host::HostTable::new([(
+            "example.com".to_string(),
+            mw_types::WebsiteId::new(1),
+        )]))
+    }
+
     #[tokio::test]
     async fn the_redirect_preserves_the_path_and_query() {
         use tower::ServiceExt;
         let location = |port: u16, host: &str, uri: &str| {
-            let router = redirector(port);
+            let router = redirector(port, redirect_hosts());
             let req = Request::builder()
                 .uri(uri)
                 .header(header::HOST, host)
@@ -682,10 +755,30 @@ mod tests {
         );
     }
 
+    /// M4-3's code review: this was the one host-consuming path that did not consult the
+    /// host table, so any `Host` became a `Location` a caching intermediary could be made
+    /// to serve to another client.
+    #[tokio::test]
+    async fn an_unconfigured_host_is_not_redirected_to() {
+        use tower::ServiceExt;
+        let resp = redirector(443, redirect_hosts())
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::HOST, "attacker.test")
+                    .body(Body::empty())
+                    .expect("a legal request"),
+            )
+            .await
+            .expect("infallible");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(resp.headers().get(header::LOCATION).is_none());
+    }
+
     #[tokio::test]
     async fn a_request_with_no_host_cannot_be_redirected() {
         use tower::ServiceExt;
-        let resp = redirector(443)
+        let resp = redirector(443, redirect_hosts())
             .oneshot(
                 Request::builder()
                     .uri("/")

@@ -196,7 +196,17 @@ pub fn site_manifest(site: &SiteView) -> RouteManifest {
     if site.is_portal {
         entries.push(RouteEntry::exact("/portal", Methods::ANY));
     } else {
-        // Additive (**D-79**), and only where there is a station to describe.
+        // Additive (**D-79**), on every non-portal website.
+        //
+        // **Including one whose primary station is missing**, whose `/` is the `500` Go
+        // gives and whose payload therefore describes nothing: `pullFromDevice` is `""` and
+        // `stationID` is `0`. That is deliberate rather than overlooked -- M4-3's code
+        // review found the comment here claiming "only where there is a station to
+        // describe", which the code never did. Declaring it conditionally would make the
+        // endpoint's presence depend on a `primary_station_key` that `ON DELETE SET NULL`
+        // can clear at any moment, so a website would gain and lose a path on a station
+        // delete; a payload of empty strings is the same answer `getAirQualityDeviceID`
+        // gives for an absent binding.
         entries.push(RouteEntry::exact("/config.json", Methods::ANY));
     }
     RouteManifest::new(Scope::Site(site.id), entries)
@@ -267,7 +277,7 @@ async fn root(State(state): State<Arc<SiteState>>) -> Response<Body> {
         return unmounted();
     };
     if rendered.root.is_empty() {
-        // `handlers.go:866`, reproduced: `http.Error` writes the message, a newline and
+        // `handlers.go:869`, reproduced: `http.Error` writes the message, a newline and
         // `text/plain; charset=utf-8`.
         return text(
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -26,23 +26,41 @@
 //!
 //! The byte diff is what surfaced this: §7.1's single-escaper account is incomplete rather
 //! than wrong, and the missing part is recorded here instead of being worked around with
-//! `|safe`, which the layout gate forbids and which would also turn off escaping for a
+//! an escaping opt-out, which the layout gate forbids and which would also disable it for a
 //! value an operator controls.
 //!
-//! # Composition with [`crate::escape::GoHtmlEscaper`] is a no-op, by construction
+//! # Composition with [`crate::escape::GoHtmlEscaper`], and the one value that must bypass it
 //!
 //! These functions are called in the template context struct and their results are
-//! interpolated like any other field, so askama's escaper runs over them. That is safe
-//! because [`js_string`]'s table maps every HTML-special byte -- `"`, `'`, `&`, `<`, `>`,
-//! `+` -- to a `\uXXXX` escape, and [`js_number`]'s output is digits, `-`, `.`, `e`, `+`
-//! and spaces... with one exception that matters: an exponent's `+`. `1e+21` would be
-//! escaped to `1e&#43;21`.
+//! interpolated like any other field, so askama's escaper runs over them. For
+//! [`js_string`] that is free: its table maps every HTML-special byte -- `"`, `'`, `&`,
+//! `<`, `>`, `+` -- to a `\uXXXX` escape, so the escaper is a no-op over its output, and
+//! `tests/escaping.rs` asserts that over every row of the golden table.
 //!
-//! **A latitude or longitude can never reach that form** -- Go switches to the exponent
-//! spelling only outside `[1e-6, 1e21)`, and a coordinate is in `[-180, 180]` -- but
-//! "can never" is not a thing to leave to a comment, so [`js_number`] returns the padded
-//! token and [`JsNumber`] is a wrapper whose `Display` is `HtmlSafe`. `tests/escaping.rs`
-//! asserts the composition over every value in the golden table, exponent forms included.
+//! [`js_number`] is the exception, and it is **one byte**: an exponent's `+`. Go writes
+//! `1e+21` for a magnitude outside `[1e-6, 1e21)`, and the page's escaper turns that into
+//! `1e&#43;21` -- which is not JSON, so `JSON.parse` in `weather-radar.js` throws and the
+//! radar panel never initialises. So the two coordinate fields are wrapped in
+//! askama's `Safe` wrapper -- the only bypass it offers that works with a **custom**
+//! escaper.
+//!
+//! **An earlier version of this crate used `askama::filters::HtmlSafe` and that silently did
+//! nothing**, which M4-3's code review found. `HtmlSafe`'s bypass is implemented only for
+//! askama's own `Html` escaper (`askama-0.16.1/src/filters/escape.rs:229`), so with
+//! `GoHtmlEscaper` registered the autoref specialisation never selects it and the value is
+//! escaped like any other -- askama's own documentation for the trait says as much. The test
+//! that was supposed to catch it asserted a property of the *escaper* rather than of a
+//! rendered page, so it passed either way; it now renders a page.
+//!
+//! **Why a bypass here is not the hole D-81 is about.** D-81 forbids an escaping opt-out
+//! because it is the one way a compile-time-checked template can emit unescaped output, and
+//! the value it is written about is `AboutStationHTML` -- a string an administrator authors.
+//! [`JsNumber`]'s field is private and its only constructors take an `f64` and an `i64`, so
+//! **no string can travel through it**. That argument is only as good as its enforcement, so
+//! `ci/layers.toml`'s `no-template-escape-opt-out` rule now forbids every askama bypass
+//! anywhere in the workspace except `crates/mw-web/src/page.rs`, and
+//! [`crate::page::tests::the_only_escaping_bypasses_in_this_file_are_the_two_coordinates`]
+//! reads that file and asserts the exception is still exactly these two numbers.
 //!
 //! # The digits are Go's, which is `ryu`
 //!
@@ -54,8 +72,6 @@
 //! sweep, because two answers to "what are Go's digits" is one answer too many.
 
 use std::fmt;
-
-use askama::filters::HtmlSafe;
 
 /// Go's `jsStrReplacementTable` (`go1.26/src/html/template/js.go:333`), plus the low-Unicode
 /// table `replace` consults first (`:319`).
@@ -106,8 +122,8 @@ fn push_js_escaped(out: &mut String, c: char) {
 ///
 /// The output carries no HTML-special byte, which is what makes composing it with
 /// [`crate::escape::GoHtmlEscaper`] a no-op. It is nonetheless returned as a plain `String`
-/// rather than a `HtmlSafe` wrapper, so that the escaper *does* run over it: an escaper that
-/// is skipped is one that cannot catch a mistake in this table.
+/// rather than a bypass wrapper, so that the escaper *does* run over it: an escaper that is
+/// skipped is one that cannot catch a mistake in this table.
 pub fn js_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -118,10 +134,12 @@ pub fn js_string(s: &str) -> String {
 
 /// A JavaScript value token, already padded the way `jsValEscaper` pads one.
 ///
-/// [`HtmlSafe`] because an exponent's `+` would otherwise be escaped to `&#43;` by the
-/// page's escaper -- see the module documentation. This is the **only** `HtmlSafe` type in
-/// this crate, and it is a number: there is no string path through it, so marking it cannot
-/// let an operator-authored value reach a page unescaped.
+/// Wrapped in askama's `Safe` at the two places it reaches a template, because an
+/// exponent's `+` would otherwise be escaped to `&#43;` -- see the module documentation for
+/// why that bypass is sound here and how it is enforced.
+///
+/// The field is private and the only constructors are [`js_number`] and [`js_integer`], so
+/// there is no string path through this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsNumber(String);
 
@@ -130,8 +148,6 @@ impl fmt::Display for JsNumber {
         f.write_str(&self.0)
     }
 }
-
-impl HtmlSafe for JsNumber {}
 
 impl JsNumber {
     /// The token, for a test and for a caller building JSON by hand.
@@ -142,9 +158,12 @@ impl JsNumber {
 
 /// Whether a byte is a JavaScript identifier part, which is what decides the padding.
 ///
-/// Go's `isJSIdentPart` (`js.go:52`): a letter, a digit, `$` or `_`. Only the first and
-/// last runes of the marshalled value are tested, and for a number those are ASCII, so a
-/// byte test is exact here.
+/// Go's `isJSIdentPart` (`js.go:434`): a letter, a digit, `$` or `_`.
+///
+/// Only the first and last runes of the marshalled value are tested, and for a number those
+/// are ASCII -- so although `char::is_alphanumeric` is Unicode-aware where Go's test is
+/// ASCII-only, the two cannot disagree on any input this reaches. M4-3's code review found
+/// the comment claiming this was "a byte test"; it is a `char` test over ASCII input.
 fn is_js_ident_part(c: char) -> bool {
     c == '$' || c == '_' || c.is_alphanumeric()
 }

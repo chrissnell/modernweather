@@ -11,6 +11,51 @@ use std::collections::HashMap;
 
 use mw_types::WebsiteId;
 
+/// **Which host a request is for**, from the request rather than from one header.
+///
+/// # Why this is not just the `Host` header
+///
+/// **An HTTP/2 request does not have one.** RFC 9113 §8.3.1 replaces `Host` with the
+/// `:authority` pseudo-header, and hyper's h2 server reconstructs the URI from `:scheme`,
+/// `:authority` and `:path` and inserts no header at all -- so a handler reading
+/// `headers[HOST]` sees nothing. `mw-http` offers `h2` **first** in its ALPN list (§6.6,
+/// matching the Go server's `NextProtos`), which means every modern browser on the TLS port
+/// negotiates HTTP/2 and every one of its requests arrives in that shape.
+///
+/// Reading only the header there is not a missing feature, it is a **data-disclosure
+/// defect**: an unresolvable host falls through to the default website (Q-18), so every
+/// HTTP/2 request would be served the default website's page and the default station's
+/// data under somebody else's hostname. That is the same class of bug **DEV-2** exists to
+/// close -- the Go version's case-sensitive map lookup -- reopened through a different door,
+/// and worse, because it fires on every request rather than on a mixed-case one.
+///
+/// # The precedence, and why it is the same for both protocols
+///
+/// The URI's authority wins, then the `Host` header. That is correct for HTTP/2 by the
+/// paragraph above, and it is also correct for HTTP/1.1: a request in absolute form
+/// (`GET http://example.com/ HTTP/1.1`) carries both, and RFC 9112 §3.2.2 makes the request
+/// target authoritative. Origin-form HTTP/1.1 -- which is every ordinary request -- has no
+/// authority in the URI, so it falls through to the header.
+///
+/// Userinfo is dropped: `http::uri::Authority::host` returns the host without it and
+/// without the port.
+///
+/// The result is [`normalise`]d, so every caller gets the same three steps applied.
+pub fn of_request(uri: &http::Uri, headers: &http::HeaderMap) -> String {
+    if let Some(authority) = uri.authority() {
+        let host = authority.host();
+        if !host.is_empty() {
+            return normalise(host);
+        }
+    }
+    normalise(
+        headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default(),
+    )
+}
+
 /// `Host`, normalised the three ways §6.3 specifies: port stripped, one trailing dot
 /// stripped, lower-cased.
 ///
@@ -209,6 +254,62 @@ mod tests {
 
     fn id(n: i64) -> WebsiteId {
         WebsiteId::new(n)
+    }
+
+    fn req(uri: &str, host: Option<&str>) -> http::Request<()> {
+        let mut b = http::Request::builder().uri(uri);
+        if let Some(host) = host {
+            b = b.header(http::header::HOST, host);
+        }
+        b.body(()).expect("a legal request")
+    }
+
+    /// **The HTTP/2 case, which is the one a `Host`-only reader gets wrong.** No header at
+    /// all, the authority in the URI.
+    #[test]
+    fn an_http2_request_resolves_from_the_uri_authority() {
+        let r = req("https://Example.COM.:8443/span/24h", None);
+        assert!(r.headers().get(http::header::HOST).is_none());
+        assert_eq!(of_request(r.uri(), r.headers()), "example.com");
+    }
+
+    /// Origin-form HTTP/1.1, which is every ordinary request: no authority in the URI, so
+    /// the header is what answers.
+    #[test]
+    fn an_http1_request_resolves_from_the_host_header() {
+        let r = req("/span/24h", Some("Example.COM:18080"));
+        assert_eq!(r.uri().authority(), None);
+        assert_eq!(of_request(r.uri(), r.headers()), "example.com");
+    }
+
+    /// Absolute form with both present. RFC 9112 §3.2.2 makes the request target
+    /// authoritative, which is also what HTTP/2 needs -- so one rule covers both.
+    #[test]
+    fn the_uri_authority_wins_over_a_disagreeing_host_header() {
+        let r = req("http://real.test/", Some("spoofed.test"));
+        assert_eq!(of_request(r.uri(), r.headers()), "real.test");
+    }
+
+    #[test]
+    fn userinfo_and_the_port_are_dropped_from_an_authority() {
+        let r = req("http://user:pw@example.com:8443/", None);
+        assert_eq!(of_request(r.uri(), r.headers()), "example.com");
+    }
+
+    /// Neither present is the Q-18 case: the empty string, which resolves to the default
+    /// website rather than to an error nothing has bytes for.
+    #[test]
+    fn neither_present_is_the_empty_host() {
+        let r = req("/", None);
+        assert_eq!(of_request(r.uri(), r.headers()), "");
+        let t = HostTable::new([("first.test".to_string(), id(1))]);
+        assert_eq!(t.resolve_normalised(""), Some(id(1)));
+    }
+
+    #[test]
+    fn an_ipv6_authority_keeps_its_brackets() {
+        let r = req("http://[::1]:8443/", None);
+        assert_eq!(of_request(r.uri(), r.headers()), "[::1]");
     }
 
     #[test]

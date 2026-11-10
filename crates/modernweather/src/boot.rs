@@ -643,13 +643,12 @@ fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<
 /// same configuration by two functions that have to agree.
 fn assert_route_tables_match_the_plan(
     cfg: &Config,
-    plan: &mw_supervisor::plan::Plan,
+    specs: &[mw_component::ComponentSpec],
 ) -> anyhow::Result<()> {
     use mw_component::Capability;
     use std::collections::BTreeSet;
 
-    let planned: BTreeSet<String> = plan
-        .specs()
+    let planned: BTreeSet<String> = specs
         .iter()
         .filter(|spec| {
             spec.provides
@@ -883,7 +882,7 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     // five frozen paths -- has to be asserted rather than arranged. Both directions, because
     // each one is a different defect: a table with no owner is that `503`, and an owner with
     // no table is a component that reaches `Running` while its paths 404.
-    assert_route_tables_match_the_plan(&cfg, &plan)?;
+    assert_route_tables_match_the_plan(&cfg, plan.specs())?;
 
     let (report, (), ()) = tokio::join!(
         supervisor.run(plan),
@@ -1572,6 +1571,98 @@ mod tests {
     }
 
     /// No weather database: neither component, and that is not an error (**D-44**).
+    /// **The pairing tripwire, in both directions.**
+    ///
+    /// M4-3's code review found it untested while `docs/implementation-plan.md` advertised
+    /// it as half of M4-1's constraint 1 being discharged -- which is exactly the shape
+    /// `docs/reconciliation.md` G-1 records. Each direction is a different defect: a
+    /// mounted table whose owner was not planned answers a `503` for ever on paths nobody
+    /// will fill, and a planned provider with no mounted table reaches `Running` while its
+    /// paths 404.
+    #[test]
+    fn the_mounted_tables_and_the_planned_providers_must_agree() {
+        use mw_component::{Methods, RouteEntry, RouteManifest, Scope};
+
+        let table = |owner: &str| {
+            mw_http::RouteTable::new(
+                mw_component::ComponentId::new(owner).expect("a legal id"),
+                RouteManifest::new(
+                    Scope::Any,
+                    vec![RouteEntry::exact(format!("/{owner}"), Methods::READ)],
+                ),
+                axum::Router::new(),
+            )
+        };
+        let mount = |owners: &[&str]| {
+            let (mount, _) = mw_http::Mount::new(
+                owners.iter().map(|o| table(o)).collect(),
+                mw_http::HostTable::default(),
+            )
+            .expect("the tables mount");
+            Arc::new(mount)
+        };
+        let planned = |owners: &[&str]| {
+            owners
+                .iter()
+                .map(|owner| {
+                    mw_component::ComponentSpec::new(
+                        mw_component::ComponentId::new(*owner).expect("a legal id"),
+                        mw_component::Trigger::Service,
+                        mw_component::Builder::serve(|_| async { Ok(Stub) }),
+                    )
+                    .provides([mw_component::Provision::routes(
+                        RouteManifest::new(
+                            Scope::Any,
+                            vec![RouteEntry::exact(format!("/{owner}"), Methods::READ)],
+                        ),
+                    )])
+                })
+                .collect::<Vec<_>>()
+        };
+        // The agreeing case, which is what the daemon does.
+        let mut cfg = config(false);
+        cfg.mount = Some(mount(&["a:one", "b:two"]));
+        let agreeing = planned(&["a:one", "b:two"]);
+        assert_route_tables_match_the_plan(&cfg, &agreeing).expect("they agree");
+
+        // Mounted, not planned: the permanent `503`.
+        let only_planned = planned(&["a:one"]);
+        let err = assert_route_tables_match_the_plan(&cfg, &only_planned)
+            .expect_err("`b:two` is mounted and nothing fills it");
+        let text = format!("{err:#}");
+        assert!(text.contains("b:two"), "{text}");
+        assert!(text.contains("mounted-not-planned"), "{text}");
+
+        // Planned, not mounted: a component that runs while its paths 404.
+        cfg.mount = Some(mount(&["a:one"]));
+        let err = assert_route_tables_match_the_plan(&cfg, &agreeing)
+            .expect_err("`b:two` is planned and has no table");
+        let text = format!("{err:#}");
+        assert!(text.contains("b:two"), "{text}");
+        assert!(text.contains("planned-not-mounted"), "{text}");
+
+        // And the listener itself is mounted and never planned, by design (§5.10).
+        cfg.mount = Some(mount(&["a:one", "b:two", mw_http::ID]));
+        assert_route_tables_match_the_plan(&cfg, &agreeing)
+            .expect("`http:listener` owns `/metrics` and provides nothing");
+    }
+
+    /// A `Serve` body that does nothing, for the specs above. They are never built.
+    #[derive(Debug)]
+    struct Stub;
+
+    impl mw_component::Serve for Stub {
+        fn serve(
+            self: Box<Self>,
+            cx: mw_component::Cx,
+        ) -> mw_component::BoxFuture<'static, Result<(), mw_component::ComponentError>> {
+            Box::pin(async move {
+                cx.cancelled().await;
+                Ok(())
+            })
+        }
+    }
+
     #[test]
     fn no_weather_database_plans_neither_the_pool_nor_the_writer() {
         let mut cfg = config(false);

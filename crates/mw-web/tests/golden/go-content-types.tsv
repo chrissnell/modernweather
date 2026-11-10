@@ -1,7 +1,7 @@
+# Produced by `cargo xtask go-golden` from ci/go-golden/mime, which runs Go's own
+# html/template or net/http over this tree. Do not edit: a change here is a change
+# in Go's behaviour or in the asset tree, and the diff is the review.
 # path	status	Content-Type
-# Captured by running Go 1.26's http.FileServer(http.FS(os.DirFS(...))) over
-# crates/mw-web/assets, which is the tree this crate embeds. Regenerate with
-# scratch/gorender/mime.
 /apple-touch-icon.png	200	image/png
 /css/	200	text/html; charset=utf-8
 /css/fonts.css	200	text/css; charset=utf-8

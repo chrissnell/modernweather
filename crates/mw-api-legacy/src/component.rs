@@ -43,7 +43,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwapOption;
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{HeaderMap, Response, StatusCode};
+use axum::http::{HeaderMap, Response, StatusCode, Uri};
 use axum::routing::any;
 use axum::Router;
 use mw_component::{
@@ -262,17 +262,23 @@ pub fn route_table(state: Arc<RouteState>) -> Result<mw_http::RouteTable, Legacy
     ))
 }
 
-/// The `Host` header, or an empty string.
+/// Which host a request is for, normalised -- `mw_http::host::of_request`'s answer.
 ///
-/// An absent or non-ASCII `Host` resolves to the default website, which is what an
+/// **Not the `Host` header.** An HTTP/2 request carries none: the authority is a
+/// pseudo-header hyper puts in the URI, and the listener offers `h2` first in its ALPN list
+/// (§6.6). Reading only the header would resolve every HTTP/2 request to the **default**
+/// website, so `/latest` on a browser-negotiated connection would answer with another
+/// station's readings -- the frozen surface returning the wrong data, which is the
+/// disclosure class **DEV-2** exists to close. M4-3's code review found it.
+///
+/// One implementation, and it is the listener's: §6.3 puts host resolution there, and two
+/// copies is two answers to "whose data is this request for".
+///
+/// An absent or non-ASCII authority resolves to the default website, which is what an
 /// unmatched one does (Q-18) -- so there is no error path here and no response the contract
 /// would have no bytes for.
-fn host_of(headers: &HeaderMap) -> String {
-    headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string()
+fn host_of(uri: &Uri, headers: &HeaderMap) -> String {
+    mw_http::host::of_request(uri, headers)
 }
 
 /// What a request gets when the component is not running.
@@ -291,6 +297,7 @@ fn unmounted() -> Response<Body> {
 
 async fn latest(
     State(state): State<Arc<RouteState>>,
+    uri: Uri,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
@@ -299,7 +306,7 @@ async fn latest(
     };
     crate::latest::handle(
         &h,
-        &host_of(&headers),
+        &host_of(&uri, &headers),
         &Params::parse(query.as_deref()),
         &headers,
     )
@@ -308,6 +315,7 @@ async fn latest(
 async fn span(
     State(state): State<Arc<RouteState>>,
     Path(span): Path<String>,
+    uri: Uri,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
@@ -316,7 +324,7 @@ async fn span(
     };
     crate::span::handle(
         &h,
-        &host_of(&headers),
+        &host_of(&uri, &headers),
         &span,
         &Params::parse(query.as_deref()),
     )
@@ -325,25 +333,36 @@ async fn span(
 
 async fn snow(
     State(state): State<Arc<RouteState>>,
+    uri: Uri,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
     let Some(h) = state.handlers() else {
         return unmounted();
     };
-    crate::snow::handle(&h, &host_of(&headers), &Params::parse(query.as_deref())).await
+    crate::snow::handle(
+        &h,
+        &host_of(&uri, &headers),
+        &Params::parse(query.as_deref()),
+    )
+    .await
 }
 
-async fn stationinfo(State(state): State<Arc<RouteState>>, headers: HeaderMap) -> Response<Body> {
+async fn stationinfo(
+    State(state): State<Arc<RouteState>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
     let Some(h) = state.handlers() else {
         return unmounted();
     };
-    crate::stationinfo::handle(&h, &host_of(&headers))
+    crate::stationinfo::handle(&h, &host_of(&uri, &headers))
 }
 
 async fn forecast(
     State(state): State<Arc<RouteState>>,
     Path(span): Path<String>,
+    uri: Uri,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
@@ -352,7 +371,7 @@ async fn forecast(
     };
     crate::forecast::handle(
         &h,
-        &host_of(&headers),
+        &host_of(&uri, &headers),
         &span,
         &Params::parse(query.as_deref()),
     )
@@ -361,20 +380,30 @@ async fn forecast(
 
 async fn almanac(
     State(state): State<Arc<RouteState>>,
+    uri: Uri,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
     let Some(h) = state.handlers() else {
         return unmounted();
     };
-    crate::almanac::handle(&h, &host_of(&headers), &Params::parse(query.as_deref())).await
+    crate::almanac::handle(
+        &h,
+        &host_of(&uri, &headers),
+        &Params::parse(query.as_deref()),
+    )
+    .await
 }
 
-async fn stations(State(state): State<Arc<RouteState>>, headers: HeaderMap) -> Response<Body> {
+async fn stations(
+    State(state): State<Arc<RouteState>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
     let Some(h) = state.handlers() else {
         return unmounted();
     };
-    crate::stations::handle(&h, &host_of(&headers))
+    crate::stations::handle(&h, &host_of(&uri, &headers))
 }
 
 /// Why `api:legacy` could not be planned.
@@ -626,6 +655,60 @@ mod tests {
         for pattern in FROZEN_PATTERNS {
             assert!(declared.contains(&pattern), "`{pattern}` is not declared");
         }
+    }
+
+    /// **The frozen surface resolves its website from the request, not from the `Host`
+    /// header**, because an HTTP/2 request does not have one.
+    ///
+    /// Found by M4-3's code review. Reading the header alone made `/latest` and the other
+    /// four frozen routes answer with the **default** website's station on every
+    /// browser-negotiated HTTP/2 connection -- the frozen surface returning another
+    /// station's readings, which is the disclosure class **DEV-2** exists to close.
+    /// `mw_http::host::of_request` is the one implementation and has the argument;
+    /// `mw_http::mount`'s own tests assert the routing end to end. What is asserted here is
+    /// that this crate asks it, and that its answer composes with the website lookup.
+    #[test]
+    fn the_website_is_resolved_from_the_request_rather_than_the_host_header() {
+        let named = |id: i64, hostname: &str| WebsiteView {
+            hostname: hostname.into(),
+            ..website(id)
+        };
+        let directory = Directory::new(
+            vec![named(1, "first.test"), named(2, "second.test")],
+            Vec::new(),
+            Listener {
+                port: 18080,
+                tls: true,
+            },
+        );
+
+        // HTTP/2: no header, the authority in the URI.
+        let h2 = Uri::from_static("https://second.test/latest");
+        let host = host_of(&h2, &HeaderMap::new());
+        assert_eq!(host, "second.test");
+        assert_eq!(
+            directory.website_for_host(&host).expect("a website").id,
+            WebsiteId::new(2),
+            "and NOT the default website"
+        );
+
+        // Origin-form HTTP/1.1: the header is what answers.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("SECOND.test:18080"),
+        );
+        assert_eq!(
+            host_of(&Uri::from_static("/latest"), &headers),
+            "second.test"
+        );
+
+        // Neither: the empty string, which is Q-18's default-website path.
+        assert_eq!(host_of(&Uri::from_static("/latest"), &HeaderMap::new()), "");
+        assert_eq!(
+            directory.website_for_host("").expect("the default").id,
+            WebsiteId::new(1)
+        );
     }
 
     /// The table the listener mounts and the manifest `plan()` validates are the same

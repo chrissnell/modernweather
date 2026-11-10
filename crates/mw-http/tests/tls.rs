@@ -139,6 +139,42 @@ where
     out
 }
 
+/// Assert the **server refused** rather than that anything went wrong.
+///
+/// The distinction is the whole of **DEV-6**'s security half, and M4-3's code review found
+/// the earlier `is_err()` assertions blind to it. There are two ways a handshake for an
+/// uncovered name can fail, and only one of them is this design:
+///
+/// | Outcome | What the client sees | Which behaviour |
+/// |---|---|---|
+/// | the server refuses | `received fatal alert: AccessDenied` | **DEV-6** -- the resolver returned `None` |
+/// | the server serves a wrong certificate | `invalid peer certificate: ... not valid for name ...` | the Go behaviour DEV-6 replaces |
+///
+/// The client here trusts the test CA, so both leaves are acceptable to it -- which is what
+/// makes an `invalid peer certificate` message attributable to the *server* having presented
+/// the wrong one rather than to a trust-store gap.
+///
+/// `access_denied` rather than `unrecognized_name` is rustls's choice for a resolver that
+/// returns `None`; `src/sni.rs` and `docs/reconciliation.md`'s A-M4-3-4 have why.
+fn assert_refused(
+    outcome: std::io::Result<tokio_rustls::client::TlsStream<TcpStream>>,
+    name: &str,
+) {
+    let err = match outcome {
+        Ok(_) => panic!("{name}: the handshake succeeded; nothing covers that name"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        !err.contains("invalid peer certificate"),
+        "{name}: the server handed out a certificate for a name it does not cover, which is \
+         the Go behaviour DEV-6 replaces -- the client is what rejected it: {err}"
+    );
+    assert!(
+        err.contains("AccessDenied"),
+        "{name}: expected the server's refusal alert, got: {err}"
+    );
+}
+
 /// The happy path, end to end: the loader, the resolver, ALPN, and a request over TLS.
 #[tokio::test]
 async fn an_exact_name_handshakes_negotiates_h2_and_serves() {
@@ -164,6 +200,34 @@ async fn an_exact_name_handshakes_negotiates_h2_and_serves() {
                 .map(|c| c.expect("a PEM certificate"))
                 .collect();
         assert_eq!(presented, expected, "the exact entry, not the wildcard");
+
+        // **And a request, which is what covers `LazyTls`'s write half.** M4-3's code
+        // review found that nothing in the suite served a byte over TLS, so
+        // `poll_write`/`poll_flush` -- the half the lazy handshake has to drive on first use
+        // -- was never entered. `http/1.1` rather than `h2` so the exchange is readable
+        // without an h2 client; the ALPN assertion above is what covers the h2 offer.
+        let mut plain = client_config();
+        plain.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(plain));
+        let tcp = TcpStream::connect(addr).await.expect("the port accepts");
+        let mut stream = connector
+            .connect(
+                ServerName::try_from("exact.test".to_string()).expect("a legal name"),
+                tcp,
+            )
+            .await
+            .expect("the handshake completes");
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: exact.test\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("the request is written");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("the response is read to the close");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.ends_with("mw_up 1\n"), "{response}");
     })
     .await;
 }
@@ -186,16 +250,16 @@ async fn a_wildcard_covers_one_label_and_not_two() {
             wild
         );
         // Two labels deep, which the Go `strings.HasSuffix` check accepts.
-        assert!(
-            handshake(addr, "a.b.wild.test").await.is_err(),
-            "the Go check matches any depth; this one does not"
-        );
+        //
+        // **`assert_refused`, not `is_err`.** M4-3's code review found that `is_err` is
+        // satisfied by both outcomes: if the server handed out the wildcard certificate --
+        // which is what Go does -- the *client* would reject it for the name, so the
+        // assertion passed either way and the test guarding DEV-6's security half was not a
+        // gate. Reverting `matches_one_label` to `strings.HasSuffix` left it green.
+        assert_refused(handshake(addr, "a.b.wild.test").await, "a.b.wild.test");
         // And the name that merely ends with the suffix, which is the certificate the Go
         // check hands out for a domain it does not cover.
-        assert!(
-            handshake(addr, "evilwild.test").await.is_err(),
-            "`evilwild.test` must not get `*.wild.test`'s certificate"
-        );
+        assert_refused(handshake(addr, "evilwild.test").await, "evilwild.test");
     })
     .await;
 }
@@ -211,17 +275,7 @@ async fn a_wildcard_covers_one_label_and_not_two() {
 async fn a_miss_with_no_default_refuses_the_handshake() {
     let (bound, addr) = tls_listener(None).await;
     with_server(bound, || async move {
-        let err = handshake(addr, "nobody.test")
-            .await
-            .expect_err("nothing resolves `nobody.test`");
-        // The failure is the server's, not the client's trust decision: the client trusts
-        // both checked-in certificates, so a presented one would have been accepted.
-        assert!(
-            !err.to_string()
-                .to_ascii_lowercase()
-                .contains("unknown issuer"),
-            "the client rejected a certificate instead of the server refusing: {err}"
-        );
+        assert_refused(handshake(addr, "nobody.test").await, "nobody.test");
     })
     .await;
 }
@@ -264,9 +318,19 @@ async fn the_plaintext_port_redirects_to_the_tls_one() {
         https_port: Some(0),
         grpc_port: 0,
     };
-    let bound = bind(&listen, router(), Some(resolver))
-        .await
-        .expect("both ports bind");
+    // The redirector refuses a `Location` built from a hostname nothing serves, so the
+    // host table has to name the one the request sends.
+    let bound = mw_http::bind_with_hosts(
+        &listen,
+        router(),
+        Some(resolver),
+        Arc::new(HostTable::new([(
+            "exact.test".to_string(),
+            mw_types::WebsiteId::new(1),
+        )])),
+    )
+    .await
+    .expect("both ports bind");
     let tls_port = bound.local_addr().port();
     let plain = bound
         .redirect_addr()
@@ -294,6 +358,21 @@ async fn the_plaintext_port_redirects_to_the_tls_one() {
             )),
             "the path and query survive: {response}"
         );
+
+        // And a hostname nothing is configured to serve is not reflected into a
+        // `Location` -- M4-3's code review found this path not consulting the host table.
+        let mut socket = TcpStream::connect(plain).await.expect("the port accepts");
+        socket
+            .write_all(b"GET / HTTP/1.1\r\nHost: attacker.test\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("the request is written");
+        let mut refused = String::new();
+        socket
+            .read_to_string(&mut refused)
+            .await
+            .expect("the response is read");
+        assert!(refused.starts_with("HTTP/1.1 404"), "{refused}");
+        assert!(!refused.contains("attacker.test"), "{refused}");
     })
     .await;
 }

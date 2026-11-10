@@ -166,7 +166,7 @@ pub enum MountError {
 #[derive(Debug)]
 struct Mounted {
     /// Host → website.
-    hosts: HostTable,
+    hosts: Arc<HostTable>,
     /// One router per website, each already falling back to [`Mounted::shared`].
     sites: HashMap<WebsiteId, Router>,
     /// Every `Scope::Any` table, merged, falling back to the catch-all.
@@ -178,10 +178,10 @@ struct Mounted {
 }
 
 impl Mounted {
-    /// The router a request for this `Host` enters.
-    fn route(&self, host: &str) -> &Router {
+    /// The router a request for this **already-normalised** host enters.
+    fn route_normalised(&self, host: &str) -> &Router {
         self.hosts
-            .resolve(host)
+            .resolve_normalised(host)
             .and_then(|id| self.sites.get(&id))
             .unwrap_or(&self.shared)
     }
@@ -263,6 +263,14 @@ impl Mount {
     /// How many websites have their own router, for a log line and a test.
     pub fn sites(&self) -> usize {
         self.inner.load().sites.len()
+    }
+
+    /// The host table this generation routes by, for the redirector's one use of it.
+    ///
+    /// A clone of the `Arc` the mount holds, so the redirector sees the generation that was
+    /// mounted rather than a copy that could drift.
+    pub fn hosts(&self) -> Arc<HostTable> {
+        Arc::clone(&self.inner.load().hosts)
     }
 
     /// Which component owns each mounted table.
@@ -350,6 +358,17 @@ fn build(tables: Vec<RouteTable>, hosts: HostTable) -> Result<(Mounted, MountRep
         // mounted as the shared router's *fallback*, so it only ever answers a path nothing
         // else matched. A fallback cannot shadow.
         if table.is_catch_all() {
+            // **A catch-all must be `Scope::Any`.** M4-3's code review found this branch
+            // `continue`ing before the scope `match` below, so a `Scope::Site(3)` catch-all
+            // became the global fallback for every host and a `Scope::Management` one
+            // bypassed `UnsupportedScope` entirely. A fallback is by definition not
+            // per-website: it answers what nobody claimed, on every host.
+            if !matches!(table.scope(), Scope::Any) {
+                return Err(MountError::UnsupportedScope {
+                    owner: table.owner().clone(),
+                    scope: table.scope(),
+                });
+            }
             if let Some(first) = &catch_all {
                 return Err(MountError::TwoCatchAlls {
                     a: first.owner().clone(),
@@ -361,11 +380,22 @@ fn build(tables: Vec<RouteTable>, hosts: HostTable) -> Result<(Mounted, MountRep
             continue;
         }
         if !matches!(table.scope(), Scope::Any) {
+            // **`conflicts_with`, not string equality.** M4-3's code review found the
+            // string comparison walkable twice over: `/span/{window}` is the same claim as
+            // `/span/{span}` with a different parameter name, and a prefix mount on `/`
+            // swallows all five -- and neither compares equal to a literal. The relation
+            // the rest of this module uses already answers both (`RouteEntry::shape`
+            // normalises parameter names, and a prefix contains what is under it), so the
+            // check uses it.
+            let frozen: Vec<mw_component::RouteEntry> = crate::FROZEN_PATTERNS
+                .iter()
+                .map(|p| mw_component::RouteEntry::exact(*p, mw_component::Methods::ANY))
+                .collect();
             if let Some(entry) = table
                 .manifest()
                 .entries
                 .iter()
-                .find(|e| crate::FROZEN_PATTERNS.contains(&e.pattern.as_str()))
+                .find(|e| frozen.iter().any(|f| e.conflicts_with(f)))
             {
                 return Err(MountError::FrozenPatternShadowed {
                     owner: table.owner().clone(),
@@ -401,15 +431,31 @@ fn build(tables: Vec<RouteTable>, hosts: HostTable) -> Result<(Mounted, MountRep
     report.shared = shared_tables.len();
     report.sites = site_tables.len();
 
-    // The catch-all is the shared router's fallback, which is the Go router's last entry:
-    // `router.PathPrefix("/")`. With none mounted, the listener's own 404 answers.
-    let mut shared = match catch_all {
-        Some(table) => Router::new().fallback_service(table.into_router().into_service::<Body>()),
-        None => Router::new().fallback(|| async { not_found() }),
-    };
+    // **Merge first, attach the fallback last.** M4-3's code review found the previous
+    // order -- fallback first, then `merge` -- panicking inside `Router::merge` for a
+    // `Scope::Any` provider that declared a fallback of its own, which is reachable from
+    // `attach_listener` at boot and from `Mount::swap` at M7-1. `MountError`'s own
+    // documentation says these checks exist precisely so that a mount failure is an error
+    // somebody can read rather than an axum panic, so the one remaining ambiguous case --
+    // two providers each with a fallback -- is still a panic from `merge` and is what
+    // `TwoCatchAlls` exists to catch before it.
+    //
+    // The catch-all becomes the shared router's fallback, which is the Go router's last
+    // entry: `router.PathPrefix("/")`. With none mounted, the listener's own 404 answers.
+    //
+    // **The listener owns the fallback, so a `Scope::Any` provider's own is replaced.** That
+    // is the rule rather than an accident: `404 page not found\n` is one response with one
+    // owner (**DEV-3**), and "which 404 did I get" is not a question an operator should have
+    // to ask. A provider that wants to answer an unrouted path declares `catch_all()`, and
+    // then it is the only one that may.
+    let mut shared = Router::new();
     for table in shared_tables {
         shared = shared.merge(table.into_router());
     }
+    shared = match catch_all {
+        Some(table) => shared.fallback_service(table.into_router().into_service::<Body>()),
+        None => shared.fallback(|| async { not_found() }),
+    };
 
     // A site's router falls back to the shared one, so `/latest` answers on every host
     // without being declared per website -- which is what `Scope::Any` means.
@@ -427,7 +473,7 @@ fn build(tables: Vec<RouteTable>, hosts: HostTable) -> Result<(Mounted, MountRep
 
     Ok((
         Mounted {
-            hosts,
+            hosts: Arc::new(hosts),
             sites,
             shared,
             owners,
@@ -465,17 +511,18 @@ impl Service<Request<Body>> for Dispatch {
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        // An absent or non-ASCII `Host` normalises to the empty string, which resolves to
-        // the default website -- the same answer an unmatched one gets (Q-18), so there is
-        // no error path here and no response the contract has no bytes for.
-        let host = req
-            .headers()
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
+        // **`of_request`, not the `Host` header.** An HTTP/2 request carries no `Host` at
+        // all -- the authority is a pseudo-header hyper puts in the URI -- and this listener
+        // offers `h2` first in its ALPN list, so reading the header alone would route every
+        // HTTP/2 request to the default website. `crate::host::of_request` has the whole of
+        // that argument.
+        //
+        // An absent or non-ASCII authority normalises to the empty string, which resolves
+        // to the default website -- the same answer an unmatched one gets (Q-18), so there
+        // is no error path here and no response the contract has no bytes for.
+        let host = crate::host::of_request(req.uri(), req.headers());
         let mounted = self.inner.load();
-        let mut router = mounted.route(&host).clone();
+        let mut router = mounted.route_normalised(&host).clone();
         Box::pin(async move { router.call(req).await })
     }
 }
@@ -561,6 +608,54 @@ mod tests {
         assert_eq!(get_with_host(&m, "one.test", "/").await.1, "site one");
         assert_eq!(get_with_host(&m, "two.test", "/").await.1, "site two");
         assert_eq!(m.sites(), 2);
+    }
+
+    /// **An HTTP/2 request has no `Host` header, and it must still reach its website.**
+    ///
+    /// Found by M4-3's code review. `hyper`'s h2 server reconstructs the URI from
+    /// `:scheme`, `:authority` and `:path` and inserts no header, so a dispatch that read
+    /// `headers[HOST]` resolved **every** HTTP/2 request to the default website -- and this
+    /// listener offers `h2` first in its ALPN list, so that is every browser on the TLS
+    /// port. The failure is a data disclosure rather than a 404: Q-18 makes an unresolvable
+    /// host fall through to the default website's own data.
+    #[tokio::test]
+    async fn an_http2_request_reaches_its_own_site_without_a_host_header() {
+        let m = mount();
+        let req = Request::builder()
+            .uri("https://two.test/")
+            .version(axum::http::Version::HTTP_2)
+            .body(Body::empty())
+            .expect("a legal request");
+        assert!(
+            req.headers().get(header::HOST).is_none(),
+            "the shape hyper's h2 server produces"
+        );
+        let resp = m.router().oneshot(req).await.expect("infallible");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("a readable body");
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "site two",
+            "the `:authority` was ignored and the default website answered"
+        );
+    }
+
+    /// Absolute-form HTTP/1.1 carries both, and RFC 9112 §3.2.2 makes the request target
+    /// authoritative -- which is the same rule HTTP/2 needs, so there is one rule.
+    #[tokio::test]
+    async fn an_absolute_uri_wins_over_a_disagreeing_host_header() {
+        let m = mount();
+        let req = Request::builder()
+            .uri("http://two.test/")
+            .header(header::HOST, "one.test")
+            .body(Body::empty())
+            .expect("a legal request");
+        let resp = m.router().oneshot(req).await.expect("infallible");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("a readable body");
+        assert_eq!(String::from_utf8_lossy(&body), "site two");
     }
 
     /// Q-18: an unmatched `Host` gets the default website, and nothing in the response
@@ -658,6 +753,55 @@ mod tests {
         assert_eq!(get_with_host(&m, "one.test", "/latest").await.1, "latest");
     }
 
+    /// **M4-1's constraint 1, in the three shapes a string comparison misses.**
+    ///
+    /// Found by M4-3's code review. A per-website router is tried *before* the shared one,
+    /// so any of these would make a frozen path answer a non-contract response on one
+    /// hostname -- and `plan()` cannot see it, because two tables in different scopes are
+    /// not a route conflict.
+    #[test]
+    fn a_site_table_cannot_shadow_a_frozen_pattern_however_it_spells_it() {
+        let claim = |entry: RouteEntry| {
+            Mount::new(
+                vec![RouteTable::new(
+                    id("web:site:1"),
+                    RouteManifest::new(Scope::Site(WebsiteId::new(1)), vec![entry]),
+                    Router::new(),
+                )],
+                hosts(),
+            )
+            .map(|_| ())
+        };
+        for (what, entry) in [
+            (
+                "the literal pattern",
+                RouteEntry::exact("/latest", Methods::ANY),
+            ),
+            (
+                "a different parameter name",
+                RouteEntry::exact("/span/{window}", Methods::ANY),
+            ),
+            (
+                "a prefix mount that contains them all",
+                RouteEntry::prefix("/", Methods::ANY),
+            ),
+            (
+                "a prefix mount on one of them",
+                RouteEntry::prefix("/forecast", Methods::ANY),
+            ),
+        ] {
+            let err = claim(entry).expect_err(what);
+            assert!(
+                matches!(err, MountError::FrozenPatternShadowed { .. }),
+                "{what}: {err}"
+            );
+        }
+        // And a path that is not frozen is still allowed per website, or the check would be
+        // refusing the website's own routes.
+        claim(RouteEntry::exact("/config.json", Methods::ANY)).expect("not a frozen pattern");
+        claim(RouteEntry::exact("/", Methods::ANY)).expect("every website declares `/`");
+    }
+
     #[test]
     fn two_catch_alls_are_refused() {
         let catch = |owner: &str| {
@@ -684,6 +828,46 @@ mod tests {
         )
         .expect_err("the second would silently replace the first");
         assert!(matches!(err, MountError::TwoSiteTables { .. }), "{err}");
+    }
+
+    /// M4-3's code review: the catch-all branch used to skip the scope check entirely.
+    #[test]
+    fn a_catch_all_must_be_scope_any() {
+        for scope in [Scope::Site(WebsiteId::new(3)), Scope::Management] {
+            let err = Mount::new(
+                vec![RouteTable::new(
+                    id("web:assets"),
+                    RouteManifest::new(scope, vec![]),
+                    Router::new(),
+                )
+                .catch_all()],
+                hosts(),
+            )
+            .expect_err("a fallback is not per-website and is not the management API");
+            assert!(matches!(err, MountError::UnsupportedScope { .. }), "{err}");
+        }
+    }
+
+    /// M4-3's code review: this used to panic inside `Router::merge`, which `MountError`'s
+    /// own documentation says these checks exist to prevent.
+    #[tokio::test]
+    async fn a_shared_provider_may_declare_its_own_fallback() {
+        let with_fallback = RouteTable::new(
+            id("api:legacy"),
+            RouteManifest::new(Scope::Any, vec![RouteEntry::exact("/latest", Methods::ANY)]),
+            Router::new()
+                .route("/latest", any(|| async { "latest" }))
+                .fallback(|| async { (StatusCode::NOT_FOUND, "the provider's own 404") }),
+        );
+        let (m, _) = Mount::new(vec![with_fallback], hosts()).expect("mounts without panicking");
+        assert_eq!(get_with_host(&m, "one.test", "/latest").await.1, "latest");
+        // And the listener still owns the 404: a provider's own fallback is replaced rather
+        // than honoured, because `404 page not found\n` has one owner (**DEV-3**). Declaring
+        // `catch_all()` is how a provider asks to be that owner.
+        assert_eq!(
+            get_with_host(&m, "one.test", "/nope").await.1,
+            "404 page not found\n"
+        );
     }
 
     #[test]

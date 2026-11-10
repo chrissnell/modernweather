@@ -90,7 +90,8 @@ const MANGLE_PORT: u16 = 18081;
 /// `contract/README.md`'s 26 is a count of *failures* against the Go daemon, which serves
 /// all 70 endpoints and passes all 70 directly -- so against that target "26 failed" and
 /// "the proxy broke 26" are the same sentence. Against this one they are not: 22 fixtures
-/// fail whatever the proxy does, because nine are `retired` and thirteen are [`PENDING`].
+/// fail whatever the proxy does: the nine `retired` ones. It was 22 between M4-2 and M4-3,
+/// when thirteen `coupled` fixtures were also excused by [`PENDING`].
 /// A floor on the failure count would therefore be cleared by a proxy that mangled
 /// **nothing**, which is exactly the failure mode W1 Decision 10 exists to prevent.
 ///
@@ -98,19 +99,23 @@ const MANGLE_PORT: u16 = 18081;
 /// is the number of responses the proxy actually broke, and it is independent of how many
 /// endpoints the target does not serve.
 ///
-/// **Measured at 23**, against a green direct replay of 48:
+/// **Measured at 23**, against a green direct replay of 61 (implementation-plan.md M4-3;
+/// it was 48 between M4-2 and M4-3, when thirteen `coupled` fixtures were excused):
 ///
 /// ```text
-/// direct   48 passed, 22 failed
-/// mangled  25 passed, 45 failed      -> 23 broken
+/// direct   61 passed,  9 failed
+/// mangled  38 passed, 32 failed      -> 23 broken
 /// ```
 ///
 /// The 23 are every JSON-object-or-array response on an implemented endpoint -- the six
 /// `/latest`, six `/span`, five `/snow`, three `/stationinfo`, two `/almanac` and one
-/// `/api/stations`. The 25 that still pass are the plain-text error bodies, the `403`, and
-/// the whole `/forecast` family: the proxy rewrites parsed JSON and `/forecast`'s body is
-/// `jsonb` text it does not match. That split is what makes the control meaningful rather
-/// than a blanket failure.
+/// `/api/stations`. The 38 that still pass are the plain-text error bodies, the `403`, the
+/// whole `/forecast` family and -- since M4-3 -- the thirteen HTML pages and embedded
+/// assets: the proxy rewrites parsed JSON, and neither `/forecast`'s `jsonb` text nor an
+/// asset body is JSON it matches. That split is what makes the control meaningful rather
+/// than a blanket failure, and it is also why the **frozen** floor below is the one that
+/// binds: adding thirteen non-JSON responses to the direct count moved the total and not
+/// the number broken.
 ///
 /// A **floor** rather than an equality, for `go-target.sh`'s reason: the proxy's `windd`
 /// rewrite only matches an integer-formatted value, so the exact count varies with live
@@ -121,14 +126,14 @@ const MIN_MANGLED_BROKEN: usize = 20;
 /// The same floor, over the `frozen` class alone.
 ///
 /// **Measured at 20** on the same run: every one of the 23 broken responses bar three
-/// `/almanac` and `/api/stations` bodies is a frozen one. Fifteen leaves five of slack, the
-/// same proportion the total floor carries.
+/// `/almanac` and `/api/stations` bodies is a frozen one. Fifteen leaves five of slack.
 ///
-/// This exists because the total floor stops binding on its own. Six coupled fixtures pass
-/// directly today, so a total of 20 cannot be reached without the frozen ones -- but
-/// `implementation-plan.md` **M4-3** makes all 19 coupled pass, and 19 + 1 would then clear
-/// it while the control said nothing about the five endpoints `D-68` freezes. A floor that
-/// only holds until the next work item is not a floor.
+/// This exists because the total floor stops binding on its own, and **M4-3 is the item that
+/// made that real rather than predicted**: all 19 `coupled` fixtures now pass directly, so
+/// 19 + 1 clears a total floor of 20 with the control saying nothing about the five
+/// endpoints `D-68` freezes. Measured on the run that landed M4-3: 23 broken in total and
+/// **20 of the 42 frozen**, so the frozen floor is what is actually binding, with five of
+/// slack. A floor that only holds until the next work item is not a floor.
 const MIN_FROZEN_MANGLED_BROKEN: usize = 15;
 
 /// The deviation this target is known to differ by on purpose, and **which fixtures may
@@ -253,7 +258,7 @@ const RETIRED: [&str; 9] = [
 /// -- which is why M4-3 removed thirteen of them in the same commit.
 const PENDING: [(&str, &str); 0] = [];
 
-/// The schema's seeded `listener.http_port`./// The schema's seeded `listener.http_port`. The bootstrap start below binds this, because
+/// The schema's seeded `listener.http_port`. The bootstrap start below binds this, because
 /// the row it is about to be given is the one that says otherwise.
 const SCHEMA_PORT: u16 = 8080;
 
@@ -2236,12 +2241,6 @@ mod tests {
 
     /// Today's green shape: every frozen fixture passing, the thirteen pending website
     /// fixtures failing, the nine retired ones failing, and nothing else.
-    /// [`green`], for a caller that mutates it. `Summary` is not `Clone` and does not need
-    /// to be: rebuilding it is one call.
-    fn green_clone() -> Summary {
-        green()
-    }
-
     fn green() -> Summary {
         let failed: Vec<(&str, &str)> = PENDING.iter().map(|(n, _)| (*n, "coupled")).collect();
         // 42 frozen, 19 coupled, 9 retired = 70. Since M4-3 emptied [`PENDING`] the second
@@ -2621,15 +2620,14 @@ deviations applied: DEV-10
         const SYNTHETIC: [(&str, &str); 1] = [("coupled-0", "M9-9")];
 
         // Stale: a declared fixture passed, which is what M4-3 landing looked like.
-        let green = green();
+        let base = green();
         assert!(
-            green
-                .fixtures
+            base.fixtures
                 .iter()
                 .any(|f| f.name == SYNTHETIC[0].0 && f.passed),
             "the synthetic entry has to name a fixture that passes, or `stale` is vacuous"
         );
-        match judge_direct(&green, EXPECTED_FIXTURES, &SYNTHETIC) {
+        match judge_direct(&base, EXPECTED_FIXTURES, &SYNTHETIC) {
             Direct::Inconclusive(why) => {
                 assert!(why.contains("declared pending and PASSED"), "{why}");
                 assert!(why.contains(SYNTHETIC[0].0), "{why}");
@@ -2640,7 +2638,7 @@ deviations applied: DEV-10
         // Missing: a declared fixture the runner did not report, which is a rename. The
         // replacement **passes**, so that the unexcused-coupled check does not fire first
         // and the message under test is the one about the declaration.
-        let mut s = green_clone();
+        let mut s = green();
         s.fixtures.retain(|f| f.name != SYNTHETIC[0].0);
         s.fixtures
             .push(verdict("coupled-renamed", "coupled", true, false));
@@ -2654,7 +2652,7 @@ deviations applied: DEV-10
 
         // And the excuse working: the declared fixture fails and the gate still passes,
         // which is the state M4-3 inherited and removed.
-        let mut s = green_clone();
+        let mut s = green();
         for f in &mut s.fixtures {
             if f.name == SYNTHETIC[0].0 {
                 f.passed = false;

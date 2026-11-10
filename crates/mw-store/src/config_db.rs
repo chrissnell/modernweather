@@ -612,6 +612,55 @@ mod tests {
         assert!(!bare[2].snow_enabled);
     }
 
+    /// **`aerisWeatherEnabled` is a row, and nothing tested the query that reads it.**
+    ///
+    /// Found by M4-3's code review. The pairing drives the rendered page's whole forecast
+    /// band, no fixture asserts that band, and `crates/mw-web/tests/byte_diff.rs` builds its
+    /// own `SiteView` and never reads a database -- so a wrong `service` literal or a
+    /// renamed column would silently drop the band from every page with no gate noticing.
+    ///
+    /// Both directions: the `aeris` pairing comes back, and a pairing for a different
+    /// service does not.
+    #[tokio::test]
+    async fn the_aeris_pairing_round_trips_and_excludes_other_services() {
+        let scratch = Scratch::new("aeris");
+        let pool = open_and_migrate(&scratch.db()).await.expect("migrate");
+        assert!(
+            aeris_stations(&pool).await.expect("reads").is_empty(),
+            "the migration seeds no pairing"
+        );
+
+        for sql in [
+            "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind)
+             VALUES ('davis-full', x'0193f3c28b207c71ae3f10cc92d4b7aa', 'davis-full',
+                     'davis', 'from_registration')",
+            "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind)
+             VALUES ('csi-minimal', x'0193f3c28b207c71ae3f10cc92d4b7aa', 'csi-minimal',
+                     'campbellscientific', 'from_registration')",
+            // The Aeris pairing carries no `uploader_id` -- an Aeris account is not an
+            // uploader, which the table's own CHECK requires.
+            "INSERT INTO station_service (station_key, service) VALUES ('davis-full', 'aeris')",
+            // A different service on the OTHER station, so that a query missing its
+            // `WHERE` would return both and this test would say so.
+            "INSERT INTO uploader (id, kind, name, enabled)
+             VALUES (1, 'wunderground', 'backyard', 1)",
+            "INSERT INTO station_service (station_key, service, uploader_id)
+             VALUES ('csi-minimal', 'wunderground', 1)",
+        ] {
+            sqlx::query(sql)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("the schema rejected a row: {e}\n{sql}"));
+        }
+
+        assert_eq!(
+            aeris_stations(&pool).await.expect("reads"),
+            vec!["davis-full".to_string()],
+            "only the `aeris` pairing, and by station key"
+        );
+        pool.close().await;
+    }
+
     /// The three columns M3-1 added, and the round trip the station registrar depends on.
     #[tokio::test]
     async fn a_weatherlink_live_row_round_trips_through_the_station_reader() {

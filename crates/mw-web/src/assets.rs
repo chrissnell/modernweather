@@ -61,6 +61,18 @@ use rust_embed::Embed;
 #[folder = "assets/"]
 struct Assets;
 
+/// Every embedded path, in `rust-embed`'s order.
+///
+/// **For `tests/mime.rs`, which was golden-driven and therefore blind to a new file.**
+/// M4-3's code review found that iterating the recorded capture rather than the tree meant
+/// an asset added with an extension [`content_type`] does not list would fall through to
+/// `text/plain; charset=utf-8` -- under a comment asserting that every unlisted extension in
+/// this tree is text -- with no test disagreeing. The test now pairs the two sets, so adding
+/// an asset forces the capture to be regenerated.
+pub fn embedded_paths() -> Vec<String> {
+    Assets::iter().map(|p| p.to_string()).collect()
+}
+
 /// One embedded file's bytes, or a panic naming it.
 ///
 /// For the three files this crate serves by name rather than by request path --
@@ -88,8 +100,11 @@ const FONT_CACHE: &str = "public, max-age=31536000, immutable";
 
 /// The frozen `Content-Type` for one asset path.
 ///
-/// The path is the full request path, because two of the entries are **path**-specific
-/// rather than extension-specific.
+/// `path` is the request path **without its leading slash**, which is how `rust-embed` keys
+/// the tree and how [`serve`] passes it -- `content_type("/js/weather-app.js")` would miss
+/// the one path-specific entry. The distinction matters because two of the entries are
+/// **path**-specific rather than extension-specific, and M4-3's code review found this doc
+/// saying "the full request path".
 pub fn content_type(path: &str) -> &'static str {
     // The one path whose content type came from a handler rather than from the file
     // server, and therefore carries no charset (§7.2).

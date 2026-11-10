@@ -298,15 +298,15 @@ pub fn rain_rolled_over() {
 ///   `X-MW-Snapshot-Age` header. It is the **reading's** age rather than the render's,
 ///   which is what W1's 10-minute recency rule is measured against.
 ///
-///   **It is the age at the last fold, and it does not climb on its own.** This is written
-///   only when a snapshot is published, so a station that stops reporting freezes its gauge
-///   instead of crossing 600 — which is the one transition an operator would want to alert
-///   on. Said here rather than left to be discovered: until something sweeps every key on a
-///   timer, alert on `rate(mw_snapshot_published_total)` going flat, which *does* detect a
-///   station that has gone quiet. The sweep's natural home is the scrape path, and that is
-///   M4-3's (`http:listener`) — recorded on this function rather than in a work item,
-///   because the number is here and the gap is a property of the number.
-///   `mw_snapshot_degraded` has the same shape for the same reason.
+///   **It is the age at the last fold, and on its own it would not climb.** This is written
+///   only when a snapshot is published, so a station that stops reporting would freeze its
+///   gauge instead of crossing 600 — which is the one transition an operator would want to
+///   alert on. [`sweep_snapshot_ages`] is what closes that, fifty lines below: M4-3 put it
+///   on the **scrape** path, so the gauge an operator reads is recomputed when `/metrics`
+///   renders rather than at the last fold, and `mw_snapshot_age_seconds > 600` is an alert
+///   that can fire for the station that has gone quiet. `mw_snapshot_degraded` is swept with
+///   it. `rate(mw_snapshot_published_total)` going flat detects the same thing and is still
+///   the cheaper query.
 /// - `mw_snapshot_degraded{website,station}` — **D-36**'s indicator as a number, 1 while the
 ///   window-derived values are being served from their last good value. This is the series
 ///   an alert fires on, because the frozen body cannot carry the fact and must not.

@@ -91,6 +91,18 @@ impl RouteTable {
     pub(crate) fn into_router(self) -> Router {
         self.router
     }
+
+    /// [`RouteTable::into_router`], for a test in a route-providing crate that wants to
+    /// drive its own handlers without mounting a whole listener.
+    ///
+    /// Named so that it reads as test-only at every call site, which is
+    /// `mw_api_legacy::RouteState::install_for_test`'s reason. `crates/mw-web/tests/routes.rs`
+    /// is the caller: `Mount` would give it the host dispatch and the catch-all as well,
+    /// and what those tests are about is one website's five responses.
+    #[doc(hidden)]
+    pub fn into_router_for_test(table: Self) -> Router {
+        table.into_router()
+    }
 }
 
 #[cfg(test)]

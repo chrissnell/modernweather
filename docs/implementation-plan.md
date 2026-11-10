@@ -747,6 +747,14 @@ G-5):
    established the structural precondition; this is where the response itself first exists, so the
    route table's mounting rule is the last place the invariant can be broken. `grep` for `503` found
    only prose before this item.
+
+   *Landed differently from that text, and M4-3's code review asked for the difference to be
+   stated: nothing in `mw-http` emits a `503`. The per-website tables do —
+   `mw_web::component::unmounted`, and `crates/mw-web/tests/routes.rs` asserts its bytes — and for
+   a declared path whose component nobody planned, `boot.rs`'s
+   `assert_route_tables_match_the_plan` makes the state unrepresentable at startup rather than
+   answering it per request. That is the stronger outcome. The constraint's substance — the mount
+   is the last place D-48 can be broken — is `mw_http::MountError::FrozenPatternShadowed`.*
 2. **`mw_snapshot_age_seconds` and `mw_snapshot_degraded` freeze rather than climb.** Both are
    written only when a snapshot is folded, so a station that stops reporting — the one transition
    worth alerting on — leaves its gauge where it was. The sweep belongs on the scrape path, which is
@@ -773,10 +781,19 @@ The two things it found are **A-M4-3-1** and **A-M4-3-2** in `docs/reconciliatio
   `jsValEscaper`, which no HTML escaper would produce. `mw_web::gojs` is that second escaper, and
   `crates/mw-web/tests/escaping.rs` asserts every byte of both tables against output produced by
   **running** Go's `html/template` over every ASCII codepoint in four contexts.
-- `html/template` **elides HTML, CSS and JavaScript comments**, so the recorded bodies carry 29
-  fewer comments than the template does. The port keeps them as askama `{# … #}` comments, which
-  occupy no output bytes, and `assets/portal.html` is the Go server's rendered output rather than
-  its template source. Byte equality is therefore real rather than normalised.
+- `html/template` **removes comments**, so the recorded bodies carry **42** fewer than
+  `weather-station.html.tmpl` does — 29 HTML comments and 13 JavaScript line comments. The port
+  keeps all 42 as askama `{# … #}` comments, which occupy no output bytes, and
+  `assets/portal.html` is the Go server's rendered output rather than its template source. Byte
+  equality is therefore real rather than normalised.
+
+  **The rule is "remove" for an HTML or JavaScript *line* comment and "replace with a space"
+  for a CSS or JavaScript *block* comment**, which M4-3's code review corrected: `escapeText`
+  substitutes a single space for `stateCSSBlockCmt` and a space or a newline for
+  `stateJSBlockCmt`. `weather-station.html.tmpl` carries no `/* */` so nothing here depends on
+  the difference — but `portal.html.tmpl`'s one CSS comment became a space in the rendered file
+  that is now the static asset, and applying the simpler rule to a future `/* */` would silently
+  drop a byte the recording has.
 
 **2. `GoHtmlEscaper` is pinned by the layout gate, which needed a new rule.** `ci/layers.toml`'s
 `[templates]` check already rejected `safe` and the `escape` filter's `none` argument under
@@ -793,7 +810,7 @@ pass, which is this milestone's done-criterion. `asset-weather-app-js` had to ch
 the nine configuration values out of `/js/weather-app.js` and into the inline block, so the four
 `pullFromDevice: 'davis-full'`-style substrings it asserted exist on the Go target and not on this
 one — and the **deviation mechanism cannot carry an assertion**, only a recorded response
-(`contract/conformance/src/lib.rs:424` makes `assert` the fixture's for both targets by design). So
+(`contract/conformance/src/lib.rs:432` makes `assert` the fixture's for both targets by design). So
 its `required_substrings` become three that identify the module on both targets, and what the suite
 stops checking — that the nine values reach the client — is checked by `crates/mw-web`'s own tests:
 the inline block's key set and order, its byte agreement with `/config.json`, and the byte diff.
@@ -858,6 +875,93 @@ two implementations agree. And **DEV-6's refusal sends `access_denied`, not `unr
 rustls chooses the alert for a resolver that returns `None` and offers no hook
 (**A-M4-3-4**). What DEV-6 is for — a diagnosable refusal instead of a wrong certificate — is
 unaffected.
+
+**7. The code review found two Critical defects, and they were the whole reason to run one.**
+Three reviewers, scoped to the listener, the website and the gates. Both Criticals have the
+same shape — a mechanism that looked present and was not — and neither is visible to any gate
+this programme has.
+
+**(a) An HTTP/2 request carries no `Host` header.** RFC 9113 §8.3.1 replaces it with the
+`:authority` pseudo-header, which hyper's h2 server puts in the URI and does not mirror into
+a header — and both host-resolving call sites read `headers[HOST]`. The listener offers `h2`
+**first** in its ALPN list (§6.6, matching the Go server's `NextProtos`), so every browser on
+the TLS port negotiates HTTP/2, and every one of its requests resolved to the **default**
+website:
+
+- `/` and `/portal` served the default website's page under somebody else's hostname;
+- **`/latest`, `/span`, `/snow`, `/stationinfo` and `/forecast` returned the default
+  station's readings** — the frozen surface answering with the wrong station's data.
+
+That is the same class of defect **DEV-2** exists to close (the Go version's case-sensitive
+map lookup serving someone else's website), reopened through a different door and firing on
+every request rather than on a mixed-case one. The conformance suite cannot see it: the
+runner is `ureq` over HTTP/1.1, so all 70 fixtures pass either way.
+
+The fix is one function — `mw_http::host::of_request`, which takes the URI's authority first
+and the `Host` header second. That precedence is right for both protocols: RFC 9112 §3.2.2
+makes an HTTP/1.1 absolute-form request target authoritative over `Host`, and origin-form
+(every ordinary HTTP/1.1 request) has no authority in the URI and falls through to the
+header. `mw-api-legacy` asks the same function rather than carrying a second copy, so the
+seven frozen handlers gained a `Uri` extractor. Three regression tests: the dispatch end to
+end over an h2-shaped request, the absolute-form precedence, and the frozen surface's own
+seam composed with the website lookup.
+
+**(b) `askama::filters::HtmlSafe` does nothing under a custom escaper.** The page's two
+coordinates have to bypass the escaper, because Go writes `1e+21` for a magnitude outside
+`[1e-6, 1e21)` and `html/template`'s table turns `+` into `&#43;` — which is not JSON inside
+the `<script type="application/json">` block, so `JSON.parse` throws and the radar panel never
+initialises. `HtmlSafe` was the mechanism, and its bypass is implemented **only for askama's
+own `Html` escaper** (`askama-0.16.1/src/filters/escape.rs:229`); with `GoHtmlEscaper`
+registered the autoref specialisation never selects it. askama's `Safe` wrapper is generic
+over the escaper and is what works.
+
+**The test that was supposed to catch it asserted a property of the escaper, not of a page**,
+so it passed either way — which is the finding behind the finding. There is now a test that
+renders a page with `latitude = 1e21` and asserts Go's bytes, and the bypass is gated:
+`no-template-escape-opt-out` forbids every askama bypass in the workspace, exempts one file,
+and `crates/mw-web/src/page.rs`'s own test reads that file and asserts the exemption is still
+exactly two fields each wrapping a number. `stations.latitude` is a nullable `REAL` with no
+range `CHECK`, so a bad import reaches this.
+
+**Three Important findings, each closing a check that could not fail.**
+
+- **`FrozenPatternShadowed` compared raw pattern strings**, so M4-1's constraint 1 was
+  walkable three ways: `/span/{window}` is the same claim as `/span/{span}`, and a prefix
+  mount on `/` or on `/forecast` contains the frozen paths without equalling any of them. It
+  now uses `RouteEntry::conflicts_with`, the relation the rest of the module uses.
+- **`tests/tls.rs`'s DEV-6 negatives were `is_err()`**, which both outcomes satisfy: if the
+  server hands out the wildcard certificate — what Go does — the *client* rejects it for the
+  name. Reverting `matches_one_label` to `strings.HasSuffix` left the test green. It now
+  asserts the server's refusal alert, and that revert turns it red (shown).
+- **`Directory::website_for_host` had no wildcard arm while `HostTable` did.** A
+  `*.wild.test` row is representable — the column's three `CHECK`s accept it — so `/` was
+  served by that website and `/latest` by the **default** one, on the same request host: one
+  hostname, two websites' data. It now asks `mw_http::matches_one_label`, the single-label
+  rule the host table and the certificate store already share.
+
+**Two gates could be silenced by one line, which is the same defect in the tooling.**
+`check_askama_escaper` was called *after* `check_templates`'s `if !dir.exists() { return }`,
+so repointing `[templates].dir` at a missing path silenced both the escaper pin and the
+needle scan — while the rule's own prose claimed a missing file was a violation. And an
+`askama.toml` `[general] dirs` key parsed clean, moving the templates out of the scan without
+touching `ci/layers.toml` at all. The check is hoisted, a missing directory is a violation,
+`AskamaConfig` is `deny_unknown_fields`, and both doors have tests that watch them shut.
+Separately, **`go-number-digits` could be deleted with nothing failing** — armed but absent
+from the id list the layout test walks. It is pinned now.
+
+**Everything else the reviews raised is fixed or recorded.** Eight more findings landed as
+code: the catch-all's scope is checked, a `Scope::Any` provider's own fallback no longer
+panics `Router::merge`, the rustls provider is named rather than defaulted, the redirector
+validates its `Host` against the host table, accept errors are split the way axum splits them,
+`/config.json`'s two deliveries are compared **byte for byte** (the docs claimed that and the
+test compared parsed values), the mime capture is paired against the embedded tree so a new
+asset cannot go unchecked, and the two Go golden generators moved out of gitignored `scratch/`
+into `ci/go-golden/` behind `cargo xtask go-golden` — one had an absolute path containing the
+runtime's working directory, so nobody else could re-derive the table the tests rest on. Three
+things that had no test now do: `assert_route_tables_match_the_plan` in both directions,
+`config_db::aeris_stations`, and `mw-web`'s five handlers. A dozen false or drifted claims in
+comments and prose are corrected, including the comment count (42, not 29), the rule for block
+comments (a space, not nothing), five Go line citations and this item's own `503` text.
 
 **What is deliberately not here.** No gRPC *service*: the socket exists and serves the same router,
 and `grpc:weatherv1`, `grpc:weatherappsv1` and `station:grpcrx` are M6-1 and M6-4. No `RouteFlags`

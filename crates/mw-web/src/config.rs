@@ -20,9 +20,9 @@
 //! [`config_json`] is what the endpoint serves and the **template** interpolates the same
 //! nine values itself, one field at a time. That is deliberate rather than duplication for
 //! its own sake: a whole JSON document interpolated as one value would be escaped by the
-//! page's escaper -- every `"` would become `&#34;` -- and the only way out is `|safe`,
-//! which the layout gate forbids and which would turn escaping off for values an operator
-//! controls. So the template carries the JSON *punctuation* as template text and the values
+//! page's escaper -- every `"` would become `&#34;` -- and the only way out is an escaping
+//! bypass, which the layout gate forbids outside the one file that needs it for a number and
+//! which would here turn escaping off for values an operator controls. So the template carries the JSON *punctuation* as template text and the values
 //! as fields, exactly as the page's own `radar-config` block already did, and
 //! [`tests::the_endpoint_and_the_inline_block_carry_the_same_nine_values`] asserts the two
 //! agree.
@@ -36,10 +36,14 @@ use crate::gojs::js_string;
 pub struct SiteView {
     /// `website.id`.
     pub id: WebsiteId,
-    /// `website.hostname`, lower-case and port-free. `""` is the default website.
+    /// `website.hostname`, **as the column holds it**: the schema's three `CHECK`s make it
+    /// lower-case, port-free and without a trailing dot, and this field is a verbatim copy
+    /// rather than a normalised one. `mw_http::HostTable::new` normalises on ingest, so
+    /// routing does not depend on the column being clean; what reads this field is the
+    /// "a website is mounted" log line. `""` is the default website.
     pub hostname: String,
     /// `website.name`, which is the page's `StationName` -- the *website's* name, not the
-    /// station's. Faithful to `handlers.go:884`.
+    /// station's. Faithful to `handlers.go:896`.
     pub name: String,
     /// `website.page_title`. Reaches no rendered byte: `weather-station.html.tmpl` has no
     /// `{{ .PageTitle }}` action and `portal.html.tmpl` has none at all, so the Go handler
@@ -78,7 +82,7 @@ pub struct SiteView {
     /// The primary station's longitude.
     pub longitude: Option<f64>,
     /// Whether the primary station has Aeris enabled, which is what gates the forecast
-    /// band. **The station's flag, not the website's** -- `handlers.go:891` reads
+    /// band. **The station's flag, not the website's** -- `handlers.go:908` reads
     /// `primaryDevice.AerisEnabled`.
     pub aeris_enabled: bool,
 }
@@ -87,7 +91,7 @@ impl SiteView {
     /// Whether this website can render the weather page.
     ///
     /// A non-portal website with no primary station cannot: the Go handler answers
-    /// `500 No device configured for this website` (`handlers.go:866`). A portal does not
+    /// `500 No device configured for this website` (`handlers.go:869`). A portal does not
     /// need one.
     pub fn renders_weather_page(&self) -> bool {
         !self.is_portal && self.primary_station.is_some()
@@ -209,22 +213,49 @@ pub(crate) mod tests {
     }
 
     /// **D-79**'s two deliveries must not disagree, and the only way to be sure is to
-    /// compare them.
+    /// compare their **bytes**.
+    ///
+    /// M4-3's code review found this comparing two `serde_json::Value`s, which cannot see
+    /// key order, whitespace or escaping -- the three properties
+    /// [`push_str_field`]'s own documentation says the shared escaping exists to guarantee.
+    /// The two constructions are genuinely independent (the template interpolates
+    /// `page.rs`'s `*_js` fields; this function builds the document by hand), so a
+    /// divergence in any of the three is exactly what can happen, and a parsed comparison
+    /// would have passed through it.
     #[test]
-    fn the_endpoint_and_the_inline_block_carry_the_same_nine_values() {
-        let site = suncrest();
-        let endpoint: serde_json::Value =
-            serde_json::from_str(&config_json(&site)).expect("the endpoint's JSON parses");
-        let page = crate::page::weather_station(&site, "0.1.0").expect("renders");
+    fn the_endpoint_and_the_inline_block_are_byte_identical() {
+        for site in [suncrest(), hostile(), portal_site()] {
+            let page = crate::page::weather_station(&site, "0.1.0").expect("renders");
+            assert_eq!(
+                inline_block(&page),
+                config_json(&site),
+                "website {}: the inline block and `/config.json` differ",
+                site.id
+            );
+        }
+    }
+
+    /// The `mw-config` payload, lifted out of a rendered page.
+    fn inline_block(page: &str) -> String {
         let start = page
             .find(r#"<script id="mw-config" type="application/json">"#)
-            .expect("the inline block");
+            .expect("the inline block is in the page");
         let body = &page[start..];
-        let open = body.find('\n').expect("the payload line") + 1;
-        let close = body.find("</script>").expect("the close tag");
-        let inline: serde_json::Value =
-            serde_json::from_str(body[open..close].trim()).expect("the inline JSON parses");
-        assert_eq!(endpoint, inline);
+        let open = body.find('\n').expect("the payload is on its own line") + 1;
+        let close = body.find("</script>").expect("the block closes");
+        body[open..close].trim().to_string()
+    }
+
+    /// A website whose every string is hostile, so the byte comparison above has something
+    /// to disagree about.
+    fn hostile() -> SiteView {
+        SiteView {
+            name: "Bob's \"</script><script>alert(1)</script>\" & Co +1".into(),
+            primary_station_name: "a/b\\c`d".into(),
+            snow_device: "snow\u{2028}gauge".into(),
+            air_quality_device: "aq<mon>".into(),
+            ..suncrest()
+        }
     }
 
     /// A `</script>` in a station name must not terminate the block, which is the whole

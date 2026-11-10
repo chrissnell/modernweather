@@ -48,6 +48,8 @@ thiserror.workspace = true
 # h2c work on it. Adding the three back is one line each when there is a service to mount.
 
 [dev-dependencies]
+# `WebsiteId`, for the host tables the mount and redirect tests build.
+mw-types.workspace = true
 # `ServiceExt::oneshot`, which is how the mount tests drive the real router without binding
 # a socket.
 tower.workspace = true

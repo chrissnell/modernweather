@@ -56,6 +56,8 @@ use askama::Template;
 const NO_LOCATION: f64 = 0.0;
 
 use crate::config::SiteView;
+use askama::filters::Safe;
+
 use crate::gojs::{js_number, js_string, JsNumber};
 
 /// `weather-station.html`, with every value the page interpolates.
@@ -66,7 +68,7 @@ use crate::gojs::{js_number, js_string, JsNumber};
 /// HTML text and in a JSON block, and the two need different bytes. Naming the second one
 /// `_js` is what makes a template author's mistake visible at the call site rather than at
 /// render time.
-#[derive(Template, Debug)]
+#[derive(Template)]
 #[template(path = "weather-station.html")]
 pub struct WeatherStationPage {
     /// `{{ .StationName }}` in HTML text, four times.
@@ -76,9 +78,15 @@ pub struct WeatherStationPage {
     /// `{{ .AppleAppID }}` in a quoted attribute, and the condition on the `<meta>` tag.
     apple_app_id: String,
     /// `{{ .Latitude }}` in the `radar-config` JSON block, padded as `jsValEscaper` pads.
-    latitude_js: JsNumber,
+    ///
+    /// **The two `Safe` fields in this crate, and the only ones it may have.** An exponent's
+    /// `+` would otherwise be escaped to `&#43;`, which is not JSON;
+    /// [`crate::gojs`]'s module documentation has the whole argument and
+    /// [`tests::the_only_escaping_bypasses_in_this_file_are_the_two_coordinates`] is what
+    /// keeps it to these two.
+    latitude_js: Safe<JsNumber>,
     /// `{{ .Longitude }}`, likewise.
-    longitude_js: JsNumber,
+    longitude_js: Safe<JsNumber>,
     /// `{{ .RadarToken }}` as a JavaScript string literal.
     radar_token_js: String,
 
@@ -108,6 +116,18 @@ pub struct WeatherStationPage {
     air_quality_device_id: i64,
 }
 
+impl std::fmt::Debug for WeatherStationPage {
+    /// Hand-written because `askama::filters::Safe` is not `Debug`, and the two fields it
+    /// wraps are the coordinates. What is useful in a log line is which website this is,
+    /// which the station name carries.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeatherStationPage")
+            .field("station_name", &self.station_name)
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
 impl WeatherStationPage {
     /// The page for one website, at one build.
     pub fn new(site: &SiteView, version: &str) -> Self {
@@ -115,8 +135,8 @@ impl WeatherStationPage {
             station_name: site.name.clone(),
             version: version.to_string(),
             apple_app_id: site.apple_app_id.clone(),
-            latitude_js: js_number(site.latitude.unwrap_or(NO_LOCATION)),
-            longitude_js: js_number(site.longitude.unwrap_or(NO_LOCATION)),
+            latitude_js: Safe(js_number(site.latitude.unwrap_or(NO_LOCATION))),
+            longitude_js: Safe(js_number(site.longitude.unwrap_or(NO_LOCATION))),
             radar_token_js: js_string(&site.radar_token),
             snow_enabled: site.snow_enabled,
             air_quality_enabled: site.air_quality_enabled,
@@ -134,7 +154,7 @@ impl WeatherStationPage {
     /// The `latitude` token, for the test that composes the escapers.
     #[cfg(test)]
     pub(crate) fn latitude_token(&self) -> &str {
-        self.latitude_js.as_str()
+        self.latitude_js.0.as_str()
     }
 }
 
@@ -191,6 +211,47 @@ mod tests {
 
     fn site() -> SiteView {
         crate::config::tests::suncrest()
+    }
+
+    /// **The exemption `ci/layers.toml` grants this file, asserted to be what it says.**
+    ///
+    /// `no-template-escape-opt-out` forbids every askama escaping bypass in the workspace
+    /// and exempts this one file, because the rendered page's two coordinates have to carry
+    /// Go's `1e+21` rather than `1e&#43;21` (see [`crate::gojs`]). A file-level exemption is
+    /// the finest granularity that rule has, so this is what stops it widening into "any
+    /// field in the template context may bypass escaping": the bypasses here are exactly
+    /// two, and both wrap a number.
+    ///
+    /// Reading this file's own source is the only way to assert that. It is cheap --
+    /// `include_str!` is compile-time -- and it fails loudly the moment somebody adds a
+    /// third.
+    #[test]
+    fn the_only_escaping_bypasses_in_this_file_are_the_two_coordinates() {
+        let me = include_str!("page.rs");
+        // Field declarations only: `Safe(` is the constructor call and is not a bypass of
+        // its own, and the doc comments above them name the type in prose.
+        // **The struct body only.** Scanning the whole file would match this test's own
+        // source, which is the shape of mistake a self-check invites; the question is what
+        // the template CONTEXT declares, and that is one block.
+        let start = me
+            .find("pub struct WeatherStationPage {")
+            .expect("the template context is in this file");
+        let body = &me[start..start + me[start..].find("\n}\n").expect("the struct closes")];
+        let wrapped: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("Safe<"))
+            .collect();
+        assert_eq!(
+            wrapped,
+            vec![
+                "latitude_js: Safe<JsNumber>,",
+                "longitude_js: Safe<JsNumber>,"
+            ],
+            "exactly two fields may bypass the page's escaper and both must wrap a \
+             `JsNumber`. A third, or one wrapping anything else, is the escaping opt-out \
+             D-81 forbids -- and this file's exemption in ci/layers.toml does not cover it."
+        );
     }
 
     #[test]

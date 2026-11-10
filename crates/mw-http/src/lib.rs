@@ -78,7 +78,7 @@ pub use component::{register, ListenerConfig, ID};
 pub use host::{matches_one_label, normalise, HostTable};
 pub use mount::{not_found, Mount, MountError, MountReport, NOT_FOUND_BODY};
 pub use sni::{CertError, CertPaths, CertStore, SniResolver};
-pub use socket::{bind, Bound, Listen, DRAIN};
+pub use socket::{bind, bind_with_hosts, Bound, Listen, DRAIN};
 pub use table::RouteTable;
 
 /// The five frozen path patterns, in `axum` 0.8 syntax.
@@ -205,6 +205,21 @@ pub enum HttpError {
     NoCertificate {
         /// The TLS address that would have been served.
         addr: SocketAddr,
+    },
+
+    /// The TLS configuration could not be built.
+    ///
+    /// One reachable cause: `rustls`'s `ring` provider refusing the safe default protocol
+    /// versions, which would mean a provider built without TLS 1.2 or 1.3 support. The
+    /// provider is **named** rather than defaulted (`socket::bind`), so this is a build
+    /// mistake rather than a configuration one -- and it is a named error rather than the
+    /// panic `ServerConfig::builder()` would have given.
+    #[error("the TLS configuration for {addr} could not be built")]
+    Tls {
+        /// The TLS address that would have been served.
+        addr: SocketAddr,
+        #[source]
+        source: rustls::Error,
     },
 
     /// A certificate is configured and could not be loaded.

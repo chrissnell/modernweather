@@ -111,13 +111,22 @@ pub struct Templates {
 }
 
 /// The shape of the `askama.toml` [`Templates::escaper_config`] names.
+///
+/// **`deny_unknown_fields`, and that is the second door M4-3's code review found.**
+/// `[general] dirs = ["pages"]` in `askama.toml` moves every template out of the scanned
+/// directory without touching `ci/layers.toml` at all -- so both template rules would go
+/// quiet and the gate would stay green. Refusing a key this struct does not model means any
+/// such addition is a load failure that names the file, which is the same answer the
+/// `only_paths` existence check gives.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AskamaConfig {
     #[serde(default)]
     escaper: Vec<AskamaEscaper>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AskamaEscaper {
     path: String,
     extensions: Vec<String>,
@@ -770,9 +779,28 @@ fn check_every_source_is_scanned(root: &Path, decl: &Layers, v: &mut Vec<Violati
 /// W3 decision 81. Whitespace is stripped before matching, so `{{ x | safe }}` is caught
 /// as well as `{{ x|safe }}`.
 fn check_templates(root: &Path, decl: &Layers, v: &mut Vec<Violation>) -> Result<(), String> {
+    // **First, and outside the directory check.** M4-3's code review found that calling it
+    // last meant one edit -- pointing `[templates].dir` at a path that does not exist --
+    // silenced BOTH this rule and the needle scan below, while the rule's own `reason`
+    // claimed the opposite. The escaper table is a property of the crate, not of the
+    // directory listing.
+    check_askama_escaper(root, decl, v);
     let dir = root.join(&decl.templates.dir);
     if !dir.exists() {
-        return Ok(()); // the website's templates arrive with the website
+        // **A violation rather than a skip.** This used to return `Ok(())` with the comment
+        // "the website's templates arrive with the website"; they arrived with
+        // implementation-plan.md M4-3, and a scan that stops applying when its subject is
+        // renamed away is the failure mode every `only_paths` exemption in this module is
+        // checked against.
+        v.push(Violation {
+            rule: "template-escaping".into(),
+            what: format!(
+                "{} does not exist, so no template was scanned",
+                decl.templates.dir
+            ),
+            reason: decl.templates.reason.trim().to_string(),
+        });
+        return Ok(());
     }
     let (files, unreadable) = files_under(&dir, None);
     for path in unreadable {
@@ -790,7 +818,6 @@ fn check_templates(root: &Path, decl: &Layers, v: &mut Vec<Violation>) -> Result
             }
         }
     }
-    check_askama_escaper(root, decl, v);
     Ok(())
 }
 
@@ -1074,7 +1101,14 @@ mod tests {
         assert_eq!(decl.crates.len(), 18, "W3 §1.2 decided eighteen crates");
         // Every rule id the done-criteria or a design decision name, so that deleting one
         // from ci/layers.toml fails a test rather than quietly shrinking the gate.
-        for id in ["anyhow-only-at-the-binary-boundary", "one-logging-path"] {
+        for id in [
+            "anyhow-only-at-the-binary-boundary",
+            // M4-3's code review found this one deletable with nothing failing: the rule was
+            // armed but its id was not pinned here, and `dep_rules.len()` is printed rather
+            // than asserted.
+            "go-number-digits",
+            "one-logging-path",
+        ] {
             assert!(decl.dep_rules.iter().any(|r| r.id == id), "dep_rule {id}");
         }
         for id in [
@@ -1186,13 +1220,15 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             let me = Scratch { root };
             me.root_manifest("");
-            // The escaper table `[templates]` pins. Written by default rather than per
-            // test, because every tree a real check runs over has one -- and a missing file
-            // is itself a violation.
+            // The escaper table `[templates]` pins, and one benign template so that the
+            // declared directory exists. Both written by default rather than per test,
+            // because every tree a real check runs over has them -- and a missing file or a
+            // missing directory is itself a violation now.
             me.write(
                 "askama.toml",
                 "[[escaper]]\npath = \"crate::GoHtmlEscaper\"\nextensions = [\"html\"]\n",
             );
+            me.write("crates/c-high/templates/base.html", "<p>{{ name }}</p>\n");
             // `r##` rather than `r#`: the declaration below contains `"#`, in the
             // `#[path` needle, which would close a single-hash raw string.
             me.write(
@@ -1860,6 +1896,49 @@ reason = "nothing hand-written lives in generated/"
         s.write("crates/c-high/templates/index.html", "{{ name }}\n");
         std::fs::remove_file(s.root.join("askama.toml")).unwrap();
         assert_eq!(s.rules(), ["askama-escaper"], "{:?}", s.check());
+    }
+
+    /// **The two doors M4-3's code review found into the template rules**, both shown shut.
+    ///
+    /// Each one silenced the escaper pin *and* the `|safe` needle scan with a single edit
+    /// that touched no template and no crate.
+    #[test]
+    fn the_template_rules_cannot_be_silenced_by_moving_their_subject() {
+        // 1. `[templates].dir` pointed at a path that does not exist. This used to return
+        //    early with "the website's templates arrive with the website".
+        let s = Scratch::new();
+        s.write("crates/c-high/templates/index.html", "{{ name|safe }}\n");
+        let decl = std::fs::read_to_string(s.root.join("ci/layers.toml")).unwrap();
+        s.write(
+            "ci/layers.toml",
+            &decl.replace(
+                r#"dir = "crates/c-high/templates""#,
+                r#"dir = "crates/c-high/gone""#,
+            ),
+        );
+        assert_eq!(
+            s.rules(),
+            ["template-escaping"],
+            "a missing template directory is a violation, not a skip: {:?}",
+            s.check()
+        );
+
+        // 2. An `askama.toml` key this gate does not model -- `[general] dirs` moves every
+        //    template out of the scanned directory. A load failure rather than a violation,
+        //    because an unmodelled key means the gate's view of the file is incomplete.
+        let s = Scratch::new();
+        s.write("crates/c-high/templates/index.html", "{{ name }}\n");
+        s.write(
+            "askama.toml",
+            "[general]\ndirs = [\"pages\"]\n\
+             [[escaper]]\npath = \"crate::GoHtmlEscaper\"\nextensions = [\"html\"]\n",
+        );
+        assert_eq!(
+            s.rules(),
+            ["askama-escaper"],
+            "an unmodelled askama.toml key must not pass unseen: {:?}",
+            s.check()
+        );
     }
 
     /// And the declared one passes, so the test above is not asserting that everything

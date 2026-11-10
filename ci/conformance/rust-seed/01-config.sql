@@ -155,10 +155,16 @@ VALUES
 -- requires.
 --
 -- What it reaches: the rendered page's forecast band (`{{ if .AerisWeatherEnabled }}`) and
--- the ninth value of the inline configuration block. No fixture asserts either as a
--- substring, so a missing row would not fail the suite -- it would quietly render a
--- different page from the one W1 recorded, which is exactly what
--- `crates/mw-web/tests/byte_diff.rs` is for and why this row is here.
+-- the ninth value of the inline configuration block.
+--
+-- **Nothing would fail if this row were missing**, and that is worth stating rather than
+-- implying. No fixture asserts the forecast band as a substring, and
+-- `crates/mw-web/tests/byte_diff.rs` builds its own `SiteView` rather than reading a
+-- database, so it cannot observe this seed either -- an earlier version of this comment
+-- claimed otherwise, which M4-3's code review corrected. What IS gated is the query:
+-- `mw_store::config_db`'s `the_aeris_pairing_round_trips_and_excludes_other_services`
+-- asserts the pairing reads back and that another service does not. The row is here so the
+-- rig renders the page W1 recorded rather than one with the band missing.
 DELETE FROM station_service;
 INSERT INTO station_service (station_key, service) VALUES ('davis-full', 'aeris');
 

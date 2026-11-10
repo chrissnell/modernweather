@@ -459,19 +459,54 @@ contains exactly that, and passes only because it is one of the exempt paths."""
 
 [[source_rule]]
 id = "no-template-escape-opt-out"
-needles = ['escape = "none"', "escape = 'none'"]
+needles = [
+  'escape = "none"',
+  "escape = 'none'",
+  "|safe",
+  '|e("none")',
+  "|e('none')",
+  "filters::Safe",
+  "MaybeSafe",
+  "HtmlSafeOutput",
+]
 only = []
+only_paths = ["crates/mw-web/src/page.rs"]
 reason = """
 The `[templates]` check below reads the template files. This one reads Rust, because the
-strongest form of the same opt-out is not in a template at all: `#[template(escape = "none")]`
-on the derive turns escaping off for the WHOLE template, is one attribute rather than one
-expression, and is easier to write than `|safe`. A gate that only read the templates would
-have had nothing to say about it.
+strongest forms of the same opt-out are not in a template at all.
 
-Nobody may write it, so `only` is empty. W3 decision 81's reasoning is that `askama` was
-chosen for compile-time checking and escapes by default, which means an explicit opt-out is
-the only way such a template emits unescaped output -- and there is more than one place to
-write one."""
+Three kinds. `#[template(escape = "none")]` on the derive turns escaping off for the WHOLE
+template, is one attribute rather than one expression, and is easier to write than a filter.
+The filter spellings are here as well as in `[templates]` below, because
+`#[template(source = "...", ext = "html")]` puts a template in a Rust file, where the
+`[templates]` directory scan never reads it. The rest are WRAPPER TYPES -- `askama::filters::Safe<T>`, `MaybeSafe` and
+`HtmlSafeOutput<T>` -- which bypass escaping for a single field with nothing appearing in the
+template at all, so neither the `[templates]` needles nor a reading of the template would
+find one. M4-3's code review is why they are listed: its fix for one real defect is the only
+legitimate use of a bypass in this workspace, and a rule that did not name it would not have
+noticed the next one.
+
+`askama::filters::HtmlSafe` is deliberately NOT a needle, and that is the defect the review
+found rather than an omission: its bypass is implemented only for askama's own `Html`
+escaper, and `crates/mw-web/askama.toml` registers a custom one -- so an `impl HtmlSafe`
+does nothing, which is why `crates/mw-web/src/gojs.rs` no longer has one. Forbidding a
+no-op would be noise; `crates/mw-web/src/page.rs`'s own test is what keeps the real bypass
+to its two fields.
+
+`only` is empty and ONE path is exempt. `crates/mw-web/src/page.rs` wraps the rendered
+page's two coordinates, because Go writes `1e+21` for a magnitude outside `[1e-6, 1e21)` and
+`html/template`'s table turns `+` into `&#43;` -- which is not JSON inside the
+`<script type="application/json">` block the page carries, so `JSON.parse` throws and the
+radar panel never initialises. The value bypassing the escaper is a PRIVATE newtype whose
+only constructors take an `f64` and an `i64`, so no string can travel through it, and
+`crates/mw-web/src/page.rs`'s
+`the_only_escaping_bypasses_in_this_file_are_the_two_coordinates` reads the file and asserts
+that is still true. W3 decision 81's reasoning -- `askama` escapes by default, so an explicit
+opt-out is the only way such a template emits unescaped output -- is why the exemption is one
+file, one reason and one test rather than a convention.
+
+A path here must exist: `cargo xtask gate-layout` fails to LOAD if one does not, so an
+exemption that outlives the file it names cannot quietly widen the rule back out."""
 
 # ---------------------------------------------------------------------------------------
 

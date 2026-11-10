@@ -10,8 +10,18 @@
 //! ranked by them**, so §3.6's "a consumer must never observe a revoked capability" did not
 //! cover it. The second one is what this closes: the listener is now stopped in rank order
 //! like everything else, so the socket closes *after* the components whose tables it serves
-//! have stopped, and a request in flight cannot reach a handler whose capability has been
-//! revoked.
+//! have stopped.
+//!
+//! **That holds up to the drain deadline and not past it**, which M4-3's code review asked
+//! to have bounded rather than implied. `axum::serve` spawns each connection on its own
+//! task; when [`crate::DRAIN`] expires, the select drops the serve futures -- closing the
+//! listeners, which is what the `warn!` says -- and does not abort those tasks. So a
+//! connection that was still in flight at the deadline can run its request against providers
+//! the supervisor has since stopped. What makes that defensible rather than a hole is
+//! **D-48**: a frozen handler with its capability gone answers its contract response, which
+//! `crates/mw-api-legacy/tests/degraded.rs` asserts byte for byte. Tracking the connection
+//! tasks instead would mean not using `axum::serve`, and the thing it would buy is already
+//! guaranteed one layer up.
 //!
 //! # One behaviour change, stated rather than discovered: a held port
 //!
@@ -135,12 +145,13 @@ pub fn register<C: ListenerConfig>(
                     // Additive and soft: the set of providers is observed, never waited
                     // for (W2a Decision 19).
                     let routes = cx.additive::<Arc<dyn RouteProvider>>()?;
-                    let bound = socket::bind(&listen, mount.router(), resolver)
-                        .await
-                        .map_err(|source| mw_component::BuildError::Resource {
-                            what: format!("the listener on {}", listen.main()),
-                            source: Box::new(source),
-                        })?;
+                    let bound =
+                        socket::bind_with_hosts(&listen, mount.router(), resolver, mount.hosts())
+                            .await
+                            .map_err(|source| mw_component::BuildError::Resource {
+                                what: format!("the listener on {}", listen.main()),
+                                source: Box::new(source),
+                            })?;
                     info!(
                         main = %bound.local_addr(),
                         tls = listen.tls(),
