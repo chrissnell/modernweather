@@ -206,6 +206,88 @@ impl Ingress for RecordingIngress {
     }
 }
 
+/// A `socat` pty pair: two character devices wired back to back.
+///
+/// W3 **D-83**'s requirement for Davis and Campbell — "serial framing and read-timeout
+/// behaviour is where that class of defect lives", so the serial path is exercised over a
+/// real character device rather than over a transcript. One end is the daemon's
+/// `transport_dev`; the other is where an emulator writes.
+///
+/// **`socat` is a test dependency and `spawn` returns `None` without it**, rather than
+/// panicking. That is not a skipped check: `tests/emulators/manifest.toml`'s `davis` and
+/// `campbell` entries are the gate that fails loudly when the pair cannot be made, and a
+/// unit test that panicked on a developer's machine without `socat` would be a worse
+/// version of the same signal.
+#[derive(Debug)]
+pub struct PtyPair {
+    child: tokio::process::Child,
+    dir: std::path::PathBuf,
+    daemon: std::path::PathBuf,
+    device: std::path::PathBuf,
+}
+
+impl PtyPair {
+    /// Spawn `socat` and wait for both links to appear. `None` if `socat` is not on `PATH`.
+    ///
+    /// `name` distinguishes one pair's directory from another's, because two tests running
+    /// concurrently in one process would otherwise race on the link paths.
+    pub async fn spawn(name: &str) -> Option<Self> {
+        let dir = std::env::temp_dir().join(format!("mw-pty-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok()?;
+        let daemon = dir.join("daemon");
+        let device = dir.join("device");
+        let child = tokio::process::Command::new("socat")
+            // `raw` so that no line discipline rewrites a Davis packet's `\r`, and
+            // `echo=0` so that a command written at one end does not come back at it --
+            // both of which a real serial port's `cfmakeraw` setup would also do.
+            .arg(format!("PTY,raw,echo=0,link={}", daemon.display()))
+            .arg(format!("PTY,raw,echo=0,link={}", device.display()))
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+
+        // `socat` creates the links after it has opened both ptys, so the paths do not
+        // exist when `spawn` returns. Polled rather than slept on: a fixed sleep is either
+        // slower than it needs to be or flaky under load.
+        for _ in 0..200 {
+            if daemon.exists() && device.exists() {
+                return Some(Self {
+                    child,
+                    dir,
+                    daemon,
+                    device,
+                });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    /// The end a station component opens as its `transport_dev`.
+    pub fn daemon_side(&self) -> &std::path::Path {
+        &self.daemon
+    }
+
+    /// The end an emulator writes packets into.
+    pub fn device_side(&self) -> &std::path::Path {
+        &self.device
+    }
+
+    /// `socat`'s process id, for a test that wants to say which process it is waiting on.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+}
+
+impl Drop for PtyPair {
+    /// `kill_on_drop` handles the process; the links are ours.
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
 /// A [`StationRegistry`] that resolves one claim, for a test that needs the gate itself
 /// rather than a driver's view of it.
 #[derive(Debug)]

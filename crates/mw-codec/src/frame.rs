@@ -114,6 +114,78 @@ pub enum CodecError {
         what: &'static str,
     },
 
+    /// The frame is not the length this protocol frames.
+    ///
+    /// Distinct from [`CodecError::Incomplete`] because a fixed-length binary protocol has
+    /// no partial record: a Davis LOOP packet is ninety-nine bytes with no terminator, so a
+    /// short read is a framing failure in the session above rather than a device reporting
+    /// less than it has, and the two numbers are what tell them apart.
+    #[error("{what} is {expected} bytes and this frame is {found}")]
+    Framing {
+        /// What was expected, named as the operator would name it.
+        what: &'static str,
+        /// How many bytes one frame is.
+        expected: usize,
+        /// How many arrived.
+        found: usize,
+    },
+
+    /// The frame's own check bytes do not match its contents.
+    ///
+    /// Distinct from every other variant because it is the one that means **the bytes were
+    /// corrupted in transit**: a Davis console on a long serial run with a marginal cable
+    /// produces these and nothing else, and `undecodable` without this distinction would
+    /// make "a flaky cable" and "not a Davis" the same number.
+    #[error("{what} failed its own checksum")]
+    Check {
+        /// What was being checked.
+        what: &'static str,
+    },
+
+    /// The frame is a record of a kind this build does not decode.
+    ///
+    /// A Davis LOOP2 record shares the LOOP record's header and length and has a different
+    /// field layout, so decoding one as the other produces plausible wrong numbers rather
+    /// than an error. Refusing it by its own discriminant is what makes that a counted drop.
+    #[error("{what} {found} is not one this codec decodes")]
+    Unsupported {
+        /// Which discriminant was read.
+        what: &'static str,
+        /// What it held.
+        found: i64,
+    },
+
+    /// The frame is not the protobuf message this codec decodes.
+    ///
+    /// Distinct from [`CodecError::Json`] for its reason: two wire formats, two parsers, and
+    /// a decoder that reported "not JSON" for a protobuf frame would send a reader to the
+    /// wrong half of the system.
+    #[error("the frame is not the protobuf message this codec decodes")]
+    Protobuf {
+        /// The decode failure.
+        #[source]
+        source: prost::DecodeError,
+    },
+
+    /// The frame decoded, and what it decoded to is a fault the station's own configuration
+    /// says it cannot be.
+    ///
+    /// The one variant that is not about the *bytes*. A snow gauge reporting a distance
+    /// greater than its configured base distance has not sent a malformed frame; it has sent
+    /// a measurement that would store a negative depth, and `snowgauge/station.go:171`
+    /// discards it at the device. Carried as an error so that the drop is counted with a
+    /// reason an operator can act on rather than returned as an empty batch, which is
+    /// indistinguishable from a frame that mapped nothing.
+    #[error("{what} is {value} and the station's own limit is {limit}")]
+    Implausible {
+        /// What was measured, named as the operator would name it.
+        what: &'static str,
+        /// What the station reported.
+        value: f64,
+        /// The limit its configuration declares.
+        limit: f64,
+    },
+
     /// The frame is structurally valid and carries nothing this codec can map.
     ///
     /// Not an empty *reading* — that is admission's [`mw_component::Reject::EmptyReading`]
@@ -123,7 +195,7 @@ pub enum CodecError {
 }
 
 impl mw_types::Classify for CodecError {
-    /// All five are [`mw_types::Class::Ignorable`], and that is the whole of this impl's
+    /// All ten are [`mw_types::Class::Ignorable`], and that is the whole of this impl's
     /// content: retrying a decode of the same bytes against the same codec cannot change
     /// the answer, and a frame the device sent wrong is not a failure of the component that
     /// received it (§4.4's canonical example).
@@ -209,6 +281,61 @@ mod tests {
             }
             .class(),
             Class::Ignorable
+        );
+        assert_eq!(
+            CodecError::Framing {
+                what: "a Davis LOOP record",
+                expected: 99,
+                found: 40
+            }
+            .class(),
+            Class::Ignorable
+        );
+        assert_eq!(
+            CodecError::Check {
+                what: "a Davis LOOP record"
+            }
+            .class(),
+            Class::Ignorable
+        );
+        assert_eq!(
+            CodecError::Unsupported {
+                what: "LOOP record type",
+                found: 1
+            }
+            .class(),
+            Class::Ignorable
+        );
+    }
+
+    /// Each of the three framing-class variants says which it is, because `undecodable`
+    /// with no sentence behind it cannot tell a flaky cable from a device that is not the
+    /// one configured.
+    #[test]
+    fn the_three_binary_framing_failures_read_as_three_different_sentences() {
+        assert_eq!(
+            CodecError::Framing {
+                what: "a Davis LOOP record",
+                expected: 99,
+                found: 40
+            }
+            .to_string(),
+            "a Davis LOOP record is 99 bytes and this frame is 40"
+        );
+        assert_eq!(
+            CodecError::Check {
+                what: "a Davis LOOP record"
+            }
+            .to_string(),
+            "a Davis LOOP record failed its own checksum"
+        );
+        assert_eq!(
+            CodecError::Unsupported {
+                what: "LOOP record type",
+                found: 1
+            }
+            .to_string(),
+            "LOOP record type 1 is not one this codec decodes"
         );
     }
 }

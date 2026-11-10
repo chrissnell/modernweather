@@ -45,22 +45,33 @@
 //! request arrives on and a receive socket is not one. That asymmetry is what lets
 //! [`wll::BroadcastListener`] exist, and it is the only place this crate uses it.
 
+pub mod airgradient;
+pub mod ambient;
+pub mod campbell;
 pub mod config;
+pub mod davis;
+pub mod driver;
 pub mod endpoint;
 pub mod http;
 pub mod identity;
+pub mod lines;
 pub mod mdns;
 pub mod metrics;
 pub mod plan;
 pub mod resolve;
 pub mod session;
+pub mod stream;
 pub mod testing;
 pub mod transport;
 pub mod wll;
 
 pub use config::{StationConfig, StationRow};
+pub use davis::DavisSession;
+pub use driver::{Conversation, StreamStation};
 pub use endpoint::{Endpoint, EndpointError};
 pub use identity::{IdentityError, StationIdentity};
+pub use lines::Lines;
 pub use plan::{fixed_receivers, register, FixedReceiver, StationPlanError};
 pub use session::{ByteStream, NoSession, Session, SessionError, MAX_FRAME_BYTES};
+pub use stream::{OpenError, SerialPort, TcpByteStream};
 pub use transport::{HttpMethod, TlsFiles, Transport, TransportColumns, TransportError};

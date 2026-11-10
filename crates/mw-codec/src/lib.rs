@@ -32,10 +32,30 @@
 //! number, which is a position in the spool. Both are `admit`'s, and the type is the shape
 //! of that division.
 
+mod airgradient;
+mod ambient;
+mod campbell;
+mod crc16;
+mod davis;
 mod frame;
+mod query;
+mod snowgauge;
+mod winddir;
 mod wll;
 
+pub use airgradient::{AirGradientJson, MEASURES_CURRENT};
+pub use ambient::{
+    observed_at as ambient_observed_at, params as ambient_params, rain_since, total_rain,
+    AmbientQuery, ACTION_PARAM, ACTION_UPDATERAW, DATE_UTC_PARAM, ID_PARAM, PASSWORD_PARAM,
+    TOTAL_RAIN_PARAM, WIND_DIR_PARAM,
+};
+pub use campbell::CampbellAscii;
+pub use crc16::{check as crc16_check, crc16};
+pub use davis::{DavisLoop, INCHES_PER_CLICK, LOOP_BYTES, LOOP_HEADER};
 pub use frame::{Codec, CodecError, Frame};
+pub use query::QueryParams;
+pub use snowgauge::{SnowGaugeProto, STREAM_READING};
+pub use winddir::WindDirCorrection;
 pub use wll::{
     real_time, Broadcast, MappingError, SensorEntry, SensorMapping, SensorRole, WllConditions,
     MAX_DSN_BYTES,

@@ -24,6 +24,10 @@ chrono.workspace = true
 # `transport_auth` is a credential from the moment it is read (D-33), and `Endpoint`'s
 # parse refuses to let one arrive in a URL instead.
 secrecy.workspace = true
+# The slot the Ambient ingest endpoint's handler is published into, which is the
+# `mw_api_legacy::RouteState` pattern: `mw-http` builds the route and this crate may not name
+# `axum`, so the handler travels as a closure over a published slot (`crate::ambient`).
+arc-swap.workspace = true
 # The station endpoint counters of `metrics.rs`. The recorder is `mw-obs`'s; this crate
 # names the one series it owns (A-W3-1, §5.10).
 metrics.workspace = true

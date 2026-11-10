@@ -34,7 +34,11 @@ use mw_component::BoxFuture;
 /// Dyn-compatible, so `Session`'s methods can take `&mut dyn ByteStream` and one session
 /// implementation serves a serial port, a TCP connection and a transcript. That is also why
 /// the methods return [`BoxFuture`] rather than being `async fn`.
-pub trait ByteStream: Send {
+///
+/// `Debug` for [`mw_codec::Codec`]'s reason: the workspace lints require it, "which stream
+/// is this" is a useful log field, and a trait object with no `Debug` makes every
+/// `Result<Box<dyn ByteStream>, _>` unassertable in a test.
+pub trait ByteStream: std::fmt::Debug + Send {
     /// Read some bytes. `Ok(0)` is end of stream.
     fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxFuture<'a, std::io::Result<usize>>;
 
@@ -123,6 +127,20 @@ pub trait Session: Send {
         &'a mut self,
         io: &'a mut dyn ByteStream,
     ) -> BoxFuture<'a, Result<Frame, SessionError>>;
+
+    /// How many bytes this session has dropped looking for a frame boundary, since it was
+    /// created.
+    ///
+    /// Monotonic, so the driver records the delta
+    /// (`mw_station_resync_bytes_total{component}`). Zero by default, which is the honest
+    /// answer for a session with no framing to resynchronise: [`NoSession`] is handed a
+    /// frame and a line reader's boundary is a byte it either has or waits for. The Davis
+    /// conversation is the one that resynchronises, because a `LOOP` record is ninety-nine
+    /// bytes with no terminator, and it is also the one where the number matters -- a
+    /// serial line at the wrong rate produces nothing else (`crate::stream`).
+    fn discarded(&self) -> u64 {
+        0
+    }
 }
 
 /// The identity session: one read is one frame, and nothing is ever written.

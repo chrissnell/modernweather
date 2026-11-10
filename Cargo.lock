@@ -1540,6 +1540,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "mw-types",
+ "prost",
  "serde",
  "serde_json",
  "thiserror",
@@ -1677,6 +1678,7 @@ dependencies = [
 name = "mw-station"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "chrono",
  "metrics",
  "mw-codec",
