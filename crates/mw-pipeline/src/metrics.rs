@@ -298,15 +298,15 @@ pub fn rain_rolled_over() {
 ///   `X-MW-Snapshot-Age` header. It is the **reading's** age rather than the render's,
 ///   which is what W1's 10-minute recency rule is measured against.
 ///
-///   **It is the age at the last fold, and it does not climb on its own.** This is written
-///   only when a snapshot is published, so a station that stops reporting freezes its gauge
-///   instead of crossing 600 — which is the one transition an operator would want to alert
-///   on. Said here rather than left to be discovered: until something sweeps every key on a
-///   timer, alert on `rate(mw_snapshot_published_total)` going flat, which *does* detect a
-///   station that has gone quiet. The sweep's natural home is the scrape path, and that is
-///   M4-3's (`http:listener`) — recorded on this function rather than in a work item,
-///   because the number is here and the gap is a property of the number.
-///   `mw_snapshot_degraded` has the same shape for the same reason.
+///   **It is the age at the last fold, and on its own it would not climb.** This is written
+///   only when a snapshot is published, so a station that stops reporting would freeze its
+///   gauge instead of crossing 600 — which is the one transition an operator would want to
+///   alert on. [`sweep_snapshot_ages`] is what closes that, fifty lines below: M4-3 put it
+///   on the **scrape** path, so the gauge an operator reads is recomputed when `/metrics`
+///   renders rather than at the last fold, and `mw_snapshot_age_seconds > 600` is an alert
+///   that can fire for the station that has gone quiet. `mw_snapshot_degraded` is swept with
+///   it. `rate(mw_snapshot_published_total)` going flat detects the same thing and is still
+///   the cheaper query.
 /// - `mw_snapshot_degraded{website,station}` — **D-36**'s indicator as a number, 1 while the
 ///   window-derived values are being served from their last good value. This is the series
 ///   an alert fires on, because the frozen body cannot carry the fact and must not.
@@ -339,6 +339,53 @@ pub fn snapshot_published(
         "station" => station,
     )
     .set(if fresh { 0.0 } else { 1.0 });
+}
+
+/// Recompute `mw_snapshot_age_seconds` and `mw_snapshot_degraded` for every published key.
+///
+/// **M4-1's constraint 2, and the scrape path is where it belongs.** Both gauges are written
+/// by [`snapshot_published`], which runs only when a fold happens -- so a station that stops
+/// reporting leaves its age gauge at whatever it was when the last reading arrived, and the
+/// 600-second recency rule the frozen contract applies is never crossed in the metric. An
+/// alert on `mw_snapshot_age_seconds > 600` would therefore never fire for the failure it
+/// exists to catch.
+///
+/// Sweeping here rather than on a timer is the decision M4-1 recorded: a timer would be a
+/// second clock (§3.3 allows one) and would cost work on a daemon nobody is scraping, while
+/// the scrape is exactly the moment the number is read. The cost is one iteration of the
+/// published table -- W3 §2a.4 bounds it at the cross product of websites and stations, 30
+/// keys in W1's rig -- per scrape.
+///
+/// **`now` is a parameter** so that the sweep is testable without a clock, which is the same
+/// shape [`snapshot_published`] already has.
+///
+/// A key with no snapshot yet is skipped rather than reported as age zero: a gauge that
+/// claimed a fresh reading for a station that has never reported would be worse than an
+/// absent series, and `/latest`'s cold-start answer is a `404` for the same reason.
+pub fn sweep_snapshot_ages(state: &crate::SnapshotState, now: chrono::DateTime<chrono::Utc>) {
+    // `LatestSnapshot::table()` rather than an inherent accessor, which is what M4-1's
+    // constraint names: the sweep reads the same published table every request reads.
+    use mw_component::LatestSnapshot as _;
+    for (key, snapshot) in state.table().iter() {
+        let website = key.website.to_string();
+        let station = key.station.as_str().to_string();
+        metrics::gauge!(
+            "mw_snapshot_age_seconds",
+            "website" => website.clone(),
+            "station" => station.clone(),
+        )
+        .set(snapshot.age_seconds(now));
+        metrics::gauge!(
+            "mw_snapshot_degraded",
+            "website" => website,
+            "station" => station,
+        )
+        .set(if snapshot.staleness().is_fresh() {
+            0.0
+        } else {
+            1.0
+        });
+    }
 }
 
 /// One key's payload could not be serialised, so its previous bytes stay published.

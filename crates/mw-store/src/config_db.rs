@@ -571,6 +571,10 @@ mod tests {
                 is_portal: false,
                 radar_enabled: true,
                 radar_token: "contract-radar-token".into(),
+                apple_app_id: String::new(),
+                tls_cert_path: None,
+                tls_key_path: None,
+                is_default_tls: false,
             }
         );
         assert_eq!(
@@ -589,6 +593,10 @@ mod tests {
                 is_portal: true,
                 radar_enabled: false,
                 radar_token: String::new(),
+                apple_app_id: String::new(),
+                tls_cert_path: None,
+                tls_key_path: None,
+                is_default_tls: false,
             }
         );
 
@@ -602,6 +610,55 @@ mod tests {
         assert_eq!(bare.len(), 3);
         assert_eq!(bare[2].primary_station_key, None);
         assert!(!bare[2].snow_enabled);
+    }
+
+    /// **`aerisWeatherEnabled` is a row, and nothing tested the query that reads it.**
+    ///
+    /// Found by M4-3's code review. The pairing drives the rendered page's whole forecast
+    /// band, no fixture asserts that band, and `crates/mw-web/tests/byte_diff.rs` builds its
+    /// own `SiteView` and never reads a database -- so a wrong `service` literal or a
+    /// renamed column would silently drop the band from every page with no gate noticing.
+    ///
+    /// Both directions: the `aeris` pairing comes back, and a pairing for a different
+    /// service does not.
+    #[tokio::test]
+    async fn the_aeris_pairing_round_trips_and_excludes_other_services() {
+        let scratch = Scratch::new("aeris");
+        let pool = open_and_migrate(&scratch.db()).await.expect("migrate");
+        assert!(
+            aeris_stations(&pool).await.expect("reads").is_empty(),
+            "the migration seeds no pairing"
+        );
+
+        for sql in [
+            "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind)
+             VALUES ('davis-full', x'0193f3c28b207c71ae3f10cc92d4b7aa', 'davis-full',
+                     'davis', 'from_registration')",
+            "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind)
+             VALUES ('csi-minimal', x'0193f3c28b207c71ae3f10cc92d4b7aa', 'csi-minimal',
+                     'campbellscientific', 'from_registration')",
+            // The Aeris pairing carries no `uploader_id` -- an Aeris account is not an
+            // uploader, which the table's own CHECK requires.
+            "INSERT INTO station_service (station_key, service) VALUES ('davis-full', 'aeris')",
+            // A different service on the OTHER station, so that a query missing its
+            // `WHERE` would return both and this test would say so.
+            "INSERT INTO uploader (id, kind, name, enabled)
+             VALUES (1, 'wunderground', 'backyard', 1)",
+            "INSERT INTO station_service (station_key, service, uploader_id)
+             VALUES ('csi-minimal', 'wunderground', 1)",
+        ] {
+            sqlx::query(sql)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("the schema rejected a row: {e}\n{sql}"));
+        }
+
+        assert_eq!(
+            aeris_stations(&pool).await.expect("reads"),
+            vec!["davis-full".to_string()],
+            "only the `aeris` pairing, and by station key"
+        );
+        pool.close().await;
     }
 
     /// The three columns M3-1 added, and the round trip the station registrar depends on.
@@ -1191,9 +1248,9 @@ pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbErro
 /// `/api/stations` a `403` or a `200`, and the air-quality binding is where `/almanac`
 /// reads its particulate extremes from.
 ///
-/// Still absent, and still deliberately: the TLS paths and `is_default_tls`, which belong
-/// to the SNI resolver, and `apple_app_id`, which only the rendered page carries. Both are
-/// M4-3's.
+/// The TLS paths, `is_default_tls` and `apple_app_id` arrived with **M4-3**, which is the
+/// item that built the SNI resolver and the rendered page -- the two consumers the earlier
+/// note said they were waiting for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebsiteRow {
     /// `id` -- the surrogate key the snapshot table is keyed by.
@@ -1227,6 +1284,18 @@ pub struct WebsiteRow {
     /// what makes it a plain `String` here rather than a `SecretString`: the schema's
     /// "write-only" note is about the management API, not about secrecy.
     pub radar_token: String,
+    /// `apple_app_id`. Reaches the rendered page's `<meta name="apple-itunes-app">` tag and
+    /// nothing else; an empty value removes the tag. Added by M4-3, which is the item that
+    /// renders a page.
+    pub apple_app_id: String,
+    /// `tls_cert_path`. `None` for a website with no certificate of its own.
+    pub tls_cert_path: Option<String>,
+    /// `tls_key_path`. The schema's `CHECK` makes this `Some` exactly when
+    /// [`WebsiteRow::tls_cert_path`] is.
+    pub tls_key_path: Option<String>,
+    /// `is_default_tls` -- W3 §6.4's SNI fallback, tried before the default website's own
+    /// certificate. At most one row may set it, and only a row with a certificate may.
+    pub is_default_tls: bool,
 }
 
 /// Read every `config.website` row, ordered by id.
@@ -1241,7 +1310,8 @@ pub async fn websites(pool: &SqlitePool) -> Result<Vec<WebsiteRow>, ConfigDbErro
     let rows = sqlx::query(
         "SELECT id, name, primary_station_key, snow_enabled, snow_station_key, hostname, \
                 page_title, about_station_html, air_quality_enabled, \
-                air_quality_station_key, is_portal, radar_enabled, radar_token \
+                air_quality_station_key, is_portal, radar_enabled, radar_token, \
+                apple_app_id, tls_cert_path, tls_key_path, is_default_tls \
          FROM website ORDER BY id",
     )
     .fetch_all(pool)
@@ -1266,9 +1336,37 @@ pub async fn websites(pool: &SqlitePool) -> Result<Vec<WebsiteRow>, ConfigDbErro
                 is_portal: flag(&r, "is_portal")?,
                 radar_enabled: flag(&r, "radar_enabled")?,
                 radar_token: r.get("radar_token"),
+                apple_app_id: r.get("apple_app_id"),
+                tls_cert_path: r.get("tls_cert_path"),
+                tls_key_path: r.get("tls_key_path"),
+                is_default_tls: flag(&r, "is_default_tls")?,
             })
         })
         .collect()
+}
+
+/// Every station paired with the Aeris service, in key order.
+///
+/// **This is W3 §7's `aerisWeatherEnabled`, and it is a row rather than a column.** The Go
+/// `devices` table carries `aeris_enabled` per device; the new schema makes "which stations
+/// get forecasts and alerts" a `station_service` pairing like any other, which is what the
+/// `website` table's own comment means by "`aerisWeatherEnabled` is a `station_service` row
+/// with `service = 'aeris'`". So the rendered page's forecast band is gated on membership of
+/// this set, and `mw-web` is handed the answer rather than a join.
+///
+/// Ordered for [`stations`]'s reason: the order reaches the plan through the website
+/// components' `ConfigDigest`.
+pub async fn aeris_stations(pool: &SqlitePool) -> Result<Vec<String>, ConfigDbError> {
+    let rows = sqlx::query(
+        "SELECT station_key FROM station_service WHERE service = 'aeris' ORDER BY station_key",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|source| ConfigDbError::Query {
+        what: "the Aeris station pairings",
+        source,
+    })?;
+    Ok(rows.into_iter().map(|r| r.get("station_key")).collect())
 }
 
 /// A `0`/`1` column as a `bool`, refusing anything else.

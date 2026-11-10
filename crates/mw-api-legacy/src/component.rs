@@ -25,12 +25,11 @@
 //!
 //! # The state slot, and why the router is built by the binary
 //!
-//! The router, host routing and `RouteTable` mounting are M4-3's. What exists today is one
-//! listener the binary binds directly (`mw_http`'s module documentation records that as a
-//! step in the boot sequence rather than a component). So [`routes`] builds an
+//! The router, host routing and `RouteTable` mounting are `mw-http`'s, and since M4-3 the
+//! listener is the `http:listener` component §6.1 describes. [`routes`] builds an
 //! `axum::Router` over a [`RouteState`] -- a root resource `main` owns, exactly as
-//! `SnapshotState` and `RollupState` are -- and the component installs its [`Handlers`]
-//! into that slot while it runs.
+//! `SnapshotState` and `RollupState` are -- [`route_table`] pairs it with [`manifest`], and
+//! the component installs its [`Handlers`] into that slot while it runs.
 //!
 //! That makes "the table is mounted" and "the component is `Running`" **the same fact**,
 //! which is what D-48's invariant is stated over, without putting an `axum::Router` on the
@@ -44,7 +43,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwapOption;
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{HeaderMap, Response, StatusCode};
+use axum::http::{HeaderMap, Response, StatusCode, Uri};
 use axum::routing::any;
 use axum::Router;
 use mw_component::{
@@ -208,14 +207,18 @@ pub fn manifest() -> RouteManifest {
 /// rather than frozen, so a `503` on either is a website that renders an empty panel and
 /// not a shipped client that stops working.
 ///
-/// **There is no plan-level check over these yet**, and this comment used to say there was
-/// -- "for the plan-level check that none of them is claimed by a component whose hard needs
-/// reach outside `{LatestSnapshot}`". Nothing does that: the constant is used by
-/// [`manifest`] and its test, and it is not re-exported from `lib.rs`, so no other crate
-/// could. The check belongs to `implementation-plan.md` M4-3, which is the item that mounts
-/// a second component on these paths; until then the assertion that matters is this
-/// component's own hard-need set, which `the_hard_needs_are_exactly_the_latest_snapshot`
-/// pins. Describing enforcement that does not exist is the shape of G-1.
+/// **There is a check now, and it is `mw-http`'s.** This comment once described one that did
+/// not exist, which is the shape of G-1; M4-3 built it.
+/// `mw_http::MountError::FrozenPatternShadowed` refuses a `Scope::Site` table that claims one
+/// of these five, because a per-website router is tried *before* the shared one and would
+/// shadow the frozen surface for that host -- and `plan()` cannot see it, since two tables in
+/// different scopes are not a route conflict. The patterns themselves live in
+/// `mw_http::FROZEN_PATTERNS`: the crate that needs them for the check may not depend on the
+/// crate that serves them, so there is **one** list and
+/// [`tests::the_frozen_patterns_are_the_listeners_frozen_patterns`] pins this one to it.
+///
+/// The other half is still this component's own hard-need set, which
+/// `the_hard_needs_are_exactly_the_latest_snapshot` pins.
 pub const FROZEN_PATTERNS: [&str; 5] = [
     "/latest",
     "/span/{span}",
@@ -241,17 +244,41 @@ pub fn routes(state: Arc<RouteState>) -> Router {
         .with_state(state)
 }
 
-/// The `Host` header, or an empty string.
+/// The frozen surface as a [`mw_http::RouteTable`], ready for the one listener to mount.
 ///
-/// An absent or non-ASCII `Host` resolves to the default website, which is what an
+/// **One function rather than two for the binary to pair up.** Before M4-3 the binary built
+/// the router with [`routes`] and the manifest never left this crate's `Provision`; the
+/// listener now mounts a table that carries both, so "the paths `plan()` validated" and
+/// "the paths the router answers" travel together and cannot be assembled from different
+/// configurations.
+///
+/// `Scope::Any` and not the catch-all: the frozen paths answer on every host (the website
+/// is selected inside the handler), and the fallback is `mw-web`'s asset tree.
+pub fn route_table(state: Arc<RouteState>) -> Result<mw_http::RouteTable, LegacyPlanError> {
+    Ok(mw_http::RouteTable::new(
+        ComponentId::new(ID)?,
+        manifest(),
+        routes(state),
+    ))
+}
+
+/// Which host a request is for, normalised -- `mw_http::host::of_request`'s answer.
+///
+/// **Not the `Host` header.** An HTTP/2 request carries none: the authority is a
+/// pseudo-header hyper puts in the URI, and the listener offers `h2` first in its ALPN list
+/// (§6.6). Reading only the header would resolve every HTTP/2 request to the **default**
+/// website, so `/latest` on a browser-negotiated connection would answer with another
+/// station's readings -- the frozen surface returning the wrong data, which is the
+/// disclosure class **DEV-2** exists to close. M4-3's code review found it.
+///
+/// One implementation, and it is the listener's: §6.3 puts host resolution there, and two
+/// copies is two answers to "whose data is this request for".
+///
+/// An absent or non-ASCII authority resolves to the default website, which is what an
 /// unmatched one does (Q-18) -- so there is no error path here and no response the contract
 /// would have no bytes for.
-fn host_of(headers: &HeaderMap) -> String {
-    headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string()
+fn host_of(uri: &Uri, headers: &HeaderMap) -> String {
+    mw_http::host::of_request(uri, headers)
 }
 
 /// What a request gets when the component is not running.
@@ -270,6 +297,7 @@ fn unmounted() -> Response<Body> {
 
 async fn latest(
     State(state): State<Arc<RouteState>>,
+    uri: Uri,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
@@ -278,7 +306,7 @@ async fn latest(
     };
     crate::latest::handle(
         &h,
-        &host_of(&headers),
+        &host_of(&uri, &headers),
         &Params::parse(query.as_deref()),
         &headers,
     )
@@ -287,6 +315,7 @@ async fn latest(
 async fn span(
     State(state): State<Arc<RouteState>>,
     Path(span): Path<String>,
+    uri: Uri,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
@@ -295,7 +324,7 @@ async fn span(
     };
     crate::span::handle(
         &h,
-        &host_of(&headers),
+        &host_of(&uri, &headers),
         &span,
         &Params::parse(query.as_deref()),
     )
@@ -304,25 +333,36 @@ async fn span(
 
 async fn snow(
     State(state): State<Arc<RouteState>>,
+    uri: Uri,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
     let Some(h) = state.handlers() else {
         return unmounted();
     };
-    crate::snow::handle(&h, &host_of(&headers), &Params::parse(query.as_deref())).await
+    crate::snow::handle(
+        &h,
+        &host_of(&uri, &headers),
+        &Params::parse(query.as_deref()),
+    )
+    .await
 }
 
-async fn stationinfo(State(state): State<Arc<RouteState>>, headers: HeaderMap) -> Response<Body> {
+async fn stationinfo(
+    State(state): State<Arc<RouteState>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
     let Some(h) = state.handlers() else {
         return unmounted();
     };
-    crate::stationinfo::handle(&h, &host_of(&headers))
+    crate::stationinfo::handle(&h, &host_of(&uri, &headers))
 }
 
 async fn forecast(
     State(state): State<Arc<RouteState>>,
     Path(span): Path<String>,
+    uri: Uri,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
@@ -331,7 +371,7 @@ async fn forecast(
     };
     crate::forecast::handle(
         &h,
-        &host_of(&headers),
+        &host_of(&uri, &headers),
         &span,
         &Params::parse(query.as_deref()),
     )
@@ -340,20 +380,30 @@ async fn forecast(
 
 async fn almanac(
     State(state): State<Arc<RouteState>>,
+    uri: Uri,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
     let Some(h) = state.handlers() else {
         return unmounted();
     };
-    crate::almanac::handle(&h, &host_of(&headers), &Params::parse(query.as_deref())).await
+    crate::almanac::handle(
+        &h,
+        &host_of(&uri, &headers),
+        &Params::parse(query.as_deref()),
+    )
+    .await
 }
 
-async fn stations(State(state): State<Arc<RouteState>>, headers: HeaderMap) -> Response<Body> {
+async fn stations(
+    State(state): State<Arc<RouteState>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
     let Some(h) = state.handlers() else {
         return unmounted();
     };
-    crate::stations::handle(&h, &host_of(&headers))
+    crate::stations::handle(&h, &host_of(&uri, &headers))
 }
 
 /// Why `api:legacy` could not be planned.
@@ -589,6 +639,92 @@ impl Serve for Legacy {
 mod tests {
     use super::*;
     use crate::config::{Listener, StationView, WebsiteView};
+
+    /// **One list, cross-asserted.** `mw_http::FROZEN_PATTERNS` is what
+    /// `mw_http::MountError::FrozenPatternShadowed` refuses a per-website table for, and it
+    /// has to be the same five paths this crate serves -- the listener may not depend on
+    /// this crate, so the constant lives there and the agreement lives here. Two lists with
+    /// no assertion between them is how a sixth frozen path would get mounted per website
+    /// with nothing noticing.
+    #[test]
+    fn the_frozen_patterns_are_the_listeners_frozen_patterns() {
+        assert_eq!(FROZEN_PATTERNS, mw_http::FROZEN_PATTERNS);
+        // And every one of them is a pattern this crate actually declares.
+        let frozen = manifest();
+        let declared: Vec<&str> = frozen.entries.iter().map(|e| e.pattern.as_str()).collect();
+        for pattern in FROZEN_PATTERNS {
+            assert!(declared.contains(&pattern), "`{pattern}` is not declared");
+        }
+    }
+
+    /// **The frozen surface resolves its website from the request, not from the `Host`
+    /// header**, because an HTTP/2 request does not have one.
+    ///
+    /// Found by M4-3's code review. Reading the header alone made `/latest` and the other
+    /// four frozen routes answer with the **default** website's station on every
+    /// browser-negotiated HTTP/2 connection -- the frozen surface returning another
+    /// station's readings, which is the disclosure class **DEV-2** exists to close.
+    /// `mw_http::host::of_request` is the one implementation and has the argument;
+    /// `mw_http::mount`'s own tests assert the routing end to end. What is asserted here is
+    /// that this crate asks it, and that its answer composes with the website lookup.
+    #[test]
+    fn the_website_is_resolved_from_the_request_rather_than_the_host_header() {
+        let named = |id: i64, hostname: &str| WebsiteView {
+            hostname: hostname.into(),
+            ..website(id)
+        };
+        let directory = Directory::new(
+            vec![named(1, "first.test"), named(2, "second.test")],
+            Vec::new(),
+            Listener {
+                port: 18080,
+                tls: true,
+            },
+        );
+
+        // HTTP/2: no header, the authority in the URI.
+        let h2 = Uri::from_static("https://second.test/latest");
+        let host = host_of(&h2, &HeaderMap::new());
+        assert_eq!(host, "second.test");
+        assert_eq!(
+            directory.website_for_host(&host).expect("a website").id,
+            WebsiteId::new(2),
+            "and NOT the default website"
+        );
+
+        // Origin-form HTTP/1.1: the header is what answers.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("SECOND.test:18080"),
+        );
+        assert_eq!(
+            host_of(&Uri::from_static("/latest"), &headers),
+            "second.test"
+        );
+
+        // Neither: the empty string, which is Q-18's default-website path.
+        assert_eq!(host_of(&Uri::from_static("/latest"), &HeaderMap::new()), "");
+        assert_eq!(
+            directory.website_for_host("").expect("the default").id,
+            WebsiteId::new(1)
+        );
+    }
+
+    /// The table the listener mounts and the manifest `plan()` validates are the same
+    /// paths, built from the same function.
+    #[test]
+    fn the_route_table_carries_the_manifest_the_provision_declares() {
+        let table = route_table(Arc::new(RouteState::new())).expect("a table");
+        assert_eq!(table.manifest(), &manifest());
+        assert_eq!(table.owner().as_str(), ID);
+        assert_eq!(table.scope(), Scope::Any);
+        assert!(
+            !table.is_catch_all(),
+            "the catch-all is `mw-web`'s asset tree"
+        );
+    }
+
     use mw_component::Match;
     use mw_types::{StationKey, WebsiteId};
 

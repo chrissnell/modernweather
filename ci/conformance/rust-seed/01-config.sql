@@ -14,9 +14,15 @@
 -- three fixtures address by number (`/latest?station_id=1`, `/snow?station_id=3`,
 -- `/latest?station_id=4`), each station's name and configured type, each `enabled` flag,
 -- which stations have coordinates, the six hostnames the `Host` headers send, and each
--- website's snow and air-quality bindings. Not load-bearing, because the runner compares
--- JSON *shape* rather than values: the page titles, the exact coordinates and the radar
--- token.
+-- website's snow and air-quality bindings.
+--
+-- **Three more became load-bearing with implementation-plan.md M4-3**, which is the item
+-- that renders a page: `apple_app_id` and `radar_token` are asserted as substrings of
+-- `html-weather-station`, and `website.name` is the `StationName` the page renders four
+-- times. The earlier note here said the radar token was not load-bearing "because the
+-- runner compares JSON *shape* rather than values" -- which is true of the JSON endpoints
+-- and was never true of the HTML fixtures' `required_substrings`. The page titles and the
+-- exact coordinates are still reconstructions: no fixture reads either.
 
 PRAGMA foreign_keys = ON;
 
@@ -107,30 +113,59 @@ VALUES
 
 -- The six websites, by hostname. An unmatched `Host` resolves to the first by id (Q-18),
 -- which no fixture reaches: all 70 send one of these six.
+-- `apple_app_id` is written explicitly, and that is a difference from the Go rig rather
+-- than a choice: the Go `weather_websites` column defaults to `6755874087` and
+-- `ci/conformance/config-seed.sql` leaves it alone, while this schema defaults it to `''`.
+-- `html-weather-station` asserts the value as a substring of the rendered
+-- `<meta name="apple-itunes-app" content="app-id=...">` tag, so an empty one would both
+-- fail the fixture and remove the tag -- which is what `{{- if .AppleAppID }}` does.
 INSERT INTO website
   (id, name, hostname, page_title, about_station_html, primary_station_key,
    snow_enabled, snow_station_key, air_quality_enabled, air_quality_station_key,
-   is_portal, radar_enabled, radar_token, radar_registered_at)
+   is_portal, apple_app_id, radar_enabled, radar_token, radar_registered_at)
 VALUES
   -- The happy path: snow on, air quality on, radar on, about text set.
   (1, 'Suncrest Live Weather', 'localhost', 'Suncrest Live Weather',
    '<p>A Davis Vantage Pro2 on a ridge at 1800 m.</p>', 'davis-full',
-   1, 'snowgauge', 1, 'aqmon', 0, 1, 'contract-radar-token', 1761667200),
+   1, 'snowgauge', 1, 'aqmon', 0, '6755874087', 1, 'contract-radar-token', 1761667200),
   -- The `about_text` half of the DEV-10 hazard: no about text, so the Go server omits the
   -- key and the iOS decode of the whole object fails. This target emits it.
   (2, 'Minimal Station', 'minimal.test', 'Minimal Station', '', 'csi-minimal',
-   0, NULL, 0, NULL, 0, 0, '', NULL),
+   0, NULL, 0, NULL, 0, '', 0, '', NULL),
   -- The `weather_device` half: a portal has no primary station, so Go omits BOTH keys.
   -- Also the only website `/api/stations` answers for.
   (3, 'Weather Portal', 'portal.test', 'Weather Management Portal', '', NULL,
-   0, NULL, 0, NULL, 1, 0, '', NULL),
+   0, NULL, 0, NULL, 1, '', 0, '', NULL),
   -- `/snow` is a 404 for a website with snow disabled.
   (4, 'No Snow Station', 'nosnow.test', 'No Snow Station', '', 'nolocation',
-   0, NULL, 0, NULL, 0, 0, '', NULL),
+   0, NULL, 0, NULL, 0, '', 0, '', NULL),
   -- The stale gauge, and the dead one.
   (5, 'Stale Snow Station', 'stalesnow.test', 'Stale Snow Station', '', 'nolocation',
-   1, 'snowgauge-stale', 0, NULL, 0, 0, '', NULL),
+   1, 'snowgauge-stale', 0, NULL, 0, '', 0, '', NULL),
   (6, 'Dead Snow Station', 'deadsnow.test', 'Dead Snow Station', '', 'nolocation',
-   1, 'snowgauge-dead', 0, NULL, 0, 0, '', NULL);
+   1, 'snowgauge-dead', 0, NULL, 0, '', 0, '', NULL);
+
+-- **`aerisWeatherEnabled`, which is a row here and a column in the Go schema.**
+--
+-- The Go rig sets `devices.aeris_enabled = 1` on `davis-full`; this schema makes "which
+-- stations get forecasts and alerts" a `station_service` pairing, which is what the
+-- `website` table's own comment means by "`aerisWeatherEnabled` is a `station_service` row
+-- with `service = 'aeris'`". The pairing carries no `uploader_id` -- an Aeris account is
+-- not an uploader -- which the table's `CHECK ((service = 'aeris') = (uploader_id IS NULL))`
+-- requires.
+--
+-- What it reaches: the rendered page's forecast band (`{{ if .AerisWeatherEnabled }}`) and
+-- the ninth value of the inline configuration block.
+--
+-- **Nothing would fail if this row were missing**, and that is worth stating rather than
+-- implying. No fixture asserts the forecast band as a substring, and
+-- `crates/mw-web/tests/byte_diff.rs` builds its own `SiteView` rather than reading a
+-- database, so it cannot observe this seed either -- an earlier version of this comment
+-- claimed otherwise, which M4-3's code review corrected. What IS gated is the query:
+-- `mw_store::config_db`'s `the_aeris_pairing_round_trips_and_excludes_other_services`
+-- asserts the pairing reads back and that another service does not. The row is here so the
+-- rig renders the page W1 recorded rather than one with the band missing.
+DELETE FROM station_service;
+INSERT INTO station_service (station_key, service) VALUES ('davis-full', 'aeris');
 
 COMMIT;

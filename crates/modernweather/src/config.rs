@@ -47,9 +47,9 @@ pub struct Config {
     /// Every `config.website` row, in id order.
     ///
     /// The left half of the snapshot's `(website, station)` key (**D-31**), and the whole of
-    /// what the frozen REST surface reads a website for. The TLS paths and `apple_app_id`
-    /// are still absent: they belong to the SNI resolver and the rendered page, and both are
-    /// M4-3's.
+    /// what the frozen REST surface reads a website for. The TLS paths, `is_default_tls` and
+    /// `apple_app_id` arrived with M4-3, which built the SNI resolver and the rendered
+    /// page -- the two consumers the earlier note said they were waiting for.
     pub websites: Vec<WebsiteRow>,
 
     /// The website rows in the shape `mw-api-legacy` plans from.
@@ -151,6 +151,33 @@ pub struct Config {
     /// a second answer to "which midnight does this station's day begin at".
     pub(crate) station_zones: Vec<(StationKey, Option<Zone>)>,
 
+    /// Every website in the shape `mw-web` renders from -- the row **joined to its primary
+    /// station**, which is what the Go handler renders from.
+    ///
+    /// `pub(crate)` for [`Config::declared_stations`]' reason: the registrar reaches them
+    /// through [`mw_web::WebConfig`].
+    pub(crate) web_sites: Vec<mw_web::SiteView>,
+
+    /// The per-website state slots, once `main` has built them.
+    ///
+    /// A root resource for [`Config::legacy_routes`]' reason: the **listener** is built
+    /// from the same tables, in the same function, so the slots have to exist before
+    /// `plan()` runs.
+    pub(crate) web_states: Option<Vec<Arc<mw_web::SiteState>>>,
+
+    /// The mounted router set, once `main` has built it.
+    ///
+    /// The fourth root resource of its kind, and the one every other route provider feeds:
+    /// `mw-http` may name neither `mw-api-legacy` nor `mw-web` (`ci/layers.toml`), so the
+    /// binary is where the tables and the listener meet (§1.3 rule 1).
+    pub(crate) mount: Option<Arc<mw_http::Mount>>,
+
+    /// The SNI resolver, for a node with a TLS port.
+    ///
+    /// `None` when `listener.https_port` is NULL, which is every node that has not
+    /// configured one.
+    pub(crate) sni: Option<Arc<mw_http::SniResolver>>,
+
     /// The generation these rows were read at (**D-53**).
     ///
     /// `ZERO` until something can bump it: a generation is assigned by `ConfigAdmin` on
@@ -165,7 +192,15 @@ impl Config {
     pub async fn load(pool: &SqlitePool) -> Result<Self, ConfigDbError> {
         let stations = config_db::stations(pool).await?;
         let websites = config_db::websites(pool).await?;
+        // `aerisWeatherEnabled` is a `station_service` row with `service = 'aeris'` rather
+        // than a column -- the `website` table's own comment says so -- and it is folded
+        // into the website views below rather than kept, because nothing else reads it.
+        let aeris_stations = config_db::aeris_stations(pool).await?;
         Ok(Config {
+            web_sites: websites
+                .iter()
+                .map(|w| declare_site(w, &stations, &aeris_stations))
+                .collect(),
             listener: config_db::listener(pool).await?,
             weather_database: config_db::weather_database(pool).await?,
             node: config_db::node(pool).await?,
@@ -183,6 +218,9 @@ impl Config {
             legacy_render: None,
             snapshot_render: None,
             station_zones: Vec::new(),
+            web_states: None,
+            mount: None,
+            sni: None,
             generation: Generation::ZERO,
         })
     }
@@ -244,25 +282,75 @@ impl Config {
         self.legacy_render = Some(render);
     }
 
-    /// The address the one listener binds, and therefore where `/metrics` is served.
+    /// Hand the configuration the per-website state slots.
     ///
-    /// §5.10 puts `/metrics` on **an additive route on the one listener** rather than on a
-    /// port of its own, so this is the main port -- not the management port, which is
-    /// loopback by default (A-W5-3) and would make the metrics unscrapable from the
-    /// homelab's Prometheus.
-    pub fn listen_addr(&self) -> Result<std::net::SocketAddr, AddressError> {
+    /// One per website in [`Config::web_sites`]' order, which `mw_web::register` asserts:
+    /// a mismatch would mount one website's page under another's hostname.
+    pub fn set_web_states(&mut self, states: Vec<Arc<mw_web::SiteState>>) {
+        self.web_states = Some(states);
+    }
+
+    /// Hand the configuration the mounted router set and, where there is a TLS port, the
+    /// certificate resolver.
+    ///
+    /// One call for the same reason [`Config::set_legacy`] is one: a mount with no resolver
+    /// on a node with a TLS port is a listener that accepts connections and fails every
+    /// handshake, and `mw_http::bind` refuses it -- so the two travel together rather than
+    /// being two states a caller can get half right.
+    pub fn set_listener(
+        &mut self,
+        mount: Arc<mw_http::Mount>,
+        sni: Option<Arc<mw_http::SniResolver>>,
+    ) {
+        self.mount = Some(mount);
+        self.sni = sni;
+    }
+
+    /// Every website's certificate paths, for the SNI resolver (§6.4).
+    ///
+    /// Only the rows that have one: the schema's `CHECK` makes a certificate without its
+    /// key unrepresentable, so a `Some` cert path is a complete pair.
+    pub fn cert_paths(&self) -> Vec<mw_http::CertPaths> {
+        self.websites
+            .iter()
+            .filter_map(|w| {
+                let (cert, key) = (w.tls_cert_path.as_ref()?, w.tls_key_path.as_ref()?);
+                Some(mw_http::CertPaths {
+                    hostname: w.hostname.clone(),
+                    cert: cert.into(),
+                    key: key.into(),
+                    is_default: w.is_default_tls,
+                })
+            })
+            .collect()
+    }
+
+    /// The sockets the configuration names (§6.1), with `listen_addr` already parsed.
+    pub fn listen(&self) -> Result<mw_http::Listen, AddressError> {
+        Ok(mw_http::Listen {
+            addr: self.listen_ip()?,
+            http_port: self.listener.http_port,
+            https_port: self.listener.https_port,
+            grpc_port: self.listener.grpc_port,
+        })
+    }
+
+    /// `listener.listen_addr`, parsed.
+    ///
+    /// The schema cannot check this -- SQLite has no inet type -- so it is a startup
+    /// failure that names what was configured, rather than a bind that fails with "invalid
+    /// argument".
+    fn listen_ip(&self) -> Result<std::net::IpAddr, AddressError> {
         let host = &self.listener.listen_addr;
-        let port = self.listener.http_port;
-        // A bare IPv6 literal has to be bracketed before it can be parsed with a port, and
-        // the column holds whatever the operator typed.
-        let text = if host.contains(':') && !host.starts_with('[') {
-            format!("[{host}]:{port}")
-        } else {
-            format!("{host}:{port}")
-        };
-        text.parse().map_err(|_| AddressError {
+        // A bracketed IPv6 literal is what an operator may have typed into a column that
+        // also accepts a bare one.
+        let bare = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        bare.parse().map_err(|_| AddressError {
             addr: host.clone(),
-            port,
+            port: self.listener.http_port,
         })
     }
 }
@@ -427,6 +515,109 @@ impl mw_api_legacy::LegacyConfig for Config {
     }
 }
 
+/// What the public website plans and renders from.
+///
+/// Column into field, like every registrar trait above it: `mw-web` may not depend on
+/// `mw-store`, and the row it needs is the website **joined to its primary station** --
+/// which is the join the Go handler does per request (`handlers.go:869`).
+impl mw_web::WebConfig for Config {
+    fn web_sites(&self) -> &[mw_web::SiteView] {
+        &self.web_sites
+    }
+
+    /// The daemon's version, which the footer renders.
+    ///
+    /// `CARGO_PKG_VERSION` of the **binary**, which is what `mw_build_info` reports and
+    /// what `--version` prints. The Go page rendered `constants.Version` for the same
+    /// reason.
+    fn web_version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    /// The same question `api:legacy` asks, with the same one answer behind it -- see
+    /// `mw_web::component`'s module documentation for why a website component has to ask.
+    fn web_has_latest_snapshot(&self) -> bool {
+        mw_pipeline::snapshot::provides_latest_snapshot(self)
+    }
+
+    fn web_states(&self) -> Option<&[Arc<mw_web::SiteState>]> {
+        self.web_states.as_deref()
+    }
+}
+
+/// What the one listener plans from.
+impl mw_http::ListenerConfig for Config {
+    /// **`expect` rather than a fallible accessor**, and the reason is where the parse
+    /// already happened: [`crate::boot`] calls [`Config::listen`] before `plan()` -- it has
+    /// to, because the sockets' addresses are what the mount is built for -- so a bad
+    /// `listen_addr` is already a named startup failure by the time a registrar runs. A
+    /// second fallible path here would be a second place that decides what an unparseable
+    /// address means.
+    fn listen(&self) -> mw_http::Listen {
+        Config::listen(self).expect(
+            "the boot sequence parses `listener.listen_addr` before `plan()` runs, so an \
+             unparseable one has already been reported",
+        )
+    }
+
+    fn mount(&self) -> Option<&Arc<mw_http::Mount>> {
+        self.mount.as_ref()
+    }
+
+    fn sni_resolver(&self) -> Option<&Arc<mw_http::SniResolver>> {
+        self.sni.as_ref()
+    }
+}
+
+/// One `config.website` row joined to its primary station, as the website renders it.
+///
+/// Three of the nine values the inline configuration block carries are **not** on the
+/// website row, and each one is resolved here: `stationID` and `airQualityDeviceID` are the
+/// `stations.id` surrogates, and `aerisWeatherEnabled` is a `station_service` row with
+/// `service = 'aeris'` (the schema's own comment says so).
+fn declare_site(
+    row: &WebsiteRow,
+    stations: &[config_db::StationRow],
+    aeris: &[String],
+) -> mw_web::SiteView {
+    let by_key = |key: &Option<String>| -> Option<&config_db::StationRow> {
+        let key = key.as_deref()?;
+        stations.iter().find(|s| s.station_key == key)
+    };
+    let primary = by_key(&row.primary_station_key);
+    let air_quality = by_key(&row.air_quality_station_key);
+    let snow = by_key(&row.snow_station_key);
+    mw_web::SiteView {
+        id: WebsiteId::new(row.id),
+        hostname: row.hostname.clone(),
+        name: row.name.clone(),
+        page_title: row.page_title.clone(),
+        apple_app_id: row.apple_app_id.clone(),
+        is_portal: row.is_portal,
+        radar_enabled: row.radar_enabled,
+        radar_token: row.radar_token.clone(),
+        snow_enabled: row.snow_enabled,
+        // The station **name**, which is what the JavaScript queries by -- not the key.
+        // `?station=` names `devices.name` in the frozen contract, and the writer projects
+        // the same string onto `stationname` (`mw_api_legacy::config`).
+        snow_device: snow.map(|s| s.name.clone()).unwrap_or_default(),
+        air_quality_enabled: row.air_quality_enabled,
+        air_quality_device: air_quality.map(|s| s.name.clone()).unwrap_or_default(),
+        // `0` for a website with no air-quality station, which is what
+        // `getAirQualityDeviceID` returns.
+        air_quality_device_id: air_quality.map(|s| s.id).unwrap_or(0),
+        // `None` when the column names a station that is not in `stations` -- which
+        // `ON DELETE SET NULL` makes unreachable from a consistent database, and which a
+        // hand-edited one can still produce. A portal has no primary station by design.
+        primary_station: primary.map(|s| StationKey::new(s.station_key.clone())),
+        primary_station_name: primary.map(|s| s.name.clone()).unwrap_or_default(),
+        primary_station_id: primary.map(|s| s.id).unwrap_or(0),
+        latitude: primary.and_then(|s| s.latitude),
+        longitude: primary.and_then(|s| s.longitude),
+        aeris_enabled: primary.is_some_and(|s| aeris.contains(&s.station_key)),
+    }
+}
+
 /// One `config.website` row, as the frozen surface reads it.
 fn declare_website(row: &WebsiteRow) -> mw_api_legacy::WebsiteView {
     mw_api_legacy::WebsiteView {
@@ -517,6 +708,10 @@ mod tests {
             snapshot: None,
             snapshot_windows: None,
             station_zones: Vec::new(),
+            web_sites: Vec::new(),
+            web_states: None,
+            mount: None,
+            sni: None,
             listener: Listener {
                 listen_addr: addr.to_string(),
                 http_port: port,
@@ -533,22 +728,44 @@ mod tests {
 
     #[test]
     fn the_schema_default_binds_every_interface_on_the_main_port() {
-        let addr = config("0.0.0.0", 8080)
-            .listen_addr()
+        let listen = config("0.0.0.0", 8080)
+            .listen()
             .expect("the seeded default is an address");
-        assert_eq!(addr.to_string(), "0.0.0.0:8080");
+        assert_eq!(listen.main().to_string(), "0.0.0.0:8080");
+        assert_eq!(listen.grpc().to_string(), "0.0.0.0:50051");
+        assert_eq!(listen.redirect(), None, "no TLS port, no redirector");
     }
 
+    /// An IPv6 literal, bracketed or bare, which is what the column accepts.
     #[test]
-    fn an_ipv6_literal_is_bracketed_for_the_operator() {
+    fn an_ipv6_literal_is_accepted_either_way() {
         assert_eq!(
-            config("::", 8080).listen_addr().expect("v6").to_string(),
+            config("::", 8080).listen().expect("v6").main().to_string(),
             "[::]:8080"
         );
         assert_eq!(
-            config("[::1]", 9090).listen_addr().expect("v6").to_string(),
+            config("[::1]", 9090)
+                .listen()
+                .expect("v6")
+                .main()
+                .to_string(),
             "[::1]:9090"
         );
+    }
+
+    /// With a TLS port configured the main socket is **that** port and the HTTP port
+    /// becomes the redirector (§6.1).
+    #[test]
+    fn a_tls_port_moves_the_main_socket_and_leaves_a_redirector() {
+        let mut cfg = config("127.0.0.1", 8080);
+        cfg.listener.https_port = Some(8443);
+        let listen = cfg.listen().expect("an address");
+        assert_eq!(listen.main().to_string(), "127.0.0.1:8443");
+        assert_eq!(
+            listen.redirect().expect("a redirector").to_string(),
+            "127.0.0.1:8080"
+        );
+        assert!(listen.tls());
     }
 
     #[test]
@@ -557,9 +774,7 @@ mod tests {
         // which supports neither `nsswitch.conf` nor NSS modules (W8 OQ-4) -- so a
         // listen address that needs resolution is a configuration that behaves
         // differently in the release build than in a developer's.
-        let e = config("localhost", 8080)
-            .listen_addr()
-            .expect_err("rejected");
+        let e = config("localhost", 8080).listen().expect_err("rejected");
         assert_eq!(
             e,
             AddressError {

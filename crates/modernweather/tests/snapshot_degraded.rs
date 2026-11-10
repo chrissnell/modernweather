@@ -24,12 +24,13 @@
 //!
 //! The second half is **byte-level**: `/latest` answering
 //! `404 no recent weather data available for this station\n` rather than `503`, for each of
-//! the five frozen routes. That needs the frozen routes to exist. `mw-api-legacy` is M4-2
-//! and `http:listener` with its `RouteTable` mounting is M4-3, so the fixtures cannot be
-//! driven against a Rust binary yet — which is also why `cargo xtask gate conformance` is
-//! red on `main` and stays red until M4-2. What is here instead is the precondition that
-//! half rests on, plus the two things the handler will read: `None` before any reading, and
-//! bytes after one, with no store handle anywhere in reach.
+//! the five frozen routes. That needs the frozen routes to exist, and they do:
+//! `crates/mw-api-legacy/tests/degraded.rs` drives the real router with all three soft
+//! capability slots empty and asserts each one's contract bytes (M4-2), and
+//! `cargo xtask gate conformance` has replayed all 70 fixtures against the Rust binary since
+//! the same item. What is here is the precondition that half rests on, plus the two things
+//! the handler reads: `None` before any reading, and bytes after one, with no store handle
+//! anywhere in reach.
 //!
 //! **Why it lives in the binary's tests.** `mw-supervisor` and `mw-pipeline` are the same
 //! layer in `ci/layers.toml` and the layout gate rejects a same-layer dependency in either

@@ -227,6 +227,24 @@ impl Directory {
         self.websites
             .iter()
             .find(|w| w.hostname == normalised)
+            // **The wildcard arm, which M4-3's code review found missing here and present
+            // in the listener.** `website.hostname`'s three `CHECK`s all accept
+            // `*.wild.test`, and `mw_http::HostTable` has an explicit wildcard arm with its
+            // own tests -- so with such a row, `/` on `a.wild.test` served that website's
+            // page while `/latest` on the same host fell through to the **default**
+            // website's station. One hostname, two websites' data, which is the disclosure
+            // Q-18 and **DEV-2** are written about.
+            //
+            // `mw_http::matches_one_label` is the same single-label rule the host table and
+            // the certificate store both use (**DEV-6**), so there is one answer to what a
+            // wildcard covers rather than three.
+            .or_else(|| {
+                self.websites.iter().find(|w| {
+                    w.hostname
+                        .strip_prefix("*.")
+                        .is_some_and(|suffix| mw_http::matches_one_label(&normalised, suffix))
+                })
+            })
             .or_else(|| self.default_website.map(|i| &self.websites[i]))
     }
 
@@ -283,22 +301,13 @@ impl Directory {
 
 /// `Host`, normalised the three ways §6.3 specifies.
 ///
-/// An IPv6 literal keeps its brackets and loses its port: `[::1]:8080` is `[::1]`, which is
-/// what the stored hostname would have to be to match it. Splitting on the **last** colon
-/// is what makes that work, and splitting on the first would truncate the address.
+/// **One implementation, and it is `mw-http`'s.** §6.3 puts host normalisation in the
+/// listener, and this crate used to carry a second copy -- which is two answers to "does
+/// `EXAMPLE.COM.` match `example.com`", on a lookup whose whole purpose is deciding whose
+/// weather data a request gets. `mw-http` is a lower layer, so naming it is a permitted
+/// edge; M4-3 removed the copy.
 fn normalise_host(host: &str) -> String {
-    let mut h = host.trim();
-    // The port, if there is one. A bracketed literal's port is after the `]`.
-    if let Some(close) = h.rfind(']') {
-        h = &h[..=close];
-    } else if let Some(colon) = h.rfind(':') {
-        // Only when what follows is a port rather than part of a bare IPv6 literal, which
-        // is not legal in a `Host` header anyway.
-        if h[colon + 1..].chars().all(|c| c.is_ascii_digit()) {
-            h = &h[..colon];
-        }
-    }
-    h.trim_end_matches('.').to_ascii_lowercase()
+    mw_http::normalise(host)
 }
 
 #[cfg(test)]
@@ -342,10 +351,16 @@ mod tests {
         assert_eq!(normalise_host("EXAMPLE.COM.:443"), "example.com");
         assert_eq!(normalise_host("[::1]:8080"), "[::1]");
         assert_eq!(normalise_host("[::1]"), "[::1]");
-        // Two trailing dots are not "a single trailing dot", and `trim_end_matches` takes
-        // both -- which is more permissive than §6.3 says and cannot match any stored
-        // hostname either way, because the schema forbids a stored trailing dot.
-        assert_eq!(normalise_host("example.com.."), "example.com");
+        // §6.3 says "a single trailing dot", and `mw_http::normalise` takes exactly one.
+        //
+        // **This is a behaviour change, and M4-3's code review asked for it to be said
+        // accurately.** The copy this crate used to carry ran `trim_end_matches('.')`, so
+        // `example.com..` normalised to `example.com` and matched a stored hostname; it now
+        // normalises to `example.com.` and falls through to the default website. The new
+        // behaviour is the §6.3-conformant one and `example.com..` is not a hostname, so
+        // nothing legitimate reached the old path -- but the old path did match, and saying
+        // it could not would have been wrong.
+        assert_eq!(normalise_host("example.com.."), "example.com.");
     }
 
     /// **DEV-2**: mixed case matches rather than falling through to somebody else's
@@ -357,6 +372,37 @@ mod tests {
             .website_for_host("SECOND.test:18080")
             .expect("a website is configured");
         assert_eq!(w.id, WebsiteId::new(2), "and NOT the default website");
+    }
+
+    /// **A wildcard hostname resolves here as it does in the listener**, which M4-3's code
+    /// review found it did not: `/` was served by the wildcard's website and `/latest` by
+    /// the default one, on the same request host.
+    #[test]
+    fn a_wildcard_hostname_resolves_one_label_deep() {
+        let d = directory(vec![site(1, "first.test"), site(2, "*.wild.test")]);
+        assert_eq!(
+            d.website_for_host("a.wild.test").expect("the wildcard").id,
+            WebsiteId::new(2)
+        );
+        // **DEV-6**'s rule, shared with the certificate store: one label, and a suffix that
+        // does not start at a label boundary is not a match.
+        for miss in ["a.b.wild.test", "evilwild.test", "wild.test"] {
+            assert_eq!(
+                d.website_for_host(miss).expect("the default").id,
+                WebsiteId::new(1),
+                "{miss} must not take the wildcard's website"
+            );
+        }
+        // An exact row still wins over a wildcard that would also cover it.
+        let d = directory(vec![
+            site(1, "first.test"),
+            site(2, "*.wild.test"),
+            site(3, "a.wild.test"),
+        ]);
+        assert_eq!(
+            d.website_for_host("a.wild.test").expect("the exact row").id,
+            WebsiteId::new(3)
+        );
     }
 
     /// **Q-18**, in both of its arms.

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "The one listener: axum + tonic, RouteTable mounting, host routing, the SNI resolver."
+description = "The one listener: axum on N sockets, RouteTable mounting, host routing, the SNI resolver."
 
 [lints]
 workspace = true
@@ -17,17 +17,40 @@ mw-component.workspace = true
 mw-types.workspace = true
 
 axum.workspace = true
-tonic.workspace = true
+# `tower::Service`, for the host dispatcher in front of the per-website routers. Not an
+# addition to D-32's table: `tower` is already there for sink composition, and a
+# `Service` impl is the only way to choose a router per request.
 tower.workspace = true
+# `CompressionLayer` (gzip and deflate; brotli and zstd deliberately off) and
+# `SetResponseHeaderLayer`, which is what makes the one `Vary` one -- see
+# `mount::Mount::router`.
 tower-http.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
 http.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
+# D-33: the private key PEM is read into a secret and zeroised when the load returns.
 secrecy.workspace = true
+# The router, the host table and the certificate store: three published snapshots read
+# without a lock (**D-28**, **D-32**).
 arc-swap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+
+# `tonic`, `hyper` and `hyper-util` are deliberately **not** listed, even though §1.2's
+# responsibility line for this crate says "axum + tonic" and the `only-mw-http-binds-a-socket`
+# source rule reserves `tonic::transport::Server` for this crate. Nothing here mounts a
+# gRPC service yet: `grpc:weatherv1`, `grpc:weatherappsv1` and `station:grpcrx` are
+# implementation-plan.md M6-1 and M6-4, and `src/socket.rs` has the whole of why the
+# dispatcher is not written in advance. The gRPC *socket* exists and serves the same router;
+# `hyper-util`'s auto connection builder, which `axum::serve` uses internally, is what makes
+# h2c work on it. Adding the three back is one line each when there is a service to mount.
+
+[dev-dependencies]
+# `WebsiteId`, for the host tables the mount and redirect tests build.
+mw-types.workspace = true
+# `ServiceExt::oneshot`, which is how the mount tests drive the real router without binding
+# a socket.
+tower.workspace = true
+tokio.workspace = true

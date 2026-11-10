@@ -1450,6 +1450,7 @@ name = "modernweather"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "metrics",
  "mw-api-legacy",
@@ -1493,6 +1494,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "mw-component",
+ "mw-http",
  "mw-pipeline",
  "mw-types",
  "ryu",
@@ -1594,8 +1596,6 @@ dependencies = [
  "arc-swap",
  "axum",
  "http",
- "hyper",
- "hyper-util",
  "mw-component",
  "mw-types",
  "rustls",
@@ -1604,7 +1604,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
- "tonic",
  "tower",
  "tower-http",
  "tracing",
@@ -1737,14 +1736,20 @@ dependencies = [
 name = "mw-web"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "askama",
  "axum",
  "mw-component",
+ "mw-http",
  "mw-types",
  "rust-embed",
+ "ryu",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "tokio-util",
+ "tower",
  "tracing",
 ]
 

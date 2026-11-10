@@ -1,0 +1,23 @@
+# `GoHtmlEscaper` is the escaper for the `html` extension, and it is the only one
+# configured (**D-81**).
+#
+# Why this file exists. docs/service-architecture.md §7.1 requires the rendered page to be
+# byte-identical to W1's recorded bodies, and that is achievable only with Go's spellings:
+# `html/template` writes `&#34;` and `&#39;` where askama's own `Html` escaper writes
+# `&quot;` and `&#x27;`, and those differ on every attribute containing an apostrophe. A
+# `[[escaper]]` entry is the only way askama lets a crate choose one.
+#
+# **ci/layers.toml's `[templates]` check knows about this file.** Its own `reason` records
+# that "an `askama.toml` that reassigns the `html` escaper would turn escaping off globally
+# without any of these appearing anywhere. There is no such file, and the day one arrives it
+# needs a rule of its own." It has arrived, and it has one: `askama-escaper-is-the-go-one`
+# in that file asserts this table names `crate::GoHtmlEscaper` for `html` and nothing else,
+# so swapping in `askama::filters::Empty` -- which emits its input unchanged -- is a gate
+# failure rather than a one-line edit nothing reads.
+#
+# The extension list is askama's own default set for the HTML escaper minus the ones this
+# crate has no templates for; `html` is the one that matters, because the template is
+# `templates/weather-station.html`.
+[[escaper]]
+path = "crate::GoHtmlEscaper"
+extensions = ["html", "htm"]

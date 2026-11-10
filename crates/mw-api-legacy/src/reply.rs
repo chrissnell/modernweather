@@ -31,9 +31,13 @@
 //! type -- it comes from `gorilla/handlers.CompressHandler`, which wraps every route. This
 //! crate sets it on every response instead, because the runner compares a header's **value**
 //! exactly and `tower_http`'s `CompressionLayer` writes `vary: accept-encoding` in lower
-//! case. **When M4-3 adds compression it must not also add a second `Vary`**: the value has
-//! to stay `Accept-Encoding`, capitalised, and appending rather than replacing would make
-//! it `Accept-Encoding, accept-encoding`.
+//! case. **M4-3 added compression and did not add a second `Vary`**: `mw_http::Mount::router`
+//! puts a `SetResponseHeaderLayer::overriding` for `Vary` **outside** the `CompressionLayer`,
+//! so whatever is there when the response leaves a handler is replaced by exactly one
+//! `Accept-Encoding`, capitalised. Appending rather than overriding would have produced
+//! `Accept-Encoding, accept-encoding`, and leaving it to compression would have produced the
+//! lower-case spelling on every response that does not set one. The value this module writes
+//! is therefore still what goes out, and the layer is what makes it the only one.
 //!
 //! # The two additive headers (DEV-1, DEV-5)
 //!

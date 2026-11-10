@@ -90,7 +90,8 @@ const MANGLE_PORT: u16 = 18081;
 /// `contract/README.md`'s 26 is a count of *failures* against the Go daemon, which serves
 /// all 70 endpoints and passes all 70 directly -- so against that target "26 failed" and
 /// "the proxy broke 26" are the same sentence. Against this one they are not: 22 fixtures
-/// fail whatever the proxy does, because nine are `retired` and thirteen are [`PENDING`].
+/// fail whatever the proxy does: the nine `retired` ones. It was 22 between M4-2 and M4-3,
+/// when thirteen `coupled` fixtures were also excused by [`PENDING`].
 /// A floor on the failure count would therefore be cleared by a proxy that mangled
 /// **nothing**, which is exactly the failure mode W1 Decision 10 exists to prevent.
 ///
@@ -98,19 +99,23 @@ const MANGLE_PORT: u16 = 18081;
 /// is the number of responses the proxy actually broke, and it is independent of how many
 /// endpoints the target does not serve.
 ///
-/// **Measured at 23**, against a green direct replay of 48:
+/// **Measured at 23**, against a green direct replay of 61 (implementation-plan.md M4-3;
+/// it was 48 between M4-2 and M4-3, when thirteen `coupled` fixtures were excused):
 ///
 /// ```text
-/// direct   48 passed, 22 failed
-/// mangled  25 passed, 45 failed      -> 23 broken
+/// direct   61 passed,  9 failed
+/// mangled  38 passed, 32 failed      -> 23 broken
 /// ```
 ///
 /// The 23 are every JSON-object-or-array response on an implemented endpoint -- the six
 /// `/latest`, six `/span`, five `/snow`, three `/stationinfo`, two `/almanac` and one
-/// `/api/stations`. The 25 that still pass are the plain-text error bodies, the `403`, and
-/// the whole `/forecast` family: the proxy rewrites parsed JSON and `/forecast`'s body is
-/// `jsonb` text it does not match. That split is what makes the control meaningful rather
-/// than a blanket failure.
+/// `/api/stations`. The 38 that still pass are the plain-text error bodies, the `403`, the
+/// whole `/forecast` family and -- since M4-3 -- the thirteen HTML pages and embedded
+/// assets: the proxy rewrites parsed JSON, and neither `/forecast`'s `jsonb` text nor an
+/// asset body is JSON it matches. That split is what makes the control meaningful rather
+/// than a blanket failure, and it is also why the **frozen** floor below is the one that
+/// binds: adding thirteen non-JSON responses to the direct count moved the total and not
+/// the number broken.
 ///
 /// A **floor** rather than an equality, for `go-target.sh`'s reason: the proxy's `windd`
 /// rewrite only matches an integer-formatted value, so the exact count varies with live
@@ -121,14 +126,14 @@ const MIN_MANGLED_BROKEN: usize = 20;
 /// The same floor, over the `frozen` class alone.
 ///
 /// **Measured at 20** on the same run: every one of the 23 broken responses bar three
-/// `/almanac` and `/api/stations` bodies is a frozen one. Fifteen leaves five of slack, the
-/// same proportion the total floor carries.
+/// `/almanac` and `/api/stations` bodies is a frozen one. Fifteen leaves five of slack.
 ///
-/// This exists because the total floor stops binding on its own. Six coupled fixtures pass
-/// directly today, so a total of 20 cannot be reached without the frozen ones -- but
-/// `implementation-plan.md` **M4-3** makes all 19 coupled pass, and 19 + 1 would then clear
-/// it while the control said nothing about the five endpoints `D-68` freezes. A floor that
-/// only holds until the next work item is not a floor.
+/// This exists because the total floor stops binding on its own, and **M4-3 is the item that
+/// made that real rather than predicted**: all 19 `coupled` fixtures now pass directly, so
+/// 19 + 1 clears a total floor of 20 with the control saying nothing about the five
+/// endpoints `D-68` freezes. Measured on the run that landed M4-3: 23 broken in total and
+/// **20 of the 42 frozen**, so the frozen floor is what is actually binding, with five of
+/// slack. A floor that only holds until the next work item is not a floor.
 const MIN_FROZEN_MANGLED_BROKEN: usize = 15;
 
 /// The deviation this target is known to differ by on purpose, and **which fixtures may
@@ -231,30 +236,27 @@ const RETIRED: [&str; 9] = [
 
 /// The fixtures whose subject no landed work item implements, and who owns each.
 ///
-/// **Coupled-class only.** Every one of these is a website page or an embedded asset, which
-/// is `mw-web` and `implementation-plan.md` **M4-3** -- the item that ports the three
-/// templates to `askama` with a `GoHtmlEscaper`, embeds the assets with a hard-coded mime
-/// table, and whose own done-criterion is a byte diff against these recorded bodies.
+/// **Empty, and that is implementation-plan.md M4-3's visible done-criterion on this gate.**
+/// It held thirteen entries -- the six HTML pages and the seven embedded assets, every one
+/// of them `mw-web`'s -- excused because no landed item served them. M4-3 ported the three
+/// templates to `askama` with a `GoHtmlEscaper`, embedded the assets with a hard-coded mime
+/// table, and made the acceptance test a byte diff against those same recorded bodies; all
+/// nineteen `coupled` fixtures pass, which is Milestone 4's done-criterion, and the list
+/// emptying is how this gate says so.
+///
+/// **Coupled-class only, for whatever lands here next.** Every entry was a website page or
+/// an embedded asset. A `frozen` fixture must never appear here: that class is the five
+/// endpoints **D-68** freezes, the iOS client is deployed independently of this server, and
+/// an excuse there is a contract break with a note attached. [`judge_direct`] enforces the
+/// class separately, so this is a rule about what to *write* rather than one it has to check.
 ///
 /// **Declared here rather than read off the fixtures**, and checked in both directions. A
 /// fixture may carry a `pending` field saying the same thing, and that field alone would be
 /// a filter anybody could widen by editing one JSON file: the list that *excuses* a failure
 /// lives in the gate, next to the policy, and a disagreement between the two is exit 2.
-const PENDING: [(&str, &str); 13] = [
-    ("asset-favicon", "M4-3"),
-    ("asset-font", "M4-3"),
-    ("asset-not-found", "M4-3"),
-    ("asset-static-css", "M4-3"),
-    ("asset-static-js", "M4-3"),
-    ("asset-weather-app-js", "M4-3"),
-    ("asset-webmanifest", "M4-3"),
-    ("html-portal", "M4-3"),
-    ("html-portal-on-non-portal", "M4-3"),
-    ("html-portal-root", "M4-3"),
-    ("html-privacy", "M4-3"),
-    ("html-support", "M4-3"),
-    ("html-weather-station", "M4-3"),
-];
+/// With the list empty, the matching check is that **no** fixture carries a `pending` field
+/// -- which is why M4-3 removed thirteen of them in the same commit.
+const PENDING: [(&str, &str); 0] = [];
 
 /// The schema's seeded `listener.http_port`. The bootstrap start below binds this, because
 /// the row it is about to be given is the one that says otherwise.
@@ -359,7 +361,7 @@ pub fn main(args: &[String]) -> Result<ExitCode, String> {
     let direct = replay(&opts, &runner, &direct_url, "direct")?;
     println!("    {}", direct.summary_line());
 
-    match judge_direct(&direct, EXPECTED_FIXTURES) {
+    match judge_direct(&direct, EXPECTED_FIXTURES, &PENDING) {
         Direct::Inconclusive(why) => Ok(report(2, &why)),
         // A deliberately corrupted transport is not a contract verdict. Both halves of
         // CONFORMANCE_FORCE_MANGLE are exit 2 for the same reason: the knob exists to show
@@ -637,7 +639,7 @@ pub enum Direct {
 ///    **both** directions. An excused fixture nobody declared would mean this gate was
 ///    narrower than it says; a declared one that passed would mean the list is stale and the
 ///    gate is excusing something it no longer has to.
-pub fn judge_direct(s: &Summary, expected: usize) -> Direct {
+pub fn judge_direct(s: &Summary, expected: usize, pending: &[(&str, &str)]) -> Direct {
     if s.attempted() != expected {
         return Direct::Inconclusive(format!(
             "the runner attempted {} fixtures, expected {expected}.\n  \
@@ -795,7 +797,7 @@ pub fn judge_direct(s: &Summary, expected: usize) -> Direct {
     let unexcused: Vec<&str> = coupled
         .iter()
         .copied()
-        .filter(|name| !PENDING.iter().any(|(pending, _)| pending == name))
+        .filter(|name| !pending.iter().any(|(excused, _)| excused == name))
         .collect();
     if !unexcused.is_empty() {
         return Direct::NotConforming(format!(
@@ -811,8 +813,8 @@ pub fn judge_direct(s: &Summary, expected: usize) -> Direct {
 
     // Both directions, because a stale excuse is as bad as an undeclared one.
     let mut stale: Vec<&str> = Vec::new();
-    for (name, owner) in PENDING {
-        let verdict = s.fixtures.iter().find(|f| f.name == name);
+    for (name, owner) in pending {
+        let verdict = s.fixtures.iter().find(|f| f.name == *name);
         match verdict {
             None => {
                 return Direct::Inconclusive(format!(
@@ -822,7 +824,7 @@ pub fn judge_direct(s: &Summary, expected: usize) -> Direct {
                      xtask/src/conformance.rs is out of date."
                 ))
             }
-            Some(f) if f.passed => stale.push(name),
+            Some(f) if f.passed => stale.push(*name),
             Some(_) => {}
         }
     }
@@ -2241,7 +2243,9 @@ mod tests {
     /// fixtures failing, the nine retired ones failing, and nothing else.
     fn green() -> Summary {
         let failed: Vec<(&str, &str)> = PENDING.iter().map(|(n, _)| (*n, "coupled")).collect();
-        // 42 frozen, 19 coupled (13 of them pending), 9 retired = 70.
+        // 42 frozen, 19 coupled, 9 retired = 70. Since M4-3 emptied [`PENDING`] the second
+        // term is all nineteen, which is Milestone 4's done-criterion; the expression is
+        // left in terms of `PENDING` so that a future excuse needs no edit here.
         classified(42, 19 - PENDING.len(), 9, &failed)
     }
 
@@ -2524,7 +2528,7 @@ deviations applied: DEV-10
         // M4-2 narrows the frozen surface to five endpoints, and the obvious way to
         // implement that is to replay fewer fixtures. This is the assertion that makes such
         // a change arrive as a red gate instead of a quieter green one.
-        match judge_direct(&summary(0, 69, 0, 0), EXPECTED_FIXTURES) {
+        match judge_direct(&summary(0, 69, 0, 0), EXPECTED_FIXTURES, &PENDING) {
             Direct::Inconclusive(why) => {
                 assert!(why.contains("attempted 69 fixtures, expected 70"), "{why}");
             }
@@ -2550,7 +2554,7 @@ deviations applied: DEV-10
         s.fixtures[i].passed = false;
         s.passed -= 1;
         s.failed += 1;
-        match judge_direct(&s, EXPECTED_FIXTURES) {
+        match judge_direct(&s, EXPECTED_FIXTURES, &PENDING) {
             Direct::NotConforming(why) => {
                 assert!(why.contains("FROZEN-class"), "{why}");
                 assert!(why.contains("latest-full-complement"), "{why}");
@@ -2575,7 +2579,7 @@ deviations applied: DEV-10
         coupled.passed = false;
         s.passed -= 1;
         s.failed += 1;
-        match judge_direct(&s, EXPECTED_FIXTURES) {
+        match judge_direct(&s, EXPECTED_FIXTURES, &PENDING) {
             Direct::NotConforming(why) => {
                 assert!(why.contains("COUPLED-class"), "{why}");
                 assert!(why.contains("almanac-populated"), "{why}");
@@ -2593,44 +2597,78 @@ deviations applied: DEV-10
     /// so that the replay still attempts all 70.
     #[test]
     fn the_retired_class_fails_and_the_gate_is_still_green() {
-        assert_eq!(judge_direct(&green(), EXPECTED_FIXTURES), Direct::Conforms);
+        assert_eq!(
+            judge_direct(&green(), EXPECTED_FIXTURES, &PENDING),
+            Direct::Conforms
+        );
     }
 
     /// A fixture excused without a declaration would make this gate narrower than it says,
     /// and a declaration whose fixture has started passing would make it excuse a failure
     /// that cannot happen. Both are exit 2.
+    ///
+    /// **Over a synthetic list, because the real one is empty.** M4-3 emptied [`PENDING`],
+    /// and a test that read it would now assert nothing -- so [`judge_direct`] takes the
+    /// list as a parameter and the production call site passes `&PENDING`. That is the only
+    /// way this property stays checked for whatever is excused next; a both-directions check
+    /// that cannot fail is worth exactly as much as a gate that cannot.
     #[test]
     fn the_pending_list_is_checked_in_both_directions() {
-        // Stale: a declared fixture passed.
-        let mut s = green();
-        let stale = PENDING[0].0;
-        for f in &mut s.fixtures {
-            if f.name == stale {
-                f.passed = true;
-            }
-        }
-        s.passed += 1;
-        s.failed -= 1;
-        match judge_direct(&s, EXPECTED_FIXTURES) {
+        // `classified` names its coupled fixtures `coupled-<n>`, so the synthetic entry
+        // names one of those rather than a real fixture: what is under test is the
+        // bookkeeping, not which page is excused.
+        const SYNTHETIC: [(&str, &str); 1] = [("coupled-0", "M9-9")];
+
+        // Stale: a declared fixture passed, which is what M4-3 landing looked like.
+        let base = green();
+        assert!(
+            base.fixtures
+                .iter()
+                .any(|f| f.name == SYNTHETIC[0].0 && f.passed),
+            "the synthetic entry has to name a fixture that passes, or `stale` is vacuous"
+        );
+        match judge_direct(&base, EXPECTED_FIXTURES, &SYNTHETIC) {
             Direct::Inconclusive(why) => {
                 assert!(why.contains("declared pending and PASSED"), "{why}");
-                assert!(why.contains(stale), "{why}");
+                assert!(why.contains(SYNTHETIC[0].0), "{why}");
             }
             other => panic!("a stale excuse proves less than it claims; got {other:?}"),
         }
 
-        // Missing: a declared fixture the runner did not report, which is a rename.
+        // Missing: a declared fixture the runner did not report, which is a rename. The
+        // replacement **passes**, so that the unexcused-coupled check does not fire first
+        // and the message under test is the one about the declaration.
         let mut s = green();
-        s.fixtures.retain(|f| f.name != stale);
+        s.fixtures.retain(|f| f.name != SYNTHETIC[0].0);
         s.fixtures
-            .push(verdict("html-renamed", "coupled", false, false));
-        match judge_direct(&s, EXPECTED_FIXTURES) {
-            Direct::NotConforming(why) => {
-                // The rename is caught as an unexcused coupled failure first, which names
-                // the new name -- the more useful of the two messages.
-                assert!(why.contains("html-renamed"), "{why}");
+            .push(verdict("coupled-renamed", "coupled", true, false));
+        match judge_direct(&s, EXPECTED_FIXTURES, &SYNTHETIC) {
+            Direct::Inconclusive(why) => {
+                assert!(why.contains("did not report it at all"), "{why}");
+                assert!(why.contains(SYNTHETIC[0].0), "{why}");
             }
             other => panic!("got {other:?}"),
+        }
+
+        // And the excuse working: the declared fixture fails and the gate still passes,
+        // which is the state M4-3 inherited and removed.
+        let mut s = green();
+        for f in &mut s.fixtures {
+            if f.name == SYNTHETIC[0].0 {
+                f.passed = false;
+            }
+        }
+        s.passed -= 1;
+        s.failed += 1;
+        assert_eq!(
+            judge_direct(&s, EXPECTED_FIXTURES, &SYNTHETIC),
+            Direct::Conforms,
+            "a declared failure is excused, which is what the list is for"
+        );
+        // The same failure with the real, empty list is a contract break.
+        match judge_direct(&s, EXPECTED_FIXTURES, &PENDING) {
+            Direct::NotConforming(why) => assert!(why.contains("COUPLED-class"), "{why}"),
+            other => panic!("nothing excuses it any more; got {other:?}"),
         }
     }
 
@@ -2638,7 +2676,7 @@ deviations applied: DEV-10
     /// as unclassified would excuse every coupled-class failure.
     #[test]
     fn a_report_without_class_tags_reaches_no_verdict() {
-        match judge_direct(&summary(70, 0, 0, 0), EXPECTED_FIXTURES) {
+        match judge_direct(&summary(70, 0, 0, 0), EXPECTED_FIXTURES, &PENDING) {
             Direct::Inconclusive(why) => assert!(why.contains("class tag"), "{why}"),
             other => panic!("got {other:?}"),
         }
@@ -2649,7 +2687,7 @@ deviations applied: DEV-10
         // The same 70 failures as the case above, for a completely different reason. If
         // these two were one verdict, "the daemon did not start" would read as "the
         // rewrite does not match the contract" for the whole of M3.
-        match judge_direct(&summary(0, 70, 0, 70), EXPECTED_FIXTURES) {
+        match judge_direct(&summary(0, 70, 0, 70), EXPECTED_FIXTURES, &PENDING) {
             Direct::Inconclusive(why) => assert!(why.contains("transport failures"), "{why}"),
             other => panic!("transport failures prove nothing; got {other:?}"),
         }
@@ -2659,7 +2697,10 @@ deviations applied: DEV-10
     fn a_clean_replay_does_not_pass_on_its_own() {
         // W1 Decision 10: a green conformance run is only accepted alongside a passing
         // negative control, so the clean case is a question rather than an answer.
-        assert_eq!(judge_direct(&green(), EXPECTED_FIXTURES), Direct::Conforms);
+        assert_eq!(
+            judge_direct(&green(), EXPECTED_FIXTURES, &PENDING),
+            Direct::Conforms
+        );
     }
 
     /// A SKIP is "the fixture stores no body", not "the fixture did not run", so it is part
@@ -2679,7 +2720,7 @@ deviations applied: DEV-10
         }
         s.passed -= 2;
         s.skipped += 2;
-        match judge_direct(&s, EXPECTED_FIXTURES) {
+        match judge_direct(&s, EXPECTED_FIXTURES, &PENDING) {
             Direct::Inconclusive(why) => {
                 assert!(
                     why.contains("frozen-class fixture(s) were SKIPPED"),
@@ -2707,7 +2748,10 @@ deviations applied: DEV-10
         s.fixtures[i].skipped = true;
         s.failed -= 1;
         s.skipped += 1;
-        assert_eq!(judge_direct(&s, EXPECTED_FIXTURES), Direct::Conforms);
+        assert_eq!(
+            judge_direct(&s, EXPECTED_FIXTURES, &PENDING),
+            Direct::Conforms
+        );
     }
 
     /// The roster, in the direction that matters: a frozen fixture moved to `retired` stops
@@ -2717,7 +2761,7 @@ deviations applied: DEV-10
     fn a_frozen_fixture_relabelled_retired_is_refused() {
         let mut s = green();
         s.fixtures[0].class = "retired".into();
-        match judge_direct(&s, EXPECTED_FIXTURES) {
+        match judge_direct(&s, EXPECTED_FIXTURES, &PENDING) {
             Direct::Inconclusive(why) => {
                 assert!(why.contains("class this gate does not declare"), "{why}");
                 assert!(why.contains(FROZEN[0]), "it names which: {why}");
@@ -2732,7 +2776,7 @@ deviations applied: DEV-10
     fn a_duplicate_fixture_name_is_refused() {
         let mut s = green();
         s.fixtures[1].name = s.fixtures[0].name.clone();
-        match judge_direct(&s, EXPECTED_FIXTURES) {
+        match judge_direct(&s, EXPECTED_FIXTURES, &PENDING) {
             Direct::Inconclusive(why) => assert!(why.contains("was reported twice"), "{why}"),
             other => panic!("got {other:?}"),
         }
@@ -2750,7 +2794,7 @@ deviations applied: DEV-10
             .position(|f| f.name == "latest-full-complement")
             .expect("green() has it");
         s.fixtures[i].deviation = Some("DEV-10".into());
-        match judge_direct(&s, EXPECTED_FIXTURES) {
+        match judge_direct(&s, EXPECTED_FIXTURES, &PENDING) {
             Direct::Inconclusive(why) => {
                 assert!(why.contains("this gate does not declare it for"), "{why}");
                 assert!(why.contains("latest-full-complement"), "{why}");
@@ -2771,7 +2815,7 @@ deviations applied: DEV-10
             .position(|f| f.name == "stationinfo-about-text-omitted")
             .expect("green() has it");
         s.fixtures[i].deviation = None;
-        match judge_direct(&s, EXPECTED_FIXTURES) {
+        match judge_direct(&s, EXPECTED_FIXTURES, &PENDING) {
             Direct::Inconclusive(why) => {
                 assert!(why.contains("did not apply it to"), "{why}");
                 assert!(why.contains("stationinfo-about-text-omitted"), "{why}");
@@ -3290,7 +3334,7 @@ deviations applied: DEV-10
     fn a_replay_where_everything_skipped_is_not_a_pass() {
         // A SKIP means "the fixture stores no body". All 70 skipping means the fixtures
         // lost their recorded responses, which is not the binary conforming.
-        match judge_direct(&summary(0, 0, 70, 0), EXPECTED_FIXTURES) {
+        match judge_direct(&summary(0, 0, 70, 0), EXPECTED_FIXTURES, &PENDING) {
             Direct::Inconclusive(why) => assert!(why.contains("were SKIPPED"), "{why}"),
             other => panic!("70 skips is not a verdict; got {other:?}"),
         }

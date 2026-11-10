@@ -233,6 +233,34 @@ supervisor then has nothing to branch on. The binary is where the last answer re
 "print it and exit", which is the one place `anyhow` is right."""
 
 [[dep_rule]]
+id = "go-number-digits"
+dependency = "ryu"
+only = ["mw-api-legacy", "mw-web"]
+reason = """
+`[workspace.dependencies]`'s entry for `ryu` has always said "`mw_api_legacy::dto` is the only
+crate that may name this, because it is the only one that has to produce Go's bytes
+(ci/layers.toml)" -- and until implementation-plan.md M4-3 this file carried no such rule, so
+that sentence described a gate that did not exist. It does now, and it names **two** crates
+rather than one.
+
+Why two. `encoding/json` formats a float with `strconv.AppendFloat(b, f, fmt, -1, bits)`, which
+is ryu and breaks a shortest-representation tie round-half-to-even; Rust's `Display` is
+Grisu/Dragon and breaks the same tie round-half-up. Two surfaces have to reproduce Go's bytes
+and they are in the same layer, so neither may name the other: `mw-api-legacy` owns the frozen
+DTO's numbers, and `mw-web` owns the two coordinates in the rendered page's `radar-config`
+block, which `contract/fixtures/html-weather-station` records as ` 39.9 ` and ` -105.5 ` --
+padding included, because `html/template` escapes that block as JavaScript.
+
+What stops the two drifting is `crates/modernweather/tests/go_numbers.rs`, which sweeps f64 bit
+patterns and asserts `mw_api_legacy::dto::go_float64` and `mw_web::gojs::json_f64` agree. The
+binary is where that test can live: it is the one crate that may name both (§1.3 rule 1).
+
+Adding a third crate here needs the same treatment -- a reason, and an assertion against one of
+the existing two. "Three answers to what Go's digits are" is how a frozen number changes in one
+place and not another.
+"""
+
+[[dep_rule]]
 id = "one-logging-path"
 dependency = "log"
 only = []
@@ -431,25 +459,63 @@ contains exactly that, and passes only because it is one of the exempt paths."""
 
 [[source_rule]]
 id = "no-template-escape-opt-out"
-needles = ['escape = "none"', "escape = 'none'"]
+needles = [
+  'escape = "none"',
+  "escape = 'none'",
+  "|safe",
+  '|e("none")',
+  "|e('none')",
+  "filters::Safe",
+  "MaybeSafe",
+  "HtmlSafeOutput",
+]
 only = []
+only_paths = ["crates/mw-web/src/page.rs"]
 reason = """
 The `[templates]` check below reads the template files. This one reads Rust, because the
-strongest form of the same opt-out is not in a template at all: `#[template(escape = "none")]`
-on the derive turns escaping off for the WHOLE template, is one attribute rather than one
-expression, and is easier to write than `|safe`. A gate that only read the templates would
-have had nothing to say about it.
+strongest forms of the same opt-out are not in a template at all.
 
-Nobody may write it, so `only` is empty. W3 decision 81's reasoning is that `askama` was
-chosen for compile-time checking and escapes by default, which means an explicit opt-out is
-the only way such a template emits unescaped output -- and there is more than one place to
-write one."""
+Three kinds. `#[template(escape = "none")]` on the derive turns escaping off for the WHOLE
+template, is one attribute rather than one expression, and is easier to write than a filter.
+The filter spellings are here as well as in `[templates]` below, because
+`#[template(source = "...", ext = "html")]` puts a template in a Rust file, where the
+`[templates]` directory scan never reads it. The rest are WRAPPER TYPES -- `askama::filters::Safe<T>`, `MaybeSafe` and
+`HtmlSafeOutput<T>` -- which bypass escaping for a single field with nothing appearing in the
+template at all, so neither the `[templates]` needles nor a reading of the template would
+find one. M4-3's code review is why they are listed: its fix for one real defect is the only
+legitimate use of a bypass in this workspace, and a rule that did not name it would not have
+noticed the next one.
+
+`askama::filters::HtmlSafe` is deliberately NOT a needle, and that is the defect the review
+found rather than an omission: its bypass is implemented only for askama's own `Html`
+escaper, and `crates/mw-web/askama.toml` registers a custom one -- so an `impl HtmlSafe`
+does nothing, which is why `crates/mw-web/src/gojs.rs` no longer has one. Forbidding a
+no-op would be noise; `crates/mw-web/src/page.rs`'s own test is what keeps the real bypass
+to its two fields.
+
+`only` is empty and ONE path is exempt. `crates/mw-web/src/page.rs` wraps the rendered
+page's two coordinates, because Go writes `1e+21` for a magnitude outside `[1e-6, 1e21)` and
+`html/template`'s table turns `+` into `&#43;` -- which is not JSON inside the
+`<script type="application/json">` block the page carries, so `JSON.parse` throws and the
+radar panel never initialises. The value bypassing the escaper is a PRIVATE newtype whose
+only constructors take an `f64` and an `i64`, so no string can travel through it, and
+`crates/mw-web/src/page.rs`'s
+`the_only_escaping_bypasses_in_this_file_are_the_two_coordinates` reads the file and asserts
+that is still true. W3 decision 81's reasoning -- `askama` escapes by default, so an explicit
+opt-out is the only way such a template emits unescaped output -- is why the exemption is one
+file, one reason and one test rather than a convention.
+
+A path here must exist: `cargo xtask gate-layout` fails to LOAD if one does not, so an
+exemption that outlives the file it names cannot quietly widen the rule back out."""
 
 # ---------------------------------------------------------------------------------------
 
 [templates]
 dir = "crates/mw-web/templates"
 needles = ["|safe", 'escape("none")', "escape('none')", '|e("none")', "|e('none')"]
+escaper_config = "crates/mw-web/askama.toml"
+escaper_path = "crate::GoHtmlEscaper"
+escaper_extensions = ["html", "htm"]
 reason = """
 W3 decision 81. `askama` is chosen because it is compile-time checked, so a missing field is
 a build error rather than a request-time one -- and escaping is on by default, so the only
@@ -460,9 +526,21 @@ which is askama's documented alias for the `escape` filter. The fifth lives in R
 than in a template and is handled by `no-template-escape-opt-out` above. Whitespace is
 ignored, so `{{ x | safe }}` is caught as well as `{{ x|safe }}`.
 
-Not covered, and worth knowing: an `askama.toml` that reassigns the `html` escaper would turn
-escaping off globally without any of these appearing anywhere. There is no such file, and the
-day one arrives it needs a rule of its own."""
+**The `askama.toml` hole is now covered too.** An earlier version of this note said: "an
+`askama.toml` that reassigns the `html` escaper would turn escaping off globally without any
+of these appearing anywhere. There is no such file, and the day one arrives it needs a rule
+of its own." The day arrived with implementation-plan.md M4-3: the byte diff against W1's
+recorded bodies is achievable only with Go's spellings -- `html/template` writes `&#34;` and
+`&#39;` where askama's own `Html` escaper writes `&quot;` and `&#x27;` -- so
+`crates/mw-web/askama.toml` registers `mw_web::GoHtmlEscaper`, and `escaper_config`,
+`escaper_path` and `escaper_extensions` above are the rule.
+
+Three ways to break it, all checked: a different `path` (`askama::filters::Empty` writes its
+input unchanged), a missing extension, and a **second** `[[escaper]]` entry -- askama takes
+the first match, so an entry added above the real one silently wins. A missing or unparseable
+file is a violation rather than a skip, for the same reason a stale `only_paths` entry is a
+load failure: "the gate stopped applying because the file was deleted" is the failure mode
+this whole file is arranged against."""
 
 [generated]
 dir = "generated"

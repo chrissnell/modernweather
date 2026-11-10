@@ -15,11 +15,39 @@ workspace = true
 # Workspace crates, by layer (ci/layers.toml).
 mw-component.workspace = true
 mw-types.workspace = true
+# §7.6: this crate depends on `mw-http` for `RouteTable`. A lower layer, so a permitted
+# edge; declared with a reason because a surface crate naming the listener is the kind of
+# edge a reader should find justified rather than assumed.
+mw-http.workspace = true
 
 axum.workspace = true
+# Compile-time checked templates, with `GoHtmlEscaper` registered through `askama.toml`.
 askama.workspace = true
-rust-embed.workspace = true
+# The asset tree, embedded. `debug-embed` is on so that a debug build does not read the
+# source tree at runtime -- `crates/mw-web/src/assets.rs` has the whole of that argument.
+# `mime-guess` is deliberately NOT enabled: D-76 makes the mime table a hard-coded const.
+rust-embed = { workspace = true, features = ["debug-embed"] }
+# The per-website rendered page: one atomic load per request, no lock on the read path
+# (**D-28**).
+arc-swap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# **Go's float digits**, for the `radar-config` block's two coordinates. `encoding/json`
+# formats a float with `strconv.AppendFloat(b, f, fmt, -1, 64)`, which is ryu and breaks a
+# shortest-representation tie round-half-to-even where Rust's `Display` breaks it
+# round-half-up -- so a byte diff against a recorded page needs ryu's digits and not
+# `Display`'s. `mw-api-legacy` has the same need for the frozen surface and the two crates
+# are in the same layer, so neither may name the other; `ci/layers.toml`'s `go-number-digits`
+# rule names both and `crates/modernweather/tests/go_numbers.rs` asserts they agree.
+ryu.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# `#[tokio::test]` for the handler tests, which drive the real `axum` routers.
+tokio.workspace = true
+# `ServiceExt::oneshot`, which is how the route tests drive a router without binding a
+# socket -- `ci/layers.toml` reserves binding for `mw-http` and scans `tests/`.
+tower.workspace = true
+# `Cx::new` takes a `CancellationToken`.
+tokio-util.workspace = true

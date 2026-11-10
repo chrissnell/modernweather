@@ -27,13 +27,17 @@ the runner reads** — all 70 are still attempted, which is what stops it being 
 | Class | Count | What the gate does with it |
 |---|---|---|
 | `frozen` | 42 | every one must pass. A failure is a **contract break** — the iOS client is deployed independently of this server |
-| `coupled` | 19 | every one must pass **except** the thirteen whose subject M4-3 owns (the HTML pages and the asset trees), which are excused by a list declared in `xtask/src/conformance.rs` |
+| `coupled` | 19 | every one must pass. Thirteen were excused until **M4-3** by a list declared in `xtask/src/conformance.rs`; that list is now **empty**, which is Milestone 4's done-criterion on this gate |
 | `retired` | 9 | `/alerts`, `/api/remote-stations` and `format=msgpack`, which **D-69** does not carry forward. Reported on every run, never gating |
 
-So a green run today prints `48 passed, 22 failed`. The excuse list is checked in **both**
-directions: a fixture excused without a declaration and a declaration whose fixture has started
-passing are each exit 2, because the first would make the gate narrower than it says and the second
-would leave it excusing a failure that cannot happen.
+So a green run today prints `61 passed, 9 failed` — the nine `retired` fixtures, which never gate. It
+printed `48 passed, 22 failed` between M4-2 and M4-3, when thirteen `coupled` fixtures were excused.
+
+The excuse list is checked in **both** directions: a fixture excused without a declaration and a
+declaration whose fixture has started passing are each exit 2, because the first would make the gate
+narrower than it says and the second would leave it excusing a failure that cannot happen. With the
+list empty the matching check is that no fixture carries a `pending` field, and `judge_direct` takes
+the list as a parameter so that the both-directions property stays testable over a synthetic one.
 
 **The Rust target is replayed with `--deviation DEV-10`.** `/stationinfo` emits `about_text` and
 `weather_device` unconditionally, which is `docs/reconciliation.md` **O-5** answered by the owner as

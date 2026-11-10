@@ -27,6 +27,7 @@ mod dist;
 mod emulators;
 mod gates;
 mod gen;
+mod gogolden;
 mod layout;
 mod legacy;
 mod migrate;
@@ -77,6 +78,11 @@ fn main() -> ExitCode {
         // The `db-tests` gate's command, and the same split as `gate-layout`:
         // `cargo xtask gate db-tests` consults ci/gates.toml and then runs this.
         "db-tests" => dbtests::main(&owned),
+        // Not a gate: re-deriving a capture of Go's behaviour needs a Go toolchain in a
+        // job whose point is that there is none, and a drift check would turn a Go point
+        // release into a red PR on a commit that touched nothing. `gogolden`'s module
+        // documentation has the whole argument.
+        "go-golden" => gogolden::main(&owned),
         "coverage" => coverage::main(&owned).map(|()| ExitCode::SUCCESS),
         "dist" => dist::main(&owned).map(|()| ExitCode::SUCCESS),
         "targets" => dist::targets(&owned).map(|()| ExitCode::SUCCESS),
@@ -171,6 +177,10 @@ fn usage() {
          \x20 gate-layout        check the crate boundaries declared in ci/layers.toml:\n\
          \x20                    the layer order, every crate's forbidden list, and the\n\
          \x20                    source rules. Exit 1 on a violation.\n\
+         \x20 go-golden          regenerate the two tables that are captures of Go's own\n\
+         \x20                    behaviour, from ci/go-golden/. Needs a Go toolchain. NOT a\n\
+         \x20                    gate: the tables are reviewed artefacts, so a\n\
+         \x20                    regeneration is a diff somebody reads.\n\
          \x20 coverage --check   compare line coverage against ci/coverage-floor.txt\n\
          \x20          --bump    raise the floor to the measured value\n\
          \x20 dist --target <t>  build and package one release artefact\n\

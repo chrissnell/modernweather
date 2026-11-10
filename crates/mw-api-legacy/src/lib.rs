@@ -36,13 +36,14 @@
 //!
 //! # Where the routes are mounted, and why that is not here either
 //!
-//! The router, host routing and `RouteTable` mounting are M4-3's (`mw-http`'s module
-//! documentation says so). What this crate exposes is [`routes`] -- an `axum::Router` over
-//! a [`RouteState`] -- and [`manifest`], the pure declaration **D-51** puts on the
-//! component's `Provision` so that a duplicate path is a `PlanError` naming both owners.
-//! The binary builds the router once and hands it to the one listener; the component
-//! installs its handler set into the state while it runs and clears it on the way out, so
-//! "the table is mounted" and "the component is `Running`" are the same fact.
+//! The router, host routing and `RouteTable` mounting are `mw-http`'s, which M4-3 built.
+//! What this crate exposes is [`route_table`] -- the `axum::Router` over a [`RouteState`]
+//! **and** [`manifest`], the pure declaration **D-51** puts on the component's `Provision`,
+//! as one `mw_http::RouteTable` so that the paths `plan()` validated and the paths the
+//! router answers cannot be assembled from different configurations. The binary builds it
+//! once and hands it to the one listener; the component installs its handler set into the
+//! state while it runs and clears it on the way out, so "the table is mounted" and "the
+//! component is `Running`" are the same fact.
 //!
 //! **D-48 is why that matters and why it cannot be violated here.** `api:legacy`'s only
 //! hard need is `LatestSnapshot`, whose provider has no hard need of its own, so the
@@ -90,4 +91,4 @@ pub use dto::zf;
 pub use render::Renderer;
 pub use span::SpanCache;
 
-pub use component::{manifest, routes};
+pub use component::{manifest, route_table, routes};
