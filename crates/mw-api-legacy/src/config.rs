@@ -283,22 +283,13 @@ impl Directory {
 
 /// `Host`, normalised the three ways §6.3 specifies.
 ///
-/// An IPv6 literal keeps its brackets and loses its port: `[::1]:8080` is `[::1]`, which is
-/// what the stored hostname would have to be to match it. Splitting on the **last** colon
-/// is what makes that work, and splitting on the first would truncate the address.
+/// **One implementation, and it is `mw-http`'s.** §6.3 puts host normalisation in the
+/// listener, and this crate used to carry a second copy -- which is two answers to "does
+/// `EXAMPLE.COM.` match `example.com`", on a lookup whose whole purpose is deciding whose
+/// weather data a request gets. `mw-http` is a lower layer, so naming it is a permitted
+/// edge; M4-3 removed the copy.
 fn normalise_host(host: &str) -> String {
-    let mut h = host.trim();
-    // The port, if there is one. A bracketed literal's port is after the `]`.
-    if let Some(close) = h.rfind(']') {
-        h = &h[..=close];
-    } else if let Some(colon) = h.rfind(':') {
-        // Only when what follows is a port rather than part of a bare IPv6 literal, which
-        // is not legal in a `Host` header anyway.
-        if h[colon + 1..].chars().all(|c| c.is_ascii_digit()) {
-            h = &h[..colon];
-        }
-    }
-    h.trim_end_matches('.').to_ascii_lowercase()
+    mw_http::normalise(host)
 }
 
 #[cfg(test)]
@@ -342,10 +333,10 @@ mod tests {
         assert_eq!(normalise_host("EXAMPLE.COM.:443"), "example.com");
         assert_eq!(normalise_host("[::1]:8080"), "[::1]");
         assert_eq!(normalise_host("[::1]"), "[::1]");
-        // Two trailing dots are not "a single trailing dot", and `trim_end_matches` takes
-        // both -- which is more permissive than §6.3 says and cannot match any stored
-        // hostname either way, because the schema forbids a stored trailing dot.
-        assert_eq!(normalise_host("example.com.."), "example.com");
+        // §6.3 says "a single trailing dot", and `mw_http::normalise` takes exactly one.
+        // Two is not a hostname and cannot match a stored one either way, because the
+        // schema forbids a stored trailing dot.
+        assert_eq!(normalise_host("example.com.."), "example.com.");
     }
 
     /// **DEV-2**: mixed case matches rather than falling through to somebody else's

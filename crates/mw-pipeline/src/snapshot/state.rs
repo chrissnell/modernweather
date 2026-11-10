@@ -1,7 +1,7 @@
 //! [`SnapshotState`] — the published table, and the [`LatestSnapshot`] over it.
 //!
 //! **The hot path is three pointer reads.** `/latest` resolves a website from an
-//! `ArcSwap<HostTable>` (M4-3's), resolves a station from the configuration, loads this
+//! `ArcSwap<HostTable>` (`mw_http::host`, M4-3), resolves a station from the configuration, loads this
 //! table from an [`ArcSwap`], looks one key up and clones an `Arc<[u8]>`. Nothing on that
 //! path can wait, and that asymmetry is the whole point of **D-28**: the readers are
 //! request handlers and the writer is a component tick, so a `RwLock` would make a request

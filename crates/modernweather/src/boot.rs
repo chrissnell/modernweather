@@ -9,24 +9,32 @@
 //! 4b. open the spool                              <- the fan-out, the second root (D-30a)
 //! 4c. registry + rollup + snapshot table           <- `config:sqlite` has no work item
 //! 4d. ingress                                     <- needs 4b's spool
+//! 4e. route tables + host table + certs + mount  <- NOT in §3.1; see below
 //! 5. specs = plan(&cfg, registrars)               pure; every structural error caught here
 //! 6. supervisor = Supervisor::new(pool.schedule_store(), log_control, ...)
-//! 6a. bind the listener                           <- NOT in §3.1; see below
 //! 7. supervisor.run(specs).await                  never returns until shutdown completes
 //! ```
 //!
-//! **Step 6a is a deviation from two sections and it is temporary.** §3.1 says `main`
-//! touches exactly three resources outside a component, and §6.1 gives the socket to an
-//! `http:listener` *component*. This binary binds one directly, because M2-4's
-//! done-criteria require `/metrics` to be served, §5.10 puts it on an additive route on
-//! the one listener, and §1.4 allows only `mw-http` to bind -- so the socket exists before
-//! the component that should own it. Two consequences, neither of which bites yet: `main`
-//! owns a fourth root resource, and the listener's teardown runs concurrently with the
-//! supervisor's reverse-topological component stops rather than being ranked by them, so
-//! §3.6's "a consumer must never observe a revoked capability" does not cover it. It is
-//! safe today because the only route closes over a renderer rather than over a capability
-//! handle. implementation-plan.md M4-3 builds `http:listener` and removes this step along
-//! with `mw_http::bind`, the `served` future and the `join!` arm.
+//! **Step 6a is gone, and step 4e replaced it.** M2-4 bound one socket directly here,
+//! because `/metrics` had to be served before any component existed, and recorded two
+//! consequences: `main` owned a fourth root resource, and the listener's teardown ran
+//! concurrently with the supervisor's reverse-topological component stops rather than being
+//! ranked by them -- so §3.6's "a consumer must never observe a revoked capability" did not
+//! cover it. M4-3 made `http:listener` the component §6.1 describes, which closes the
+//! second: the socket now closes *after* the components whose tables it serves have
+//! stopped.
+//!
+//! The first is not closed, and is now explicit rather than temporary. [`attach_listener`]
+//! builds the **mounted router** as a root resource, because the route tables come from
+//! `mw-api-legacy` and `mw-web` and `mw-http` may name neither (`ci/layers.toml`) -- so the
+//! binary is where they meet (§1.3 rule 1), exactly as it is for the spool, the station
+//! registry, the window rollup, the snapshot table and the frozen surface's state slot.
+//! §3.1 names three root resources and there are seven; what makes that safe is that every
+//! one of them is handed to its component through a registrar trait rather than reached for.
+//!
+//! One behaviour change comes with it, and `mw_http::component`'s module documentation has
+//! the whole of it: **a port another process holds is now a `Failed -> Backoff` loop rather
+//! than a non-zero exit.**
 //!
 //! Step 3 before step 5 is forced and worth justifying: `plan()` is a pure function *of
 //! configuration*, and configuration lives in SQLite, so something has to read SQLite
@@ -66,7 +74,9 @@ use crate::spool;
 /// One line per component crate, which is §1.3 rule 2: adding a component crate adds a line
 /// here and edits nothing else -- the shape `managers/controller.go` could not take, down to
 /// its `if con.Type == "management" { continue }`.
-const REGISTRARS: &[&dyn Registrar<Config>] = &[&Stations, &Database, &Rollup, &Snapshot, &Legacy];
+const REGISTRARS: &[&dyn Registrar<Config>] = &[
+    &Stations, &Database, &Rollup, &Snapshot, &Legacy, &Web, &Listener,
+];
 
 /// `mw-station`'s registrar.
 ///
@@ -242,6 +252,55 @@ impl Registrar<Config> for Legacy {
         out: &mut Vec<mw_component::ComponentSpec>,
     ) -> Result<(), RegisterError> {
         mw_api_legacy::register(cfg, out)
+            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
+    }
+}
+
+/// `web:static` and one `web:site:<id>` per website -- the public website.
+///
+/// An adapter here for `Legacy`'s reason. `mw_web::register` makes every decision, and the
+/// one it makes is the same one `api:legacy`'s does: a node with no `LatestSnapshot`
+/// provider gets no website component, because §2.6 declares that need `Hard` and `plan()`
+/// refuses a configuration whose hard need nobody provides. The asset tree, `/privacy` and
+/// `/support` are planned unconditionally -- they depend on nothing.
+#[derive(Debug)]
+struct Web;
+
+impl Registrar<Config> for Web {
+    fn name(&self) -> &'static str {
+        "mw-web (the public website)"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        mw_web::register(cfg, out)
+            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
+    }
+}
+
+/// `http:listener` -- the one listener of §6.1.
+///
+/// **Unconditional**, and the last registrar in the list rather than the first: the order
+/// in `REGISTRARS` has no effect on the plan (`plan()` sorts by the hard-edge digraph), but
+/// reading the list top to bottom should read as the dependency direction, and the listener
+/// is what everything above it is served through.
+#[derive(Debug)]
+struct Listener;
+
+impl Registrar<Config> for Listener {
+    fn name(&self) -> &'static str {
+        "mw-http (the one listener)"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        mw_http::register(cfg, out)
             .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
     }
 }
@@ -447,6 +506,179 @@ fn attach_ingress(cfg: &mut Config, fanout: &spool::Fanout) -> anyhow::Result<()
     Ok(())
 }
 
+/// Step 4e: build every route table, the host table, the certificate store and the one
+/// router, and hand them to the configuration.
+///
+/// **Before `plan()`**, because two registrars plan from them. The ordering is forced for
+/// `mw_api_legacy::RouteState`'s reason one level up: the tables come from crates
+/// `mw-http` may not name, so the binary assembles them (§1.3 rule 1).
+///
+/// `render` is the metrics payload renderer -- `mw-obs`'s handle in the daemon, a stub in a
+/// plan test. Taken as a closure rather than as `&mw_obs::Obs` because installing a
+/// subscriber is a process-global act only one test per binary could perform, and what this
+/// function needs from it is one `String`.
+///
+/// # Which tables are mounted, and the condition each one carries
+///
+/// | Table | Condition |
+/// |---|---|
+/// | `/metrics` | none -- §5.10 puts it on the one listener, so every node has it |
+/// | the frozen REST surface | the same predicate `mw_api_legacy::register` plans on |
+/// | the asset tree, `/privacy`, `/support` | none |
+/// | one per website | the same predicate `mw_web::register` plans on |
+///
+/// The two conditional ones ask the **registrar's own** predicate rather than a second
+/// reading of the configuration, and [`assert_route_tables_match_the_plan`] checks after
+/// `plan()` that the answers agreed. M4-2's code review found the other direction of that
+/// mismatch -- a table mounted where no component was planned, answering a permanent
+/// body-less `503` on five frozen paths -- so the pairing is asserted rather than arranged.
+fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<()> {
+    use mw_api_legacy::LegacyConfig as _;
+
+    // Parsed here rather than inside the registrar: a bad `listener.listen_addr` is a
+    // named startup failure, and `mw_http::ListenerConfig::listen` says so where it
+    // `expect`s.
+    let listen = cfg
+        .listen()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("`listener.listen_addr` is not an address to listen on")?;
+
+    // One slot per website, in id order. `mw_web::register` refuses a count that does not
+    // match, which is what stops one website's page being mounted under another's hostname.
+    let states: Vec<Arc<mw_web::SiteState>> = cfg
+        .web_sites
+        .iter()
+        .map(|_| Arc::new(mw_web::SiteState::new()))
+        .collect();
+    cfg.set_web_states(states);
+
+    let snapshot = cfg.snapshot.clone();
+    let mut tables = vec![mw_http::metrics_table(mw_http::MetricsRoute::new(
+        Arc::new(move || {
+            // **M4-1's constraint 2, on the scrape path.** `mw_snapshot_age_seconds` and
+            // `mw_snapshot_degraded` are written only when a snapshot is folded, so a
+            // station that stops reporting freezes its gauge instead of crossing 600 --
+            // the one transition worth alerting on. The sweep's natural home is the scrape
+            // path, and this is it: every key's age is recomputed from the published table
+            // immediately before the payload is rendered.
+            if let Some(state) = &snapshot {
+                mw_pipeline::metrics::sweep_snapshot_ages(state, chrono::Utc::now());
+            }
+            render()
+        }),
+        mw_obs::CONTENT_TYPE,
+    ))];
+    if cfg.has_latest_snapshot() {
+        if let Some(state) = cfg.legacy_routes.as_ref().map(Arc::clone) {
+            tables.push(mw_api_legacy::route_table(state)?);
+        }
+    }
+    tables.extend(mw_web::tables(cfg).context("building the website's route tables")?);
+
+    // §6.3's host table, in configuration order -- which is id order, because
+    // `config_db::websites` says `ORDER BY id`. The default is `controller.go:186`
+    // reproduced: the first row, unless one has an empty hostname.
+    let hosts = mw_http::HostTable::new(
+        cfg.websites
+            .iter()
+            .map(|w| (w.hostname.clone(), mw_types::WebsiteId::new(w.id))),
+    );
+    let hostnames = hosts.len();
+
+    // §6.4's certificate store, loaded only where there is a TLS port to serve. A
+    // configured-but-unreadable path is a startup failure naming the path, never a silent
+    // substitution of some other site's certificate.
+    let paths = cfg.cert_paths();
+    let sni = if listen.tls() {
+        let fallback = cfg
+            .websites
+            .iter()
+            .find(|w| w.hostname.is_empty())
+            .or_else(|| cfg.websites.first())
+            .map(|w| w.hostname.clone());
+        let store = mw_http::CertStore::load(&paths, fallback.as_deref())
+            .context("loading the configured TLS certificates")?;
+        info!(
+            certificates = store.len(),
+            fallback = store.has_default(),
+            "the SNI resolver is loaded"
+        );
+        Some(Arc::new(mw_http::SniResolver::new(store)))
+    } else {
+        if !paths.is_empty() {
+            // A certificate with nowhere to be served from is the kind of half-finished
+            // configuration an operator should hear about once, at startup, rather than
+            // discover when a browser cannot connect.
+            warn!(
+                certificates = paths.len(),
+                "websites have TLS certificates configured and `listener.https_port` is \
+                 not set, so nothing serves them; set the port or clear the paths"
+            );
+        }
+        None
+    };
+
+    let (mount, report) =
+        mw_http::Mount::new(tables, hosts).context("mounting the route tables")?;
+    info!(
+        shared = report.shared,
+        sites = report.sites,
+        paths = report.paths,
+        catch_all = report.catch_all.as_ref().map(|c| c.as_str()),
+        hostnames,
+        main = %listen.main(),
+        grpc = %listen.grpc(),
+        "route tables mounted"
+    );
+    cfg.set_listener(Arc::new(mount), sni);
+    Ok(())
+}
+
+/// Both directions of the pairing between what is mounted and what is planned.
+///
+/// A mounted table whose owner was not planned answers a `503` for ever on paths nobody
+/// will ever fill; a planned `HttpRoutes` provider with no mounted table reaches `Running`
+/// while its paths 404. Neither is a state worth representing, and neither is visible
+/// without this check: the mount happens before `plan()`, so the two are derived from the
+/// same configuration by two functions that have to agree.
+fn assert_route_tables_match_the_plan(
+    cfg: &Config,
+    plan: &mw_supervisor::plan::Plan,
+) -> anyhow::Result<()> {
+    use mw_component::Capability;
+    use std::collections::BTreeSet;
+
+    let planned: BTreeSet<String> = plan
+        .specs()
+        .iter()
+        .filter(|spec| {
+            spec.provides
+                .iter()
+                .any(|p| p.capability == Capability::HttpRoutes)
+        })
+        .map(|spec| spec.id.as_str().to_string())
+        .collect();
+    // `http:listener` owns `/metrics` and provides nothing: §5.10 makes that route the
+    // listener's own rather than a component's, so it is mounted and not planned, by
+    // design. Every other owner must be in both sets.
+    let mounted: BTreeSet<String> = cfg
+        .mount
+        .as_ref()
+        .context("the route tables have not been mounted")?
+        .owners()
+        .into_iter()
+        .filter(|owner| owner != mw_http::ID)
+        .collect();
+    anyhow::ensure!(
+        planned == mounted,
+        "the mounted route tables and the planned route providers disagree: \
+         mounted-not-planned {:?}, planned-not-mounted {:?}",
+        mounted.difference(&planned).collect::<Vec<_>>(),
+        planned.difference(&mounted).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
 /// How long the **D-62** probe may take before the boot sequence gives up on it.
 ///
 /// Chosen against `TimeoutStartSec=60` in W8's unit rather than against a round number:
@@ -606,6 +838,15 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
         attach_ingress(&mut cfg, fanout).context("assembling the reading pipeline")?;
     }
 
+    // Step 4e: the route tables, the host table, the certificate store and the one
+    // router. **Before `plan()`**, because `http:listener` and every `web:site:<id>` plan
+    // from them -- the same ordering the snapshot table and the frozen route state already
+    // have, and for the same reason (§1.3 rule 1: the binary is where a consumer and a
+    // provider meet).
+    let metrics = obs.metrics();
+    attach_listener(&mut cfg, Arc::new(move || metrics.render()))
+        .context("mounting the route tables")?;
+
     // Step 5. Pure: every structural error in W2a Decision 2's list is caught here,
     // before anything is constructed.
     let log: Arc<dyn mw_component::LogControl> = Arc::new(ObsLogControl::new(obs.log()));
@@ -635,68 +876,17 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     // has a second consumer for either.
     let readiness = supervisor.readiness();
 
-    // `/metrics` on the one listener (§5.10). Bound before the supervisor runs, so that a
-    // port already in use is a startup failure rather than a daemon that reports itself
-    // ready and serves nothing.
-    let metrics = obs.metrics();
-    // The frozen REST surface, merged into the one listener. The router is built over the
-    // state slot `attach_registry` created; the slot is empty until `api:legacy` reaches
-    // `Running`, at which point every frozen path answers its contract response -- see
-    // that component's own note on why an empty slot is not a state D-48 is about.
-    //
-    // **Mounted on the PLAN, not on the slot.** `attach_registry` sets `legacy_routes`
-    // unconditionally, so merging on its presence mounted the table on nodes where
-    // `register` deliberately planned no component -- and then nothing ever filled the
-    // slot, so `unmounted()` answered a permanent body-less `503` on all five frozen
-    // paths. That is the response **D-48** declares unobservable, and
-    // `mw_pipeline::snapshot`'s own documentation says such a node gets `mw-http`'s bare
-    // `404`. It did not; the fall-through worked and the frozen paths never reached it.
-    //
-    // The shape is ordinary: websites and stations configured, no spool and no weather
-    // database yet -- a staged rollout, or a serve-only node before its database URL is
-    // written.
-    let legacy = plan
-        .ids()
-        .any(|id| id.as_str() == mw_api_legacy::ID)
-        .then(|| {
-            cfg.legacy_routes
-                .as_ref()
-                .map(|state| mw_api_legacy::routes(Arc::clone(state)))
-        })
-        .flatten();
-    let bound = mw_http::bind(
-        cfg.listen_addr()?,
-        mw_http::MetricsRoute::new(Arc::new(move || metrics.render()), mw_obs::CONTENT_TYPE),
-        legacy,
-    )
-    .await
-    .context("binding the listener")?;
-    info!(addr = %bound.local_addr(), "serving /metrics and the frozen REST surface");
+    // **Every mounted route table has a planned owner, and every planned route provider
+    // has a mounted table.** The mount happens before `plan()` now, so the pairing that
+    // M4-2's review found broken in the other direction -- a table mounted on a node where
+    // `register` planned no component, which then answered a permanent body-less `503` on
+    // five frozen paths -- has to be asserted rather than arranged. Both directions, because
+    // each one is a different defect: a table with no owner is that `503`, and an owner with
+    // no table is a component that reaches `Running` while its paths 404.
+    assert_route_tables_match_the_plan(&cfg, &plan)?;
 
-    // Step 7. Four concurrent jobs, one task: the supervisor's own tasks are spawned by
-    // `mw_supervisor::task`, which is the only module in the workspace allowed to spawn
-    // (§3.2), so this is a `join!` rather than four handles to leak.
-    let served = {
-        let shutdown = shutdown.clone();
-        async move {
-            let outcome = bound.serve(shutdown.clone().cancelled_owned()).await;
-            if outcome.is_err() {
-                // A daemon that is not serving is not working, so the accept loop dying
-                // takes the process with it rather than leaving half of one running.
-                // `Restart=always` in W8's unit is what makes that the right answer: the
-                // supervisor still stops every component in order on the way out.
-                //
-                // Not logged here. The error is returned, and `main` logs the chain once
-                // for whatever ended the process -- two lines for one event would undo
-                // the care `main` takes to use whichever channel exists and not both.
-                shutdown.cancel();
-            }
-            outcome
-        }
-    };
-    let (report, serving, (), ()) = tokio::join!(
+    let (report, (), ()) = tokio::join!(
         supervisor.run(plan),
-        served,
         notify::run(readiness, &obs, &shutdown),
         signals.wait(&shutdown),
     );
@@ -730,9 +920,6 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
         clock_steps = report.clock_steps,
         "shutdown complete"
     );
-    // Reported after the shutdown rather than instead of it: every component is stopped
-    // by here, and what is left to decide is the exit code.
-    serving.context("serving the listener")?;
     Ok(report)
 }
 
@@ -805,6 +992,10 @@ mod tests {
             snapshot: None,
             snapshot_windows: None,
             station_zones: Vec::new(),
+            web_sites: Vec::new(),
+            web_states: None,
+            mount: None,
+            sni: None,
             listener: Listener {
                 listen_addr: "127.0.0.1".into(),
                 http_port: 8080,
@@ -1038,6 +1229,9 @@ mod tests {
         let fanout = spool::open(&node).expect("the spool opens");
         attach_registry(&mut cfg).expect("the registry publishes");
         attach_ingress(&mut cfg, &fanout).expect("the pipeline assembles");
+        // Step 4e, which `plan()` needs: `http:listener` and every `web:site:<id>` plan
+        // from the mounted router and the per-website slots.
+        attach_listener(&mut cfg, Arc::new(String::new)).expect("the route tables mount");
         (pool, cfg, fanout)
     }
 
@@ -1095,12 +1289,18 @@ mod tests {
                 // no `website` row serves the contract's `503` from the handlers and not
                 // a `404` from a route that is not there (`mw_api_legacy::register`).
                 "api:legacy",
+                // The one listener, planned unconditionally: §5.10 puts `/metrics` on it
+                // and the schema seeds a `listener` row, so every node has one.
+                "http:listener",
                 // And the snapshot it reads, which needs a reading stream and not a
                 // database -- this node has a spool and no `weather_database` row, so
                 // `snapshot:warm` is absent and `snapshot:latest` is not.
                 "snapshot:latest",
                 "station:wll:suncrest:roof:rearm",
                 &format!("station:wll:udp:{port}")[..],
+                // The fixture's one `website` row, and the asset tree every node serves.
+                "web:site:1",
+                "web:static",
             ],
             "one listener for the endpoint, one re-arm for the unit (W2a D-44)"
         );
@@ -1309,10 +1509,15 @@ mod tests {
         );
         // And the surface that reads them, planned unconditionally.
         assert!(ids.contains(&"api:legacy"), "got {ids:?}");
-        // The listener, its re-arm (the fixture's station has a `transport_host`), the
-        // pool, the writer, the rollup, the rollover, the two snapshot components and
-        // `api:legacy`.
-        assert_eq!(ids.len(), 9, "got {ids:?}");
+        // The station's listener, its re-arm (the fixture's station has a
+        // `transport_host`), the pool, the writer, the rollup, the rollover, the two
+        // snapshot components, `api:legacy`, the **one** listener, the website and the
+        // asset tree.
+        assert_eq!(ids.len(), 12, "got {ids:?}");
+        assert!(
+            ids.contains(&"http:listener") && ids.contains(&"web:static"),
+            "both are planned unconditionally: got {ids:?}"
+        );
         assert!(
             ids.iter().any(|id| id.starts_with("station:wll:udp:")),
             "got {ids:?}"
@@ -1334,6 +1539,7 @@ mod tests {
         )));
         // No `ingress`, which is what "no spool" means to the registrar.
         assert!(cfg.ingress.is_none());
+        attach_listener(&mut cfg, Arc::new(String::new)).expect("the route tables mount");
 
         let roots = Roots {
             schedule: Arc::new(mw_supervisor::testing::MemoryScheduleStore::new()),
@@ -1352,8 +1558,17 @@ mod tests {
         // website and no station, so the `(website, station)` key set is empty and there
         // is nothing to fold into (`mw_pipeline::snapshot::register`). `api:legacy` goes
         // with them, because its hard `LatestSnapshot` would then be a need nobody
-        // provides and `plan()` refuses the whole configuration for one.
-        assert_eq!(ids, vec!["db:postgres"], "got {ids:?}");
+        // provides and `plan()` refuses the whole configuration for one -- and so does
+        // every `web:site:<id>`, which declares the same hard need (§2.6).
+        //
+        // What **is** planned is the one listener and the asset tree, neither of which
+        // needs anything: a node in this shape still serves `/metrics`, `/privacy` and
+        // `/support`, which is §6.3's own asymmetry.
+        assert_eq!(
+            ids,
+            vec!["db:postgres", "http:listener", "web:static"],
+            "got {ids:?}"
+        );
     }
 
     /// No weather database: neither component, and that is not an error (**D-44**).
@@ -1426,11 +1641,14 @@ mod tests {
             ids,
             vec![
                 "api:legacy",
+                "http:listener",
                 "snapshot:latest",
                 "station:wll:suncrest:barn:rearm",
                 "station:wll:suncrest:field",
                 "station:wll:suncrest:roof:rearm",
                 &format!("station:wll:udp:{port}")[..],
+                "web:site:1",
+                "web:static",
             ],
             "a second unit on one port is a row, not a second socket (W2a §4a.4)"
         );

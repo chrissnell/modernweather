@@ -1,71 +1,114 @@
 //! **The one listener.**
 //!
-//! `axum` + `tonic` on one socket, `RouteTable` mounting, host routing, the SNI resolver,
-//! ALPN, compression and CORS. The Go version has seven listener-owning sites and a single
-//! type that owns an HTTP server, an HTTPS server, a gRPC server, SNI, middleware,
-//! database queries and config reload; the direct structural answer is that **only this
-//! crate may bind a socket**, enforced by `cargo xtask gate layout`
+//! `axum` on N sockets, `RouteTable` mounting, host routing, the SNI resolver, ALPN,
+//! compression and the one 404. The Go version has seven listener-owning sites and a single
+//! type that owns an HTTP server, an HTTPS server, a gRPC server, SNI, middleware, database
+//! queries and config reload; the direct structural answer is that **only this crate may
+//! bind a socket**, enforced by `cargo xtask gate layout`
 //! (docs/service-architecture.md §1.4, §1.5).
 //!
 //! It mounts route tables; it does not know what is in them. So it may not depend on
 //! `mw-store`, `mw-pipeline`, `mw-api-legacy` or `mw-web`.
 //!
-//! # What exists so far
+//! # The shape, and which module owns which decision
 //!
-//! One listener, `/metrics`, and **one place to merge a route table into it**. The router
-//! proper -- host routing, `ArcSwap` rebuilds, N sockets, the SNI resolver -- is
-//! implementation-plan.md M4-3 and is not here.
+//! | Module | Decision |
+//! |---|---|
+//! | [`socket`] | N sockets from configuration, one router, one shutdown path (§6.1, **A-W3-4**, **D-92**) |
+//! | [`mount`] | the route tables merged into one router, with the host dispatch in front (§6.2) |
+//! | [`host`] | the three `Host` normalisation steps and the host table (§6.3, **DEV-2**) |
+//! | [`sni`] | the certificate store and the miss chain (§6.4, **DEV-6**) |
+//! | [`component`] | `http:listener`, which owns all of the above for the supervisor |
 //!
-//! [`bind`] takes an `Option<Router>` because M4-2 has a table to serve and no component to
-//! mount it from: `api:legacy`'s routes are built by the binary over a state slot the
-//! component fills while it runs, so what this crate needs from that item is one `merge`
-//! and nothing else. The alternative -- giving this crate the route table type -- would
-//! mean naming the surface crates it is forbidden to name, and the alternative to *that* --
-//! bringing M4-3's `RouteTable` forward -- is a router rebuild, a host table and an
-//! `ArcSwap` for one caller that needs none of them.
+//! # `/metrics` is a route table like any other
 //!
-//! **The merged table owns the fallback.** `Router::merge` of two routers each with a
-//! fallback is a panic, so the caller's table must not declare one; this crate's is the
-//! single 404 (DEV-3) and stays that way.
-//!
-//! What forces a socket to exist now is M2-4's own done-criteria: the daemon has to serve
-//! `/metrics`, §5.10 puts it on **an additive route on the one listener**, and §1.4 says
-//! only this crate may bind. So [`bind`] is the one listener in the shape it has today,
-//! with exactly the route that has a consumer. When M4-3 arrives, `/metrics` becomes one
-//! entry in the route table instead of the only one, and nothing outside this crate has to
-//! change: the binary already hands in a renderer rather than a registry.
-//!
-//! The metrics *recorder* is `mw-obs`'s (§5.10), and this crate does not depend on
-//! `metrics` or on its exporter. It is handed a closure that renders the current payload,
-//! which is also why `metrics-exporter-prometheus` is pinned `default-features = false` in
+//! §5.10 puts it on **an additive route on the one listener**, and §1.4 says only this crate
+//! may bind -- so the route is here and the recorder is `mw-obs`'s. [`metrics_table`] is
+//! handed a closure that renders the current payload rather than a registry, which is also
+//! why `metrics-exporter-prometheus` is pinned `default-features = false` in
 //! `[workspace.dependencies]`: with `http-listener` on, the exporter would bind a port of
 //! its own and be the seventh listener-owning site this design exists to remove.
 //!
-//! **What does change outside this crate when M4-3 arrives:** today the binary binds and
-//! serves directly, which makes the listener a fourth root resource owned by `main`
-//! (§3.1 names three) and leaves its teardown outside the supervisor's reverse-topological
-//! shutdown (§3.6). That is recorded as a step in `crates/modernweather/src/boot.rs`'s own
-//! sequence rather than left implicit, and M4-3 removes it by making `http:listener` the
-//! component §6.1 describes -- at which point `bind`, the `serve` future and the binary's
-//! `join!` arm all go. What does *not* have to change is this crate's shape: the route is
-//! handed a renderer rather than a registry, so it becomes one entry in a route table
-//! instead of the only one.
+//! The table's owner is `http:listener` itself. That is not a component borrowing another's
+//! identity: §5.10 makes `/metrics` the listener's own additive route, and naming an owner
+//! is what lets [`mount`]'s conflict check report it by name if a component ever claims the
+//! same path.
+//!
+//! # What the listener does **not** do
+//!
+//! **It does not resolve a website for the frozen surface.** `api:legacy`'s routes are
+//! `Scope::Any` and its handlers select a website from the `Host` header themselves, which
+//! is the frozen routing (§6.3) and the reason three websites declaring `/` are not in
+//! conflict while two components declaring `/latest` would be. Both sides ask
+//! [`host::normalise`], so there is one answer to "does `EXAMPLE.COM.` match `example.com`".
+//!
+//! **It does not mount a gRPC service.** The gRPC *socket* is here; the services are
+//! implementation-plan.md M6-1 and M6-4. [`socket`]'s module documentation has why the
+//! dispatcher is not written in advance.
+//!
+//! **It does not apply CORS or `Cache-Control` as layers.** §6.6 lists both as `RouteFlags`
+//! bits, and the providers in this workspace set them per *response* rather than per table,
+//! because the frozen surface's values are per endpoint and finer than a table-level flag
+//! can express: `mw_api_legacy::reply` emits `Access-Control-Allow-Origin: *` on its JSON
+//! bodies and deliberately **not** on its four error bodies ("None of the seven call sites
+//! carries CORS"), and `Cache-Control` is `no-store` on `/latest`, `max-age=<computed>` on
+//! `/span`, 3600 on `/almanac` and absent on three more. A table-level flag that the router
+//! applied would add CORS to the error bodies and would have to carry a value per endpoint
+//! anyway. So those two bits are **not** modelled here; what is global is global
+//! ([`mount::Mount::router`]'s compression and the one `Vary`), and what is per endpoint
+//! stays with the endpoint. Recorded because a reader looking for `RouteFlags` should find
+//! the reason rather than the omission.
 
-use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
-use axum::http::{header, StatusCode};
+use axum::http::header;
 use axum::routing::get;
 use axum::Router;
-use tokio::net::TcpListener;
+use mw_component::{ComponentId, Methods, RouteEntry, RouteManifest, Scope};
+
+pub mod component;
+pub mod host;
+pub mod mount;
+pub mod sni;
+pub mod socket;
+mod table;
+
+pub use component::{register, ListenerConfig, ID};
+pub use host::{matches_one_label, normalise, HostTable};
+pub use mount::{not_found, Mount, MountError, MountReport, NOT_FOUND_BODY};
+pub use sni::{CertError, CertPaths, CertStore, SniResolver};
+pub use socket::{bind, Bound, Listen, DRAIN};
+pub use table::RouteTable;
+
+/// The five frozen path patterns, in `axum` 0.8 syntax.
+///
+/// **Here rather than in `mw-api-legacy` because the check that needs them is here.**
+/// M4-1's constraint 1 says the route table's mounting rule is the last place **D-48**'s
+/// invariant can be broken, and [`MountError::FrozenPatternShadowed`] is that rule -- so the
+/// patterns have to be nameable by a crate that may not depend on the one that serves them.
+///
+/// `mw-api-legacy` is a higher layer and may name this crate, so there is **one** copy and
+/// a test over there asserts its own `FROZEN_PATTERNS` equals this list. Two lists with no
+/// assertion between them is how a sixth frozen path would get mounted per website without
+/// anything noticing.
+///
+/// The **five** of **D-68**, not all seven of `api:legacy`'s routes: `/almanac` and
+/// `/api/stations` are coupled rather than frozen, so a website table shadowing one of them
+/// is a refactor rather than a contract break.
+pub const FROZEN_PATTERNS: [&str; 5] = [
+    "/latest",
+    "/span/{span}",
+    "/snow",
+    "/stationinfo",
+    "/forecast/{span}",
+];
 
 /// Renders the current metrics payload on demand.
 ///
-/// A closure rather than a trait: the only implementation is `mw-obs`'s handle, and a
-/// trait would have to live in `mw-component` -- a capability for one consumer, which is
-/// the thing **D-52** declined to add for the log handle.
+/// A closure rather than a trait: the only implementation is `mw-obs`'s handle, and a trait
+/// would have to live in `mw-component` -- a capability for one consumer, which is the thing
+/// **D-52** declined to add for the log handle.
 pub type Render = Arc<dyn Fn() -> String + Send + Sync>;
 
 /// What `/metrics` serves, and in what content type.
@@ -93,6 +136,35 @@ impl MetricsRoute {
     }
 }
 
+/// `/metrics` as a route table, owned by the listener (§5.10).
+///
+/// `Methods::READ` rather than `Methods::ANY`: the frozen surface accepts every method
+/// because W1 pinned that it does (Q-17), and `/metrics` is not on the frozen surface --
+/// it is additive, it has one client, and that client sends `GET`.
+pub fn metrics_table(metrics: MetricsRoute) -> RouteTable {
+    RouteTable::new(
+        // `expect` rather than `?`: the id is a literal this function owns, so a failure
+        // would be a build-time typo and not a configuration error any caller can act on.
+        ComponentId::new(ID).expect("`http:listener` is a legal component id"),
+        RouteManifest::new(
+            Scope::Any,
+            vec![RouteEntry::exact("/metrics", Methods::READ)],
+        ),
+        Router::new().route(
+            "/metrics",
+            get(move || {
+                let metrics = metrics.clone();
+                async move {
+                    (
+                        [(header::CONTENT_TYPE, metrics.content_type)],
+                        (metrics.render)(),
+                    )
+                }
+            }),
+        ),
+    )
+}
+
 /// Why the listener could not be bound or served.
 #[derive(Debug, thiserror::Error)]
 pub enum HttpError {
@@ -100,8 +172,8 @@ pub enum HttpError {
     ///
     /// The address is in the message because "permission denied" without one is the least
     /// useful thing a failed bind can say, and the unit grants `CAP_NET_BIND_SERVICE`
-    /// precisely so that a low port works -- so an operator seeing this needs to know
-    /// which address was tried.
+    /// precisely so that a low port works -- so an operator seeing this needs to know which
+    /// address was tried.
     #[error("cannot bind {addr}")]
     Bind {
         /// What was tried.
@@ -118,150 +190,96 @@ pub enum HttpError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A TLS port is configured and no website has a usable certificate.
+    ///
+    /// A refusal rather than a socket that accepts connections and fails every handshake:
+    /// the second is indistinguishable, from the client's side, from a certificate the
+    /// client does not trust, and §6.4's whole argument is that a wrong-or-absent
+    /// certificate must be an operator-visible startup failure.
+    #[error(
+        "`listener.https_port` names {addr} and no website has a certificate to serve it \
+         with; set `website.tls_cert_path` and `website.tls_key_path`, or clear \
+         `listener.https_port`"
+    )]
+    NoCertificate {
+        /// The TLS address that would have been served.
+        addr: SocketAddr,
+    },
+
+    /// A certificate is configured and could not be loaded.
+    #[error("a configured certificate could not be loaded")]
+    Certificate {
+        #[from]
+        #[source]
+        source: CertError,
+    },
+
+    /// The route tables cannot be mounted.
+    #[error("the route tables cannot be mounted")]
+    Mount {
+        #[from]
+        #[source]
+        source: MountError,
+    },
 }
 
 impl mw_types::Classify for HttpError {
-    /// Both fatal, which is right for the case that happens: a port another process holds
-    /// is not released by asking again, and §3.4's classification exists so that the
-    /// supervisor does not re-decide this at the call site.
+    /// All fatal, which is right for the cases that happen: a port another process holds is
+    /// not released by asking again, an unreadable certificate path is not made readable by
+    /// retrying, and two tables claiming one path is a wiring mistake. §3.4's
+    /// classification exists so that the supervisor does not re-decide this at the call
+    /// site -- and §3.4's own backoff means "fatal" is still retried with a cap rather than
+    /// given up on (W2a Decision 30).
     ///
     /// The case this is *arguably* wrong for is `EADDRNOTAVAIL` -- a configured address on
-    /// an interface that has not come up -- where `Fatal` plus `Restart=always` is a
-    /// restart loop until it does. Left fatal deliberately: `After=network-online.target`
-    /// in W8's unit is what makes it unlikely, the loop is self-healing, and a retry here
-    /// would be a second place that decides how long to wait for a network.
+    /// an interface that has not come up -- where the retry is the only thing that helps.
+    /// It gets it, for the reason above.
     fn class(&self) -> mw_types::Class {
         mw_types::Class::Fatal
     }
 }
 
-/// How long in-flight requests get to finish once shutdown has been signalled.
-///
-/// §3.6's default grace, and for the same reason: `TimeoutStopSec=30` in W8's unit leaves
-/// room for it, and the daemon's own done-criterion is that it exits inside ten seconds.
-///
-/// **It has to be bounded, and that is not a precaution.** `with_graceful_shutdown` waits
-/// for every connection with an unfinished request and nothing else -- so one client that
-/// sent a request line and no blank line holds the drain open for as long as it likes, and
-/// `/metrics` is on the unauthenticated main port. Without a deadline, a stalled TCP peer
-/// or a scraper that died mid-request is enough to keep the process alive until systemd
-/// reaches `TimeoutStopSec` and sends SIGKILL -- or, outside systemd, indefinitely.
-pub const DRAIN: Duration = Duration::from_secs(10);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
 
-/// A bound socket that is not yet serving.
-///
-/// Bind and serve are separate so that the caller knows the port is actually held before
-/// it tells the service manager anything. §3.5's `READY=1` means the supervisor has
-/// converged; a readiness notification sent while the socket might still fail to bind
-/// would be the `Type=simple` problem with extra steps.
-#[derive(Debug)]
-pub struct Bound {
-    listener: TcpListener,
-    router: Router,
-    addr: SocketAddr,
-}
+    /// `/metrics` is one entry in a route table now rather than the only route, and nothing
+    /// outside this crate had to change for it: the route is still handed a renderer.
+    #[tokio::test]
+    async fn metrics_is_a_route_table() {
+        let table = metrics_table(MetricsRoute::new(
+            Arc::new(|| "mw_up 1\n".to_string()),
+            "text/plain; version=0.0.4",
+        ));
+        assert_eq!(table.owner().as_str(), "http:listener");
+        assert_eq!(table.scope(), Scope::Any);
+        assert_eq!(table.manifest().entries.len(), 1);
 
-impl Bound {
-    /// The address actually bound, which is how a caller that asked for port 0 finds out
-    /// what it got.
-    pub fn local_addr(&self) -> SocketAddr {
-        self.addr
+        let (mount, _) = Mount::new(vec![table], HostTable::default()).expect("mounts");
+        let resp = mount
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("a legal request"),
+            )
+            .await
+            .expect("infallible");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; version=0.0.4")
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .expect("a readable body");
+        assert_eq!(&body[..], b"mw_up 1\n");
     }
-
-    /// Serve until `shutdown` completes, then drain in-flight requests for at most
-    /// [`DRAIN`].
-    pub async fn serve<F>(self, shutdown: F) -> Result<(), HttpError>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        self.serve_with_drain(shutdown, DRAIN).await
-    }
-
-    /// [`Bound::serve`] with the drain deadline chosen by the caller, for a test that does
-    /// not want to wait ten seconds to prove the deadline exists.
-    pub async fn serve_with_drain<F>(self, shutdown: F, drain: Duration) -> Result<(), HttpError>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        let addr = self.addr;
-        // The shutdown future is consumed by `with_graceful_shutdown`, so the deadline is
-        // started from a second observation of the same signal: the channel fires when the
-        // first one resolves.
-        let (signalled, signal) = tokio::sync::oneshot::channel();
-        let shutdown = async move {
-            shutdown.await;
-            let _ = signalled.send(());
-        };
-        let serving = axum::serve(self.listener, self.router).with_graceful_shutdown(shutdown);
-        tokio::select! {
-            result = serving => result.map_err(|source| HttpError::Serve { addr, source }),
-            () = async move {
-                let _ = signal.await;
-                tokio::time::sleep(drain).await;
-            } => {
-                // Abandoning the drain is a `WARN` rather than an error: every component
-                // is already stopped by the time the binary gets here, and a client that
-                // never finished its request is not a reason to exit non-zero.
-                tracing::warn!(
-                    addr = %addr,
-                    drain_s = drain.as_secs(),
-                    "connections did not drain inside the deadline; closing the listener"
-                );
-                Ok(())
-            }
-        }
-    }
-}
-
-/// Bind the listener, optionally merging one additional route table into it.
-///
-/// `routes` is `None` for a node with no surface to serve -- which is no node today, and is
-/// the shape a test that only wants `/metrics` uses. See the module documentation for why
-/// the parameter is an `axum::Router` rather than a type this crate owns.
-pub async fn bind(
-    addr: SocketAddr,
-    metrics: MetricsRoute,
-    routes: Option<Router>,
-) -> Result<Bound, HttpError> {
-    let listener = TcpListener::bind(addr)
-        .await
-        .map_err(|source| HttpError::Bind { addr, source })?;
-    // `0.0.0.0:0` is a legitimate request and the kernel chooses the port, so the bound
-    // address is read back rather than echoed.
-    let addr = listener
-        .local_addr()
-        .map_err(|source| HttpError::Bind { addr, source })?;
-    Ok(Bound {
-        listener,
-        router: router(metrics, routes),
-        addr,
-    })
-}
-
-fn router(metrics: MetricsRoute, routes: Option<Router>) -> Router {
-    let mounted = match routes {
-        Some(routes) => routes,
-        None => Router::new(),
-    };
-    mounted.merge(base(metrics))
-}
-
-/// `/metrics` and the one fallback.
-fn base(metrics: MetricsRoute) -> Router {
-    Router::new()
-        .route(
-            "/metrics",
-            get(move || {
-                let metrics = metrics.clone();
-                async move {
-                    (
-                        [(header::CONTENT_TYPE, metrics.content_type)],
-                        (metrics.render)(),
-                    )
-                }
-            }),
-        )
-        // DEV-3 in advance: a path with no route is a 404 with no body rather than a
-        // directory listing or a 405. One route table means one fallback.
-        .fallback(|| async { StatusCode::NOT_FOUND })
 }

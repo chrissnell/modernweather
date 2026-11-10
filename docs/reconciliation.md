@@ -1202,6 +1202,9 @@ something it does not read. *Behavioural* — a byte a client does read, or coul
 | **DEV-6** | Wildcard certificates match exactly one label; on an SNI miss the chain is exact → wildcard → designated default → refuse with `unrecognized_name` | W3 D-69, D-70 | behavioural — **closes two defects** | **Only by depending on the bugs.** The Go `strings.HasSuffix` check matches any depth *and* matches `evilexample.com` for `*.example.com`. On a miss, Go returns an arbitrary certificate by iterating a map — non-deterministic between runs, producing a browser interstitial that blames the user. |
 | **DEV-8** | A WeatherLink Live station's readings are stored in the units the registry declares (°F, inHg, inches), its indoor temperature and humidity are stored at all, its rainfall is converted from tip counts, its ten-minute wind average is stored, and its sensor records are matched by record type as well as by transmitter | **D-26** and `metrics/registry.toml`'s declared units, applied by implementation-plan.md **M3-1**; five defects in the Go driver | behavioural — **closes five defects**, and **needs the owner's acknowledgement** | **Yes, if the owner has ever run a WeatherLink Live.** (1) `internal/weatherstations/weatherlinklive/data_transformer.go` converts every temperature `(F - 32) * 5 / 9` and every pressure `* 33.8639`, writing Celsius into `outtemp` and hPa into `barometer`/`baromrelin`/`baromabsin` — columns `metrics/registry.toml` declares as `degF` and `inHg`, which the Go **Davis** driver on the same schema fills in °F and inHg (`convBigVal10` of the LOOP packet) and which `/latest` emits with no conversion. The two Go drivers therefore disagree about what the column means, and the WeatherLink Live one disagrees with the frozen contract: 62.7 °F is stored as 17.06 and rendered as 17.06 °F. (2) It copies `rainfall_daily` and `rain_rate_last` — which are **tip counts** — into `dayrain` and `rainrate`, declared `in` and `in_per_hour`. The error is the reciprocal of the collector size, so it is **100×** for a 0.01 in collector, **127×** for 0.2 mm, **254×** for 0.1 mm and **1000×** for 0.001 in; `rain_size`, the only value that can convert a count into a depth, is decoded into the struct and never used to convert anything (`discovery.go:217` only lists its name). (3) Its `th_indoor` arm looks for `DataStructureBarometer` (record type 3) while `temp_in` and `hum_in` are in record type 4, so `intemp` and `inhumidity` are never populated from one of these units at all. (4) `findCondition` returns the first record whose transmitter matches regardless of record type, so `th:2` on a deployment with a leaf/soil station on transmitter 2 reads `temp` out of a record that has none and the outdoor temperature silently stops. (5) `windspeed10` has a column, the unit reports `wind_speed_avg_last_10_min` on both transports, and the Go driver does not map it — so that column is empty for this station type and populated for Davis. The Rust codec stores the device's own units, converts rainfall through `rain_size`, leaves rainfall `NULL` when `rain_size` is absent rather than storing a count (**D-26**), reads the indoor record, prefers the record type the role implies before falling back to the transmitter, and fills `windspeed10`. **Marked as needing acknowledgement** for DEV-7's reason: these are corrections and not decisions, and whether a stored series changes meaning is the owner's call. **The conformance suite cannot catch any of it** — it compares shape, type and formatting, not values — and nothing in this repository can tell whether any WeatherLink Live data exists in the production database. |
 | **DEV-9** | The enrich stage computes `windchill`, `heatindex`, `aqi_pm25_aqin`, `aqi_pm10_aqin`, `potentialsolarwatts` and `snowdepth` **at ingest and stores them**, for every station rather than for the one driver that computed each; `windchill` and `heatindex` are `NULL` rather than the air temperature where their formula does not apply; and the clear-sky model reads the **station's** longitude instead of the **server's** time zone | **R1** (W3 §2.5), applied by implementation-plan.md **M3-3** | behavioural — **changes what five stored series mean**, and **needs the owner's acknowledgement** | **On the wire: one key changes, and it is `potentialsolarwatts`. In the database: five columns change meaning.** The distinction is the whole of this entry and the first draft of it got it wrong, so it is stated before the parts: the Go **read path** already computed three of these per request, so the JSON a client sees for them does not change — what changes is the *column*, which is what `/span`'s aggregate levels and every future query read. Taken in four parts. **(1) `windchill`/`heatindex` — the column changes, the JSON cannot.** The Go drivers store the *air temperature* where the formula does not apply (`utils.go:CalculateWindChill` returns `tempF` above 50 °F or below 3 mph); this stores `NULL`. The frozen JSON is unaffected **because the frozen handler never reads the column**: `transform.go:18` recomputes both from `OutTemp` plus wind speed or humidity on every request, which is exactly what `metrics/registry.toml`'s `legacy_read_time_computed` flag records and what `docs/metric-registry.md` §6.1 means by "the column and the JSON key are not guaranteed to be the same number". **So M4-2 must recompute them too, and this entry is the reason that is now a constraint rather than an open question** — reading the column and zero-filling it would produce `mean(windchill)` where Go produces `windchill(mean(outtemp), mean(windspeed))`, and those differ by more than rounding: for a bucket of two readings at (40 °F, 10 mph) and (60 °F, 10 mph), Go emits 46.04 and the column-mean path emits 33.64. Recorded as a constraint on M4-2 in the plan. The column itself improves either way: a stored `windchill == outtemp` is indistinguishable from a real wind chill and makes the column's `min` and `mean` the temperature's for every summer bucket. **(2) `potentialsolarwatts` — the one key that changes on the wire.** Only the Go **Campbell** driver computed it, so the column is NULL for every other station type and the frozen DTO zero-fills it; it is now computed for any station whose configuration has **coordinates** and whose reading carries **`outtemp` and `outhumidity`** (the model needs all three, so a station with coordinates and no humidity sensor still stores NULL). Where the Go daemon's own time zone is the station's — the production configuration, and the only one in which the Go behaviour is correct — the two agree to **1.1 × 10⁻¹² W/m²** over five zones × 53 days × 24 hours, measured against the Go function. They differ in two cases, both Go defects: a daemon whose zone is not the station's (`pkg/solar/asce.go` reads `time.Local`, and D-24 already says every calendar quantity is the station's), and any station in the eastern hemisphere, where Go's meridian table maps `+7` to 105° exactly as it maps `-7` and the offset doubles instead of cancelling. **(3) `snowdepth` — column only.** Computed per request in Go from a per-website cache (`restserver/controller.go:903`), so the **column** and every aggregate bucket are NULL today while the **response** already carries a number for any snow site with a configured base distance. The arithmetic is unchanged (`base_distance - snowdistance`, with Go's own `snowdistance > 0` guard) and it now reaches storage, which is what gets it into the aggregate levels. One consequence Go does not have: the Go snow-gauge driver discards a distance greater than the base at the device (`snowgauge/station.go:172`), so Go never stored a negative depth and this will — a mis-set base distance now contaminates `min`/`mean`/`max` buckets rather than leaving a gap. The enrich stage is the wrong layer to filter at (it is handed an already-admitted reading), so the discard is recorded as a constraint on **M6-1**'s snow-gauge driver in the plan. **(4) The two AQI keys — column only, and one naming oddity worth knowing.** The Go handler reads the column only when it is greater than zero and **computes otherwise** on both `/latest` and `/span` (`transform.go:209`, called per bucket at `:80`), so a client was never charting a flat zero here; the column is now populated from the same EPA table in `pkg/aqi/aqi.go`, so the handler's stored branch returns the number its computed branch would have. The oddity: `aqi_pm25_aqin` is derived from **`pm25`** (the outdoor sensor) and not from `pm25_in_aqin`, because that is what `transform.go:216` does. Faithful, and newly *stored* — so a station with only an outdoor particulate sensor and no AQIN device now has a permanently populated `aqi_pm25_aqin` column where Go left it NULL and carried the number only in the response. Every formula, constant, guard condition and `f32` rounding is asserted bit-for-bit against values produced by **running** the Go code at `c3ec9f7`. |
+| **DEV-14** | The nine configuration values leave `/js/weather-app.js` and arrive as JSON: inline as `<script id="mw-config" type="application/json">`, plus an additive `GET /config.json` | **D-38**, as extended by A-3 and A-W3-3; applied by implementation-plan.md **M4-3** | behavioural — **changes the body of one coupled response and adds a block to another** | **Yes, and that is the point.** `text/template` has no JavaScript context awareness, so a station name containing an apostrophe broke the page and one containing `';alert(1);//` **executed**; the values now pass through a JSON encoder and never through a code generator. The affected response is `coupled` (**D-68**): server and website ship as one binary, so both halves moved in one commit. `contract/fixtures/asset-weather-app-js` therefore asserts three substrings that identify the module on **both** targets rather than four that identify the generated literal on one — the deviation mechanism cannot carry an assertion, only a recorded response (`contract/conformance/src/lib.rs:424`). What the suite stops checking is checked by `crates/mw-web`'s tests: the inline block's key set and order, its byte agreement with `/config.json`, and the byte diff against `html-weather-station`'s recorded body. `/latest` and the other four frozen endpoints are untouched. |
+| **DEV-15** | A static asset carries no `Accept-Ranges`, so a range request gets the whole file | implementation-plan.md **M4-3**, as a consequence of serving the embedded tree from a handler rather than from `http.ServeContent` | behavioural — **removes a capability** | **No shipped client uses it.** Go's `ServeContent` advertises `Accept-Ranges: bytes` and honours `Range` on every asset; `mw_web::assets` writes the whole body. The tree is CSS, JavaScript, fonts and three icons, the largest of which is 125 kB, and no fixture asserts the header. Recorded rather than left to be discovered, because it is a byte a client *could* read. Re-adding it is a `Range` parse and a slice, and the reason not to is that a partial-content path with no consumer is a code path nothing exercises. |
+
 
 **DEV-4 answers W9's OQ-W9-4 in the affirmative**, which is what W9 asked W6 to decide. It belongs
 here rather than only in `docs/data-migration.md` for the reason W9 gave for rejecting its own option
@@ -2304,7 +2307,7 @@ A-W2-1 and A-W2-2, W2a's D-30 split, W3's A-W3-1 to A-W3-4, W4's A-W4-1 to A-W4-
 A-W5-3, W7's A-W7-1 to A-W7-4, W8's A-1 to A-4 and W9's A-W9-1 to A-W9-3. All are applied there under
 the protocol; none is edited in place. See `docs/DESIGN.md`'s `## Amendments` section.
 
-This document proposes **one** amendment of its own, which is not to a decision. Seven more
+This document proposes **one** amendment of its own, which is not to a decision. Eleven more
 were appended later by implementation items and are marked as such.
 
 **A-M4-2-1 — a `Soft` capability handle is read when it is used, not once at build.**
@@ -2626,3 +2629,118 @@ document set has to be maintained forever, and the evidence that nobody will is 
 is an active hazard, not a documentation nit. It does not look stale — W4's 42-line outline is a
 well-formed document that simply stops. The failure mode is an agent run on half instructions, which
 is the one failure this programme's pre-flight list explicitly set out to avoid.
+
+
+**A-M4-3-1 — `html/template`'s escaping is contextual, and §7.1's table is missing two entries.**
+*Proposed by implementation-plan.md **M4-3**, 2026-11-10. Not applied: the protocol above reserves
+that for a work item that owns the ledger.*
+
+*What was found.* W3 §7.1 specifies one escaper, `GoHtmlEscaper`, as *`&` → `&amp;`, `<` → `&lt;`,
+`>` → `&gt;`, `"` → `&#34;`, `'` → `&#39;`, NUL → `&#0;`*, and makes the byte diff against W1's
+recorded bodies the acceptance test. Two things about that do not hold, and the byte diff is what
+surfaced both — which is exactly what §7.1 said it was for.
+
+**The table.** Go's `htmlReplacementTable` (`go1.26/src/html/template/html.go:54`) also carries
+**`+` → `&#43;`**, and spells NUL as **`U+FFFD`** rather than `&#0;` — the HTML5 parse-error
+replacement, which the table's own comment quotes. An escaper following the prose would differ from
+the recording on any interpolated value containing `+`.
+
+**The contexts.** `html/template` escapes per context, and the page enters a JavaScript one: the
+`radar-config` block is `<script id="radar-config" type="application/json">`, and its three values go
+through `jsValEscaper` and `jsStrEscaper`. `jsValEscaper` **pads a number with spaces** when its
+first or last rune is a JavaScript identifier character (`js.go:219`), so the recorded body reads
+`{"lat":  39.9 , "lon":  -105.5 , …}` — two spaces, because the template has one and the escaper adds
+one. No HTML escaper produces that. §7.1's single-escaper account is incomplete rather than wrong:
+one table is right for the five HTML interpolations, and the golden capture confirms that
+`htmlEscaper`, `attrEscaper` and `rcdataEscaper` agree for a plain string.
+
+*What replaces it.* §7.1 gains: *`GoHtmlEscaper` reproduces Go's `htmlReplacementTable` as Go has it,
+including `+` → `&#43;` and NUL → `U+FFFD`. The `<script type="application/json">` block is a
+JavaScript context and needs `jsStrEscaper`'s table and `jsValEscaper`'s padding, which are a second
+escaper rather than a filter; both are asserted against output produced by running Go's
+`html/template`.*
+
+*Why this is more than inconvenient.* The decision §7.1 makes — a custom escaper so that the
+acceptance test can be a byte diff — is right, and the transcription of the table is what the test
+would have been run against. Following the prose would have produced an escaper that passes its own
+unit tests and fails the recording, which is the one failure mode the decision exists to prevent.
+`crates/mw-web/src/escape.rs` and `src/gojs.rs` carry the measurement; `tests/golden/go-escapes.tsv`
+is the capture.
+
+**A-M4-3-2 — `html/template` elides comments, so the recorded bodies are not the template's bytes.**
+*Proposed by implementation-plan.md **M4-3**, 2026-11-10. Not applied: as above.*
+
+*What was found.* §7.1's byte diff compares the port's output against W1's recorded bodies, and the
+recordings are **short of every comment in the templates**: 29 HTML and JavaScript comments in
+`weather-station.html.tmpl` and 9 HTML plus 1 CSS comment in `portal.html.tmpl`. `html/template`
+elides them as part of its escaping analysis — an HTML or JavaScript comment is replaced by nothing
+and a CSS block comment by a single space — so the Go server never shipped them. `askama` does not,
+and neither does a static file.
+
+*What replaces it.* §7.1 gains: *the port reproduces `html/template`'s comment elision.* Two
+mechanisms, because the two files are different kinds of thing: the template keeps its comments as
+askama `{# … #}` comments, which carry the text and occupy no output bytes; and `portal.html`, which
+**D-75** makes a static asset, is the Go server's *rendered* output rather than its template source.
+
+*Why this is more than inconvenient.* The alternatives were all worse than recording this. Comparing
+with comments normalised out of both sides would make the "byte diff" a diff modulo a transformation
+nobody can audit. Reproducing the elision at render time would mean a contextual HTML/CSS/JavaScript
+scanner in `mw-web` — `//` inside a `<script>` is a comment and inside `<a href="https://…">` is
+not — to *delete* developer comments from a page. And shipping the comments would be a byte change on
+100% of page responses, in the same class as the directory listings **DEV-3** removes. The chosen
+answer keeps the source documented, the delivered bytes identical, and the test a real byte diff.
+
+**A-M4-3-3 — the asset tree is not per-website, and `web:site:*`'s hard need is unread.**
+*Proposed by implementation-plan.md **M4-3**, 2026-11-10. Not applied: as above. **Two proposals, and
+the first is already implemented while the second is not** — see below.*
+
+*What was found.* `docs/component-model.md` §2.6 names one website component, `web:site:<id>`,
+requiring `LatestSnapshot` **Hard**. Implementing it surfaces two separate problems.
+
+**The asset tree has no website.** The Go handlers for `/privacy` and `/support` read the file
+straight out of the asset filesystem and never look at the website (`handlers.go:819`, `:832`), which
+W3 §6.3 records as "`/privacy` and `/support` bypass the website check entirely"; the file server
+behind `router.PathPrefix("/")` has no website either. Attaching any of that to a per-website table
+means three copies of a 2.6 MB tree for three websites, or an arbitrary website owning everyone's
+assets, or `/css/weather.css` disappearing when website 1 stops. **M4-3 adds `web:static`** — the
+asset tree, `/privacy` and `/support`, no capability needs, planned on every node including one with
+no website at all. The proposal is that `docs/component-model.md` §2.6's provider table gain a row
+for it; this document does not edit that file, for the reason the protocol above gives.
+
+**The hard `LatestSnapshot` need is declared and nothing reads it.** §2.6's stated reason for the
+capability is `/latest`'s zero-query invariant, which is `api:legacy`'s; for `web:site:*` it is
+unexplained. W3 §7.3 says in as many words that "`/` and `/portal` depend only on
+`(website, config_generation, binary_version)`", and every live value on the page is fetched by the
+browser from `api:legacy`'s endpoints. Declaring it has one real consequence: `plan()` refuses a
+configuration whose hard need nobody provides, so a node with websites and **no station** would be a
+daemon that will not start.
+
+*What replaces it.* §2.6 gains the `web:static` row, and the proposal for the second half is: *drop
+`LatestSnapshot` from `web:site:*`'s need set until something on the page reads it.*
+
+*What M4-3 did instead, which is the protocol.* The need is **declared as §2.6 says**, and
+`mw_web::register` guards it the way `mw_api_legacy::register` guards the identical problem — it asks
+whether a provider will exist and plans no website component when none will, logging which websites
+are therefore not served. So a station-less node boots, serves `/metrics`, `/privacy`, `/support` and
+the asset tree, and answers `404 page not found` on `/`. That is strictly better than refusing to
+start and strictly worse than serving the page, and which of those two the owner wants is the
+decision this amendment asks for.
+
+**A-M4-3-4 — DEV-6's refusal is `access_denied`, because rustls chooses the alert.**
+*Proposed by implementation-plan.md **M4-3**, 2026-11-10. A correction to §3's ledger rather than to a
+decision.*
+
+*What was found.* §3's **DEV-6** entry says that on an SNI miss "the chain is exact → wildcard →
+designated default → refuse with `unrecognized_name`". The chain is implemented exactly; the alert is
+not `unrecognized_name`. A `rustls::server::ResolvesServerCert` that returns `None` makes rustls send
+a fatal **`AccessDenied`** (`rustls-0.23.46/src/server/hs.rs:451`), and the trait offers no hook to
+choose the code. Choosing it would mean driving every handshake through `LazyConfigAcceptor` and
+building a `ServerConfig` per connection, to change one byte of an alert nothing branches on.
+
+*What replaces it.* DEV-6's wording: *refuse the handshake*. The alert code is the TLS library's.
+
+*Why this is recorded rather than silently different.* §3's own definition is "every place a design
+knowingly changes a byte a shipped client could observe", and an alert code is such a byte. What
+DEV-6 is **for** is unaffected: the Go version iterates a map and hands out an arbitrary certificate,
+which is non-deterministic between runs and produces a browser interstitial that blames the user. A
+refusal is diagnosable either way.

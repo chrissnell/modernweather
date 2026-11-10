@@ -251,12 +251,18 @@ impl RouteManifest {
 
 /// The handle type `Capability::HttpRoutes` is published under.
 ///
-/// **A marker trait with no methods, and that is the point.** The *pure* half of what a
-/// route provider offers is the [`RouteManifest`] on its `Provision` (**D-51**), which is
-/// what `plan()` needs and all it needs. The *impure* half is an `axum::Router`, and this
-/// crate may not name `axum` (`ci/layers.toml`) -- so a router cannot be the handle type
-/// and a handle trait with a query set cannot be written until the listener is a component
-/// with something to ask (M4-3).
+/// **A marker trait with no methods, and it stayed one.** The *pure* half of what a route
+/// provider offers is the [`RouteManifest`] on its `Provision` (**D-51**), which is what
+/// `plan()` needs and all it needs. The *impure* half is an `axum::Router`, and this crate
+/// may not name `axum` (`ci/layers.toml`) -- so a router cannot be the handle type.
+///
+/// An earlier version of this note expected a query set once the listener was a component
+/// with something to ask. M4-3 made it one and the answer did not change: `http:listener`
+/// takes this capability **additively** so that it observes the provider set without
+/// waiting for it (W2a Decision 19), and the `mw_http::RouteTable`s themselves travel as a
+/// root resource the binary builds -- which is the only arrangement available while
+/// `mw-http` may name neither `mw-api-legacy` nor `mw-web`. The publication is a graph edge,
+/// and that is what it is for.
 ///
 /// What the publication buys today is the capability **graph**: a provider appears and
 /// disappears with its component, so "the table is mounted" and "the component is

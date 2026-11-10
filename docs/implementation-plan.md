@@ -710,7 +710,7 @@ paths. `cargo xtask gate conformance` cannot establish this, because it replays 
 database; that is exactly why the test is in-process and takes the capability away rather than the
 server.
 
-### M4-3 — `mw-http` and `mw-web`
+### M4-3 — `mw-http` and `mw-web` *(landed 2026-11-10)*
 **Depends on:** M4-2. **Blocks:** M5, M7.
 One router over N sockets per **D-31 as amended by A-W3-4** — the main port, an optional redirecting
 plaintext port, and the **legacy gRPC port, which keeps its own socket** (W3 D-92) so no peer's
@@ -755,6 +755,119 @@ G-5):
 3. **`web:site:*` requires `LatestSnapshot` Hard** (`docs/component-model.md` §2.6), so M4-2's
    constraint 2 applies to the website's route tables as well: a hard need outside
    `{LatestSnapshot, ConfigStore}` on a table carrying a frozen pattern reopens D-48.
+
+#### What landed, and the six places it is narrower, wider or different
+
+**1. The byte diff passes, and getting there found two things §7.1's account of `GoHtmlEscaper`
+leaves out.** The acceptance test reads `contract/fixtures/html-weather-station.json`,
+`html-portal.json`, `html-portal-root.json`, `html-privacy.json` and `html-support.json` — the
+recordings themselves rather than a copy — applies the one expected delta as a patch, and compares
+every byte. It has a negative control, and the delta is asserted to be load-bearing: comparing
+against the *unpatched* recording must fail, or the configuration block would not be being emitted.
+
+The two things it found are **A-M4-3-1** and **A-M4-3-2** in `docs/reconciliation.md`:
+
+- §7.1's table is missing `+` → `&#43;` and gets NUL wrong (Go writes `U+FFFD`, not `&#0;`), and
+  `html/template` is **contextual**, so the three values inside `<script id="radar-config"
+  type="application/json">` are escaped as *JavaScript* — numbers padded with spaces by
+  `jsValEscaper`, which no HTML escaper would produce. `mw_web::gojs` is that second escaper, and
+  `crates/mw-web/tests/escaping.rs` asserts every byte of both tables against output produced by
+  **running** Go's `html/template` over every ASCII codepoint in four contexts.
+- `html/template` **elides HTML, CSS and JavaScript comments**, so the recorded bodies carry 29
+  fewer comments than the template does. The port keeps them as askama `{# … #}` comments, which
+  occupy no output bytes, and `assets/portal.html` is the Go server's rendered output rather than
+  its template source. Byte equality is therefore real rather than normalised.
+
+**2. `GoHtmlEscaper` is pinned by the layout gate, which needed a new rule.** `ci/layers.toml`'s
+`[templates]` check already rejected `safe` and the `escape` filter's `none` argument under
+`crates/mw-web/templates/`, and its own `reason` recorded the hole it could not see: "an
+`askama.toml` that reassigns the `html` escaper would turn escaping off globally without any of
+these appearing anywhere. There is no such file, and the day one arrives it needs a rule of its
+own." The day arrived — a custom escaper is the only way to get Go's spellings — so `[templates]`
+gains `escaper_config`, `escaper_path` and `escaper_extensions`, and the gate refuses a different
+path, a missing extension, a second `[[escaper]]` entry (askama matches the first) and a missing
+file. All four are shown failing in `xtask/src/layout.rs`.
+
+**3. The `PENDING` list is empty, and one fixture changed with it.** All nineteen `coupled` fixtures
+pass, which is this milestone's done-criterion. `asset-weather-app-js` had to change: **D-38** moves
+the nine configuration values out of `/js/weather-app.js` and into the inline block, so the four
+`pullFromDevice: 'davis-full'`-style substrings it asserted exist on the Go target and not on this
+one — and the **deviation mechanism cannot carry an assertion**, only a recorded response
+(`contract/conformance/src/lib.rs:424` makes `assert` the fixture's for both targets by design). So
+its `required_substrings` become three that identify the module on both targets, and what the suite
+stops checking — that the nine values reach the client — is checked by `crates/mw-web`'s own tests:
+the inline block's key set and order, its byte agreement with `/config.json`, and the byte diff.
+That is a coupled-class change under **D-68**/**D-69**, moving both halves in one commit.
+
+**`judge_direct` now takes the excuse list as a parameter.** With `PENDING` empty, a test that read
+the real list would assert nothing — so the both-directions property is tested over a synthetic list
+and the production call site passes `&PENDING`. A both-directions check that cannot fail is worth as
+much as a gate that cannot.
+
+**4. `http:listener` is a component, and a held port is no longer a startup failure.** M2-4 bound one
+socket directly from `boot.rs` and recorded two consequences: `main` owned a fourth root resource,
+and the listener's teardown ran *concurrently* with the supervisor's reverse-topological stops rather
+than being ranked by them. The second is closed — the socket now closes after the components whose
+tables it serves have stopped. The first is not, and is now explicit: the `Mount` is a root resource
+`main` builds, because the tables come from `mw-api-legacy` and `mw-web` and `mw-http` may name
+neither.
+
+**The behaviour change is that a port another process holds is a `Failed → Backoff` loop instead of a
+non-zero exit** (W2a Decisions 3 and 30, §3.4's cap of 60 s, no permanent give-up), with the address
+in `last_error` and the failure in `STATUS=`. That is better than what it replaces rather than a
+regression — `Restart=always` plus `StartLimitBurst` turned the old exit into a unit that eventually
+gave up and stayed down — and it means `READY=1` can be sent by a daemon whose listener is backing
+off, because §3.5's readiness is "the supervisor has converged" and deliberately not "every component
+is `Running`".
+
+**5. There are two website components, not one.** `docs/component-model.md` §2.6 names
+`web:site:<id>` and stops. The pages are per-website and that is right for them; the **asset tree is
+not** — the Go handlers for `/privacy` and `/support` never look at the website (§6.3: they "bypass
+the website check entirely") and neither does the file server behind `router.PathPrefix("/")`. So
+`web:static` owns the asset tree, `/privacy` and `/support`, requires nothing, and is planned on
+every node including one with no website at all. Attaching them to a website's table would have
+meant three copies of the asset tree, an arbitrary website owning everyone's assets, or the assets
+disappearing when website 1 stops. Recorded as **A-M4-3-3**, which also proposes dropping §2.6's hard
+`LatestSnapshot` need on `web:site:*`: it is declared, nothing reads it (the page is a function of
+configuration and the binary's version, which §7.3 says in as many words), and declaring it means a
+node with websites and no station gets no website — which the registrar handles the way
+`mw_api_legacy::register` handles the same thing, rather than refusing the whole configuration.
+
+**6. Two checks exist that the design asked for in prose and nothing performed.** M4-1's constraint 1
+says the route table's mounting rule is the last place **D-48** can be broken:
+`mw_http::MountError::FrozenPatternShadowed` refuses a `Scope::Site` table that claims one of the
+five frozen patterns, which `plan()` cannot see because two tables in different scopes are not a
+route conflict. The five patterns live in `mw-http` — the crate that needs them may not depend on the
+crate that serves them — and a test in `mw-api-legacy` pins its own list to that one. And
+`assert_route_tables_match_the_plan` pairs every mounted table's owner against every planned
+`HttpRoutes` provider in **both** directions: a table with no owner is the permanent body-less `503`
+M4-2's review found, and an owner with no table is a component that reaches `Running` while its paths
+404.
+
+**M4-1's other two constraints are discharged.** `mw_pipeline::metrics::sweep_snapshot_ages`
+recomputes both gauges from `LatestSnapshot::table()` on every scrape, so
+`mw_snapshot_age_seconds > 600` is an alert that can fire for the station that stopped reporting; and
+the hard-need rule on a frozen pattern is check 6 above.
+
+**Three smaller things, each recorded where it happens.** Host normalisation is now one function in
+`mw-http` and `mw-api-legacy` asks it rather than carrying a second copy — two answers to "does
+`EXAMPLE.COM.` match `example.com`" on a lookup that decides whose data a request gets. `ryu` gains a
+`[[dep_rule]]` naming the two crates that may produce Go's digits, which the workspace manifest had
+claimed existed since M4-2 and which did not; `crates/modernweather/tests/go_numbers.rs` asserts the
+two implementations agree. And **DEV-6's refusal sends `access_denied`, not `unrecognized_name`**:
+rustls chooses the alert for a resolver that returns `None` and offers no hook
+(**A-M4-3-4**). What DEV-6 is for — a diagnosable refusal instead of a wrong certificate — is
+unaffected.
+
+**What is deliberately not here.** No gRPC *service*: the socket exists and serves the same router,
+and `grpc:weatherv1`, `grpc:weatherappsv1` and `station:grpcrx` are M6-1 and M6-4. No `RouteFlags`
+struct: §6.6 lists CORS and `Cache-Control` as bits, and both are set per *response* by the provider
+that knows the endpoint — `mw_api_legacy::reply` emits CORS on its JSON bodies and deliberately not
+on its four error bodies, and `Cache-Control` differs per endpoint — so a table-level flag would be
+less faithful, not more. No `--assets-dir` override (§7.2's development knob): it is a second way for
+the asset tree to differ from the binary, which is the property embedding buys. And no `ArcSwap`
+*writer*: the mechanism is there and tested across a swap, and the writer is a plan diff, which has
+none until M7-1.
 
 **Milestone 4 done when:** the Rust daemon serves the entire frozen surface with the conformance suite
 green against it, and the website renders byte-identically. **It is serving its own stations from its

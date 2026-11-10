@@ -1,0 +1,491 @@
+// Weather Dashboard Application Module
+// This is the main application that uses all the refactored modules
+
+const WeatherApp = (function() {
+    'use strict';
+    
+    // Configuration, read from the inline <script id="mw-config"> block the page carries.
+    //
+    // This module used to be a Go text/template and this object literal used to be
+    // generated (DESIGN.md D-38). text/template has no JavaScript context awareness, so a
+    // station name containing an apostrophe broke the page and one containing `';alert(1);//`
+    // executed. The nine values are now delivered as JSON through a <script
+    // type="application/json"> block -- the pattern the radar module already used -- and
+    // reach this object through a JSON parser instead of a code generator
+    // (service-architecture.md D-79, D-80).
+    //
+    // Inline rather than a fetch: this module is synchronous, and an await at module
+    // initialisation would add a round trip and an ordering bug to a page that is
+    // supposed to be unchanged. GET /config.json serves the same payload for anything else
+    // that wants it.
+    const config = (() => {
+        const block = document.getElementById('mw-config');
+        const values = block ? JSON.parse(block.textContent) : {};
+        return Object.assign({}, values, {
+            debug: new URLSearchParams(window.location.search).get('debug') === '1'
+        });
+    })();
+    
+    // Application state
+    let state = {
+        currentRange: '24h',
+        currentForecastType: 'week',
+        secondsSinceLastUpdate: 0,
+        liveDataTimer: null,
+        updateTimerInterval: null,
+        chartRefreshTimer: null,
+        snowDeviceId: null,
+        airQualityDeviceId: null
+    };
+    
+    // Constants
+    const INTERVALS = {
+        LIVE_DATA: 3500,
+        CHART_REFRESH: 300000,
+        FORECAST_REFRESH: 4 * 60 * 60 * 1000
+    };
+    
+    const CHART_RANGES = {
+        '24h': 24,
+        '72h': 72,
+        '7d': 168,
+        '30d': 744,
+        '1y': 8760
+    };
+    
+    // Initialize the application
+    const init = () => {
+        if (config.debug) console.log('Initializing Weather App with config:', config);
+        
+        // Set up event listeners
+        setupEventListeners();
+        
+        // Initialize air quality tooltips if air quality is enabled
+        if (config.airQualityEnabled) {
+            WeatherDOM.initializeTooltips();
+        }
+        
+        // Start timers
+        startTimers();
+        
+        // Load initial data
+        loadInitialData();
+        
+        // Set up cleanup handlers
+        setupCleanupHandlers();
+    };
+    
+    // Set up event listeners
+    const setupEventListeners = () => {
+        // Chart tab listeners
+        document.querySelectorAll('.chart-tab').forEach(tab => {
+            tab.addEventListener('click', handleChartTabClick);
+        });
+        
+        // Forecast tab listeners (only if Aeris Weather is enabled)
+        if (config.aerisWeatherEnabled) {
+            document.querySelectorAll('.forecast-tab').forEach(tab => {
+                tab.addEventListener('click', handleForecastTabClick);
+            });
+        }
+    };
+    
+    // Handle chart tab clicks
+    const handleChartTabClick = (event) => {
+        const range = event.currentTarget.dataset.range;
+        if (range && range !== state.currentRange) {
+            switchChartRange(range);
+        }
+    };
+    
+    // Handle forecast tab clicks
+    const handleForecastTabClick = (event) => {
+        const forecastType = event.currentTarget.dataset.forecastType;
+        if (forecastType && forecastType !== state.currentForecastType) {
+            switchForecastType(forecastType);
+        }
+    };
+    
+    // Switch chart range
+    const switchChartRange = async (range) => {
+        state.currentRange = range;
+        WeatherDOM.switchChartRange(range);
+        
+        // Clear existing charts
+        WeatherCharts.destroyAllCharts();
+        
+        // Load new charts
+        await loadChartsForRange(range);
+    };
+    
+    // Switch forecast type
+    const switchForecastType = (type) => {
+        state.currentForecastType = type;
+        WeatherDOM.switchForecastType(type);
+    };
+    
+    // Start timers
+    const startTimers = () => {
+        // Live data refresh timer
+        state.liveDataTimer = setInterval(refreshLiveData, INTERVALS.LIVE_DATA);
+
+        // Update timer (for "last updated X seconds ago")
+        state.updateTimerInterval = setInterval(() => {
+            state.secondsSinceLastUpdate++;
+            WeatherDOM.updateLiveIndicator(true, state.secondsSinceLastUpdate);
+        }, 1000);
+    };
+
+    // Load almanac data
+    const loadAlmanac = async () => {
+        try {
+            const url = `/almanac?station=${config.pullFromDevice}`;
+            const response = await fetch(url);
+
+            if (!response.ok) {
+                throw new Error(`Failed to fetch almanac data: ${response.statusText}`);
+            }
+
+            const almanac = await response.json();
+            updateAlmanacDisplay(almanac);
+        } catch (error) {
+            if (config.debug) console.error('Error loading almanac data:', error);
+        }
+    };
+
+    // Update almanac display
+    const updateAlmanacDisplay = (almanac) => {
+        // Helper function to format timestamp
+        const formatTimestamp = (timestamp) => {
+            if (!timestamp) return '--';
+            const date = new Date(timestamp);
+            return date.toLocaleString('en-US', {
+                month: 'short',
+                day: 'numeric',
+                year: 'numeric',
+                hour: 'numeric',
+                minute: '2-digit',
+                hour12: true
+            });
+        };
+
+        // Helper function to get wind direction from degrees
+        const getWindDirection = (degrees) => {
+            if (degrees === null || degrees === undefined) return '--';
+            const directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+            const index = Math.round(degrees / 22.5) % 16;
+            return `${directions[index]} (${Math.round(degrees)}°)`;
+        };
+
+        // Helper function to update metric
+        const updateMetric = (valueId, timeId, record, precision = 1) => {
+            const valueEl = document.getElementById(valueId);
+            const timeEl = document.getElementById(timeId);
+
+            if (valueEl && record) {
+                valueEl.textContent = record.value.toFixed(precision);
+            }
+            if (timeEl && record) {
+                timeEl.textContent = formatTimestamp(record.timestamp);
+            }
+        };
+
+        // Update basic metrics
+        updateMetric('almanac-high-temp', 'almanac-high-temp-time', almanac.high_temp);
+        updateMetric('almanac-low-temp', 'almanac-low-temp-time', almanac.low_temp);
+        updateMetric('almanac-max-rain-hour', 'almanac-max-rain-hour-time', almanac.max_rain_hour, 2);
+        updateMetric('almanac-max-rain-day', 'almanac-max-rain-day-time', almanac.max_rain_day, 2);
+        updateMetric('almanac-low-baro', 'almanac-low-baro-time', almanac.low_barometer, 2);
+        updateMetric('almanac-high-solar', 'almanac-high-solar-time', almanac.high_solar, 0);
+        updateMetric('almanac-low-humidity', 'almanac-low-humidity-time', almanac.low_humidity, 0);
+
+        // Update wind with direction
+        if (almanac.high_wind_speed) {
+            const windValueEl = document.getElementById('almanac-high-wind');
+            const windDirEl = document.getElementById('almanac-high-wind-dir');
+            const windTimeEl = document.getElementById('almanac-high-wind-time');
+
+            if (windValueEl) windValueEl.textContent = almanac.high_wind_speed.value.toFixed(1);
+            if (windDirEl && almanac.high_wind_speed.wind_dir !== undefined) {
+                windDirEl.textContent = `from ${getWindDirection(almanac.high_wind_speed.wind_dir)}`;
+            }
+            if (windTimeEl) windTimeEl.textContent = formatTimestamp(almanac.high_wind_speed.timestamp);
+        }
+
+        // Update snow metrics if enabled
+        if (config.snowEnabled) {
+            updateMetric('almanac-deepest-snow', 'almanac-deepest-snow-time', almanac.deepest_snow, 1);
+            updateMetric('almanac-max-snow-hour', 'almanac-max-snow-hour-time', almanac.max_snow_hour, 1);
+            updateMetric('almanac-max-snow-day', 'almanac-max-snow-day-time', almanac.max_snow_day, 1);
+        }
+
+        // Update air quality metrics if enabled
+        if (config.airQualityEnabled) {
+            updateMetric('almanac-high-pm25', 'almanac-high-pm25-time', almanac.high_pm25, 1);
+            updateMetric('almanac-high-pm10', 'almanac-high-pm10-time', almanac.high_pm10_in, 1);
+            updateMetric('almanac-high-co2', 'almanac-high-co2-time', almanac.high_co2, 0);
+            updateMetric('almanac-high-tvoc', 'almanac-high-tvoc-time', almanac.high_tvoc, 0);
+            updateMetric('almanac-high-aqi-pm25', 'almanac-high-aqi-pm25-time', almanac.high_aqi_pm25, 0);
+            updateMetric('almanac-high-aqi-pm10', 'almanac-high-aqi-pm10-time', almanac.high_aqi_pm10, 0);
+        }
+    };
+
+    // Load station info to get device IDs
+    const loadStationInfo = async () => {
+        try {
+            const stationInfo = await WeatherDataService.fetchStationInfo();
+            if (stationInfo) {
+                if (config.snowEnabled) {
+                    state.snowDeviceId = WeatherDataService.getSnowDeviceId(stationInfo);
+                    if (config.debug) console.log('Snow device ID:', state.snowDeviceId);
+                }
+                if (config.airQualityEnabled) {
+                    state.airQualityDeviceId = WeatherDataService.getAirQualityDeviceId(stationInfo);
+                    if (config.debug) console.log('Air quality device ID:', state.airQualityDeviceId);
+                }
+            }
+        } catch (error) {
+            if (config.debug) console.error('Error loading station info:', error);
+        }
+    };
+
+    // Load initial data
+    const loadInitialData = async () => {
+        // First, load station info to get device IDs (needed for snow data)
+        await loadStationInfo();
+
+        // Load all data in parallel for faster initial load
+        const promises = [
+            refreshLiveData(),
+            loadChartsForRange(state.currentRange),
+            loadAlmanac()
+        ];
+
+        // Add forecast promises if Aeris Weather is enabled
+        if (config.aerisWeatherEnabled) {
+            promises.push(refreshWeekForecast());
+            promises.push(refreshDayForecast());
+        }
+
+        // Wait for all data to load in parallel
+        await Promise.all(promises);
+    };
+    
+    // Refresh live data
+    const refreshLiveData = async () => {
+        try {
+            const { weather, snow, airQuality } = await WeatherDataService.fetchLiveData(
+                config.snowEnabled,
+                config.airQualityEnabled,
+                config.stationID,
+                state.airQualityDeviceId,
+                state.snowDeviceId
+            );
+            
+            if (weather) {
+                const processedWeather = WeatherDataService.processLiveWeatherData(weather);
+                const processedSnow = config.snowEnabled ? 
+                    WeatherDataService.processSnowData(snow) : null;
+                
+                WeatherDOM.updateLiveWeather(processedWeather, processedSnow);
+                
+                // Update air quality data if enabled and available
+                if (config.airQualityEnabled && airQuality) {
+                    WeatherDOM.updateAirQualityData(airQuality);
+                }
+                
+                state.secondsSinceLastUpdate = 0;
+                WeatherDOM.updateLiveIndicator(true, 0);
+            } else {
+                WeatherDOM.updateLiveIndicator(false);
+            }
+        } catch (error) {
+            if (config.debug) console.error('Error refreshing live data:', error);
+            WeatherDOM.updateLiveIndicator(false);
+        }
+    };
+    
+    // Load charts for a specific range
+    const loadChartsForRange = async (range) => {
+        const hours = CHART_RANGES[range];
+        console.log('[SNOW DEBUG] loadChartsForRange called:', { range, hours, snowEnabled: config.snowEnabled });
+
+        try {
+            // Merge config with state-based device IDs
+            const chartConfig = {
+                ...config,
+                airQualityDeviceID: state.airQualityDeviceId
+            };
+            const { mainData, snowData, airQualityData } = await WeatherDataService.fetchChartData(hours, chartConfig);
+
+            if (!mainData) {
+                console.log('[SNOW DEBUG] No mainData returned, aborting chart load');
+                return;
+            }
+
+            console.log('[SNOW DEBUG] Chart data fetched:', {
+                hasMainData: !!mainData,
+                hasSnowData: !!snowData,
+                mainDataLength: mainData?.length,
+                snowDataLength: snowData?.length
+            });
+
+            // Create charts for each metric
+            const chartMetrics = Object.keys(WeatherCharts.chartTypeConfigs);
+            console.log('[SNOW DEBUG] Chart metrics to process:', chartMetrics);
+            
+            for (const metric of chartMetrics) {
+                // Skip snow chart if not enabled
+                if (metric === 'snowdepth' && !config.snowEnabled) {
+                    console.log('[SNOW DEBUG] Skipping snowdepth chart - snow not enabled');
+                    continue;
+                }
+                if (metric === 'snowdepth') {
+                    console.log('[SNOW DEBUG] Processing snowdepth chart metric');
+                }
+                
+                // Skip air quality charts if not enabled
+                if ((metric === 'pm25' || metric === 'pm10' || metric === 'co2' || metric === 'tvocindex' || metric === 'noxindex') && !config.airQualityEnabled) continue;
+                
+                const elementId = metric + 'Chart' + range;
+                const element = WeatherDOM.getCachedElement(elementId);
+
+                if (metric === 'snowdepth') {
+                    console.log(`[SNOW DEBUG] Chart element check: elementId=${elementId}, exists=${!!element}, snowEnabled=${config.snowEnabled}`);
+                }
+
+                if (element) {
+                    if (metric === 'snowdepth') {
+                        console.log('[SNOW DEBUG] Snow chart element found, proceeding with chart creation');
+                    }
+                    // Determine which data source to use
+                    let dataSource = mainData;
+                    if (metric === 'snowdepth') {
+                        dataSource = snowData || mainData;
+                    } else if (metric === 'pm25' || metric === 'pm10' || metric === 'co2' || metric === 'tvocindex' || metric === 'noxindex') {
+                        dataSource = airQualityData;
+                        if (!dataSource) continue;
+                    }
+
+                    // Process data for this chart type
+                    const chartData = WeatherCharts.processChartData(
+                        dataSource,
+                        metric,
+                        { snowData: snowData, airQualityData: airQualityData }
+                    );
+
+                    // Get additional series if any
+                    const additionalSeries = WeatherCharts.getAdditionalSeriesData(dataSource, metric, snowData);
+
+                    // Create the chart
+                    const chartConfig = WeatherCharts.getChartConfig(metric);
+                    const options = {
+                        ...chartConfig,
+                        additionalSeries: additionalSeries
+                    };
+
+                    // Create chart with proper title
+                    const title = metric.charAt(0).toUpperCase() + metric.slice(1).replace(/([A-Z])/g, ' $1');
+                    WeatherCharts.createChart(metric, element, chartData, title, options);
+                }
+            }
+        } catch (error) {
+            if (config.debug) console.error('Error loading charts:', error);
+        }
+    };
+    
+    // Refresh week forecast
+    const refreshWeekForecast = async () => {
+        try {
+            const data = await WeatherDataService.fetchForecast(240, config.stationID);
+            if (!data) {
+                setTimeout(refreshWeekForecast, 60000);
+                return;
+            }
+            
+            const processed = WeatherDataService.processForecastData(data, 'week');
+            const lastUpdated = WeatherUtils.formatLastUpdated(data.lastUpdated);
+            
+            WeatherDOM.updateWeekForecast(processed, lastUpdated);
+            
+            // Schedule next refresh
+            setTimeout(refreshWeekForecast, INTERVALS.FORECAST_REFRESH);
+        } catch (error) {
+            if (config.debug) console.error('Error refreshing week forecast:', error);
+            setTimeout(refreshWeekForecast, 60000);
+        }
+    };
+    
+    // Refresh day forecast
+    const refreshDayForecast = async () => {
+        try {
+            const data = await WeatherDataService.fetchForecast(24, config.stationID);
+            if (!data) {
+                setTimeout(refreshDayForecast, 60000);
+                return;
+            }
+            
+            const processed = WeatherDataService.processForecastData(data, 'day');
+            const lastUpdated = WeatherUtils.formatLastUpdated(data.lastUpdated);
+            
+            WeatherDOM.updateDayForecast(processed, lastUpdated);
+            
+            // Schedule next refresh
+            setTimeout(refreshDayForecast, INTERVALS.FORECAST_REFRESH);
+        } catch (error) {
+            if (config.debug) console.error('Error refreshing day forecast:', error);
+            setTimeout(refreshDayForecast, 60000);
+        }
+    };
+    
+    // Setup cleanup handlers
+    const setupCleanupHandlers = () => {
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', cleanup);
+        
+        // Refresh when page becomes visible
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) {
+                refreshLiveData();
+                // Also refresh charts for current time range
+                loadChartsForRange(state.currentRange);
+            }
+        });
+    };
+    
+    // Cleanup function
+    const cleanup = () => {
+        if (state.liveDataTimer) {
+            clearInterval(state.liveDataTimer);
+        }
+        if (state.updateTimerInterval) {
+            clearInterval(state.updateTimerInterval);
+        }
+        if (state.chartRefreshTimer) {
+            clearInterval(state.chartRefreshTimer);
+        }
+
+        WeatherCharts.destroyAllCharts();
+        WeatherDOM.clearCache();
+    };
+
+    // Global function for theme refresh
+    window.refreshChartsForTheme = () => {
+        WeatherCharts.destroyAllCharts();
+        loadChartsForRange(state.currentRange);
+    };
+
+    // Public API
+    return {
+        init,
+        config,
+        refreshLiveData,
+        loadAlmanac,
+        cleanup
+    };
+})();
+
+// Initialize when DOM is ready
+document.addEventListener('DOMContentLoaded', () => {
+    WeatherApp.init();
+});

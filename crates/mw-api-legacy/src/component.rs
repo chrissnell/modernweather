@@ -25,12 +25,11 @@
 //!
 //! # The state slot, and why the router is built by the binary
 //!
-//! The router, host routing and `RouteTable` mounting are M4-3's. What exists today is one
-//! listener the binary binds directly (`mw_http`'s module documentation records that as a
-//! step in the boot sequence rather than a component). So [`routes`] builds an
+//! The router, host routing and `RouteTable` mounting are `mw-http`'s, and since M4-3 the
+//! listener is the `http:listener` component §6.1 describes. [`routes`] builds an
 //! `axum::Router` over a [`RouteState`] -- a root resource `main` owns, exactly as
-//! `SnapshotState` and `RollupState` are -- and the component installs its [`Handlers`]
-//! into that slot while it runs.
+//! `SnapshotState` and `RollupState` are -- [`route_table`] pairs it with [`manifest`], and
+//! the component installs its [`Handlers`] into that slot while it runs.
 //!
 //! That makes "the table is mounted" and "the component is `Running`" **the same fact**,
 //! which is what D-48's invariant is stated over, without putting an `axum::Router` on the
@@ -208,14 +207,18 @@ pub fn manifest() -> RouteManifest {
 /// rather than frozen, so a `503` on either is a website that renders an empty panel and
 /// not a shipped client that stops working.
 ///
-/// **There is no plan-level check over these yet**, and this comment used to say there was
-/// -- "for the plan-level check that none of them is claimed by a component whose hard needs
-/// reach outside `{LatestSnapshot}`". Nothing does that: the constant is used by
-/// [`manifest`] and its test, and it is not re-exported from `lib.rs`, so no other crate
-/// could. The check belongs to `implementation-plan.md` M4-3, which is the item that mounts
-/// a second component on these paths; until then the assertion that matters is this
-/// component's own hard-need set, which `the_hard_needs_are_exactly_the_latest_snapshot`
-/// pins. Describing enforcement that does not exist is the shape of G-1.
+/// **There is a check now, and it is `mw-http`'s.** This comment once described one that did
+/// not exist, which is the shape of G-1; M4-3 built it.
+/// `mw_http::MountError::FrozenPatternShadowed` refuses a `Scope::Site` table that claims one
+/// of these five, because a per-website router is tried *before* the shared one and would
+/// shadow the frozen surface for that host -- and `plan()` cannot see it, since two tables in
+/// different scopes are not a route conflict. The patterns themselves live in
+/// `mw_http::FROZEN_PATTERNS`: the crate that needs them for the check may not depend on the
+/// crate that serves them, so there is **one** list and
+/// [`tests::the_frozen_patterns_are_the_listeners_frozen_patterns`] pins this one to it.
+///
+/// The other half is still this component's own hard-need set, which
+/// `the_hard_needs_are_exactly_the_latest_snapshot` pins.
 pub const FROZEN_PATTERNS: [&str; 5] = [
     "/latest",
     "/span/{span}",
@@ -239,6 +242,24 @@ pub fn routes(state: Arc<RouteState>) -> Router {
         .route("/almanac", any(almanac))
         .route("/api/stations", any(stations))
         .with_state(state)
+}
+
+/// The frozen surface as a [`mw_http::RouteTable`], ready for the one listener to mount.
+///
+/// **One function rather than two for the binary to pair up.** Before M4-3 the binary built
+/// the router with [`routes`] and the manifest never left this crate's `Provision`; the
+/// listener now mounts a table that carries both, so "the paths `plan()` validated" and
+/// "the paths the router answers" travel together and cannot be assembled from different
+/// configurations.
+///
+/// `Scope::Any` and not the catch-all: the frozen paths answer on every host (the website
+/// is selected inside the handler), and the fallback is `mw-web`'s asset tree.
+pub fn route_table(state: Arc<RouteState>) -> Result<mw_http::RouteTable, LegacyPlanError> {
+    Ok(mw_http::RouteTable::new(
+        ComponentId::new(ID)?,
+        manifest(),
+        routes(state),
+    ))
 }
 
 /// The `Host` header, or an empty string.
@@ -589,6 +610,38 @@ impl Serve for Legacy {
 mod tests {
     use super::*;
     use crate::config::{Listener, StationView, WebsiteView};
+
+    /// **One list, cross-asserted.** `mw_http::FROZEN_PATTERNS` is what
+    /// `mw_http::MountError::FrozenPatternShadowed` refuses a per-website table for, and it
+    /// has to be the same five paths this crate serves -- the listener may not depend on
+    /// this crate, so the constant lives there and the agreement lives here. Two lists with
+    /// no assertion between them is how a sixth frozen path would get mounted per website
+    /// with nothing noticing.
+    #[test]
+    fn the_frozen_patterns_are_the_listeners_frozen_patterns() {
+        assert_eq!(FROZEN_PATTERNS, mw_http::FROZEN_PATTERNS);
+        // And every one of them is a pattern this crate actually declares.
+        let frozen = manifest();
+        let declared: Vec<&str> = frozen.entries.iter().map(|e| e.pattern.as_str()).collect();
+        for pattern in FROZEN_PATTERNS {
+            assert!(declared.contains(&pattern), "`{pattern}` is not declared");
+        }
+    }
+
+    /// The table the listener mounts and the manifest `plan()` validates are the same
+    /// paths, built from the same function.
+    #[test]
+    fn the_route_table_carries_the_manifest_the_provision_declares() {
+        let table = route_table(Arc::new(RouteState::new())).expect("a table");
+        assert_eq!(table.manifest(), &manifest());
+        assert_eq!(table.owner().as_str(), ID);
+        assert_eq!(table.scope(), Scope::Any);
+        assert!(
+            !table.is_catch_all(),
+            "the catch-all is `mw-web`'s asset tree"
+        );
+    }
+
     use mw_component::Match;
     use mw_types::{StationKey, WebsiteId};
 

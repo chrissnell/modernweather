@@ -49,8 +49,10 @@
 //! pre-serialised bytes, so a database outage no longer touches it: that module is the
 //! table, the fold, and the cold-start seed.
 //!
-//! Not yet, each with the item that owns it: the snapshot payload **renderer** (M4-2, which
-//! exclusively owns the frozen DTO), `snow:*` (M6-3) and `live:stream` (M4-3). The seams
+//! Not yet, each with the item that owns it: `snow:*` (M6-3) and `live:stream`, which W3
+//! §2a.2's SSE surface needs and which no landed item serves -- M4-3 built the listener it
+//! would mount on and deliberately did not invent a consumer for it. The snapshot payload
+//! **renderer** landed with M4-2, which exclusively owns the frozen DTO. The seams
 //! they attach to are marked where they land — `ingress.rs` names enrich at the line it
 //! goes on — because a list in a module doc is not a work item
 //! (docs/reconciliation.md G-5).

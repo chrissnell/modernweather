@@ -95,7 +95,32 @@ pub struct SourceRule {
 pub struct Templates {
     pub dir: String,
     pub needles: Vec<String>,
+    /// The `askama.toml` whose escaper table is pinned, relative to the repository root.
+    ///
+    /// **The hole the `needles` above cannot see.** An `askama.toml` that reassigns the
+    /// `html` escaper turns escaping off globally without any filter appearing in any
+    /// template -- `ci/layers.toml`'s own `reason` recorded that and said "the day one
+    /// arrives it needs a rule of its own". M4-3 is the day: `crates/mw-web/askama.toml`
+    /// registers `GoHtmlEscaper`, and this is the rule.
+    pub escaper_config: String,
+    /// The escaper path that file must name, and the only one it may.
+    pub escaper_path: String,
+    /// The extensions it must be registered for.
+    pub escaper_extensions: Vec<String>,
     pub reason: String,
+}
+
+/// The shape of the `askama.toml` [`Templates::escaper_config`] names.
+#[derive(Debug, Deserialize)]
+struct AskamaConfig {
+    #[serde(default)]
+    escaper: Vec<AskamaEscaper>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AskamaEscaper {
+    path: String,
+    extensions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -765,7 +790,77 @@ fn check_templates(root: &Path, decl: &Layers, v: &mut Vec<Violation>) -> Result
             }
         }
     }
+    check_askama_escaper(root, decl, v);
     Ok(())
+}
+
+/// The escaper `askama.toml` registers is the declared one, and the only one.
+///
+/// **This is the hole the template scan cannot see.** A `[[escaper]]` entry pointing at
+/// `askama::filters::Empty` -- which writes its input unchanged -- turns escaping off for
+/// every template in the crate, with no `safe` filter and no attribute anywhere for the
+/// other two rules to find. Three ways to break it, all checked: a different path, a
+/// missing extension, and a second entry (askama takes the **first** match, so an added
+/// entry above the real one silently wins).
+///
+/// A missing or unparseable file is a violation rather than a skip: the rule exists because
+/// the file exists, and "the gate stopped applying because the file was deleted" is the
+/// failure mode every `only_paths` exemption in this module is checked against.
+fn check_askama_escaper(root: &Path, decl: &Layers, v: &mut Vec<Violation>) {
+    let rel = &decl.templates.escaper_config;
+    let path = root.join(rel);
+    let reason = decl.templates.reason.trim().to_string();
+    let push = |v: &mut Vec<Violation>, what: String| {
+        v.push(Violation {
+            rule: "askama-escaper".into(),
+            what,
+            reason: reason.clone(),
+        });
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            push(v, format!("{rel} cannot be read: {e}"));
+            return;
+        }
+    };
+    let config: AskamaConfig = match toml::from_str(&text) {
+        Ok(config) => config,
+        Err(e) => {
+            push(v, format!("{rel} is not valid TOML: {e}"));
+            return;
+        }
+    };
+    if config.escaper.len() != 1 {
+        push(
+            v,
+            format!(
+                "{rel} declares {} escapers; exactly one is allowed, because askama takes \
+                 the FIRST match and a second entry can silently win",
+                config.escaper.len()
+            ),
+        );
+        return;
+    }
+    let escaper = &config.escaper[0];
+    if escaper.path != decl.templates.escaper_path {
+        push(
+            v,
+            format!(
+                "{rel} registers `{}` and must register `{}`",
+                escaper.path, decl.templates.escaper_path
+            ),
+        );
+    }
+    if escaper.extensions != decl.templates.escaper_extensions {
+        push(
+            v,
+            format!(
+                "{rel} registers it for {:?} and must register it for {:?}",
+                escaper.extensions, decl.templates.escaper_extensions
+            ),
+        );
+    }
 }
 
 /// The converse of the drift gate: nothing hand-written is ever placed in `generated/`.
@@ -1091,6 +1186,13 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             let me = Scratch { root };
             me.root_manifest("");
+            // The escaper table `[templates]` pins. Written by default rather than per
+            // test, because every tree a real check runs over has one -- and a missing file
+            // is itself a violation.
+            me.write(
+                "askama.toml",
+                "[[escaper]]\npath = \"crate::GoHtmlEscaper\"\nextensions = [\"html\"]\n",
+            );
             // `r##` rather than `r#`: the declaration below contains `"#`, in the
             // `#[path` needle, which would close a single-hash raw string.
             me.write(
@@ -1150,6 +1252,9 @@ reason = "source lives where its crate owns it"
 [templates]
 dir = "crates/c-high/templates"
 needles = ["|safe"]
+escaper_config = "askama.toml"
+escaper_path = "crate::GoHtmlEscaper"
+escaper_extensions = ["html"]
 reason = "escaping is not optional"
 
 [generated]
@@ -1721,11 +1826,58 @@ reason = "nothing hand-written lives in generated/"
         assert!(s2.check().is_empty(), "{:?}", s2.check());
     }
 
+    /// **The `askama.toml` hole, shown failing in all four of its shapes.**
+    ///
+    /// A gate that cannot fail is worth nothing, and this one is the only thing standing
+    /// between `crates/mw-web/templates/` and globally disabled escaping: none of the
+    /// needles above appears anywhere when the escaper itself is swapped.
+    #[test]
+    fn an_askama_config_that_disables_escaping_is_rejected() {
+        let cases: [(&str, &str); 4] = [
+            (
+                "a different escaper",
+                "[[escaper]]\npath = \"askama::filters::Empty\"\nextensions = [\"html\"]\n",
+            ),
+            (
+                "a missing extension",
+                "[[escaper]]\npath = \"crate::GoHtmlEscaper\"\nextensions = []\n",
+            ),
+            (
+                "a second entry, which askama matches first",
+                "[[escaper]]\npath = \"askama::filters::Empty\"\nextensions = [\"html\"]\n\
+                 [[escaper]]\npath = \"crate::GoHtmlEscaper\"\nextensions = [\"html\"]\n",
+            ),
+            ("no escaper at all", "# nothing\n"),
+        ];
+        for (what, body) in cases {
+            let s = Scratch::new();
+            s.write("crates/c-high/templates/index.html", "{{ name }}\n");
+            s.write("askama.toml", body);
+            assert_eq!(s.rules(), ["askama-escaper"], "{what}: {:?}", s.check());
+        }
+        // And the file being gone is a violation rather than a skip.
+        let s = Scratch::new();
+        s.write("crates/c-high/templates/index.html", "{{ name }}\n");
+        std::fs::remove_file(s.root.join("askama.toml")).unwrap();
+        assert_eq!(s.rules(), ["askama-escaper"], "{:?}", s.check());
+    }
+
+    /// And the declared one passes, so the test above is not asserting that everything
+    /// fails.
+    #[test]
+    fn the_declared_askama_escaper_passes() {
+        let s = Scratch::new();
+        s.write("crates/c-high/templates/index.html", "{{ name }}\n");
+        assert!(s.check().is_empty(), "{:?}", s.check());
+    }
+
     // ------------------------------------------------------------- the declaration itself
 
     #[test]
     fn a_declaration_that_contradicts_itself_fails_to_load() {
-        let tail = "[templates]\ndir=\"t\"\nneedles=[]\nreason=\"r\"\n\
+        let tail = "[templates]\ndir=\"t\"\nneedles=[]\n\
+                    escaper_config=\"askama.toml\"\nescaper_path=\"p\"\n\
+                    escaper_extensions=[]\nreason=\"r\"\n\
                     [generated]\ndir=\"g\"\nheader=\"H\"\nreason=\"r\"\n";
         let crate_decl = "[[crate]]\nname=\"x\"\nlayer=\"a\"\n";
         let cases = [

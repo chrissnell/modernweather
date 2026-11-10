@@ -1,0 +1,68 @@
+# path	status	Content-Type
+# Captured by running Go 1.26's http.FileServer(http.FS(os.DirFS(...))) over
+# crates/mw-web/assets, which is the tree this crate embeds. Regenerate with
+# scratch/gorender/mime.
+/apple-touch-icon.png	200	image/png
+/css/	200	text/html; charset=utf-8
+/css/fonts.css	200	text/css; charset=utf-8
+/css/normalize.css	200	text/css; charset=utf-8
+/css/portal-responsive.css	200	text/css; charset=utf-8
+/css/portal.css	200	text/css; charset=utf-8
+/css/weather.css	200	text/css; charset=utf-8
+/favicon-96x96.png	200	image/png
+/favicon.ico	200	image/vnd.microsoft.icon
+/favicon.svg	200	image/svg+xml
+/fonts/	200	text/html; charset=utf-8
+/fonts/Cinzel-VariableFont_wght.ttf	200	font/ttf
+/fonts/Courgette-Regular.ttf	200	font/ttf
+/fonts/gopherwx.eot	200	application/vnd.ms-fontobject
+/fonts/gopherwx.svg	200	image/svg+xml
+/fonts/gopherwx.ttf	200	font/ttf
+/fonts/gopherwx.woff	200	font/woff
+/fonts/gopherwx.woff2	200	font/woff2
+/fonts/inconsolata-400.ttf	200	font/ttf
+/fonts/inconsolata-400.woff2	200	font/woff2
+/fonts/inconsolata-500.ttf	200	font/ttf
+/fonts/inconsolata-500.woff2	200	font/woff2
+/fonts/inconsolata-700.ttf	200	font/ttf
+/fonts/inconsolata-700.woff2	200	font/woff2
+/fonts/roboto-300.ttf	200	font/ttf
+/fonts/roboto-400.ttf	200	font/ttf
+/fonts/roboto-500.ttf	200	font/ttf
+/fonts/roboto-700.ttf	200	font/ttf
+/fonts/roboto-slab-300.ttf	200	font/ttf
+/fonts/roboto-slab-400.ttf	200	font/ttf
+/fonts/roboto-slab-500.ttf	200	font/ttf
+/fonts/roboto-slab-700.ttf	200	font/ttf
+/fonts/roboto-slab-800.ttf	200	font/ttf
+/fonts/roboto-slab-900.ttf	200	font/ttf
+/fonts/weathericons-regular-webfont.ttf	200	font/ttf
+/fonts/weathericons-regular-webfont.woff	200	font/woff
+/fonts/weathericons-regular-webfont.woff2	200	font/woff2
+/images/	200	text/html; charset=utf-8
+/images/favicon.png	200	image/png
+/images/gopherwx.svg	200	image/svg+xml
+/images/webclip.png	200	image/png
+/js/	200	text/html; charset=utf-8
+/js/moment.min.js	200	text/javascript; charset=utf-8
+/js/portal-app.js	200	text/javascript; charset=utf-8
+/js/portal-data-service.js	200	text/javascript; charset=utf-8
+/js/portal-dom.js	200	text/javascript; charset=utf-8
+/js/portal-map.js	200	text/javascript; charset=utf-8
+/js/portal-utils.js	200	text/javascript; charset=utf-8
+/js/weather-app.js	200	text/javascript; charset=utf-8
+/js/weather-charts.js	200	text/javascript; charset=utf-8
+/js/weather-data-service.js	200	text/javascript; charset=utf-8
+/js/weather-dom.js	200	text/javascript; charset=utf-8
+/js/weather-forecast-band.js	200	text/javascript; charset=utf-8
+/js/weather-forecast-band.test.js	200	text/javascript; charset=utf-8
+/js/weather-radar.js	200	text/javascript; charset=utf-8
+/js/weather-radar.test.js	200	text/javascript; charset=utf-8
+/js/weather-utils.js	200	text/javascript; charset=utf-8
+/nonexistent-asset	404	text/plain; charset=utf-8
+/portal.html	200	text/html; charset=utf-8
+/privacy.html	200	text/html; charset=utf-8
+/site.webmanifest	200	text/plain; charset=utf-8
+/support.html	200	text/html; charset=utf-8
+/web-app-manifest-192x192.png	200	image/png
+/web-app-manifest-512x512.png	200	image/png

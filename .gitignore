@@ -3,3 +3,6 @@
 /scratch
 Cargo.lock.orig
 /.conformance-go-src
+# Client binaries lifted out of the TimescaleDB pod so that the database gates can run
+# where `apt` is not available. Not part of the build and not portable between hosts.
+/.tools

@@ -341,6 +341,53 @@ pub fn snapshot_published(
     .set(if fresh { 0.0 } else { 1.0 });
 }
 
+/// Recompute `mw_snapshot_age_seconds` and `mw_snapshot_degraded` for every published key.
+///
+/// **M4-1's constraint 2, and the scrape path is where it belongs.** Both gauges are written
+/// by [`snapshot_published`], which runs only when a fold happens -- so a station that stops
+/// reporting leaves its age gauge at whatever it was when the last reading arrived, and the
+/// 600-second recency rule the frozen contract applies is never crossed in the metric. An
+/// alert on `mw_snapshot_age_seconds > 600` would therefore never fire for the failure it
+/// exists to catch.
+///
+/// Sweeping here rather than on a timer is the decision M4-1 recorded: a timer would be a
+/// second clock (§3.3 allows one) and would cost work on a daemon nobody is scraping, while
+/// the scrape is exactly the moment the number is read. The cost is one iteration of the
+/// published table -- W3 §2a.4 bounds it at the cross product of websites and stations, 30
+/// keys in W1's rig -- per scrape.
+///
+/// **`now` is a parameter** so that the sweep is testable without a clock, which is the same
+/// shape [`snapshot_published`] already has.
+///
+/// A key with no snapshot yet is skipped rather than reported as age zero: a gauge that
+/// claimed a fresh reading for a station that has never reported would be worse than an
+/// absent series, and `/latest`'s cold-start answer is a `404` for the same reason.
+pub fn sweep_snapshot_ages(state: &crate::SnapshotState, now: chrono::DateTime<chrono::Utc>) {
+    // `LatestSnapshot::table()` rather than an inherent accessor, which is what M4-1's
+    // constraint names: the sweep reads the same published table every request reads.
+    use mw_component::LatestSnapshot as _;
+    for (key, snapshot) in state.table().iter() {
+        let website = key.website.to_string();
+        let station = key.station.as_str().to_string();
+        metrics::gauge!(
+            "mw_snapshot_age_seconds",
+            "website" => website.clone(),
+            "station" => station.clone(),
+        )
+        .set(snapshot.age_seconds(now));
+        metrics::gauge!(
+            "mw_snapshot_degraded",
+            "website" => website,
+            "station" => station,
+        )
+        .set(if snapshot.staleness().is_fresh() {
+            0.0
+        } else {
+            1.0
+        });
+    }
+}
+
 /// One key's payload could not be serialised, so its previous bytes stay published.
 ///
 /// A counter rather than a component failure, because taking `snapshot:latest` down would

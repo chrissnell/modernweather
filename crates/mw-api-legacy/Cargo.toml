@@ -23,6 +23,9 @@ mw-types.workspace = true
 # a permitted edge; it is declared with a reason because an API crate depending on the
 # pipeline is a surprising one.
 mw-pipeline.workspace = true
+# `RouteTable`, so that the frozen surface's router and the manifest `plan()` validates
+# travel to the one listener together (M4-3). A lower layer, so a permitted edge.
+mw-http.workspace = true
 
 axum.workspace = true
 # The route table's state slot: one atomic load per request, no lock on the read path

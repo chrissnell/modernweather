@@ -5,7 +5,7 @@
 //!  spool watch ── OnReading ─────────▶│ snapshot:latest  │──┐
 //!  WindowedView (S) ─────────────────▶└──────────────────┘  │  Arc<dyn LatestSnapshot>
 //!                                                           ├──▶ api:legacy  (M4-2)
-//!  ReadingStore::latest ── OnStartup ▶┌──────────────────┐  │    web:site:*  (M4-3)
+//!  ReadingStore::latest ── OnStartup ▶┌──────────────────┐  │    web:site:*
 //!  WindowedView (S) ─────────────────▶│ snapshot:warm    │──┘
 //!                                     └──────────────────┘
 //!                            both write one Arc<SnapshotState>
@@ -48,9 +48,11 @@
 //! frozen route that is not mounted, which is the one thing **D-48** forbids.
 //!
 //! **This is the whole of M4-1's half of D-48's invariant.** The rest of it — "every frozen
-//! route returns its contract response and never `503`" — needs frozen routes, and
-//! `mw-api-legacy` is M4-2 while the route table and `http:listener` are M4-3. What is
-//! testable here is the precondition the invariant rests on, and
+//! route returns its contract response and never `503`" — needs frozen routes: M4-2 brought
+//! them and its `crates/mw-api-legacy/tests/degraded.rs` asserts the bytes, and M4-3 brought
+//! the route table and `http:listener` plus the mount-time refusal of a per-website table
+//! that claims one of the five patterns. What is testable here is the precondition the
+//! invariant rests on, and
 //! `crates/modernweather/tests/snapshot_degraded.rs` tests it against the real supervisor
 //! with no `db:postgres` at all: a consumer whose only hard need is `LatestSnapshot`
 //! reaches `Running`, so its route table mounts.
