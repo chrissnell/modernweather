@@ -1441,7 +1441,8 @@ endpoint the archive is carried and unreadable, which is the recorded trade.
 
 
 
-**Twelve from this pass, plus **O-13** raised by implementation-plan.md M3-1, consolidated and
+**Twelve from this pass, plus **O-13** raised by implementation-plan.md M3-1 and **O-14** by M6-1,
+consolidated and
 deduplicated from sixty-two open questions across ten documents.** Fifty
 are closed: forty-one were answered by a later document (W4 alone closed OQ-3, OQ-4, OQ-5, OQ-W1-2,
 OQ-W2-1 and OQ-W2-6; W3 closed its own ten plus OQ-D and W8's OQ-1 and OQ-2), four were resolved in
@@ -1734,6 +1735,46 @@ something the tree does not do. Note that the gate is honest either way — it r
 against a real second process, binds a declared test set by name, and prints the authorship caveat on
 every run — so this is a question about the strength of an oracle and not about whether anything is
 checked.
+
+**O-14. Does the registry gain a `jsonb` type, so that `observations.extra` can be a registry
+entry?** *(OQ-W4-3, raised at the moment W4 asked for by implementation-plan.md M6-1)*
+
+*Why it matters, and why now.* W4 left this open with an explicit trigger: it is *"worth deciding
+before W7 writes its first driver that receives an unknown field"*. **M6-1 is that moment.** Two of
+the six drivers it adds receive fields nobody can enumerate in advance:
+
+- **Campbell Scientific.** The datalogger is programmed in CRBasic by whoever installed it, and what
+  it emits is whatever that program writes. `mw_codec::CampbellAscii` maps **ten** keys — the ten the
+  Go struct declares — and an eleventh is **silently dropped**. A soil-moisture probe, a second wind
+  sensor, a thermocouple string: each is one line of CRBasic away, and today each is a measurement
+  the daemon receives, parses and discards without counting it.
+- **Ambient Weather.** A hundred and thirty-one parameters are mapped, which is the vendor's
+  "customized" vocabulary as of the pinned commit. The vendor adds parameters; a console with a
+  sensor newer than this build sends keys that go nowhere.
+
+`serde` is **not** configured to reject an unknown field in either codec, and that is deliberate: a
+`deny_unknown_fields` there would make one added CRBasic column stop a whole station. So the current
+behaviour is the quiet one — the reading is admitted with the keys this build knows, and the rest
+vanish.
+
+*Options.* **(a)** Leave it until a driver needs it, which is W4's own recommendation and is the
+status quo. **(b)** Add it now: `SqlType::Jsonb`, a `metadata` role, and a protobuf
+`map<string, double>` so the hatch survives a hop and a restart. **(c)** The middle course W4
+recorded as "(a)-then-(c)": leave the registry alone, and **count** what is dropped, so that an
+operator can see a station sending something this build does not store.
+
+*Recommendation:* **(c) now and (b) when the count moves.** The argument for not deciding (b) today is
+W4's and still holds — a `jsonb` column with no consumer is a schema commitment bought on
+speculation, and `observations.extra` already exists as a hand-authored column that nothing writes.
+The argument against pure (a) is what M6-1 found: the drop is currently **invisible**, and this
+programme's recurring defect is a station that reports less than it sends with nothing saying so.
+(c) is one counter per driver — `mw_station_frames_total` already carries an `outcome` label and a
+`dropped_fields` series beside it would be cardinality-safe — and it turns the question from a
+judgement into a measurement the owner can take on their own Campbell.
+
+**This is raised and not decided**, which is what M6-1's brief asked for. Nothing in the code
+anticipates an answer: `mw_codec::CampbellAscii`'s module documentation states the behaviour and
+points here, and a test pins it so that whichever way this goes, the change is visible.
 
 ---
 
@@ -2280,8 +2321,8 @@ the consequence as a property of the environment. Nobody retested it, because it
 ## Open questions
 
 All twelve are in §5 above, which is this document's point rather than an appendix: **O-1** to
-**O-4** are production queries, **O-5** to **O-11** are decisions, **O-13** is a decision raised after
-this pass, and **O-12** is a process finding
+**O-4** are production queries, **O-5** to **O-11** are decisions, **O-13** and **O-14** are decisions
+raised after this pass by implementation items, and **O-12** is a process finding
 about the programme's own method. They are not restated here.
 
 ## Assumptions about other work items

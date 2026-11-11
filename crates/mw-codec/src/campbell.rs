@@ -61,8 +61,13 @@
 //! and there is nowhere to put it. W4's **OQ-W4-3** is exactly this question — whether the
 //! registry gains a `jsonb` type so `observations.extra` can be a registry entry — and W4
 //! flagged it as "worth deciding before W7 writes its first driver that receives an unknown
-//! field". This is that driver. The question is **raised and not answered here**; see the
-//! pull request for M6-1.
+//! field". This is that driver.
+//!
+//! The question is **raised and not answered here**: `docs/reconciliation.md` **O-14** is
+//! where it is put to the owner, with the two drivers that reach it, the three options and a
+//! recommendation. Nothing in this file anticipates an answer, and
+//! [`tests::an_unrecognised_key_is_dropped_and_does_not_fail_the_packet`] pins the current
+//! behaviour so that whichever way it goes, the change is visible.
 
 use mw_types::{PartialReading, Reading};
 use serde::Deserialize;
