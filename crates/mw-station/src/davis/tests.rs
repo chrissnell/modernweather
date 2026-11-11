@@ -236,43 +236,125 @@ async fn bytes_dropped_to_find_a_header_are_counted() {
 }
 
 /// A line at the wrong rate produces bytes that are never a header, and the session ends
-/// rather than buffering for as long as the process runs.
+/// rather than reading noise for as long as the process runs.
+///
+/// The bound is on bytes **discarded**, which is the only form it can take: `take_packet`
+/// trims the buffer to at most ninety-eight bytes every time it returns without a frame,
+/// so the `buffer.len()` bound this test used to reach instead ran off the end of the
+/// transcript and passed as `Closed` -- the branch it names was unreachable. One read of
+/// noise is more than the bound, so `Unexpected` is now the only outcome the transcript
+/// permits and the assertion says so.
 #[tokio::test]
 async fn a_line_that_never_produces_a_header_fails_the_session() {
     let noise = vec![0x55u8; 256];
+    assert!(
+        noise.len() as u64 > DavisSession::MAX_RESYNC_BYTES,
+        "one read has to be enough, or this test proves the EOF path again"
+    );
     let reads: Vec<Vec<u8>> = std::iter::once(WAKE_RESPONSE.to_vec())
         .chain(std::iter::once(vec![ACK]))
-        .chain(std::iter::repeat_n(noise, 8))
+        .chain(std::iter::repeat_n(noise, 4))
         .collect();
     let mut io = Transcript::reading(reads);
     let mut session = session(2);
     session.open(&mut io).await.expect("wakes");
     let e = session.next_frame(&mut io).await.expect_err("never framed");
+    let SessionError::Unexpected { what } = e else {
+        panic!("expected the resync bound, got {e}");
+    };
+    assert!(what.contains("LOOP packet"), "{what}");
     assert!(
-        matches!(
-            e,
-            SessionError::Unexpected { .. } | SessionError::Closed { .. }
-        ),
-        "{e}"
-    );
-    assert!(
-        session.discarded() > 0,
+        session.discarded() > DavisSession::MAX_RESYNC_BYTES,
         "the discarded bytes are what an operator sees for a wrong line rate"
     );
+    assert!(
+        io.remaining() > 0,
+        "the session gave up on the bound rather than on the end of the transcript"
+    );
+}
+
+/// A LOOP record's own trailer does not satisfy the wake handshake.
+///
+/// `\n\r` is both the console's answer to a newline and bytes 95 and 96 of **every** LOOP
+/// record, so a console still streaming a run from before the line dropped -- a serial
+/// device the previous process let go of, a `ser2net` bridge replaying its buffer -- used
+/// to satisfy the handshake with a packet it sent before it was asked anything. The
+/// handshake then reported a woken console and `issue` read that same packet looking for an
+/// acknowledgement.
+#[tokio::test]
+async fn a_streaming_console_does_not_wake_on_its_own_packet_trailer() {
+    // The packet carries `\n\r` at 95; the answer is the two bytes at the front of the
+    // read after it.
+    assert_eq!(
+        packet(700)[95..97],
+        WAKE_RESPONSE[..],
+        "the fixture has to contain the trailer, or this test proves nothing"
+    );
+    let mut io = Transcript::reading([packet(700), WAKE_RESPONSE.to_vec()]);
+    let mut woken = session(2);
+    woken
+        .open(&mut io)
+        .await
+        .expect("the second newline wakes it");
+    assert!(
+        woken.discarded() >= mw_codec::LOOP_BYTES as u64,
+        "the packet was dropped and counted, not read as an answer"
+    );
+    // And a console that only ever streams never wakes, rather than waking on every
+    // packet it sends.
+    let mut io = Transcript::reading(std::iter::repeat_n(packet(700), WAKE_ATTEMPTS));
+    let mut streaming = session(2);
+    let e = streaming.open(&mut io).await.expect_err("never answered");
+    assert!(
+        matches!(e, SessionError::Unexpected { .. }),
+        "something is on the line and it is not a console saying hello: {e}"
+    );
+}
+
+/// A byte that arrived before the command was written is not that command's answer.
+///
+/// Both halves are failures the console caused and the driver mis-attributed: a leftover
+/// `0x15` was read as this command's refusal, which ends the session, and a leftover `0x06`
+/// was read as its acknowledgement, which starts a run the console never agreed to. The
+/// transcript delivers the stale byte in the **same read** as the wake answer, because that
+/// is how it survives into `issue`.
+#[tokio::test]
+async fn a_byte_left_over_from_the_handshake_is_not_the_commands_answer() {
+    for stale in [NAK, ACK] {
+        let mut wake = WAKE_RESPONSE.to_vec();
+        wake.push(stale);
+        let mut io = Transcript::scripted(
+            [wake, vec![ACK], packet(700)],
+            [b"\n".to_vec(), b"LOOP 2\n".to_vec()],
+        );
+        let mut session = session(2);
+        session.open(&mut io).await.expect("wakes");
+        let frame = session
+            .next_frame(&mut io)
+            .await
+            .unwrap_or_else(|e| panic!("a stale {stale:#04x} ended the session: {e}"));
+        assert_eq!(out_temp(&frame), Some(70.0));
+        // The run started on the acknowledgement that followed the command, so there are
+        // `run_length - 1` packets left rather than a run the console never agreed to.
+        assert_eq!(session.remaining(), 1);
+    }
 }
 
 /// Every wait has a deadline, which the Go serial path does not.
 #[tokio::test]
 async fn a_console_that_stops_mid_run_is_a_deadline_rather_than_a_hang() {
+    /// Each element is one `read`, which is the part that matters: a console cannot send
+    /// the acknowledgement for a command it has not been given yet, and a double that
+    /// handed over the whole transcript in one read was modelling exactly that.
     #[derive(Debug)]
-    struct OneThenQuiet(Option<Vec<u8>>);
-    impl crate::session::ByteStream for OneThenQuiet {
+    struct ThenQuiet(std::collections::VecDeque<Vec<u8>>);
+    impl crate::session::ByteStream for ThenQuiet {
         fn read<'a>(
             &'a mut self,
             buf: &'a mut [u8],
         ) -> mw_component::BoxFuture<'a, std::io::Result<usize>> {
             Box::pin(async move {
-                match self.0.take() {
+                match self.0.pop_front() {
                     Some(bytes) => {
                         buf[..bytes.len()].copy_from_slice(&bytes);
                         Ok(bytes.len())
@@ -289,10 +371,11 @@ async fn a_console_that_stops_mid_run_is_a_deadline_rather_than_a_hang() {
         }
     }
 
-    let mut bytes = WAKE_RESPONSE.to_vec();
-    bytes.push(ACK);
-    bytes.extend_from_slice(&packet(700));
-    let mut io = OneThenQuiet(Some(bytes));
+    let mut io = ThenQuiet(
+        [WAKE_RESPONSE.to_vec(), vec![ACK], packet(700)]
+            .into_iter()
+            .collect(),
+    );
     let mut session = session(4);
     session.open(&mut io).await.expect("wakes");
     session.next_frame(&mut io).await.expect("the one packet");

@@ -43,6 +43,7 @@ use crate::session::{ByteStream, Session, SessionError};
 #[derive(Debug, Default)]
 pub struct Lines {
     buffer: Vec<u8>,
+    discarded: u64,
 }
 
 impl Lines {
@@ -50,6 +51,14 @@ impl Lines {
     ///
     /// `bufio.Scanner`'s default maximum, which is also what the Go driver uses, so a record
     /// one implementation refuses the other refuses too.
+    ///
+    /// **Measured on the line and not on the buffer, which is not the same bound.** A
+    /// check made only before each read left room for one more `READ_BYTES` after it, so a
+    /// line of up to 69 631 bytes was assembled and *returned* where `ErrTooLong` refuses
+    /// anything past 65 536 — one implementation accepting a record the other refuses is
+    /// the one thing this constant exists to prevent. The buffer may still hold one read
+    /// past the bound before the session gives up, which is bounded and is not what a
+    /// device can grow.
     pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
     /// How many bytes to read at a time.
@@ -97,10 +106,22 @@ impl Session for Lines {
         Box::pin(async move {
             // Nothing to negotiate, and the buffer is cleared rather than kept: `open` is
             // called again after a reconnect, and half a record from the previous
-            // connection is not the first half of the next one.
+            // connection is not the first half of the next one. Counted for the same
+            // reason the too-long path counts.
+            self.discarded += self.buffer.len() as u64;
             self.buffer.clear();
             Ok(())
         })
+    }
+
+    /// Every byte this session dropped: half a record left by a reconnect, and the whole
+    /// of a line that ran past the bound.
+    ///
+    /// Reported rather than left at the default zero, because without it a datalogger
+    /// emitting 64 KiB of something that is not a record showed a resync counter of nought
+    /// while the session restarted — which is the one case the counter exists for.
+    fn discarded(&self) -> u64 {
+        self.discarded
     }
 
     fn next_frame<'a>(
@@ -111,12 +132,23 @@ impl Session for Lines {
             const WHAT: &str = "reading a line from the datalogger";
             loop {
                 if let Some(frame) = self.take_line() {
+                    // **The bound is on the line, not on the buffer.** A read can carry
+                    // the rest of an over-long line and its terminator at once, so a
+                    // buffer that was under the bound before the read can yield a line
+                    // that is over it -- which `ErrTooLong` refuses and this used to
+                    // return. Measured where the length is known.
+                    if frame.bytes().len() > Self::MAX_LINE_BYTES {
+                        self.discarded += frame.bytes().len() as u64;
+                        return Err(SessionError::Unexpected { what: WHAT });
+                    }
                     return Ok(frame);
                 }
-                if self.buffer.len() >= Self::MAX_LINE_BYTES {
+                if self.buffer.len() > Self::MAX_LINE_BYTES {
                     // Discarded rather than kept: the session is over either way, and
                     // holding 64 KiB until the component is dropped is 64 KiB of a device's
-                    // mistake.
+                    // mistake. Counted, because `discarded` is what an operator reads for a
+                    // device that is producing something other than records.
+                    self.discarded += self.buffer.len() as u64;
                     self.buffer.clear();
                     return Err(SessionError::Unexpected { what: WHAT });
                 }
@@ -226,6 +258,40 @@ mod tests {
         let e = session.next_frame(&mut io).await.expect_err("too long");
         assert!(matches!(e, SessionError::Unexpected { .. }), "{e}");
         assert_eq!(session.buffered(), 0, "and the bytes are not retained");
+        assert!(
+            session.discarded() >= Lines::MAX_LINE_BYTES as u64,
+            "the dropped bytes are reported rather than left at nought"
+        );
+    }
+
+    /// A line that arrives complete and over the bound is refused, which is the case a
+    /// check made before each read cannot see: the terminator comes in the same read as
+    /// the bytes that pass the bound, so the buffer was never over it when it was measured.
+    #[tokio::test]
+    async fn an_over_long_line_that_arrives_with_its_terminator_is_refused() {
+        let mut record = vec![b'x'; Lines::MAX_LINE_BYTES + 1];
+        record.push(b'\n');
+        // Delivered in `READ_BYTES` pieces, which is how a real device delivers it, with
+        // the terminator in the last piece.
+        let chunks: Vec<&[u8]> = record.chunks(Lines::READ_BYTES).collect();
+        let mut io = Transcript::reading(chunks);
+        let mut session = Lines::new();
+        session.open(&mut io).await.expect("nothing to open");
+        let e = session.next_frame(&mut io).await.expect_err("too long");
+        assert!(matches!(e, SessionError::Unexpected { .. }), "{e}");
+        // And one byte shorter is a line, so the bound is the bound rather than a
+        // rejection of long records in general.
+        let mut record = vec![b'x'; Lines::MAX_LINE_BYTES];
+        record.push(b'\n');
+        let chunks: Vec<&[u8]> = record.chunks(Lines::READ_BYTES).collect();
+        let mut io = Transcript::reading(chunks);
+        let mut session = Lines::new();
+        session.open(&mut io).await.expect("nothing to open");
+        let frame = session
+            .next_frame(&mut io)
+            .await
+            .expect("exactly the bound");
+        assert_eq!(frame.bytes().len(), Lines::MAX_LINE_BYTES);
     }
 
     #[tokio::test]

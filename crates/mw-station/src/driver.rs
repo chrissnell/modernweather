@@ -165,15 +165,28 @@ impl StreamStation {
         m::arm(&id);
         m::arm_resync(&id);
 
-        session.open(&mut *io).await.map_err(|e| {
-            warn!(
-                %station,
-                session = session.name(),
-                error = %DisplayChain(&e),
-                "a station conversation could not be opened"
-            );
-            ComponentError::tick("opening a station conversation", e)
-        })?;
+        // **Raced against cancellation, because opening is the slowest thing here.** A
+        // Davis handshake is `WAKE_ATTEMPTS * WAKE_TIMEOUT` against a console that says
+        // nothing, and `stop_rank` walks a whole rank against one shared `DEFAULT_GRACE`:
+        // awaiting this directly meant one quiet console spent nine of the rank's ten
+        // seconds and every sibling after it was aborted rather than stopped. Biased for
+        // the same reason the frame loop below is.
+        tokio::select! {
+            biased;
+            () = cx.cancelled() => {
+                debug!(%station, "a station conversation was cancelled while opening");
+                return Ok(());
+            }
+            opened = session.open(&mut *io) => opened.map_err(|e| {
+                warn!(
+                    %station,
+                    session = session.name(),
+                    error = %DisplayChain(&e),
+                    "a station conversation could not be opened"
+                );
+                ComponentError::tick("opening a station conversation", e)
+            })?,
+        }
         info!(
             %station,
             session = session.name(),
@@ -189,6 +202,13 @@ impl StreamStation {
                 // spool's cursors have been told to stop is a reading nobody drains.
                 biased;
                 () = cx.cancelled() => {
+                    // The delta is flushed before returning: the bytes a session dropped
+                    // on its last pass are as much of an operator's answer as the ones it
+                    // dropped on any other, and shutdown is not a reason to lose them.
+                    let discarded = session.discarded();
+                    if discarded > resynced {
+                        m::resync(&id, discarded - resynced);
+                    }
                     debug!(%station, "a station conversation was cancelled");
                     return Ok(());
                 }

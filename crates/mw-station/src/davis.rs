@@ -52,6 +52,8 @@
 
 use std::time::Duration;
 
+use tokio::time::Instant;
+
 use mw_codec::Frame;
 use mw_component::{BoxFuture, ComponentId, ComponentIdError};
 
@@ -92,7 +94,8 @@ pub const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long to wait for the next packet of a run.
 ///
-/// A Vantage emits a LOOP packet every two seconds and `cmd/davis-emulator` emits one every
+/// A Vantage emits a LOOP packet every two seconds and `cmd/davis-emulator` -- vendored at
+/// `tests/emulators/davis` -- emits one every
 /// 1.5 s with an optional 3-8 s "hang", so this is generous against both and still an order
 /// of magnitude below the component's own grace period. The Go serial path has no deadline
 /// at all, which is this module's fourth disagreement.
@@ -126,13 +129,36 @@ impl DavisSession {
     /// the line produces.
     const READ_BYTES: usize = 512;
 
-    /// How many bytes may be held while looking for a header before the session gives up.
+    /// How many bytes may be **discarded** looking for one header before the session gives
+    /// up.
     ///
     /// Two packets' worth. Reaching it means the console is emitting something that is not
     /// LOOP records — the symptom of a line rate that does not match — and the session
-    /// failing is what turns that into a restart with a message rather than a buffer that
-    /// grows for as long as the process runs.
-    const MAX_RESYNC_BYTES: usize = 2 * mw_codec::LOOP_BYTES;
+    /// failing is what turns that into a restart with a message rather than a driver that
+    /// reads garbage for as long as the process runs.
+    ///
+    /// **Counted as bytes dropped, not as bytes held.** The buffer cannot grow:
+    /// [`DavisSession::take_packet`] trims it to at most ninety-eight bytes every time it
+    /// returns without a frame, so a bound on `buffer.len()` was unreachable and the
+    /// restart this comment describes never happened — `next_frame` read garbage forever
+    /// while the resync counter climbed. The delta is what the bound has to be on.
+    const MAX_RESYNC_BYTES: u64 = 2 * mw_codec::LOOP_BYTES as u64;
+
+    /// How many bytes of noise may precede the wake answer.
+    ///
+    /// The console answers a newline with two bytes and nothing else, so the answer is at
+    /// the front of what arrives. The bound is here because `\n\r` is also the **trailer of
+    /// every LOOP record** (bytes 95 and 96): without it, a console still streaming a run
+    /// from before the line dropped satisfies the handshake with a packet's own trailer and
+    /// the driver proceeds as though a console that never answered had.
+    ///
+    /// Noise is tolerated rather than refused outright because a reconnect reads whatever
+    /// the kernel had buffered first. An attempt that refuses it *drops* it — the buffer is
+    /// cleared before each newline — so the next newline is the one that meets a quiet
+    /// line, which is what `WAKE_ATTEMPTS` is for. What this bound does not catch is a
+    /// buffer that happens to start ninety-three bytes into a record; the fresh
+    /// acknowledgement `issue` requires is what catches that.
+    const MAX_WAKE_NOISE: usize = 8;
 
     /// A session that asks for `run_length` packets at a time.
     #[must_use]
@@ -189,13 +215,26 @@ impl DavisSession {
     /// Ask for a run and wait for the acknowledgement.
     async fn issue(&mut self, io: &mut dyn ByteStream) -> Result<(), SessionError> {
         const WHAT: &str = "asking a Davis console for a run of LOOP packets";
+        // **Whatever is on the line now is not an answer to a command that has not been
+        // sent.** Without this, a `0x15` left over from the wake handshake or from a
+        // previous run is read as this command's refusal and kills the session, and a
+        // leftover `0x06` is read as its acknowledgement — so the driver believes a run is
+        // outstanding that the console never agreed to. A stale byte is roughly a one in
+        // three chance of a `0x15` per residual packet, which made a reconnect against a
+        // bridge that replays its buffer an unexplained `Backoff` loop. `sendData` reads
+        // one byte with no such guard; this is the second disagreement.
+        self.drop_buffered();
         io.write_all(&self.command())
             .await
             .map_err(|source| SessionError::io(WHAT, source))?;
+        // One deadline for the whole acknowledgement, not one per read: a console
+        // trickling a byte at a time renewed a per-read deadline forever, which is
+        // sixteen minutes of waiting at `ACK_TIMEOUT` and `MAX_RESYNC_BYTES`.
+        let until = Instant::now() + self.ack_timeout;
         // How many bytes have been skipped looking for the acknowledgement, bounded so
         // that a console answering something else forever is a session failure rather than
         // a loop.
-        let mut skipped = 0usize;
+        let mut skipped = 0u64;
         loop {
             while !self.buffer.is_empty() {
                 let byte = self.buffer.remove(0);
@@ -220,26 +259,49 @@ impl DavisSession {
                     }
                 }
             }
-            self.fill(io, self.ack_timeout, WHAT).await?;
+            self.fill(io, until, self.ack_timeout, WHAT).await?;
         }
     }
 
-    /// Read until there is something in the buffer, or the deadline passes.
+    /// Drop whatever is buffered, counting it, because it belongs to a previous phase.
+    ///
+    /// The count is the point: these bytes are exactly what an operator reads
+    /// `mw_station_resync_bytes_total` for, and dropping them silently would make a line
+    /// that is producing something other than packets look like a healthy one.
+    fn drop_buffered(&mut self) {
+        self.discarded += self.buffer.len() as u64;
+        self.buffer.clear();
+    }
+
+    /// Read until there is something in the buffer, or `until` passes.
+    ///
+    /// `until` is the caller's **whole-phase** deadline and `budget` is only what the
+    /// failure reports, so every read in one wake, one acknowledgement or one frame shares
+    /// one clock. A deadline per read is not the same bound: it is renewed by every byte
+    /// that arrives, so a console emitting continuous garbage never reaches it at all.
     async fn fill(
         &mut self,
         io: &mut dyn ByteStream,
-        deadline: Duration,
+        until: Instant,
+        budget: Duration,
         what: &'static str,
     ) -> Result<(), SessionError> {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(SessionError::Silent {
+                what,
+                seconds: budget.as_secs(),
+            });
+        }
         let mut chunk = vec![0u8; Self::READ_BYTES];
-        let read = tokio::time::timeout(deadline, io.read(&mut chunk));
+        let read = tokio::time::timeout(left, io.read(&mut chunk));
         let n = match read.await {
             Ok(Ok(n)) => n,
             Ok(Err(source)) => return Err(SessionError::io(what, source)),
             Err(_) => {
                 return Err(SessionError::Silent {
                     what,
-                    seconds: deadline.as_secs(),
+                    seconds: budget.as_secs(),
                 })
             }
         };
@@ -306,16 +368,24 @@ impl Session for DavisSession {
     ) -> BoxFuture<'a, Result<(), SessionError>> {
         Box::pin(async move {
             const WHAT: &str = "waking a Davis console";
-            // A new connection, so nothing from the old one is in flight and no run is
-            // outstanding -- the console forgets its `LOOP` state when the line drops.
-            self.buffer.clear();
+            // A new connection, and no run is outstanding -- the console forgets its
+            // `LOOP` state when the line drops. What a new connection does **not**
+            // guarantee is a quiet line: a serial console keeps streaming into the
+            // character device after the previous process let go of it, and a `ser2net`
+            // bridge replays what it buffered. So each attempt below clears first.
             self.remaining = 0;
             let mut answered = false;
             for _ in 0..WAKE_ATTEMPTS {
+                // Anything already on the line predates this newline and cannot be its
+                // answer. Dropping it is also what makes a second attempt useful: the
+                // newline just written stops a console that was mid-run, so the attempt
+                // after it meets the quiet line this handshake assumes.
+                self.drop_buffered();
                 io.write_all(b"\n")
                     .await
                     .map_err(|source| SessionError::io(WHAT, source))?;
-                match self.fill(io, self.wake_timeout, WHAT).await {
+                let until = Instant::now() + self.wake_timeout;
+                match self.fill(io, until, self.wake_timeout, WHAT).await {
                     Ok(()) => answered = true,
                     // No answer to this newline. Another newline is the protocol's own
                     // answer -- a console asleep in its power-saving state misses the
@@ -327,6 +397,10 @@ impl Session for DavisSession {
                     .buffer
                     .windows(WAKE_RESPONSE.len())
                     .position(|window| window == WAKE_RESPONSE)
+                    // **Not anywhere in the buffer.** `\n\r` is the trailer of every LOOP
+                    // record, so an unbounded search is satisfied by a packet the console
+                    // sent before it was asked anything -- see `MAX_WAKE_NOISE`.
+                    .filter(|at| *at <= Self::MAX_WAKE_NOISE)
                 {
                     // Everything up to and including the answer is the handshake's, and is
                     // consumed; anything after it is not. Draining rather than clearing,
@@ -369,17 +443,22 @@ impl Session for DavisSession {
             if self.remaining == 0 {
                 self.issue(io).await?;
             }
+            // Both bounds are on this one frame: `until` is how long it may take and
+            // `dropped` is how much noise it may cost. Neither is expressible per read --
+            // a line at the wrong rate produces bytes steadily and trims the buffer on
+            // every pass, so it renews a per-read deadline and never grows a buffer.
+            let until = Instant::now() + self.frame_timeout;
+            let dropped = self.discarded;
             loop {
                 if let Some(frame) = self.take_packet() {
                     self.remaining -= 1;
                     return Ok(frame);
                 }
-                if self.buffer.len() > Self::MAX_RESYNC_BYTES {
-                    self.discarded += self.buffer.len() as u64;
-                    self.buffer.clear();
+                if self.discarded - dropped > Self::MAX_RESYNC_BYTES {
+                    self.drop_buffered();
                     return Err(SessionError::Unexpected { what: WHAT });
                 }
-                self.fill(io, self.frame_timeout, WHAT).await?;
+                self.fill(io, until, self.frame_timeout, WHAT).await?;
             }
         })
     }

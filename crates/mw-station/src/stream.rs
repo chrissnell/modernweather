@@ -59,8 +59,10 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The flags a character device is opened with.
 ///
-/// `O_NONBLOCK` because [`AsyncFd`] polls the descriptor and then reads it: without it, a
-/// read the poll said would succeed can still block the runtime thread. `O_NOCTTY` because
+/// `O_NONBLOCK` for two reasons, and the second is the stronger one: [`AsyncFd`] polls the
+/// descriptor and then reads it, so without it a read the poll said would succeed can still
+/// block the runtime thread -- and `open(2)` **itself** blocks on a tty until the modem
+/// lines assert carrier, which on an unplugged serial cable is forever. `O_NOCTTY` because
 /// opening a terminal from a daemon with no controlling terminal would otherwise *acquire*
 /// one, and a `SIGHUP` on that terminal would then reach the whole process.
 ///
@@ -212,6 +214,11 @@ pub async fn open(transport: &Transport, station: &str) -> Result<Box<dyn ByteSt
 }
 
 /// Open a character device.
+///
+/// **Must be called from inside a tokio runtime**, which is not visible in the signature:
+/// `AsyncFd::register_with_interest` panics without a current reactor. Not an `async fn`
+/// because nothing here awaits, so the obligation has to be written down rather than
+/// carried by the type. Every caller reaches this through [`open`], which is `async`.
 fn serial(dev: &Path, baud: u32, station: &str) -> Result<SerialPort, OpenError> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -334,17 +341,17 @@ impl ByteStream for SerialPort {
                 }
                 written += n;
             }
-            // A command the console has not seen is a command it cannot answer, and a tty's
-            // output queue is not drained by the write returning.
-            self.fd.get_ref().sync_data().or_else(|e| {
-                // `EINVAL` on a character device that does not implement `fsync`, which is
-                // most of them: the bytes are already in the driver's queue, so there is
-                // nothing to flush and nothing is lost.
-                match e.kind() {
-                    std::io::ErrorKind::InvalidInput => Ok(()),
-                    _ => Err(e),
-                }
-            })
+            // **No flush, and that is not an omission.** The obvious call here is
+            // `sync_data`, and it cannot do anything: `tty_fops` declares no `fsync`, so
+            // `fsync` and `fdatasync` return `EINVAL` on every serial port and on both ends
+            // of every pty -- which is every target in `ci/release.toml` and the whole of
+            // the `socat` test path. A call that is `EINVAL` everywhere it can be reached
+            // is a blocking syscall in an `async fn` that reads as a guarantee it does not
+            // make. Draining a tty's output queue is `tcdrain`, an `ioctl` and therefore a
+            // second `unsafe` block; it is not needed, because the write above returning
+            // means the bytes are in the driver's queue and the console reads them from
+            // there.
+            Ok(())
         })
     }
 }
@@ -402,6 +409,15 @@ mod tests {
 
     /// The case the path exists for: an open that succeeds and a descriptor that cannot be
     /// polled.
+    ///
+    /// **Linux only, and that is a property of the assertion rather than of the code under
+    /// test.** `NotAStream` is reported because `epoll_ctl` answers `EPERM` for a regular
+    /// file; `kqueue` registers one happily, so on macOS -- which this module supports so
+    /// that the crate builds on a developer's machine -- the open would succeed and the
+    /// `expect_err` would fail. Refusing a regular file is not a guarantee this module
+    /// makes on every platform, and a test that claimed otherwise would be asserting
+    /// `epoll`'s behaviour in a place nobody would look for it.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_regular_file_opens_and_is_refused_as_not_a_stream() {
         let dir = std::env::temp_dir().join(format!("mw-station-stream-{}", std::process::id()));
@@ -438,8 +454,9 @@ mod tests {
     // `ci/layers.toml`'s `only-mw-http-binds-a-socket` rule rather than an omission: its
     // needle list names the listener types and the scan covers `tests/` as well as `src/`,
     // so only `mw-http` may open one anywhere in this workspace. What exercises the TCP
-    // path end to end is `tests/emulator.rs` against `cmd/davis-emulator` and
-    // `cmd/campbell-emulator`, which bind their own ports in their own processes -- the
+    // path end to end is `tests/emulator_davis.rs` and `tests/emulator_campbell.rs`
+    // against the vendored `cmd/davis-emulator` and `cmd/campbell-emulator`, which bind
+    // their own ports in their own processes -- the
     // stronger test anyway, and what W3 D-82's third level means.
 
     #[tokio::test]

@@ -4,7 +4,8 @@
 //! W3 **D-82**'s three levels are the codec against captured frames (`mw-codec`'s golden
 //! tests), the session against a recorded transcript (`crate::davis::tests`,
 //! `crate::lines::tests`) and the **whole driver** against a pinned emulator
-//! (`tests/emulator.rs`). This file is the seam between the middle and the top: it drives
+//! (`tests/emulator_davis.rs`, `tests/emulator_campbell.rs`). This file is the seam
+//! between the middle and the top: it drives
 //! the real session and the real codec into a recording `Ingress`, with no emulator and no
 //! Go toolchain, so that "the driver admits every frame of the second run" is asserted here
 //! as well as there.
@@ -211,6 +212,57 @@ async fn a_cancelled_conversation_returns_without_an_error() {
         .expect("the body observed cancellation")
         .expect("the task did not panic");
     assert!(result.is_ok(), "cancellation is not a failure: {result:?}");
+}
+
+/// Cancellation is observed **while the handshake is still open**, not only after it.
+///
+/// This is the shutdown-correctness case: a Davis handshake is three newlines against a
+/// console that says nothing, and `stop_rank` walks a whole rank against one shared grace.
+/// Awaiting the open directly meant one quiet console spent nine of the rank's ten seconds
+/// before the frame loop was even reached, and every sibling queued behind it was aborted
+/// rather than stopped. The `DavisSession` here keeps its production deadlines on purpose:
+/// the assertion is that the body returns in milliseconds rather than in `WAKE_ATTEMPTS *
+/// WAKE_TIMEOUT`, which it cannot do by waiting for the handshake to give up.
+#[tokio::test]
+async fn a_conversation_cancelled_while_opening_returns_without_waiting_for_the_handshake() {
+    #[derive(Debug)]
+    struct Quiet;
+    impl ByteStream for Quiet {
+        fn read<'a>(&'a mut self, _buf: &'a mut [u8]) -> BoxFuture<'a, std::io::Result<usize>> {
+            Box::pin(std::future::pending())
+        }
+        fn write_all<'a>(&'a mut self, _bytes: &'a [u8]) -> BoxFuture<'a, std::io::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    let station = Box::new(StreamStation::over(
+        Box::new(Quiet),
+        // The production run length and, inside the session, the production deadlines.
+        Conversation::DavisLoop { run_length: 20 },
+        Arc::new(mw_codec::DavisLoop::default()),
+        StationKey::new("suncrest:backyard"),
+        RecordingIngress::accepting() as Arc<dyn Ingress>,
+    ));
+    let (cx, token) = cx("station:davis:suncrest:backyard");
+    // The same `spawn` exemption, for the same reason, as the test above.
+    #[allow(clippy::disallowed_methods)]
+    let run = tokio::task::spawn(async move { station.run(cx).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let cancelled = std::time::Instant::now();
+    token.cancel();
+    // Two seconds is far below one wake attempt (three) and far above what observing a
+    // cancelled token costs, so the bound distinguishes the two outcomes rather than
+    // merely passing.
+    let result = tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("the body observed cancellation inside the handshake")
+        .expect("the task did not panic");
+    assert!(result.is_ok(), "cancellation is not a failure: {result:?}");
+    assert!(
+        cancelled.elapsed() < Duration::from_secs(2),
+        "the handshake was waited out instead of being abandoned"
+    );
 }
 
 /// A build failure rather than a startup abort: the Go driver's `logger.Fatal`.
