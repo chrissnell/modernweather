@@ -116,10 +116,10 @@ func main() {
 		if err != nil {
 			log.Fatalf("upload %d failed: %v", i, err)
 		}
-		// Read to EOF before closing, which is what lets the transport reuse the
-		// connection -- a `Close` on an undrained body does not, so the endpoint would
-		// see N clients rather than one. The body is also what the console's own firmware
-		// keys off, so it is reported rather than discarded.
+		// Read to EOF *and then* closed, which is what lets the transport reuse the
+		// connection: a Close on an undrained body does not, so this used to be N
+		// connections where the comment claimed one. The body is also what a console's own
+		// firmware keys off, so it is reported rather than discarded.
 		body, err := io.ReadAll(response.Body)
 		if err != nil {
 			log.Fatalf("upload %d: reading the response: %v", i, err)

@@ -1433,16 +1433,6 @@ pub struct Node {
     pub spool_max_lag_seconds: i64,
 }
 
-/// Read the node row, if this node has one.
-///
-/// **An empty table means "not yet started"**, which the migration says in the comment
-/// above the table and leaves to the boot sequence to handle. It is handled by being a
-/// legitimate state: nothing in the boot sequence needs a node identity to converge, so a
-/// first start with no configuration starts, serves `/metrics` and stops cleanly. What
-/// *allocates* the identity is W7's enrolment (`node_id` is a UUIDv7 the node mints) and
-/// the row it writes also needs a `spool_path`, which has no default in the schema and no
-/// value in any design document -- so inventing one here would be this work item deciding
-/// something implementation-plan.md M6-4 owns.
 /// One `config.ingest` row.
 ///
 /// W7 §8.3's `[[ingest]]`, and "the only thing that makes this node a collector -- no flag,
@@ -1489,6 +1479,16 @@ pub async fn ingest(pool: &SqlitePool) -> Result<Vec<IngestRow>, ConfigDbError> 
         .collect()
 }
 
+/// Read the node row, if this node has one.
+///
+/// **An empty table means "not yet started"**, which the migration says in the comment
+/// above the table and leaves to the boot sequence to handle. It is handled by being a
+/// legitimate state: nothing in the boot sequence needs a node identity to converge, so a
+/// first start with no configuration starts, serves `/metrics` and stops cleanly. What
+/// *allocates* the identity is W7's enrolment (`node_id` is a UUIDv7 the node mints) and
+/// the row it writes also needs a `spool_path`, which has no default in the schema and no
+/// value in any design document -- so inventing one here would be this work item deciding
+/// something implementation-plan.md M6-4 owns.
 pub async fn node(pool: &SqlitePool) -> Result<Option<Node>, ConfigDbError> {
     let row = sqlx::query(
         "SELECT node_id, node_name, timezone, spool_path, \

@@ -176,10 +176,18 @@ impl StationRow {
 
     /// The vane calibration this station's codec applies.
     ///
-    /// Clamped into an `i16` rather than refused: the column's own `CHECK` is
-    /// `BETWEEN -360 AND 360`, `WindDirCorrection` normalises any value, and a row written
-    /// by an older build with something larger in it is better calibrated wrongly and
-    /// visibly than refused at startup.
+    /// **No correction rather than refused**, for a value the column's own
+    /// `CHECK (BETWEEN -360 AND 360)` cannot hold: an `i64` that does not fit an `i16` is a
+    /// row no build of this schema wrote, and the choice is between a station that will not
+    /// start and a station whose vane is uncalibrated. The second is better, because a
+    /// Davis with an uncorrected vane still records every other measurement.
+    ///
+    /// It is silent, which the earlier wording here called "calibrated wrongly and
+    /// visibly". There is nothing visible about it. The case is unreachable from any
+    /// schema this repository has shipped -- `0` is the column's default and the `CHECK`
+    /// has been there since the initial migration -- so it is a fallback for a database
+    /// written by something else, and a startup warning for an impossible row would be a
+    /// line nobody ever sees.
     pub fn wind_dir_correction(&self) -> mw_codec::WindDirCorrection {
         mw_codec::WindDirCorrection::new(
             i16::try_from(self.wind_dir_correction_degrees).unwrap_or(0),

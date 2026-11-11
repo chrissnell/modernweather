@@ -139,6 +139,20 @@ async fn collect(
                 }
             }
             () = enough => {}
+            // **The deadline has to be inside the select, not only above it.** One
+            // conversation that neither ends nor produces `want` readings never returns to
+            // the top of the loop, so the check there cannot fire -- and `cargo xtask
+            // emulator-tests` runs this through `Command::output()` with no timeout of its
+            // own, so the gate would hang rather than go red. `emulator_campbell.rs` and
+            // `emulator_snowgauge.rs` already bound the equivalent wait; this was the
+            // outlier.
+            () = tokio::time::sleep_until(deadline) => {
+                failures.push(format!(
+                    "one conversation neither ended nor produced {want} readings within \
+                     {DEADLINE:?}"
+                ));
+                break;
+            }
         }
     }
 

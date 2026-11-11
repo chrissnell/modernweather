@@ -87,11 +87,19 @@ struct Emulator {
     ///
     /// **The count alone was not enough, and the manifest used to claim it was.** A count
     /// catches a removed test and a filter that matched nothing; it does not catch a
-    /// *rename*, and it does not catch four tests whose bodies were emptied — which is the
-    /// realistic path, because the way a flaky emulator test gets "fixed" is by gutting it.
-    /// Demonstrated rather than reasoned about: four empty `#[ignore]`d functions produced
-    /// `ok: 4 test(s) passed` and exit 0 with no emulator process ever started. Names bind
-    /// identity, so now they have to be the same tests.
+    /// *rename*, and it does not catch a test silently added to pad the number. The list
+    /// is set equality in both directions — `passed == names.len()` over a deduped list,
+    /// plus every name in the passed set — so a rename, an addition and a removal are each
+    /// a red gate naming the test.
+    ///
+    /// **What it does not catch is a gutted body**, and the earlier wording here claimed
+    /// otherwise. Four empty `#[ignore]`d functions were shown to produce
+    /// `ok: 4 test(s) passed` and exit 0 with no emulator process ever started; renaming
+    /// four gutted functions to these four names reproduces exactly that, because a name
+    /// binds identity and not behaviour. No digest can close it either — the realistic path
+    /// is weakening the assertions inside a test that still runs. What closes it is review
+    /// of the diff that does the weakening, which is why `docs/release.md` G-1 makes a
+    /// skipped or weakened check a reviewed change rather than a gate's problem.
     test_names: Vec<String>,
     #[serde(default)]
     note: String,

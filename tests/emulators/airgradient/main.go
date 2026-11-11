@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -93,7 +92,11 @@ func main() {
 			PM005Count: f(120 + float64(n)),
 			PM01Count:  f(33 + float64(n)),
 			PM02Count:  f(4 + float64(n)),
-			Rco2:       f(round(600 + 20*math.Sin(phase) + 5*rand.Float64())),
+			// Deterministic, like every other series here: the unseeded global RNG
+			// made a failure in `every_occurrence_produces_a_reading_and_the_values_move`
+			// unreplayable, and the only assertion over this field is that the values
+			// move -- which the sine already satisfies.
+			Rco2:       f(round(600 + 20*math.Sin(phase) + 5*math.Cos(3*phase))),
 			TvocIndex:  f(round(100 + 5*math.Sin(phase))),
 			TvocRaw:    f(31000),
 			NoxIndex:   f(1),

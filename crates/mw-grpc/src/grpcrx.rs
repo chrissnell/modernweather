@@ -474,13 +474,6 @@ pub enum GrpcRxPlanError {
     #[error("`{ID}` is not a usable component id")]
     Id(#[from] ComponentIdError),
 
-    /// This node is a collector and has nowhere to put what it receives.
-    #[error(
-        "this node has a `config.ingest` row and no reading stream, so there is nothing \
-         to admit a satellite's readings to"
-    )]
-    NoIngress,
-
     /// `main` did not build the state slot.
     ///
     /// A wiring mistake rather than a configuration error: the listener and this component
@@ -563,7 +556,24 @@ where
             peer_auth: row.peer_auth.clone(),
         });
     }
-    let ingress = Arc::clone(cfg.ingress().ok_or(GrpcRxPlanError::NoIngress)?);
+    // **No reading stream means no receiver, and not a refused configuration.** This is
+    // the same shape `writer:timescale` is in and it gets the same answer, for the reason
+    // `crate::boot`'s `Database` states: refusing the whole configuration for a node that
+    // is serving but not ingesting is wrong. The stream exists only for a node with a
+    // `node` row, and nothing in this build writes one -- enrolment is M6-4 -- so the
+    // alternative was that any `config.ingest` row at all made the daemon refuse to start.
+    // Said out loud, because a collector row with no receiver is not a state an operator
+    // should have to infer.
+    let Some(ingress) = cfg.ingress() else {
+        warn!(
+            "a `config.ingest` row makes this node a collector and it has no reading \
+             stream, so no reading receiver is planned: there would be nothing to admit a \
+             satellite's readings to. The stream arrives with the `config.node` row that \
+             implementation-plan.md M6-4's enrolment writes."
+        );
+        return Ok(());
+    };
+    let ingress = Arc::clone(ingress);
     let state = Arc::clone(state.ok_or(GrpcRxPlanError::NoServiceState)?);
     let id = component_id()?;
     let receiver = id.clone();
@@ -860,15 +870,19 @@ mod tests {
             .iter()
             .any(|p| p.capability == mw_component::Capability::HttpRoutes));
 
-        // A collector with nowhere to put what it receives is refused by name.
+        // A collector with nowhere to put what it receives plans **nothing**, and does not
+        // refuse the configuration. The same answer `writer:timescale` gets for the same
+        // shape: the reading stream arrives with the `config.node` row that M6-4's
+        // enrolment writes, nothing in this build writes one, and refusing the whole
+        // configuration would make any `config.ingest` row an unstartable daemon.
         let nowhere = Cfg {
             rows: collector.rows.clone(),
             ingress: None,
         };
-        assert_eq!(
-            register(&nowhere, Some(&state), &mut out),
-            Err(GrpcRxPlanError::NoIngress)
-        );
+        let mut nothing = Vec::new();
+        register(&nowhere, Some(&state), &mut nothing)
+            .expect("a collector with no stream is not a refused configuration");
+        assert!(nothing.is_empty(), "and no receiver is planned either");
         // ... and so is one whose state slot the boot sequence did not build.
         assert_eq!(
             register(&collector, None, &mut out),

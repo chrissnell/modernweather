@@ -413,18 +413,20 @@ impl Classify for StreamFailed {
 /// station's (`mw_station::snowgauge`). What is left here is the part only this crate knows.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SnowGaugePlanError {
-    /// The station key cannot name a component.
+    /// The row is not one this driver can be built from.
     ///
-    /// Refused by `mw_station::plan` too, and still checked here: the two functions mint the
-    /// **same** id from the same function, and a correctness that depends on one of them
-    /// having run first is one a later edit breaks silently.
-    #[error("station `{station}`: its key cannot name a component: {source}")]
-    Key {
+    /// Carries `mw_station`'s own refusal, because that is the crate that owns the sentence
+    /// naming the column to fix, and because the check is literally the same function
+    /// `mw_station::plan` runs (`mw_station::check_snowgauge`) — so the two cannot drift
+    /// and neither has to have run first. Boxed because `StationPlanError` is large and
+    /// this enum is returned by value.
+    #[error("station `{station}`: {source}")]
+    Row {
         /// Which station.
         station: String,
         /// Why.
         #[source]
-        source: mw_component::ComponentIdError,
+        source: Box<mw_station::StationPlanError>,
     },
 
     /// A `transport_url` that is not an address.
@@ -450,12 +452,14 @@ pub enum SnowGaugePlanError {
 
 /// Derive one component per configured snow gauge.
 ///
-/// **The row's shape is `mw_station::plan`'s to check and this function does not re-check
-/// it.** That is the split `mw_station::snowgauge` records: a `snowgauge` row is validated
-/// there — `grpc_out`, streaming, `Fixed` identity, a usable key — and produces no spec,
-/// because `ci/layers.toml` forbids `mw-station` from naming `tonic`. So a configuration
-/// that reaches here has already been refused or accepted once, by one function, with one
-/// set of sentences; what is left is building the body.
+/// **The row's shape is checked by the same function `mw_station::plan` checks it with.**
+/// That is the split `mw_station::snowgauge` records: a `snowgauge` row needs `grpc_out`, a
+/// streaming flag, `Fixed` identity and a usable key, and `mw_station` produces no spec for
+/// one because `ci/layers.toml` forbids it from naming `tonic`. This function used to
+/// filter on `kind` alone and rely on `plan` having run first, which was true only because
+/// of the order of the binary's registrar list — a list `crate::boot` documents as having
+/// no effect on the plan. [`mw_station::check_snowgauge`] is called here instead, so the
+/// two cannot disagree and neither has to run first.
 pub fn register<C>(
     cfg: &C,
     out: &mut Vec<mw_component::ComponentSpec>,
@@ -476,15 +480,15 @@ where
     })?;
 
     for row in rows {
-        let id = mw_station::snowgauge::station_id(&row.key).map_err(|source| {
-            SnowGaugePlanError::Key {
-                station: row.key.clone(),
-                source,
-            }
+        // The shape and the id in one call, by the function `plan` uses. Its error is
+        // `mw_station`'s, which is also the crate whose sentences name the column to fix.
+        let id = mw_station::check_snowgauge(row).map_err(|source| SnowGaugePlanError::Row {
+            station: row.key.clone(),
+            source: Box::new(source),
         })?;
-        // `is_collected_here` is what guarantees the transport is present, and
-        // `mw_station::plan` is what guarantees it is a streaming `grpc_out`.
-        let columns = row.transport.as_ref().expect("a collected station");
+        // `check_snowgauge` is what guarantees the transport is present and that it is a
+        // streaming `grpc_out`.
+        let columns = row.transport.as_ref().expect("a checked station");
         let endpoint =
             Endpoint::parse(columns.url.as_deref().unwrap_or_default()).map_err(|source| {
                 SnowGaugePlanError::Address {
@@ -683,6 +687,61 @@ mod tests {
         Cfg {
             rows,
             ingress: Some(RecordingIngress::accepting() as Arc<dyn Ingress>),
+        }
+    }
+
+    /// **This function refuses a malformed row on its own**, without `mw_station::plan`
+    /// having run first.
+    ///
+    /// The three shapes below are all schema-legal and all wrong, and each used to produce
+    /// a built component here when this function filtered on `kind` alone: a
+    /// request/response row became a spec declaring `GrpcOut { streaming: true }` against
+    /// `Trigger::Service`, a `from_path` row became a component with no entry in
+    /// `fixed_receivers` and therefore every reading `unknown_station`, and a serial row
+    /// became a gauge dialled over a transport it does not have. They were caught only
+    /// because `Stations` happens to precede `SnowGauges` in the binary's registrar list --
+    /// an ordering `crate::boot` documents as having no effect on the plan.
+    #[test]
+    fn a_row_of_the_wrong_shape_is_refused_here_and_not_only_by_the_station_plan() {
+        for (what, needle, mangle) in [
+            (
+                "transport_streaming",
+                "transport_streaming",
+                (|row: &mut StationRow| {
+                    row.transport.as_mut().expect("a transport").streaming = Some(false);
+                }) as fn(&mut StationRow),
+            ),
+            (
+                "identity_kind",
+                "resolves `fixed`",
+                |row: &mut StationRow| {
+                    row.identity_kind = "from_path".into();
+                },
+            ),
+            ("transport_kind", "serial", |row: &mut StationRow| {
+                row.transport.as_mut().expect("a transport").kind = "serial".into();
+            }),
+        ] {
+            let mut row = row("suncrest:gauge", "http://gauge.lan:50051", None);
+            mangle(&mut row);
+            let mut out = Vec::new();
+            let e = register(&cfg(vec![row]), &mut out)
+                .expect_err("a row of the wrong shape is refused");
+            // The refusal carries `mw_station`'s own sentence, which is the one that names
+            // the column an operator has to change.
+            assert!(
+                matches!(&e, SnowGaugePlanError::Row { station, .. }
+                         if station == "suncrest:gauge"),
+                "{what}: {e}"
+            );
+            assert!(
+                e.to_string().contains(needle),
+                "{what}: the refusal says what is wrong: {e}"
+            );
+            assert!(
+                out.is_empty(),
+                "{what}: a row of the wrong shape produced a component"
+            );
         }
     }
 

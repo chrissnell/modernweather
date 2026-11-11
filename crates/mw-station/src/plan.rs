@@ -480,30 +480,9 @@ where
             }
             crate::snowgauge::STATION_TYPE => {
                 // Checked and not planned: see this module's documentation and
-                // `crate::snowgauge`. `mw_grpc::snowgauge::register` emits the component.
-                expect_identity(row, &identity, StationIdentity::Fixed)?;
-                let Transport::GrpcOut { streaming, .. } = &transport else {
-                    return Err(StationPlanError::WrongTransport {
-                        station: row.key.clone(),
-                        kind: row.kind.clone(),
-                        transport: transport.kind(),
-                    });
-                };
-                if !streaming {
-                    return Err(StationPlanError::Missing {
-                        station: row.key.clone(),
-                        kind: row.kind.clone(),
-                        column: "transport_streaming",
-                        because: Because(
-                            "a snow gauge streams readings, so the flag has to be set: \
-                             `transport_streaming = 0` would declare one request per \
-                             occurrence and no gauge answers one",
-                        ),
-                    });
-                }
-                // The id, so that a key which cannot name a component is refused here
-                // rather than in the crate that mints the same id for the same row.
-                component_id(row, crate::snowgauge::station_id)?;
+                // `crate::snowgauge`. `mw_grpc::snowgauge::register` emits the component,
+                // and calls this same function rather than trusting that this one ran.
+                check_snowgauge(row)?;
             }
             _ => {
                 return Err(StationPlanError::NoDriver {
@@ -549,6 +528,61 @@ where
         .find(|mount| !mount.is_empty())
 }
 
+/// Validate a `snowgauge` row, returning the component id it will be planned under.
+///
+/// **Public because it has two callers and one of them is in another crate.**
+/// `mw_grpc::snowgauge::register` builds the component this row describes -- `ci/layers.toml`
+/// forbids `mw-station` from naming `tonic`, which is the whole of why the split exists --
+/// and it used to filter on `kind` alone and rely on [`plan`] having already refused a row
+/// of the wrong shape. That held only because `Stations` precedes `SnowGauges` in the
+/// binary's registrar list, which `crate::boot`'s own comment describes as having no effect
+/// on the plan; reordering the list would have produced a component declaring
+/// `GrpcOut { streaming: true }` for a row configured request/response, or a `from_path`
+/// row with no receiver entry and every reading `unknown_station`. One function, called by
+/// both, is the arrangement in which the two cannot disagree.
+pub fn check_snowgauge(row: &StationRow) -> Result<ComponentId, StationPlanError> {
+    let identity = StationIdentity::parse(&row.identity_kind).map_err(|source| {
+        StationPlanError::Identity {
+            station: row.key.clone(),
+            source,
+        }
+    })?;
+    expect_identity(row, &identity, StationIdentity::Fixed)?;
+    let columns = row
+        .transport
+        .as_ref()
+        .ok_or_else(|| StationPlanError::WrongTransport {
+            station: row.key.clone(),
+            kind: row.kind.clone(),
+            transport: "none",
+        })?;
+    let transport =
+        Transport::from_columns(columns).map_err(|source| StationPlanError::Transport {
+            station: row.key.clone(),
+            source,
+        })?;
+    let Transport::GrpcOut { streaming, .. } = &transport else {
+        return Err(StationPlanError::WrongTransport {
+            station: row.key.clone(),
+            kind: row.kind.clone(),
+            transport: transport.kind(),
+        });
+    };
+    if !streaming {
+        return Err(StationPlanError::Missing {
+            station: row.key.clone(),
+            kind: row.kind.clone(),
+            column: "transport_streaming",
+            because: Because(
+                "a snow gauge streams readings, so the flag has to be set: \
+                 `transport_streaming = 0` would declare one request per occurrence and no \
+                 gauge answers one",
+            ),
+        });
+    }
+    component_id(row, crate::snowgauge::station_id)
+}
+
 /// Refuse a row whose identity strategy its driver does not implement.
 ///
 /// The schema's own `CHECK` rejects `fixed` with an inbound transport, which is the Ambient
@@ -584,6 +618,21 @@ fn wll_row<'a>(
     listeners: &mut Endpoints<'a>,
     out: &mut Vec<ComponentSpec>,
 ) -> Result<(), StationPlanError> {
+    // **The transport first, then the columns.** `mapping` reads
+    // `wll_sensor_mapping`, which only a WeatherLink Live row has any use for, so running
+    // it before the dispatch below told an operator with
+    // `type = 'weatherlink-live', transport_kind = 'serial'` to set a column that row will
+    // never use -- instead of naming the transport, which is the thing that is wrong.
+    if !matches!(
+        transport,
+        Transport::UdpIn { .. } | Transport::HttpOut { .. }
+    ) {
+        return Err(StationPlanError::WrongTransport {
+            station: row.key.clone(),
+            kind: row.kind.clone(),
+            transport: transport.kind(),
+        });
+    }
     let codec = WllConditions::new(mapping(row)?);
     // The schema's identity CHECK rejects `fixed` with an inbound transport, which is the
     // Ambient defect; what it cannot say is which of the four non-`fixed` strategies *this

@@ -153,7 +153,12 @@ impl Endpoint {
         // would install the same handler into the same slot.
         state.install_for_test(Arc::clone(&handler));
 
-        let table = mw_http::upload_table(receiver, DEFAULT_MOUNT, state.endpoint());
+        let table = mw_http::upload_table(
+            receiver,
+            DEFAULT_MOUNT,
+            mw_station::ambient::manifest(DEFAULT_MOUNT),
+            state.endpoint(),
+        );
         let (mount, _) = mw_http::Mount::new(vec![table], mw_http::HostTable::default())
             .expect("the table mounts");
         // Port 0 on both sockets: the kernel chooses, and `ci/layers.toml` reserves binding

@@ -995,6 +995,30 @@ async fn the_receiver_list_and_the_plan_agree_about_every_component_they_share()
             "`{id}` is a receiver no planned component answers"
         );
     }
+
+    // **The other direction, which is the dangerous one.** A planned component that
+    // admits by `Fixed` identity and is *absent* from the receiver list is a station whose
+    // every reading resolves to `unknown_station` -- silently, and only in production. The
+    // loop above cannot see it, and the hard-coded expectation in
+    // `the_receiver_list_covers_every_fixed_driver_and_no_other` would not be extended by
+    // a new driver arm. The Ambient endpoint is excluded because it is `from_query`, and
+    // the WeatherLink Live listener because it is `from_payload`; both resolve by claim
+    // rather than by being the receiver.
+    let receivers: Vec<String> = plan::fixed_receivers(&cfg)
+        .expect("a valid plan")
+        .iter()
+        .map(|r| r.component.as_str().to_string())
+        .collect();
+    for id in &planned {
+        if id.starts_with("station:wll:") || id == "station:ambient" {
+            continue;
+        }
+        assert!(
+            receivers.contains(id),
+            "`{id}` is planned, admits by `Fixed` identity, and is in no receiver entry -- \
+             so every reading it admits would resolve to `unknown_station`"
+        );
+    }
 }
 
 /// A station of a type this build serves on a transport it does not have, for each of the

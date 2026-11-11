@@ -189,7 +189,7 @@ async fn a_distance_past_the_base_is_discarded_and_the_stream_continues() {
 /// where an unconfigured gauge has a base of zero and reports nothing at all.
 ///
 /// This is also what makes the test above non-vacuous: the same emulator, the same
-/// `-fault 2`, and the faults now reach the ingress.
+/// `-fault 3`, and the faults now reach the ingress.
 #[tokio::test]
 #[ignore = "needs a Go toolchain; `cargo xtask emulator-tests` runs it"]
 async fn an_unconfigured_gauge_still_reports_its_distance() {

@@ -188,11 +188,11 @@ pub fn metrics_table(metrics: MetricsRoute) -> RouteTable {
 pub fn upload_table(
     owner: ComponentId,
     mount: &str,
+    manifest: RouteManifest,
     endpoint: mw_component::UploadEndpoint,
 ) -> RouteTable {
     use axum::routing::{on, MethodFilter};
 
-    let manifest = RouteManifest::new(Scope::Any, vec![RouteEntry::exact(mount, Methods::READ)]);
     let router = Router::new().route(
         mount,
         on(MethodFilter::GET, move |query: axum::extract::RawQuery| {
@@ -380,6 +380,12 @@ mod tests {
         let table = upload_table(
             ComponentId::new("station:ambient").expect("a legal id"),
             "/ingest/ambient",
+            // The shape the driver declares, built here because this crate may not name
+            // `mw-station`: the production caller passes `mw_station::ambient::manifest`.
+            RouteManifest::new(
+                Scope::Any,
+                vec![RouteEntry::exact("/ingest/ambient", Methods::READ)],
+            ),
             Arc::new(move |upload: Upload| {
                 let log = Arc::clone(&log);
                 Box::pin(async move {

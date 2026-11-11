@@ -72,7 +72,9 @@ pub use driver::{Conversation, StreamStation};
 pub use endpoint::{Endpoint, EndpointError};
 pub use identity::{IdentityError, StationIdentity};
 pub use lines::Lines;
-pub use plan::{ambient_mount, fixed_receivers, register, FixedReceiver, StationPlanError};
+pub use plan::{
+    ambient_mount, check_snowgauge, fixed_receivers, register, FixedReceiver, StationPlanError,
+};
 pub use session::{ByteStream, NoSession, Session, SessionError, MAX_FRAME_BYTES};
 pub use stream::{OpenError, SerialPort, TcpByteStream};
 pub use transport::{HttpMethod, TlsFiles, Transport, TransportColumns, TransportError};

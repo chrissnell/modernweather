@@ -649,6 +649,13 @@ fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<
             mw_component::ComponentId::new(mw_station::ambient::ID)
                 .context("`station:ambient` is not a usable component id")?,
             &mount,
+            // **The driver's own manifest**, not a second one built to match it. Rebuilding
+            // it here meant the mounted table and the component's `Provision` were two
+            // declarations of the same route, and `assert_route_tables_match_the_plan`
+            // compares owner ids -- so a divergence in scope or methods between them would
+            // not have been caught. `grpcrx` already shares one; this makes them agree the
+            // same way.
+            mw_station::ambient::manifest(&mount),
             state.endpoint(),
         ));
         cfg.set_ambient_upload(state);
