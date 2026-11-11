@@ -1,0 +1,6 @@
+# APRS Protocol Reference v1.0.1, Chapter 12 ("Weather Reports"), the worked example of a
+# complete weather report with position. Normative bytes: the specification's own statement
+# of the format, which makes it the reference every other capture here is read against.
+# Station at 49 03.50 N, 072 01.75 W; wind from 220 deg at 4 mph gusting 5; 77 F; no rain;
+# 50% humidity; 990.0 hPa; software/unit type "wRSW" (Weather Display, RS/W units).
+!4903.50N/07201.75W_220/004g005t077r000p000P000h50b09900wRSW

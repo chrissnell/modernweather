@@ -661,6 +661,100 @@ mod tests {
         pool.close().await;
     }
 
+    /// The `uploader` join, which is the one query in this file that reads three tables.
+    ///
+    /// Three properties, each of which a wrong literal would break silently: a disabled
+    /// uploader is absent, an enabled one with no pairing still arrives (so the registrar
+    /// can refuse it by name rather than the row being invisible), and the composite
+    /// foreign key's `service = kind` condition is in the join rather than assumed.
+    #[tokio::test]
+    async fn the_uploader_join_reads_the_account_the_pairing_and_the_station() {
+        let scratch = Scratch::new("uploaders");
+        let pool = open_and_migrate(&scratch.db()).await.expect("migrate");
+        assert!(
+            uploaders(&pool).await.expect("reads").is_empty(),
+            "the migration seeds no uploader"
+        );
+
+        for sql in [
+            // `transport_kind` and a `fixed` identity travel together, which the table's
+            // own CHECK requires: a station this node collects from has a transport.
+            "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind,
+                                   transport_kind, transport_dev, transport_baud,
+                                   latitude, longitude, aprs_callsign)
+             VALUES ('backyard', x'0193f3c28b207c71ae3f10cc92d4b7aa', 'backyard',
+                     'davis', 'fixed', 'serial', '/dev/ttyUSB0', 19200,
+                     45.1, -122.05, 'N0CALL')",
+            "INSERT INTO uploader (id, kind, name, enabled, api_key, interval_seconds)
+             VALUES (1, 'wunderground', 'wu-backyard', 1, 'hunter2', 300)",
+            "INSERT INTO station_service (station_key, service, uploader_id,
+                                          remote_station_id)
+             VALUES ('backyard', 'wunderground', 1, 'KWABACKYARD')",
+            // Enabled, and paired with nothing: it must still be returned.
+            "INSERT INTO uploader (id, kind, name, enabled, api_key)
+             VALUES (2, 'pwsweather', 'pws-unpaired', 1, 'hunter3')",
+            // Disabled: it must not be.
+            "INSERT INTO uploader (id, kind, name, enabled, api_key)
+             VALUES (3, 'wunderground', 'wu-off', 0, 'hunter4')",
+            // An APRS account, with the columns its kind owns.
+            "INSERT INTO uploader (id, kind, name, enabled, interval_seconds,
+                                   aprs_passcode, aprs_transport, aprs_kiss_tcp_address,
+                                   aprs_kiss_path, aprs_comment)
+             VALUES (4, 'aprs', 'aprs-backyard', 1, 900, '12345', 'kiss-tcp',
+                     'tnc.lan:8001', 'WIDE1-1', 'Suncrest WA')",
+            "INSERT INTO station_service (station_key, service, uploader_id)
+             VALUES ('backyard', 'aprs', 4)",
+        ] {
+            sqlx::query(sql)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("the schema rejected a row: {e}\n{sql}"));
+        }
+
+        let rows = uploaders(&pool).await.expect("reads");
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["aprs-backyard", "pws-unpaired", "wu-backyard"],
+            "ordered by kind then name, and the disabled row is absent"
+        );
+
+        let aprs = &rows[0];
+        assert_eq!(aprs.kind, "aprs");
+        assert_eq!(aprs.station_key.as_deref(), Some("backyard"));
+        assert_eq!(aprs.aprs_callsign.as_deref(), Some("N0CALL"));
+        assert_eq!(aprs.latitude, Some(45.1));
+        assert_eq!(aprs.longitude, Some(-122.05));
+        assert_eq!(aprs.interval_seconds, Some(900));
+        assert_eq!(aprs.aprs_transport.as_deref(), Some("kiss-tcp"));
+        assert_eq!(aprs.aprs_kiss_tcp_address.as_deref(), Some("tnc.lan:8001"));
+        assert_eq!(aprs.aprs_comment.as_deref(), Some("Suncrest WA"));
+        assert_eq!(aprs.aprs_passcode.as_deref(), Some("12345"));
+        // An APRS account carries no `api_key`, which the table's own CHECK requires.
+        assert!(aprs.api_key.is_none());
+
+        let pws = &rows[1];
+        assert!(
+            pws.station_key.is_none(),
+            "an enabled uploader with no pairing is returned, so it can be refused by name"
+        );
+        assert!(pws.remote_station_id.is_none());
+
+        let wu = &rows[2];
+        assert_eq!(wu.remote_station_id.as_deref(), Some("KWABACKYARD"));
+        assert_eq!(
+            wu.api_key
+                .as_ref()
+                .map(secrecy::ExposeSecret::expose_secret),
+            Some("hunter2")
+        );
+        // The station columns are the APRS ones and are read for every kind, because the
+        // join does not know which kind asked.
+        assert_eq!(wu.latitude, Some(45.1));
+
+        pool.close().await;
+    }
+
     /// The three columns M3-1 added, and the round trip the station registrar depends on.
     #[tokio::test]
     async fn a_weatherlink_live_row_round_trips_through_the_station_reader() {
@@ -1534,4 +1628,145 @@ fn optional_port(
             column,
             value: value.to_string(),
         })
+}
+
+// ---------------------------------------------------------------------------------------
+// Third-party egress: the `uploader` rows, joined to their `station_service` pairings
+//
+// **D-66.** The Go schema configures the same service in two places -- the `devices` row
+// carries that station's PWS Weather, Weather Underground and APRS settings while the
+// global credentials live on `controller_configs` -- and this schema splits it by what the
+// thing is a property OF: `uploader` is the remote ACCOUNT and the component, and
+// `station_service` is the PAIRING. So reading an uploader is a join, and this is the one
+// place that join is written.
+//
+// One row per **pairing**, not per uploader. An uploader with two pairings produces two
+// rows with the same `name`, which `mw_output::plan` refuses as W7 D-38's arity rather than
+// silently planning for one of them -- the behaviour the `station_service` table's own
+// comment predicts as `PlanError::UploaderArity`. A `LEFT JOIN`, so an enabled uploader with
+// no pairing still arrives: an uploader configured to share nothing is a configuration
+// error that names itself, where an `INNER JOIN` would make it invisible.
+
+/// One `uploader` row joined to one `station_service` pairing and that station's columns.
+///
+/// The field names are the columns'. `mw-output` owns what an uploader *is* and may not name
+/// this crate; this crate owns the query and may not name that one; the binary is where the
+/// two meet (§1.3 rule 1), which is why `crate::config` copies this into
+/// `mw_output::UploaderRow` field by field.
+///
+/// No `PartialEq`: `api_key` is a `SecretString`, which deliberately does not implement it
+/// (the same reason [`StationRow`] has none).
+#[derive(Debug, Clone)]
+pub struct UploaderRow {
+    /// `uploader.kind` -- `wunderground`, `pwsweather` or `aprs`.
+    pub kind: String,
+    /// `uploader.name`, the component id's stable suffix.
+    pub name: String,
+    /// `uploader.interval_seconds`. `None` is the kind's default.
+    pub interval_seconds: Option<i64>,
+    /// `uploader.api_endpoint`. `None` is the kind's default.
+    pub api_endpoint: Option<String>,
+    /// `uploader.api_key` -- a credential, so a secret from the moment it is read
+    /// (**D-33**). No endpoint returns it (**D-67**).
+    pub api_key: Option<SecretString>,
+
+    /// `station_service.station_key` -- the paired station. `None` is no pairing.
+    pub station_key: Option<String>,
+    /// `station_service.remote_station_id` -- this station's identifier at the far end.
+    pub remote_station_id: Option<String>,
+    /// `stations.latitude`.
+    pub latitude: Option<f64>,
+    /// `stations.longitude`.
+    pub longitude: Option<f64>,
+    /// `stations.aprs_callsign` -- public identity, printed on every packet, and therefore
+    /// on the station row rather than beside the passcode.
+    pub aprs_callsign: Option<String>,
+
+    /// `uploader.aprs_passcode`.
+    ///
+    /// A plain `String` rather than a `SecretString`, and `mw_aprs::Passcode` is what wraps
+    /// it: the parse is what decides whether the configured value or the CWOP default is
+    /// used, and that type's `Debug` redacts. Keeping it a `String` here means the
+    /// redaction happens once, where the value is interpreted, rather than being unwrapped
+    /// again at the parse.
+    pub aprs_passcode: Option<String>,
+    /// `uploader.aprs_symbol_table`.
+    pub aprs_symbol_table: Option<String>,
+    /// `uploader.aprs_symbol_code`.
+    pub aprs_symbol_code: Option<String>,
+    /// `uploader.aprs_comment`.
+    pub aprs_comment: Option<String>,
+    /// `uploader.aprs_server`.
+    pub aprs_server: Option<String>,
+    /// `uploader.aprs_transport`.
+    pub aprs_transport: Option<String>,
+    /// `uploader.aprs_kiss_serial_device`.
+    pub aprs_kiss_serial_device: Option<String>,
+    /// `uploader.aprs_kiss_serial_baud`.
+    pub aprs_kiss_serial_baud: Option<i64>,
+    /// `uploader.aprs_kiss_tcp_address`.
+    pub aprs_kiss_tcp_address: Option<String>,
+    /// `uploader.aprs_kiss_path`.
+    pub aprs_kiss_path: Option<String>,
+    /// `uploader.aprs_kiss_destination`.
+    pub aprs_kiss_destination: Option<String>,
+}
+
+/// Every **enabled** uploader, with its pairing and that station's columns.
+///
+/// `enabled = 0` rows are not returned at all, which is what makes W5 §1.4's "Stop sharing
+/// with Weather Underground" a plan that no longer contains the component (W2a §2.5) rather
+/// than `RemoveController` deleting a map entry and logging "will stop on next app restart".
+pub async fn uploaders(pool: &SqlitePool) -> Result<Vec<UploaderRow>, ConfigDbError> {
+    let rows = sqlx::query(
+        "SELECT u.kind, u.name, u.interval_seconds, u.api_endpoint, u.api_key, \
+                u.aprs_passcode, u.aprs_symbol_table, u.aprs_symbol_code, u.aprs_comment, \
+                u.aprs_server, u.aprs_transport, u.aprs_kiss_serial_device, \
+                u.aprs_kiss_serial_baud, u.aprs_kiss_tcp_address, u.aprs_kiss_path, \
+                u.aprs_kiss_destination, \
+                ss.station_key AS station_key, \
+                ss.remote_station_id AS remote_station_id, \
+                s.latitude AS latitude, s.longitude AS longitude, \
+                s.aprs_callsign AS aprs_callsign \
+         FROM uploader u \
+         LEFT JOIN station_service ss \
+                ON ss.uploader_id = u.id AND ss.service = u.kind \
+         LEFT JOIN stations s ON s.station_key = ss.station_key \
+         WHERE u.enabled = 1 \
+         ORDER BY u.kind, u.name, ss.station_key",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|source| ConfigDbError::Query {
+        what: "the uploader rows",
+        source,
+    })?;
+    Ok(rows
+        .into_iter()
+        .map(|r| UploaderRow {
+            kind: r.get("kind"),
+            name: r.get("name"),
+            interval_seconds: r.get("interval_seconds"),
+            api_endpoint: r.get("api_endpoint"),
+            api_key: r
+                .get::<Option<String>, _>("api_key")
+                .map(SecretString::from),
+            station_key: r.get("station_key"),
+            remote_station_id: r.get("remote_station_id"),
+            latitude: r.get("latitude"),
+            longitude: r.get("longitude"),
+            aprs_callsign: r.get("aprs_callsign"),
+            aprs_passcode: r.get("aprs_passcode"),
+            aprs_symbol_table: r.get("aprs_symbol_table"),
+            aprs_symbol_code: r.get("aprs_symbol_code"),
+            aprs_comment: r.get("aprs_comment"),
+            aprs_server: r.get("aprs_server"),
+            aprs_transport: r.get("aprs_transport"),
+            aprs_kiss_serial_device: r.get("aprs_kiss_serial_device"),
+            aprs_kiss_serial_baud: r.get("aprs_kiss_serial_baud"),
+            aprs_kiss_tcp_address: r.get("aprs_kiss_tcp_address"),
+            aprs_kiss_path: r.get("aprs_kiss_path"),
+            aprs_kiss_destination: r.get("aprs_kiss_destination"),
+        })
+        .collect())
 }

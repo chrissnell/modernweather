@@ -1,0 +1,5 @@
+# A packet carrying an operator comment after the software identifier. This is the one part
+# of a captured field this program does not generate and still has to reproduce byte for
+# byte, which is why `parse_info` returns the trailer rather than discarding it.
+# 45 12.34 N, 122 34.56 W; 1013.0 hPa; comment "Suncrest WA".
+!4512.34N/12234.56W_180/005g010t072r000p000P000h55b10130.mw1.0 Suncrest WA

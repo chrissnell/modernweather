@@ -261,6 +261,31 @@ place and not another.
 """
 
 [[dep_rule]]
+id = "webpki-roots-only-for-the-uploaders"
+dependency = "webpki-roots"
+only = ["mw-output"]
+reason = """
+Added by implementation-plan.md M6-2 and recorded as amendment A-M6-2-1 in
+docs/reconciliation.md: DESIGN.md D-32 names `rustls` + `ring` for TLS and names **no HTTP
+client**, which left the outbound upload path without a trust anchor source. `mw_output::https`
+writes the request out by hand rather than adding a client crate -- the same trade
+`mw_station::http` makes, and for the same `clippy.toml` reason -- so the root store is the
+one piece of it that cannot be written out.
+
+Confined to one crate because that is the only honest scope for it. The daemon's SERVER side
+has no use for a public trust store: `mw_http::sni` resolves certificates this node owns and
+`mw-store`'s pool verifies a PostgreSQL server against the CA an operator configured. A
+second crate naming this would mean something had started verifying a public endpoint
+somewhere the design does not have one -- which is exactly the kind of edge W3 decision 1
+says is only enforceable as a Cargo.toml fact.
+
+Compiled in rather than read from the platform store, which is the part worth knowing before
+somebody "fixes" it: the daemon ships as a static musl binary to four targets and into a
+container whose `/etc/ssl/certs` is the base image's, so a platform store is a trust decision
+that differs per artefact. `rustls-native-certs` and `rustls-platform-verifier` are therefore
+NOT substitutions that would be equivalent here, and either would be its own amendment."""
+
+[[dep_rule]]
 id = "one-logging-path"
 dependency = "log"
 only = []

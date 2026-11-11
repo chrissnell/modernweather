@@ -1,0 +1,5 @@
+# Solar irradiance above 1000 W/m2, which the protocol encodes by switching the field letter
+# from `L` to `l` and carrying the value less 1000 -- a three-digit field holding a
+# four-digit quantity. 1234 W/m2 renders as `l234`. Same position as the specification's
+# example so that only the solar field differs from it.
+!4903.50N/07201.75W_220/004g005t077r000p000P000h50b09900l234.mw1.0

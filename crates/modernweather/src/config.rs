@@ -208,6 +208,21 @@ pub struct Config {
     /// configured one.
     pub(crate) sni: Option<Arc<mw_http::SniResolver>>,
 
+    /// Every enabled `uploader` row, joined to its `station_service` pairing, in the shape
+    /// `mw-output` plans from.
+    ///
+    /// **Its emptiness is meaningful** and is the common case: a node with no row shares
+    /// nothing with a third party, and `mw_output::register` plans nothing. Read here
+    /// rather than by the component that consumes it for the reason every other row is:
+    /// `mw-output` may not depend on `mw-store` (`ci/layers.toml`, W2a decision 50), so the
+    /// query is this crate's and the shape the registrar plans from is the component
+    /// crate's.
+    ///
+    /// Only the declared shape is kept, unlike `stations` and `ingest`, which keep both:
+    /// nothing in the boot sequence reads an uploader, so a second copy in the store's own
+    /// shape would be a field whose only purpose is to be converted.
+    pub(crate) declared_uploaders: Vec<mw_output::UploaderRow>,
+
     /// The generation these rows were read at (**D-53**).
     ///
     /// `ZERO` until something can bump it: a generation is assigned by `ConfigAdmin` on
@@ -227,7 +242,9 @@ impl Config {
         // than a column -- the `website` table's own comment says so -- and it is folded
         // into the website views below rather than kept, because nothing else reads it.
         let aeris_stations = config_db::aeris_stations(pool).await?;
+        let uploaders = config_db::uploaders(pool).await?;
         Ok(Config {
+            declared_uploaders: uploaders.iter().map(declare_uploader).collect(),
             web_sites: websites
                 .iter()
                 .map(|w| declare_site(w, &stations, &aeris_stations))
@@ -508,6 +525,45 @@ impl mw_pipeline::RollupConfig for Config {
     }
 }
 
+/// What the three rate-limited outputs plan from.
+///
+/// Column into field, like every other registrar trait here. The handle the uploaders need
+/// is the **same** `Arc<dyn WindowedView>` the snapshot components are given -- one object,
+/// so an uploader and `/latest` cannot disagree about what the five-minute wind average is.
+impl mw_output::OutputConfig for Config {
+    fn uploaders(&self) -> Vec<mw_output::UploaderRow> {
+        self.declared_uploaders.clone()
+    }
+
+    /// The rollup state, upcast to the capability the uploaders declare — **and only when
+    /// `window:rollup` is actually planned.**
+    ///
+    /// Set by `set_rollup` beside the snapshot's view, which is what makes "these are the
+    /// same object" a fact of that one call rather than of two call sites.
+    ///
+    /// The condition is the load-bearing part and it is not the same question as "has the
+    /// state been built". The uploaders declare `WindowedView` as a **`Hard`** need —
+    /// deliberately, so that a restart leaves them `Waiting { on: WindowedView }` until the
+    /// rollup has published rather than resolving against an empty view — and a hard need
+    /// nobody provides makes `plan()` refuse the **whole** configuration (**D-44**). The
+    /// state is a root resource `attach_registry` builds unconditionally, so answering
+    /// `Some` from its existence alone would turn "this node has an uploader and collects
+    /// for nothing" into a daemon that will not start.
+    ///
+    /// So the answer is gated on the predicate `mw_pipeline::rollup::register` plans the
+    /// provider on, read through the **same accessors** it reads — a weather database, and
+    /// at least one collecting station. The rule is duplicated here and the inputs are not,
+    /// which is the half that could actually drift; `crates/modernweather/src/boot.rs` has
+    /// a test for both directions.
+    fn windowed_view(&self) -> Option<&Arc<dyn mw_component::WindowedView>> {
+        use mw_pipeline::RollupConfig;
+        if !self.has_weather_database() || self.rollup_stations().is_empty() {
+            return None;
+        }
+        self.snapshot_windows.as_ref()
+    }
+}
+
 impl mw_pipeline::SnapshotConfig for Config {
     fn has_weather_database(&self) -> bool {
         self.weather_database.is_some()
@@ -735,6 +791,39 @@ fn declare_station(row: &config_db::StationRow) -> mw_api_legacy::StationView {
 /// Column into field, and nothing else: every decision is `mw_grpc::grpcrx::register`'s,
 /// because the crate that owns what a receiver is is the crate that should decide whether
 /// to plan one.
+/// One `uploader` row, column into field.
+///
+/// Field for field with no interpretation, which is the point: every default, every clamp
+/// and every refusal is `mw_output::plan`'s, so a reader comparing the two structs is
+/// comparing names rather than behaviour. A column added to the schema that is not added
+/// here is an uploader that silently ignores it, which is why both structs document each
+/// field with its column name.
+fn declare_uploader(row: &config_db::UploaderRow) -> mw_output::UploaderRow {
+    mw_output::UploaderRow {
+        kind: row.kind.clone(),
+        name: row.name.clone(),
+        interval_seconds: row.interval_seconds,
+        api_endpoint: row.api_endpoint.clone(),
+        api_key: row.api_key.clone(),
+        station_key: row.station_key.clone(),
+        remote_station_id: row.remote_station_id.clone(),
+        latitude: row.latitude,
+        longitude: row.longitude,
+        aprs_callsign: row.aprs_callsign.clone(),
+        aprs_passcode: row.aprs_passcode.clone(),
+        aprs_symbol_table: row.aprs_symbol_table.clone(),
+        aprs_symbol_code: row.aprs_symbol_code.clone(),
+        aprs_comment: row.aprs_comment.clone(),
+        aprs_server: row.aprs_server.clone(),
+        aprs_transport: row.aprs_transport.clone(),
+        aprs_kiss_serial_device: row.aprs_kiss_serial_device.clone(),
+        aprs_kiss_serial_baud: row.aprs_kiss_serial_baud,
+        aprs_kiss_tcp_address: row.aprs_kiss_tcp_address.clone(),
+        aprs_kiss_path: row.aprs_kiss_path.clone(),
+        aprs_kiss_destination: row.aprs_kiss_destination.clone(),
+    }
+}
+
 fn declare_ingest(row: &config_db::IngestRow) -> mw_grpc::IngestRow {
     mw_grpc::IngestRow {
         listen: row.listen.clone(),
@@ -802,6 +891,7 @@ mod tests {
 
     fn config(addr: &str, port: u16) -> Config {
         Config {
+            declared_uploaders: Vec::new(),
             stations: Vec::new(),
             declared_stations: Vec::new(),
             websites: Vec::new(),

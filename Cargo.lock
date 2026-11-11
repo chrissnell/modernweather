@@ -1639,13 +1639,20 @@ name = "mw-output"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "metrics",
  "mw-aprs",
  "mw-component",
+ "mw-station",
  "mw-types",
+ "rustls",
+ "secrecy",
  "thiserror",
  "tokio",
+ "tokio-rustls",
+ "tokio-util",
  "tower",
  "tracing",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
