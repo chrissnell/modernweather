@@ -1074,32 +1074,45 @@ slightly wrong in non-leap years, so the two *should* disagree somewhere — and
 already records the fallback component's shape.
 
 ### M5-4 — delete `sun_times`
-**Depends on:** M5-3 passing. One row out of the plan, a table and a capability deleted. Trivial, and
-deliberately gated on the previous item rather than bundled with it.
+**Depends on:** M5-3 passing. One row out of the plan. Trivial, and deliberately gated on the
+previous item rather than bundled with it.
 **Deviation that lands here:** **DEV-17**.
 
-**What this item found, on running it: there was nothing to delete.** Neither schema ever carried
-the table and no capability was ever named for it — `migrations/config/` was authored from scratch
-without it, `Capability` has twelve variants and none is `SunTimes`, and `mw_api_legacy::sun`
-evaluates both values per request. `docs/rewrite/README.md`'s capability inventory already strikes the
-row through (reconciliation decision 30). So W2a Decision 36 was applied at the point each of those
-files was written, and this item is the **verification** of a deletion rather than the deletion: the
-gated action it was holding does not exist, and no `DROP TABLE` was or could be written.
+**Amended on running it (M5-4): there was no table and no capability to delete.** This row said "a
+table and a capability deleted"; neither ever existed in this tree. `migrations/config/` was authored
+from scratch without the table, `Capability` has twelve variants and none is `SunTimes`,
+`mw_api_legacy::sun` already evaluates both values per request, and `docs/rewrite/README.md`'s
+capability inventory already strikes the row through (reconciliation decision 30). W2a Decision 36
+was applied at the point each of those files was written, so this item is the **verification** of a
+deletion rather than the deletion: no `DROP TABLE sun_times` was or could be written.
 
 That makes the deletion a property of the *absence* of a statement, which nothing would notice being
-undone — so what this item adds is the guard that would:
+undone — so what this item adds is the guard that would.
 `mw_store::config_db::tests::the_sun_times_table_is_not_carried_forward` rejects the identifier in
-any `.sql` under `migrations/`, weather schema included, with
-`the_sun_times_guard_bites` as its negative control. Reinstating W2a §4.3's fallback starts by
-deleting that test, which is the point of it.
+any `.sql` under **two** roots: `migrations/`, weather schema included, and `ci/db/`, which is where
+the Go data actually crosses over and is not governed by D-8's no-startup-DDL rule at all.
+`the_sun_times_guard_bites` is its negative control, and it runs the real reader over a synthetic
+tree rather than a copy of it — dropping the reader's `to_uppercase`, its recursion or its extension
+match turns the control red, which was checked by making each of those three edits. The capability
+needs no guard: `Capability::ALL.len() == 12` is already asserted in `capability.rs`.
+Reinstating W2a §4.3's fallback starts by deleting the guard, which is the point of it.
 
-**On the gate.** M5-3's ten assertions all pass, including the one OQ-B asked for —
-`the_served_strings_are_the_stored_go_tables`, which requires the per-request evaluation to reproduce
-the row the Go daemon served, and does, 6 of 6 byte for byte. M5-3's separate finding that the served
-values sit 4.52 min from a **textbook** evaluation is a property of the ported Go formula, shared by
-the table and the evaluation alike; it is recorded in DEV-17 and is not a reason to keep a table that
-computes it identically. The three cases where deletion *does* change a served value are all the
-stored table being stale, and all three are in DEV-17 with their measurements.
+**On the gate, stated plainly, because the reading is not the literal one.** M5-3's ten assertions
+all pass. But OQ-B's instruction — compare to the minute against a fresh Meeus evaluation, and
+reinstate §4.3 if they diverge — is **not** satisfiable as written: the served value never once
+agrees with a textbook evaluation to the minute, by 2–7 min at sunrise and 1–8 min early at sunset
+(M5-3; `every_configured_station_diverges_from_a_fresh_meeus_evaluation`). M5-3's own "Done when …
+passes to the minute" was not met in that literal sense.
+
+Reinstating the table cannot close that gap, because the table is filled by the same
+`solar.CalculateSunriseSunset` the per-request evaluation ports — the divergence is the Go formula's
+missing horizon-altitude term, and the table computes it identically. What OQ-B was protecting
+against is instead established by `the_served_strings_are_the_stored_go_tables`: the per-request
+evaluation reproduces the table's own output, 6 of 6 byte for byte. W2a §4.3's own words support
+reading it that way — it calls `pkg/solar` "Meeus, already implemented" — but the reinterpretation is
+recorded here rather than assumed, and the three cases where deletion *does* change a served value
+are in **DEV-17** with their measurements and their directions. Whether to correct the formula is a
+separate decision, deliberately not taken here.
 
 ### M5-5 — drop `stationname` and `stationtype` from the raw table
 **Depends on:** M1-2, M5-1. Now safe: the `metadata` role exists, and the migration has proved
