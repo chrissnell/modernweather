@@ -31,14 +31,19 @@
 //! the handle and a leak is unexpressible".
 //!
 //! **The ordering is what the decision is about, and the ordering is kept.** `crate::uploader`
-//! drives the retry as a loop that re-enters the limiter's `poll_ready` before every
-//! attempt, which is the property D-57 states in words: *"each attempt takes its own
-//! permit"*. What is lost is one layer in a builder expression; what is kept is the
-//! behaviour, the typed error and the single policy. Recorded in
-//! `docs/reconciliation.md` as **A-M6-2-3**.
+//! drives the retry as a loop that re-enters the limiter's readiness before every attempt,
+//! which is the property D-57 states in words: *"each attempt takes its own permit"*. What
+//! is lost is one layer in a builder expression; what is kept is the behaviour, the typed
+//! error and the single policy. Recorded in `docs/reconciliation.md` as **A-M6-2-3**.
 //!
-//! The policy is deliberately still generic over `E: Classify` and knows nothing about
-//! uploads, so the first stack that *can* use `tower::retry` has one line to write.
+//! **The door a reader will try next**, recorded so they do not have to: a `Clone`-able
+//! limiter — shared state behind an `Arc<Mutex<…>>` rather than an owned `Sleep` — *would*
+//! compose with `tower::retry::Retry`, and would have the property, because `Retry::call`
+//! clones the service *after* the first `call` has spent the permit. It was not built
+//! because it is a second rate limiter to audit against `tower`'s, for a saving of thirty
+//! lines in one component. If a second tower stack in this process ever needs the composed
+//! form, that is the moment to write it — and this policy is deliberately still generic
+//! over `E: Classify` and knows nothing about uploads, so that stack has one line to write.
 
 use std::time::Duration;
 
@@ -79,6 +84,11 @@ impl ClassPolicy {
     /// `None` means stop. `Some(delay)` means wait that long and attempt again, and spends
     /// one of the budget — including when the delay is zero, which is what stops a
     /// `Retryable` with no hint from looping.
+    ///
+    /// A caller is free to do something other than sleep a hinted delay, and
+    /// `crate::uploader` does: a delay the remote end supplied is usually longer than the
+    /// occurrence's deadline, so it defers the **next** occurrence instead of sleeping
+    /// inside this one. That is why this returns the delay rather than performing it.
     ///
     /// **`Class::Ignorable` is not retried and is not an error either.** The caller decides
     /// what an ignorable failure means for the occurrence; what this says is only that

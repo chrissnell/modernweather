@@ -562,6 +562,30 @@ impl mw_output::OutputConfig for Config {
         }
         self.snapshot_windows.as_ref()
     }
+
+    /// Whether `window:rollup` maintains windows for this station.
+    ///
+    /// Read from the **same accessor the rollup's registrar plans its station set from**
+    /// (`mw_pipeline::RollupConfig::rollup_stations`), so the answer cannot disagree with
+    /// the set `RollupState` was actually built over: `crate::boot::attach_registry` builds
+    /// it from that call and nothing else.
+    fn maintains_windows_for(&self, station: &StationKey) -> bool {
+        use mw_pipeline::RollupConfig;
+        self.rollup_stations().iter().any(|(key, _)| key == station)
+    }
+
+    /// Whether this station exists and has collection switched off.
+    ///
+    /// From the rows rather than from the rollup's set, because the point is to tell the two
+    /// reasons a station is absent from that set apart. A station that is not in
+    /// `config.stations` at all answers `false`, which is the right answer: the pairing's
+    /// foreign key makes that unrepresentable, and if it somehow happened a refusal is the
+    /// honest outcome rather than a skip.
+    fn station_is_disabled(&self, station: &StationKey) -> bool {
+        self.stations
+            .iter()
+            .any(|row| row.station_key == station.as_str() && !row.enabled)
+    }
 }
 
 impl mw_pipeline::SnapshotConfig for Config {
@@ -786,11 +810,6 @@ fn declare_station(row: &config_db::StationRow) -> mw_api_legacy::StationView {
     }
 }
 
-/// One `config.ingest` row, as the gRPC crate declares its receiver from.
-///
-/// Column into field, and nothing else: every decision is `mw_grpc::grpcrx::register`'s,
-/// because the crate that owns what a receiver is is the crate that should decide whether
-/// to plan one.
 /// One `uploader` row, column into field.
 ///
 /// Field for field with no interpretation, which is the point: every default, every clamp
@@ -810,6 +829,8 @@ fn declare_uploader(row: &config_db::UploaderRow) -> mw_output::UploaderRow {
         latitude: row.latitude,
         longitude: row.longitude,
         aprs_callsign: row.aprs_callsign.clone(),
+        station_enabled: row.station_enabled,
+        station_transport_kind: row.station_transport_kind.clone(),
         aprs_passcode: row.aprs_passcode.clone(),
         aprs_symbol_table: row.aprs_symbol_table.clone(),
         aprs_symbol_code: row.aprs_symbol_code.clone(),
@@ -824,6 +845,11 @@ fn declare_uploader(row: &config_db::UploaderRow) -> mw_output::UploaderRow {
     }
 }
 
+/// One `config.ingest` row, as the gRPC crate declares its receiver from.
+///
+/// Column into field, and nothing else: every decision is `mw_grpc::grpcrx::register`'s,
+/// because the crate that owns what a receiver is is the crate that should decide whether
+/// to plan one.
 fn declare_ingest(row: &config_db::IngestRow) -> mw_grpc::IngestRow {
     mw_grpc::IngestRow {
         listen: row.listen.clone(),

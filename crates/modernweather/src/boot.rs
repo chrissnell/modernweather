@@ -1665,6 +1665,106 @@ mod tests {
         pool.close().await;
     }
 
+    /// **Every window the three encoders declare is one `window:rollup` can resolve.**
+    ///
+    /// The half of that check `mw-output` cannot make: the ring's span and the maintained
+    /// set are `mw-pipeline`'s constants, and this is the only crate that may name both
+    /// (`ci/layers.toml` puts them in the same layer, so neither may name the other). The
+    /// registry half — "does `metrics/registry.toml` declare this strategy for this metric"
+    /// — is asserted inside `mw-output`.
+    ///
+    /// Why it is worth a test at all: `RollupState::one` routes a window shorter than the
+    /// ring to the ring and everything else to the maintained set, which refuses anything
+    /// but `Agg::Sum`. A declaration that falls between the two answers
+    /// `WindowError::TooLong`, which classifies **`Fatal`** — so the component fails every
+    /// occurrence, forever, and no test with a stubbed `WindowedView` can see it.
+    #[test]
+    fn every_declared_window_is_one_the_rollup_can_resolve() {
+        use mw_output::encoder::{cwop, pws, wu};
+        use mw_pipeline::rollup::ring::RING_SPAN;
+        use mw_pipeline::rollup::state::MAINTAINED;
+        use mw_types::Agg;
+
+        for table in [cwop::REQUIRED, wu::REQUIRED, pws::REQUIRED] {
+            for (metric, window, agg) in table.iter().copied() {
+                match window.length() {
+                    // Inside the ring: every strategy resolves, from bucket state.
+                    Some(length) if length <= RING_SPAN => {}
+                    // Outside it: the window must be one the rollup maintains, and a
+                    // maintained window resolves only a total.
+                    _ => {
+                        assert!(
+                            MAINTAINED.contains(&window),
+                            "`({metric:?}, {window}, {agg})` is longer than the \
+                             {}-second ring and is not in the rollup's maintained set",
+                            RING_SPAN.as_secs()
+                        );
+                        assert_eq!(
+                            agg,
+                            Agg::Sum,
+                            "`({metric:?}, {window})` is maintained, and \
+                             `RollupState::maintained` resolves only `Agg::Sum`"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **Every station the rollup holds has a resolved time zone**, which is what makes the
+    /// three calendar-window declarations resolvable rather than `Fatal`.
+    ///
+    /// The invariant is real and is enforced three crates away, so it is worth pinning
+    /// here. `WindowedView::resolve` answers `WindowError::NoZone` — `Fatal` — for a
+    /// `Window::Day`, `Month` or `Year` declaration against a station with no zone, and all
+    /// three encoder tables declare at least one. What stops that reaching a running
+    /// uploader is that a *collecting* station with no usable zone makes `plan()` refuse the
+    /// whole configuration: `rollup_stations` hands the unresolved `None` to
+    /// `rain:rollover:<station>`'s `TzSource`, and `mw_supervisor::plan` answers
+    /// `PlanError::MissingTimeZone`. (An unparseable zone is caught earlier still, by
+    /// `attach_registry`.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_collecting_station_with_no_time_zone_refuses_the_whole_configuration() {
+        let scratch = Scratch::new("nozone");
+        // The beaconing station, with its `timezone` column left NULL -- which
+        // `mw_store::registry` treats as absent rather than as a problem, so startup
+        // proceeds and `plan()` is where it is caught.
+        let station = "INSERT INTO stations (station_key, owning_node_id, name, type,
+                                             identity_kind, transport_kind, transport_dev,
+                                             transport_baud, latitude, longitude)
+                       VALUES ('backyard', x'07070707070707070707070707070707', 'backyard',
+                               'davis', 'fixed', 'serial', '/dev/ttyUSB0', 19200,
+                               45.1, -122.05)"
+            .to_string();
+        let pool = configure(&scratch, &[station]).await;
+        let mut cfg = Config::load(&pool).await.expect("the configuration reads");
+        let node = cfg.node.clone().expect("the node row was inserted");
+        let fanout = spool::open(&node).expect("the spool opens");
+        attach_registry(&mut cfg).expect("a blank zone is not a registry problem");
+        attach_ingress(&mut cfg, &fanout).expect("the pipeline assembles");
+        attach_listener(&mut cfg, Arc::new(String::new)).expect("the route tables mount");
+        cfg.weather_database = Some(config_db::WeatherDatabase {
+            url: secrecy::SecretString::from(
+                "postgresql://mw@127.0.0.1:5432/modernweather".to_string(),
+            ),
+        });
+
+        let roots = Roots {
+            schedule: Arc::new(mw_supervisor::testing::MemoryScheduleStore::new()),
+            stream: Some(Arc::clone(&fanout.stream) as Arc<dyn mw_component::ReadingStream>),
+            log: Arc::new(mw_supervisor::testing::MemoryLogControl::new("info")),
+        };
+        let ctx = PlanContext::new(Generation::ZERO).with_roots(roots.capabilities());
+        let e = plan(&cfg, REGISTRARS, &ctx).expect_err("a station with no zone");
+        let text = mw_types::DisplayChain(&e).to_string();
+        assert!(text.contains("backyard"), "{text}");
+        assert!(
+            text.contains("time zone") || text.contains("timezone"),
+            "{text}"
+        );
+        pool.close().await;
+    }
+
     /// A station with coordinates and a callsign, which is what an APRS uploader needs.
     ///
     /// `timezone` is set for the reason [`broadcast_station`] records, and the three APRS
@@ -1794,6 +1894,8 @@ mod tests {
             latitude: None,
             longitude: None,
             aprs_callsign: None,
+            station_enabled: Some(true),
+            station_transport_kind: Some("serial".to_string()),
             aprs_passcode: None,
             aprs_symbol_table: None,
             aprs_symbol_code: None,

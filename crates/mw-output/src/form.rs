@@ -88,13 +88,13 @@ impl Form {
 
 impl fmt::Debug for Form {
     /// Redacts (**D-33**): the query holds `PASSWORD=`.
+    ///
+    /// **The byte count is not printed either.** The preamble is fixed-format, so the
+    /// query's length is a direct read on the credential's length — the one remaining fact
+    /// about a password worth not putting in a log. The measurement count is the part that
+    /// is actually useful as a diagnostic, and it says nothing about the secret.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Form(<redacted; {} bytes, {} measurements>)",
-            self.query.len(),
-            self.measurements
-        )
+        write!(f, "Form(<redacted; {} measurements>)", self.measurements)
     }
 }
 
@@ -169,7 +169,10 @@ mod tests {
         let rendered = format!("{f:?}");
         assert!(!rendered.contains("hunter2"), "{rendered}");
         assert!(!rendered.contains("PASSWORD=h"), "{rendered}");
-        assert_eq!(rendered, "Form(<redacted; 27 bytes, 1 measurements>)");
+        assert_eq!(rendered, "Form(<redacted; 1 measurements>)");
+        // Not even the length: the preamble is fixed-format, so the query's length is the
+        // credential's length.
+        assert!(!rendered.contains('7'), "{rendered}");
     }
 
     #[test]

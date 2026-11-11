@@ -663,10 +663,17 @@ mod tests {
 
     /// The `uploader` join, which is the one query in this file that reads three tables.
     ///
-    /// Three properties, each of which a wrong literal would break silently: a disabled
+    /// Four properties, each of which a wrong literal would break silently: a disabled
     /// uploader is absent, an enabled one with no pairing still arrives (so the registrar
-    /// can refuse it by name rather than the row being invisible), and the composite
-    /// foreign key's `service = kind` condition is in the join rather than assumed.
+    /// can refuse it by name rather than the row being invisible), one uploader with two
+    /// pairings produces two rows (which is what makes the arity refusal reachable), and
+    /// the station columns the two `OutputConfig` predicates read come back.
+    ///
+    /// The join's `ss.service = u.kind` condition is **not** asserted and cannot be from
+    /// here: the composite foreign key `(uploader_id, service) -> uploader (id, kind)`
+    /// makes a mismatched pairing unrepresentable unless the test switches `foreign_keys`
+    /// off. The condition is in the join anyway, because it is only the foreign key that
+    /// makes it redundant and a pragma is not a schema.
     #[tokio::test]
     async fn the_uploader_join_reads_the_account_the_pairing_and_the_station() {
         let scratch = Scratch::new("uploaders");
@@ -704,6 +711,18 @@ mod tests {
                      'tnc.lan:8001', 'WIDE1-1', 'Suncrest WA')",
             "INSERT INTO station_service (station_key, service, uploader_id)
              VALUES ('backyard', 'aprs', 4)",
+            // A SECOND station paired with the **same** Weather Underground account, which
+            // `station_service`'s primary key `(station_key, service)` permits. It is what
+            // makes this query one row per PAIRING rather than per uploader, and it is the
+            // input `mw_output::plan` refuses as W7 D-38's arity -- so it has to be
+            // representable here or that refusal is unreachable.
+            "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind,
+                                   transport_kind, transport_dev, transport_baud)
+             VALUES ('roof', x'0193f3c28b207c71ae3f10cc92d4b7aa', 'roof',
+                     'davis', 'fixed', 'serial', '/dev/ttyUSB1', 19200)",
+            "INSERT INTO station_service (station_key, service, uploader_id,
+                                          remote_station_id)
+             VALUES ('roof', 'wunderground', 1, 'KWAROOF')",
         ] {
             sqlx::query(sql)
                 .execute(&pool)
@@ -715,9 +734,23 @@ mod tests {
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["aprs-backyard", "pws-unpaired", "wu-backyard"],
-            "ordered by kind then name, and the disabled row is absent"
+            vec![
+                "aprs-backyard",
+                "pws-unpaired",
+                "wu-backyard",
+                "wu-backyard"
+            ],
+            "ordered by kind then name then station, and the disabled row is absent"
         );
+        // **One row per pairing**, which is the documented shape of this query and the
+        // input `mw_output::plan`'s arity refusal reads. Ordered by station key, so the
+        // refusal's `first`/`second` are deterministic.
+        let paired: Vec<Option<&str>> = rows
+            .iter()
+            .filter(|r| r.name == "wu-backyard")
+            .map(|r| r.station_key.as_deref())
+            .collect();
+        assert_eq!(paired, vec![Some("backyard"), Some("roof")]);
 
         let aprs = &rows[0];
         assert_eq!(aprs.kind, "aprs");
@@ -741,7 +774,16 @@ mod tests {
         assert!(pws.remote_station_id.is_none());
 
         let wu = &rows[2];
+        assert_eq!(wu.station_key.as_deref(), Some("backyard"));
         assert_eq!(wu.remote_station_id.as_deref(), Some("KWABACKYARD"));
+        // The two columns `mw_output::OutputConfig`'s predicates read, which tell "this
+        // station is switched off" from "this node does not collect for it".
+        assert_eq!(wu.station_enabled, Some(true));
+        assert_eq!(wu.station_transport_kind.as_deref(), Some("serial"));
+        // And an unpaired uploader has neither, which is distinguishable from a station
+        // that exists and is disabled.
+        assert_eq!(pws.station_enabled, None);
+        assert_eq!(pws.station_transport_kind, None);
         assert_eq!(
             wu.api_key
                 .as_ref()
@@ -1681,6 +1723,19 @@ pub struct UploaderRow {
     /// `stations.aprs_callsign` -- public identity, printed on every packet, and therefore
     /// on the station row rather than beside the passcode.
     pub aprs_callsign: Option<String>,
+    /// `stations.enabled`, for the paired station. `None` is no pairing at all.
+    ///
+    /// Selected because the registrar has to tell two different causes apart: a station
+    /// whose collection is switched off (reversible, so skip and warn) from one this node
+    /// does not collect for at all (a pairing that cannot work, so refuse).
+    /// `mw_output::OutputConfig`'s two predicates are what read it.
+    pub station_enabled: Option<bool>,
+    /// `stations.transport_kind`, for the paired station.
+    ///
+    /// `None` on a station row means a station a **peer** forwards readings for -- inventory
+    /// on this node rather than a component -- which `window:rollup` maintains no windows
+    /// for. Distinguishable from "no pairing" by [`UploaderRow::station_key`].
+    pub station_transport_kind: Option<String>,
 
     /// `uploader.aprs_passcode`.
     ///
@@ -1727,7 +1782,9 @@ pub async fn uploaders(pool: &SqlitePool) -> Result<Vec<UploaderRow>, ConfigDbEr
                 ss.station_key AS station_key, \
                 ss.remote_station_id AS remote_station_id, \
                 s.latitude AS latitude, s.longitude AS longitude, \
-                s.aprs_callsign AS aprs_callsign \
+                s.aprs_callsign AS aprs_callsign, \
+                s.enabled AS station_enabled, \
+                s.transport_kind AS station_transport_kind \
          FROM uploader u \
          LEFT JOIN station_service ss \
                 ON ss.uploader_id = u.id AND ss.service = u.kind \
@@ -1741,32 +1798,47 @@ pub async fn uploaders(pool: &SqlitePool) -> Result<Vec<UploaderRow>, ConfigDbEr
         what: "the uploader rows",
         source,
     })?;
-    Ok(rows
-        .into_iter()
-        .map(|r| UploaderRow {
-            kind: r.get("kind"),
-            name: r.get("name"),
-            interval_seconds: r.get("interval_seconds"),
-            api_endpoint: r.get("api_endpoint"),
-            api_key: r
-                .get::<Option<String>, _>("api_key")
-                .map(SecretString::from),
-            station_key: r.get("station_key"),
-            remote_station_id: r.get("remote_station_id"),
-            latitude: r.get("latitude"),
-            longitude: r.get("longitude"),
-            aprs_callsign: r.get("aprs_callsign"),
-            aprs_passcode: r.get("aprs_passcode"),
-            aprs_symbol_table: r.get("aprs_symbol_table"),
-            aprs_symbol_code: r.get("aprs_symbol_code"),
-            aprs_comment: r.get("aprs_comment"),
-            aprs_server: r.get("aprs_server"),
-            aprs_transport: r.get("aprs_transport"),
-            aprs_kiss_serial_device: r.get("aprs_kiss_serial_device"),
-            aprs_kiss_serial_baud: r.get("aprs_kiss_serial_baud"),
-            aprs_kiss_tcp_address: r.get("aprs_kiss_tcp_address"),
-            aprs_kiss_path: r.get("aprs_kiss_path"),
-            aprs_kiss_destination: r.get("aprs_kiss_destination"),
+    rows.into_iter()
+        .map(|r| {
+            Ok(UploaderRow {
+                kind: r.get("kind"),
+                name: r.get("name"),
+                interval_seconds: r.get("interval_seconds"),
+                api_endpoint: r.get("api_endpoint"),
+                api_key: r
+                    .get::<Option<String>, _>("api_key")
+                    .map(SecretString::from),
+                station_key: r.get("station_key"),
+                remote_station_id: r.get("remote_station_id"),
+                latitude: r.get("latitude"),
+                longitude: r.get("longitude"),
+                aprs_callsign: r.get("aprs_callsign"),
+                // `Option<i64>` into `Option<bool>` by hand: `flag` refuses a NULL, and a NULL
+                // here is the `LEFT JOIN` finding no station rather than a bad column value.
+                station_enabled: match r.get::<Option<i64>, _>("station_enabled") {
+                    None => None,
+                    Some(0) => Some(false),
+                    Some(1) => Some(true),
+                    Some(other) => {
+                        return Err(ConfigDbError::Column {
+                            column: "station_enabled",
+                            value: other.to_string(),
+                        })
+                    }
+                },
+                station_transport_kind: r.get("station_transport_kind"),
+                aprs_passcode: r.get("aprs_passcode"),
+                aprs_symbol_table: r.get("aprs_symbol_table"),
+                aprs_symbol_code: r.get("aprs_symbol_code"),
+                aprs_comment: r.get("aprs_comment"),
+                aprs_server: r.get("aprs_server"),
+                aprs_transport: r.get("aprs_transport"),
+                aprs_kiss_serial_device: r.get("aprs_kiss_serial_device"),
+                aprs_kiss_serial_baud: r.get("aprs_kiss_serial_baud"),
+                aprs_kiss_tcp_address: r.get("aprs_kiss_tcp_address"),
+                aprs_kiss_path: r.get("aprs_kiss_path"),
+                aprs_kiss_destination: r.get("aprs_kiss_destination"),
+            })
         })
-        .collect())
+        .collect()
 }

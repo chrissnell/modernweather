@@ -60,7 +60,12 @@ use crate::form::Form;
 use crate::uploader::Transmit;
 
 /// How long to wait for the TCP connection.
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// Strictly less than `crate::uploader::ATTEMPT_TIMEOUT`, and that is the whole reason for
+/// the number: the attempt timeout starts first and bounds everything, so a connect budget
+/// equal to it would make the specific "timed out connecting to" diagnosis unreachable and
+/// a hung connect would consume the attempt with the less useful message.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The most of a response this reads.
 ///
@@ -310,10 +315,10 @@ async fn upload(endpoint: Arc<Endpoint>, form: Form) -> Result<(), UploadError> 
 
 /// Build the request bytes.
 ///
-/// `GET`, `Connection: close` and no body. `Connection: close` is what makes reading to end
-/// of stream a correct framing for the response, which is the branch RFC 9112 §6.3 leaves
-/// for a response with neither a `Content-Length` nor a chunked encoding — and the one both
-/// services' answers have historically used.
+/// `GET`, `Connection: close` and no body. `Connection: close` asks the peer to end the
+/// response by closing, which is RFC 9112 §6.3's read-to-close framing — but **it does not
+/// stop the peer sending a `Content-Length` or a chunked body instead**, so
+/// [`read_response`] implements all three framings rather than relying on this header.
 pub fn request_bytes(endpoint: &Endpoint, query: &str) -> Vec<u8> {
     let path = if query.is_empty() {
         endpoint.path.clone()
@@ -408,15 +413,35 @@ pub fn parse_head(response: &[u8], target: &Target) -> Result<Head, UploadError>
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        if name.trim().eq_ignore_ascii_case("retry-after") {
+        if name.trim().eq_ignore_ascii_case("retry-after") && retry_after.is_none() {
+            // The **first** parseable value, so a repeated header whose second copy is
+            // unparseable cannot erase a good one. RFC 9110 permits neither a repeat nor an
+            // unparseable value; a proxy produces both.
             retry_after = parse_retry_after(value.trim());
         }
     }
 
+    // The body excerpt is the **decoded** body: the chunk sizes are framing, and a log
+    // line carrying `1f\r\nInvalid ID` instead of `Invalid ID` is the reason string a
+    // service's support is asked for.
+    let chunked = header(&head, "transfer-encoding").is_some_and(|v| {
+        v.split(',')
+            .any(|t| t.trim().eq_ignore_ascii_case("chunked"))
+    });
+    let decoded: Vec<u8> = if chunked {
+        dechunk(body)
+    } else {
+        match header(&head, "content-length").and_then(|v| v.trim().parse::<usize>().ok()) {
+            Some(len) => body[..len.min(body.len())].to_vec(),
+            None => body.to_vec(),
+        }
+    };
     Ok(Head {
         status,
         retry_after,
-        body: String::from_utf8_lossy(body)
+        // Truncated before the lossy decode rather than after, so a 64 KiB page is not
+        // allocated as a `String` to take 200 characters from it.
+        body: String::from_utf8_lossy(&decoded[..MAX_BODY_EXCERPT.min(decoded.len())])
             .chars()
             .take(MAX_BODY_EXCERPT)
             .collect(),
@@ -473,19 +498,52 @@ pub fn classify(head: &Head, target: &Target, now: DateTime<Utc>) -> Result<(), 
     }
 }
 
-/// Read the whole response, capped.
+/// Read a whole response, in whichever of RFC 9112 §6's framings the peer used.
+///
+/// Three, not one, and for the reason `mw_station::http`'s module documentation gives for
+/// implementing all three there: *"a client that only understood `Content-Length` would
+/// work until a firmware update."* The mirror of that argument applies to a public service
+/// behind a load balancer nobody here controls.
+///
+/// - **`Content-Length`**: stop at exactly that many body bytes. Without this a server that
+///   ignores `Connection: close` and keeps the connection open blocks until the attempt
+///   timeout, and the occurrence is reported as `Timeout` rather than as the status the
+///   service actually returned.
+/// - **`Transfer-Encoding: chunked`**: stop at the terminating zero-length chunk. Without
+///   this the hex chunk sizes end up inside `Head::body`, which is the reason string
+///   `UploadError::Rejected` surfaces and a log line carries.
+/// - **Neither**: read to end of stream, which is §6.3's fallback and what
+///   `Connection: close` asks the peer for.
+///
+/// **A truncated close is tolerated once the head is complete.** `rustls` answers
+/// `ErrorKind::UnexpectedEof` from a read when the peer closed TCP without `close_notify`,
+/// which a load balancer that resets after the body does routinely — and treating that as a
+/// failure turned a successful `200` into three retried attempts and a failed occurrence.
 async fn read_response(wire: &mut dyn ByteStream, target: &Target) -> Result<Vec<u8>, UploadError> {
     let mut response = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
     loop {
-        let read = wire
-            .read(&mut chunk)
-            .await
-            .map_err(|source| UploadError::Connect {
-                what: "could not read a response from",
-                target: target.clone(),
-                source,
-            })?;
+        if complete(&response) {
+            break;
+        }
+        let read = match wire.read(&mut chunk).await {
+            Ok(read) => read,
+            // A close without `close_notify`, after a complete head, is this response
+            // ending. Before the head it is a truncated response and still a failure.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::UnexpectedEof
+                    && head_end(&response).is_some() =>
+            {
+                break;
+            }
+            Err(source) => {
+                return Err(UploadError::Connect {
+                    what: "could not read a response from",
+                    target: target.clone(),
+                    source,
+                })
+            }
+        };
         if read == 0 {
             break;
         }
@@ -495,6 +553,96 @@ async fn read_response(wire: &mut dyn ByteStream, target: &Target) -> Result<Vec
         }
     }
     Ok(response)
+}
+
+/// Where the head ends, as an offset past the blank line.
+fn head_end(response: &[u8]) -> Option<usize> {
+    response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|at| at + 4)
+}
+
+/// Whether enough has been read that the peer has nothing more to say about this response.
+///
+/// `false` until the head is complete, then whichever framing the head declared. A `false`
+/// answer for the read-to-close case is what makes the loop continue to end of stream.
+fn complete(response: &[u8]) -> bool {
+    let Some(body_at) = head_end(response) else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&response[..body_at]);
+    let body = &response[body_at..];
+    if header(&head, "transfer-encoding").is_some_and(|v| {
+        v.split(',')
+            .any(|t| t.trim().eq_ignore_ascii_case("chunked"))
+    }) {
+        return chunked_end(body).is_some();
+    }
+    match header(&head, "content-length").and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(len) => body.len() >= len,
+        None => false,
+    }
+}
+
+/// One header's value, if the head carries it.
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.split("\r\n").skip(1).find_map(|line| {
+        let (field, value) = line.split_once(':')?;
+        field.trim().eq_ignore_ascii_case(name).then_some(value)
+    })
+}
+
+/// The offset just past a chunked body's terminating zero-length chunk, if it has arrived.
+fn chunked_end(body: &[u8]) -> Option<usize> {
+    let mut at = 0usize;
+    loop {
+        let line_end = body[at..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|p| at + p)?;
+        let size_text = String::from_utf8_lossy(&body[at..line_end]);
+        // A chunk size may carry extensions after a `;`, which this does not read.
+        let size_text = size_text.split(';').next().unwrap_or_default().trim();
+        let size = usize::from_str_radix(size_text, 16).ok()?;
+        let data_at = line_end + 2;
+        if size == 0 {
+            // The trailer section, terminated by its own blank line.
+            return body[data_at..]
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .map(|p| data_at + p + 2);
+        }
+        at = data_at.checked_add(size)?.checked_add(2)?;
+        if at > body.len() {
+            return None;
+        }
+    }
+}
+
+/// A chunked body's data, concatenated — what goes into [`Head::body`].
+fn dechunk(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut at = 0usize;
+    while let Some(p) = body[at..].windows(2).position(|w| w == b"\r\n") {
+        let line_end = at + p;
+        let size_text = String::from_utf8_lossy(&body[at..line_end]);
+        let size_text = size_text.split(';').next().unwrap_or_default().trim();
+        let Ok(size) = usize::from_str_radix(size_text, 16) else {
+            break;
+        };
+        if size == 0 {
+            break;
+        }
+        let data_at = line_end + 2;
+        let end = (data_at + size).min(body.len());
+        out.extend_from_slice(&body[data_at..end]);
+        at = end + 2;
+        if at >= body.len() {
+            break;
+        }
+    }
+    out
 }
 
 /// Connect, and wrap in TLS when the endpoint says so.
@@ -593,6 +741,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> ByteStream for Wire<S> {
             // Flushed here rather than left to `Drop`: a TLS stream buffers, and a record
             // that is still in the buffer when the connection closes is a request the
             // service never saw.
+            //
+            // `shutdown` is deliberately **not** called, so this client never sends
+            // `close_notify` either -- the request is one flushed `GET` and the connection
+            // is closed by dropping it after the response. That is the write-side
+            // counterpart of `read_response`'s tolerance of a peer that does the same, and
+            // it is symmetric rather than an oversight.
             self.0.flush().await
         })
     }
@@ -837,6 +991,85 @@ mod tests {
         assert_eq!(
             head.retry_after,
             Some(RetryAfter::Delta(Duration::from_secs(45)))
+        );
+    }
+
+    /// **All three of RFC 9112 §6's framings**, which is what stops a server that ignores
+    /// `Connection: close` from being reported as a timeout.
+    #[test]
+    fn a_response_is_complete_under_each_framing() {
+        // Content-Length: complete at exactly that many body bytes, and not before.
+        let partial = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nsucc";
+        assert!(!complete(partial), "four of seven bytes is not complete");
+        let whole = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nsuccess";
+        assert!(complete(whole));
+        // A body longer than the declared length is complete at the length.
+        assert!(complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nsuccess"
+        ));
+
+        // Chunked: complete at the terminating zero-length chunk and its blank line.
+        let chunked_partial =
+            b"HTTP/1.1 400 Bad\r\nTransfer-Encoding: chunked\r\n\r\na\r\nInvalid ID\r\n";
+        assert!(!complete(chunked_partial));
+        let chunked =
+            b"HTTP/1.1 400 Bad\r\nTransfer-Encoding: chunked\r\n\r\na\r\nInvalid ID\r\n0\r\n\r\n";
+        assert!(complete(chunked));
+
+        // Neither: never "complete", so the loop reads to end of stream.
+        assert!(!complete(b"HTTP/1.1 200 OK\r\n\r\nsuccess"));
+        // And an incomplete head is never complete whatever follows.
+        assert!(!complete(b"HTTP/1.1 200 OK\r\nContent-Length: 0"));
+    }
+
+    /// The chunk sizes are framing and must not reach the reason string a log line carries.
+    #[test]
+    fn a_chunked_body_is_decoded_before_it_becomes_an_excerpt() {
+        let target = endpoint().target();
+        let head = parse_head(
+            b"HTTP/1.1 400 Bad\r\nTransfer-Encoding: chunked\r\n\r\na\r\nInvalid ID\r\n7\r\n, sorry\r\n0\r\n\r\n",
+            &target,
+        )
+        .expect("parses");
+        assert_eq!(head.status, 400);
+        assert_eq!(head.body, "Invalid ID, sorry");
+        let e = classify(&head, &target, Utc::now()).expect_err("rejected");
+        assert!(e.to_string().contains("Invalid ID, sorry"), "{e}");
+        assert!(!e.to_string().contains("\r\n"), "{e}");
+
+        // `Content-Length` trims trailing bytes a pipelined peer may have sent.
+        let head = parse_head(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nsuccessGARBAGE",
+            &target,
+        )
+        .expect("parses");
+        assert_eq!(head.body, "success");
+    }
+
+    /// A repeated `Retry-After` keeps the first parseable value, because a proxy produces
+    /// both a repeat and an unparseable one.
+    #[test]
+    fn a_repeated_retry_after_keeps_the_first_usable_value() {
+        let target = endpoint().target();
+        let head = parse_head(
+            b"HTTP/1.1 429 x\r\nRetry-After: 60\r\nRetry-After: soon\r\n\r\n",
+            &target,
+        )
+        .expect("parses");
+        assert_eq!(
+            head.retry_after,
+            Some(RetryAfter::Delta(Duration::from_secs(60)))
+        );
+    }
+
+    /// The connect budget is strictly inside the attempt's, or its diagnosis is
+    /// unreachable.
+    #[test]
+    fn the_connect_timeout_is_inside_the_attempt_timeout() {
+        assert!(
+            CONNECT_TIMEOUT < crate::uploader::ATTEMPT_TIMEOUT,
+            "{CONNECT_TIMEOUT:?} vs {:?}",
+            crate::uploader::ATTEMPT_TIMEOUT
         );
     }
 

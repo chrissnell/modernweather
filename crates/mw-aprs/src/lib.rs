@@ -26,10 +26,11 @@
 //!
 //! `pkg/aprs`'s own two functions come too: `CalculatePasscode` is
 //! [`Passcode::for_callsign`], and `CalculatePasscodeDebug` is deleted — a second copy of
-//! the same XOR whose only difference is twelve calls that narrate the arithmetic to
-//! standard output, including the credential. `ci/layers.toml`'s `no-stdout-logging` rule
-//! forbids that path outright, and a second implementation of a one-line XOR is a second
-//! place for it to be wrong.
+//! the same XOR whose only difference is ten calls that narrate the arithmetic -- including
+//! the credential -- through Go's builtin `println`, which writes to **standard error**.
+//! `ci/layers.toml`'s `no-stdout-logging` rule forbids both streams, so the destination
+//! changes nothing; and a second implementation of a one-line XOR is a second place for it
+//! to be wrong.
 //!
 //! # Three defects did not come across
 //!

@@ -50,7 +50,13 @@ pub struct Target(String);
 
 impl Target {
     /// Build a target from the parts of a URL that are safe to print.
+    ///
+    /// **Truncates at a `?`**, so the no-query-string guarantee is a property of this
+    /// constructor rather than of the one caller that happens to refuse a query earlier
+    /// (`crate::https::Endpoint::parse`). This is the credential-in-logs guard; it should
+    /// not depend on a second function's validation staying where it is.
     pub fn new(scheme: &str, host: &str, port: u16, path: &str) -> Self {
+        let path = path.split('?').next().unwrap_or("");
         let default = if scheme == "https" { 443 } else { 80 };
         if port == default {
             Self(format!("{scheme}://{host}{path}"))
@@ -125,8 +131,14 @@ pub enum EncodeError {
     /// A station that is configured and has not reported yet, or one whose sensors all
     /// read `NULL`. **`Ignorable`**: posting a form with an identifier and no measurements
     /// tells the service this station is alive and reporting nothing, which is worse than
-    /// not posting — and it is what the Go uploaders do, because `ValidateReading` checks
-    /// the reading's timestamp rather than whether it holds a value.
+    /// not posting.
+    ///
+    /// The Go uploaders do refuse such a reading, and the way they do it is the defect
+    /// **D-26** names: `ValidateReading` is
+    /// `if r.Barometer == 0 && r.OutTemp == 0` (`weather_service_utils.go:214-219`), so it
+    /// cannot tell an absent barometer from a real 0 inHg — and a station reporting a
+    /// genuine 0 °F with a failed barometer is refused as "likely faulty". Asking the
+    /// resolution how many values it holds is the same decision without the zero-fill.
     #[error(
         "station `{station}` has no value for any of the {declared} windows `{service}` \
          declares, so there is nothing to upload this period. A station that has just \
@@ -364,6 +376,12 @@ mod tests {
         assert_eq!(
             Target::new("http", "localhost", 8080, "/wx").to_string(),
             "http://localhost:8080/wx"
+        );
+        // The guarantee is the constructor's: a path carrying a query is truncated here,
+        // not refused somewhere else.
+        assert_eq!(
+            Target::new("https", "wx.example", 443, "/submit?ID=K&PASSWORD=hunter2").to_string(),
+            "https://wx.example/submit"
         );
         assert_eq!(
             Target::peer("noam.aprs2.net", 14580).to_string(),

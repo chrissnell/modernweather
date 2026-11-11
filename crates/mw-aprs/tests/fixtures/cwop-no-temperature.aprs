@@ -1,3 +1,4 @@
+# CONSTRUCTED conformance vector (not a capture).
 # A station that reports humidity and pressure and no wind or temperature -- an indoor
 # barometer-and-hygrometer station, which CWOP accepts. The dotted fields are the protocol's
 # "unavailable", and the case the Go builder renders as `.../...g...t000` because it formats

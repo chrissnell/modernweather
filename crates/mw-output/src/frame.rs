@@ -19,9 +19,14 @@
 //! Two branches for three transports, and the `default:` arm is the dangerous one: **an
 //! unrecognised transport string silently transmits over APRS-IS**, so
 //! `aprs_transport = "kis"` puts the weather report on the internet instead of the radio,
-//! with no error anywhere. The third distinction — KISS over serial against KISS over TCP —
-//! is decided much deeper, inside `openKISSConnection`, on a *second* stringly-typed field
-//! whose own `default:` arm is TCP.
+//! with no error anywhere. The column has no `CHECK` either
+//! (`pkg/config/provider_sqlite.go`), so nothing refuses the typo at write time.
+//!
+//! The third distinction — KISS over serial against KISS over TCP — is decided much deeper,
+//! inside `openKISSConnection`, on a *second* stringly-typed field. That one **is** refused:
+//! `validateKISSConfig` runs first and its own `default:` answers
+//! `invalid KISS connection type %q`, so only the outer dispatch is silent. Stated precisely
+//! because the outer defect is the load-bearing one and overstating the inner one weakens it.
 //!
 //! Here the three are an enum, parsed from configuration by `crate::plan` against the
 //! `uploader` table's `CHECK (aprs_transport IN ('aprs-is', 'kiss-serial', 'kiss-tcp'))`,
@@ -260,6 +265,14 @@ pub fn ax25_ui(
 /// SSID octet.
 fn encode_address(out: &mut Vec<u8>, callsign: &Callsign, last: bool, command: bool) {
     let base = callsign.base().as_bytes();
+    // `Callsign::parse` refuses anything longer, so the shift below cannot truncate — but
+    // that invariant is now load-bearing for *wire* correctness rather than for a message,
+    // and Go returned an error here. Cheap insurance against a future `Callsign`
+    // constructor that does not go through the parse.
+    debug_assert!(
+        base.len() <= 6 && callsign.ssid() <= 15,
+        "`Callsign` admitted an address field it cannot encode: {callsign}"
+    );
     for i in 0..6 {
         let byte = base.get(i).copied().unwrap_or(b' ');
         out.push(byte << 1);
@@ -370,14 +383,25 @@ pub async fn login(
     // The passcode leaves `Passcode` here and nowhere else. The line is not logged.
     let line = format!("user {source} pass {} vers {software}", passcode.expose());
     write_line(&mut *reader.stream, &line, target).await?;
-    let reply = reader.next_line(target, "an APRS-IS login reply").await?;
-    if !reply.starts_with('#') {
-        return Err(UploadError::Malformed {
-            target: target.clone(),
-            expected: "an APRS-IS login reply",
-            why: "the reply did not begin with `#`",
-        });
-    }
+    // **Read until the `logresp` line**, rather than treating the first line after the
+    // login as it. A server is free to send another comment line first — a second banner,
+    // a notice — and treating one as a refused login would make a *successful* login
+    // permanently `Fatal`, which is the one `UploadError` an operator cannot act their way
+    // out of. Bounded by the line budget and by the attempt timeout above it; aprsc and
+    // javAPRSSrvr both answer in one line, so the loop normally runs once.
+    let reply = loop {
+        let line = reader.next_line(target, "an APRS-IS login reply").await?;
+        if !line.starts_with('#') {
+            return Err(UploadError::Malformed {
+                target: target.clone(),
+                expected: "an APRS-IS login reply",
+                why: "a line after the login did not begin with `#`",
+            });
+        }
+        if line.to_ascii_lowercase().contains("logresp") {
+            break line;
+        }
+    };
     // The server says `# logresp CALL verified, server X` on success and
     // `# logresp CALL unverified, server X` on failure. Matching `verified` as a word
     // rather than a substring, because `unverified` contains it.
@@ -752,6 +776,60 @@ mod tests {
             ),
             "{e}"
         );
+    }
+
+    /// **The two read shapes the `LineReader` exists for**, which its own documentation
+    /// names and nothing asserted: both lines in one read, and one line split across two.
+    #[tokio::test]
+    async fn the_line_reader_handles_a_joined_and_a_split_line() {
+        let source = call("N0CALL");
+        let passcode = Passcode::for_callsign(&source);
+
+        // One read carrying the greeting and the login reply together.
+        let mut joined = Transcript::scripted(
+            [b"# aprsc 2.1.19\r\n# logresp N0CALL verified, server X\r\n".to_vec()],
+            Vec::<Vec<u8>>::new(),
+        );
+        login(&mut joined, &source, passcode, "mw", &target())
+            .await
+            .expect("both lines arrived in one read");
+
+        // One line split across three reads, which is what a 19 200-baud line or a small
+        // segment produces.
+        let mut split = Transcript::scripted(
+            [
+                b"# apr".to_vec(),
+                b"sc 2.1.19\r\n# logresp N0C".to_vec(),
+                b"ALL verified, server X\r\n".to_vec(),
+            ],
+            Vec::<Vec<u8>>::new(),
+        );
+        login(&mut split, &source, passcode, "mw", &target())
+            .await
+            .expect("a line split across reads is still a line");
+    }
+
+    /// A second comment line before the `logresp` is not a refused login.
+    #[tokio::test]
+    async fn an_extra_banner_line_does_not_refuse_a_successful_login() {
+        let source = call("N0CALL");
+        let mut stream = Transcript::scripted(
+            [
+                b"# aprsc 2.1.19\r\n".to_vec(),
+                b"# notice: scheduled maintenance tonight\r\n".to_vec(),
+                b"# logresp N0CALL verified, server X\r\n".to_vec(),
+            ],
+            Vec::<Vec<u8>>::new(),
+        );
+        login(
+            &mut stream,
+            &source,
+            Passcode::for_callsign(&source),
+            "mw",
+            &target(),
+        )
+        .await
+        .expect("the notice is not a login reply");
     }
 
     /// A server that never sends a newline is a bounded read rather than an allocation

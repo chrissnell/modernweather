@@ -27,11 +27,16 @@
 //! | `SolarWatts` | 1 min | `Mean` | `solarradiation` |
 //!
 //! **One declaration, two field names** for the gust: the service documents `windgustmph`
-//! as the current gust and `windgustmph_10m` as the ten-minute peak, and this program has
-//! one gust — the ten-minute peak, which is what `window:rollup` maintains and what the
-//! Go uploader takes from a `MaxWindSpeed` column. Sending the same number under both is
-//! the honest reading of what we have; sending an instantaneous sample as `windgustmph`
-//! would be inventing a measurement.
+//! as the current gust — over a software-chosen period — and `windgustmph_10m` as the fixed
+//! ten-minute peak. This program has one gust, the ten-minute peak `window:rollup`
+//! maintains, so sending it under both is inside the documented contract; sending an
+//! instantaneous sample as `windgustmph` would be inventing a measurement.
+//!
+//! The Go Weather Underground uploader sends **no gust at all** — its seven parameters are
+//! `winddir`, `windspeedmph`, `humidity`, `tempf`, `dailyrainin`, `baromin` and
+//! `softwaretype` (`wunderground/controller.go:110-133`). The `MaxWindSpeed` column is the
+//! *PWS* uploader's approximation (`pwsweather/controller.go:119`), which
+//! `crate::encoder::pws` describes.
 
 use mw_component::Declaration;
 use mw_types::{Agg, MetricKey, Window};

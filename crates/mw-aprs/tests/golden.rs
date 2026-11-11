@@ -8,19 +8,27 @@
 //! it — the two directions have to agree about every field width, every unit and every
 //! rounding rule, or the bytes differ.
 //!
-//! # Where the captures come from
+//! # Where the vectors come from, and which one is a capture
 //!
-//! `fixtures/*.aprs` is one information field per file, with a `#` comment block above it
-//! naming the source. Three kinds:
+//! `fixtures/*.aprs` is one information field per file, with a `#` provenance block above
+//! it. **Exactly one of the six is a capture**, and the distinction is worth stating plainly
+//! because M6-2's wording ("captured packets") invites the assumption that they all are:
 //!
-//! - **The APRS Protocol Reference's own worked examples** (v1.0.1 §12, §9). These are the
-//!   normative bytes — the specification's statement of what a complete weather report
-//!   looks like — which makes them the best possible capture for a conformance test.
-//! - **CWOP traffic in the shape the live network carries**, including the two cases the Go
-//!   builder gets wrong: a station whose minutes are under ten, and a station reporting no
-//!   temperature.
-//! - **A packet with an operator comment**, because that is the one field this program does
-//!   not generate and still has to reproduce.
+//! - `spec-complete-weather-report.aprs` is the **APRS Protocol Reference v1.0.1 §12**
+//!   worked example, verbatim. Normative bytes — the specification's own statement of the
+//!   format — which is a stronger oracle than a capture, because a capture only shows what
+//!   one sender did.
+//! - The other five are **constructed conformance vectors**: hand-written fields chosen to
+//!   exercise a boundary, each with its intent recorded. They are not traffic and their
+//!   provenance blocks say so. Three of them exercise a case the Go builder gets wrong (a
+//!   station whose minutes are under ten, a station reporting no temperature, and a
+//!   sub-zero temperature); one carries an operator comment, which is the one field this
+//!   program does not generate and still has to reproduce; one crosses the solar field's
+//!   `L`/`l` switch.
+//!
+//! What would make the corpus stronger is real APRS-IS traffic, which needs a capture this
+//! runtime has no way to take — the item's own instruction is that no test may touch the
+//! public network. Recorded as the gap it is rather than papered over.
 //!
 //! This test links no database and no transport, which `ci/layers.toml` enforces over this
 //! crate's dev-dependencies as well as its dependencies — W2a assumption 7. It reads no
@@ -149,8 +157,14 @@ fn every_fixture_records_its_provenance() {
     }
 }
 
-/// The specification's own worked example, field by field, so a round trip that is
-/// self-consistently wrong is still caught.
+/// The specification's own worked example, field by field, against the values the
+/// reference documents — so a round trip that is self-consistently wrong is still caught.
+///
+/// **The unit conversions are asserted in their own units**, which is the part a round trip
+/// cannot check: `barometer_in_hg` is compared against inches of mercury rather than being
+/// multiplied back by the same constant that produced it (which would hold for any value of
+/// the constant), and the rain fields have a non-zero vector of their own below for the
+/// same reason — `r000` is invariant under any scale factor.
 ///
 /// §12 of the protocol reference: *"`!4903.50N/07201.75W_220/004g005t077r000p000P000h50
 /// b09900wRSW`"*, which it describes as a complete weather report from a station at
@@ -171,13 +185,39 @@ fn the_specifications_example_decodes_to_the_values_it_documents() {
     assert_eq!(parsed.weather.rain_last_24h_in, Some(0.0));
     assert_eq!(parsed.weather.rain_since_midnight_in, Some(0.0));
     assert_eq!(parsed.weather.humidity_percent, Some(50.0));
-    let hpa = parsed.weather.barometer_in_hg.expect("a barometer") * 33.863_886_666_666_7;
-    assert!((hpa - 990.0).abs() < 0.01, "{hpa} hPa");
+    // 990.0 hPa is 29.234 683 inHg, computed from the SI definition of the inch of mercury
+    // (1 inHg = 3386.388 666 67 Pa) and not from this crate's constant.
+    let in_hg = parsed.weather.barometer_in_hg.expect("a barometer");
+    assert!((in_hg - 29.234_683).abs() < 5e-4, "{in_hg} inHg");
     assert_eq!(parsed.weather.solar_watts_per_m2, None);
     assert_eq!(parsed.trailer, "wRSW");
 }
 
-/// **The defect the captures exist to pin.** A station between 45°00′ and 45°10′ renders a
+/// **The rain and barometer scales, in their own units.** A round trip cannot see a wrong
+/// conversion factor, and the specification's example has `r000 p000 P000 b09900` — three
+/// zeros, which are invariant under any scale, and one pressure. So the scales are pinned
+/// here against values computed outside this crate.
+#[test]
+fn the_unit_conversions_are_asserted_in_their_own_units() {
+    // `r012` is 12 hundredths of an inch; `P150` is 150, which is an inch and a half.
+    let parsed =
+        parse_info("!4506.00N/12203.00W_010/003g007t041r012p031P150h88b10204").expect("parses");
+    assert_eq!(parsed.weather.rain_last_hour_in, Some(0.12));
+    assert_eq!(parsed.weather.rain_last_24h_in, Some(0.31));
+    assert_eq!(parsed.weather.rain_since_midnight_in, Some(1.50));
+    // 1020.4 hPa is 30.132 4 inHg (1020.4 / 33.863 886 666 7).
+    let in_hg = parsed.weather.barometer_in_hg.expect("a barometer");
+    assert!((in_hg - 30.132_4).abs() < 5e-4, "{in_hg} inHg");
+    // And the encode direction, from the same numbers, so a one-way factor is caught too.
+    let encoded = parsed
+        .weather
+        .encode_info(parsed.position, parsed.symbol, "", None)
+        .expect("encodes");
+    assert!(encoded.as_str().contains("r012p031P150"), "{encoded}");
+    assert!(encoded.as_str().contains("b10204"), "{encoded}");
+}
+
+/// **The defect the vectors exist to pin.** A station between 45°00′ and 45°10′ renders a
 /// seven-byte latitude under the Go format string, and the symbol-table byte that follows
 /// is then read as part of the position.
 #[test]

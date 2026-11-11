@@ -2,7 +2,8 @@
 //!
 //! `ID`, `PASSWORD`, `dateutc`, `action` and `softwaretype` are the same five parameters in
 //! the same places for Weather Underground and PWS Weather, because both are the same
-//! WeatherUnderground-derived protocol. They are shared and the **measurements are not**:
+//! WeatherUnderground-derived protocol. (Four of them are a carry-forward from the Go
+//! uploaders; `action` is new on the PWS side, and [`Account::preamble`] says why.) They are shared and the **measurements are not**:
 //! `docs/service-architecture.md` §9.3 names the Go defect as "pwsweather and wunderground
 //! are line-for-line identical because there was no shared shape for *a thing that uploads
 //! a windowed summary on a timer*", and the shared shape is `crate::Uploader` plus this —
@@ -67,11 +68,19 @@ impl Account {
         form.set("ID", &self.station_id);
         form.set("PASSWORD", self.api_key.expose_secret());
         form.set("dateutc", &as_of.format(DATEUTC).to_string());
-        // Both services document `updateraw` as the only action for a station upload. The
-        // Go uploaders also send `realtime=1&rtfreq=2.5`, which claims a 2.5-second update
-        // rate on a component whose floor is 60 s -- so the claim is false by between one
-        // and two orders of magnitude, and Weather Underground's rapid-fire endpoint is a
-        // different host from the one the configuration names. Not carried forward.
+        // Both services document `updateraw` as the action for a station upload, and this
+        // is the one parameter of the five that is not a carry-forward on both sides:
+        //
+        // - Weather Underground's Go uploader sends it, along with `realtime=1` and
+        //   `rtfreq=2.5` (`wunderground/controller.go:117-119`). Those two are **not**
+        //   carried forward: they claim a 2.5-second update rate on a component whose floor
+        //   is 60 s, and rapid-fire is a different host (`rtupdate.wunderground.com`) from
+        //   the one the configuration names.
+        // - PWS Weather's Go uploader sends **no `action` at all**
+        //   (`pwsweather/controller.go:110-130`), so on that side this parameter is new.
+        //   PWSWeather's own `submitwx` documentation includes it, and sending it makes the
+        //   two preambles one thing rather than two that differ by a parameter nobody
+        //   decided about.
         form.set("action", "updateraw");
     }
 

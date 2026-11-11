@@ -25,8 +25,9 @@
 //!
 //! # What each row replaces
 //!
-//! `docs/component-model.md` §4b.1 tabulates where one Go packet's values come from, and
-//! three of the four are wrong:
+//! `docs/component-model.md` §4b.1 tabulates where one Go packet's values come from. All
+//! four are in the wrong place and **two of them are the wrong number** — §4b.1 calls the
+//! gust "right idea, wrong place" and the day rain "right value, wrong layer":
 //!
 //! | Value | Go | Here |
 //! |---|---|---|
@@ -63,6 +64,11 @@ use super::{
 use crate::error::EncodeError;
 
 /// This encoder's name, for a metric label and a log field.
+///
+/// `aprs` rather than `cwop`, deliberately: it is `uploader.kind`'s own value and the
+/// component id's prefix, so one word identifies the row, the component and the series. The
+/// *table* below is CWOP's, which is a use of the protocol rather than a second service —
+/// an amateur station beaconing the same packet over RF is the same component.
 pub const SERVICE: &str = "aprs";
 
 /// Averaged wind direction — CWOP's `ddd`.

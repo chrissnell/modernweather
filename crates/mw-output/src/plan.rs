@@ -6,9 +6,11 @@
 //!
 //! # `StationRegistry` is **not** declared, and A-M3-3-1 is why
 //!
-//! §9.3 and `docs/component-model.md` §4b's component table both give the uploaders
-//! `StationRegistry` as a hard need. Declaring it would refuse every configuration this
-//! program can have: W2a §4.1b gives `StationRegistry` to a `config:sqlite` component and
+//! §9.3 gives all three uploaders `StationRegistry` as a hard need, and
+//! `docs/component-model.md` §4.2's component table gives it to **`aprs:<device>` only** —
+//! `pws:<device>` and `wu:<device>` are `WindowedView` H alone there. So two of the three
+//! components match that table exactly and only the APRS row departs. Declaring it would
+//! refuse every configuration this program can have: W2a §4.1b gives `StationRegistry` to a `config:sqlite` component and
 //! **no work item in `docs/implementation-plan.md` creates one**, so a hard need on it is "a
 //! requirement nobody provides" and `plan()` refuses the whole configuration (**D-44**).
 //!
@@ -24,9 +26,12 @@
 //! §4b.5 asks for both and they are different mechanisms:
 //!
 //! - **HTTP and APRS-IS are clamped**, once, here, with a single warning naming the
-//!   component. `ResolveUploadInterval` in the Go tree clamps and warns on **every call**,
-//!   which for a 60-second uploader is a warning a minute forever — and leaves the
-//!   configuration still saying the wrong thing.
+//!   component. `ResolveUploadInterval` in the Go tree clamps and warns **per call**, and
+//!   `aprs/controller.go`'s worker re-reads it every cycle — so an APRS device configured
+//!   below its floor warns once per report, forever. (The two HTTP controllers call it once
+//!   per device at start, so §4b.5's "a warning per minute forever" is true of the APRS
+//!   path rather than of all three; the clamp leaving the configuration still saying the
+//!   wrong thing is true of all of them.)
 //! - **A KISS beacon is refused**, by `crate::RadioInterval`'s only constructor, because a
 //!   radio has no `429` and flooding a shared band has no feedback mechanism at all
 //!   (W2a Decision 60, and **O-8** answered 600 s).
@@ -60,7 +65,7 @@ use mw_component::{
 };
 use mw_types::StationKey;
 use secrecy::SecretString;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::encoder::account::Account;
 use crate::encoder::{cwop, pws, wu};
@@ -73,8 +78,9 @@ use crate::uploader::{self, Uploader, ATTEMPT_TIMEOUT, LIMIT_PERIOD};
 
 /// Weather Underground's floor, and its default interval.
 ///
-/// `MinWUUploadInterval` is 60 s in the Go tree and the schema's own default is 300 s, both
-/// carried forward.
+/// `MinWUUploadInterval` is 60 s in the Go tree and the **Go** schema's column default is
+/// 300 s, both carried forward. The new schema deliberately has no `DEFAULT` on
+/// `uploader.interval_seconds`: NULL means "the kind's default", which is this constant.
 pub const WU_FLOOR: Duration = Duration::from_secs(60);
 /// Weather Underground's default period.
 pub const WU_DEFAULT: Duration = Duration::from_secs(300);
@@ -120,6 +126,28 @@ pub trait OutputConfig {
     /// published rather than beaconing an empty view — A-M4-2-1's reasoning, from the other
     /// side.
     fn windowed_view(&self) -> Option<&Arc<dyn WindowedView>>;
+
+    /// Whether this node maintains windows for `station`.
+    ///
+    /// **Not the same question as "is this station configured".** The windowed view holds
+    /// the stations this node *collects* for, because a window is accumulated from frames
+    /// this node received — so a station a peer forwards readings for, or one whose
+    /// collection is switched off, is absent from it. `WindowedView::resolve` answers
+    /// `WindowError::UnknownStation` for such a station, which classifies `Fatal`, so an
+    /// uploader paired with one would fail **every occurrence, forever**, with the reason
+    /// visible only in that component's `last_error`. That is precisely the shape this
+    /// item exists to remove, so the registrar refuses the pairing instead.
+    fn maintains_windows_for(&self, station: &StationKey) -> bool;
+
+    /// Whether `station` exists and has collection switched off.
+    ///
+    /// Separated from [`OutputConfig::maintains_windows_for`] because the two have
+    /// different right answers. A disabled station is a **reversible operator action**
+    /// (W5 §1.2) and refusing to start over one would mean a configuration change could not
+    /// be undone without editing the uploader too — so that case is skipped with a warning
+    /// naming the row. A station this node simply does not collect for is a pairing that
+    /// cannot work, and is refused.
+    fn station_is_disabled(&self, station: &StationKey) -> bool;
 }
 
 /// One `uploader` row, joined to its `station_service` pairing.
@@ -154,6 +182,15 @@ pub struct UploaderRow {
     pub longitude: Option<f64>,
     /// `stations.aprs_callsign` — public identity, on the station row.
     pub aprs_callsign: Option<String>,
+    /// `stations.enabled`, for the paired station. `None` is no pairing.
+    ///
+    /// Read by the binary's `OutputConfig` rather than by this file, which asks the
+    /// configuration the two questions rather than deriving them — see
+    /// [`OutputConfig::maintains_windows_for`].
+    pub station_enabled: Option<bool>,
+    /// `stations.transport_kind`, for the paired station. `None` on an existing station is
+    /// one a peer forwards readings for.
+    pub station_transport_kind: Option<String>,
 
     /// `uploader.aprs_passcode`.
     pub aprs_passcode: Option<String>,
@@ -193,10 +230,13 @@ pub fn register<C: OutputConfig + ?Sized>(
         // is nothing to upload. Reported rather than refused: the `uploader` rows are
         // configuration a collector node would have, and a satellite reaching `plan()`
         // without a database is W7 §8.2's shape.
-        info!(
+        // `warn`, not `info`: an operator who enabled sharing and gets nothing uploaded,
+        // forever, with one info line is the Go failure mode this item exists to remove.
+        warn!(
             uploaders = rows.len(),
-            "this node has no window rollup, so no rate-limited output is planned -- there \
-             are no windowed values to upload. A node that uploads has a weather database."
+            "this node has no window rollup, so NO rate-limited output is planned and \
+             nothing will be uploaded -- there are no windowed values to upload. A node \
+             that uploads has a weather database and collects for at least one station."
         );
         return Ok(());
     };
@@ -204,6 +244,29 @@ pub fn register<C: OutputConfig + ?Sized>(
     // than `PlanError::DuplicateComponentId` -- which is the same answer with less in it.
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     for row in rows {
+        // The pairing has to name a station this node maintains windows for, or the
+        // component would fail every occurrence. `OutputConfig::maintains_windows_for` has
+        // the whole argument; the two outcomes differ because the two causes do.
+        if let Some(station) = row.station_key.as_deref().map(StationKey::new) {
+            if !cfg.maintains_windows_for(&station) {
+                if cfg.station_is_disabled(&station) {
+                    warn!(
+                        uploader = %row.name,
+                        kind = %row.kind,
+                        %station,
+                        "not planning this uploader: the station it shares is disabled, so \
+                         this node maintains no windows for it. Re-enable the station, or \
+                         remove the `station_service` pairing."
+                    );
+                    continue;
+                }
+                return Err(OutputPlanError::StationNotCollected {
+                    name: row.name.clone(),
+                    kind: row.kind.clone(),
+                    station: station.to_string(),
+                });
+            }
+        }
         let spec = declare(&row, windows)?;
         let station = row.station_key.clone().unwrap_or_default();
         if let Some(first) = seen.insert(spec.id.to_string(), station.clone()) {
@@ -300,6 +363,21 @@ fn http_spec(
             station: station.to_string(),
         })?;
     let endpoint = endpoint(row, kind.default_endpoint())?;
+    // **A credential may not cross a plaintext connection.** Both services send `ID` and
+    // `PASSWORD` as query parameters, so an `api_endpoint` of `http://…` puts the
+    // credential on the wire in clear — and `uploader.api_endpoint` has no scheme `CHECK`,
+    // unlike `weather_database.url`, so one `UPDATE` is all it takes.
+    //
+    // Refused at plan time rather than warned about, which is `mw_station::plan`'s
+    // precedent for the inverse mismatch: a configuration error belongs in the pure
+    // function that exists to catch one. The rule is about the **credential** and not about
+    // the scheme, so a future credential-less output may use `http`.
+    if !endpoint.is_tls() {
+        return Err(OutputPlanError::PlaintextCredential {
+            name: row.name.clone(),
+            endpoint: endpoint.to_string(),
+        });
+    }
     let period = clamped(row, &id, kind.default_interval(), kind.floor());
     let account = Account::new(remote_id, api_key, AGENT);
     let target = endpoint.target();
@@ -321,30 +399,24 @@ fn http_spec(
 
     let windows = Arc::clone(windows);
     let builder = match kind {
-        Kind::Wu => {
-            let encoder = wu::WeatherUnderground::new(account);
-            tick_builder(
-                id.clone(),
-                encoder,
-                station,
-                windows,
-                transport,
-                target,
-                period,
-            )
-        }
-        Kind::Pws => {
-            let encoder = pws::PwsWeather::new(account);
-            tick_builder(
-                id.clone(),
-                encoder,
-                station,
-                windows,
-                transport,
-                target,
-                period,
-            )
-        }
+        Kind::Wu => tick_builder(
+            id.clone(),
+            wu::WeatherUnderground::new(account),
+            station,
+            windows,
+            transport,
+            target,
+            period,
+        )?,
+        Kind::Pws => tick_builder(
+            id.clone(),
+            pws::PwsWeather::new(account),
+            station,
+            windows,
+            transport,
+            target,
+            period,
+        )?,
     };
     Ok(spec(id, period, builder, digest))
 }
@@ -373,9 +445,16 @@ fn aprs_spec(
     let transport_kind = row.aprs_transport.as_deref().unwrap_or("aprs-is");
 
     // The interval, and the asymmetry: APRS-IS is clamped and a radio is refused.
-    let configured = configured_interval(row, APRS_DEFAULT);
+    //
+    // **The default is transport-dependent**, and it has to be. `uploader.interval_seconds`
+    // being NULL means "the kind's default" (the column's own comment), and for a KISS row
+    // that default cannot be the 300 s the Go tree used for APRS generally — `RadioInterval`
+    // would refuse it and the whole configuration would fail to plan, naming an interval the
+    // operator never wrote. What the refusal is for is a value somebody *configured* below
+    // the floor, which is O-8's upgrade case and W2a Decision 60's "a config parse error".
     let (period, sink) = match transport_kind {
         "aprs-is" => {
+            let configured = configured_interval(row, APRS_DEFAULT);
             let period = clamp_with_warning(&id, configured, APRS_DEFAULT, APRS_IS_FLOOR);
             let (host, port) = peer(row.aprs_server.as_deref(), FrameSink::DEFAULT_APRS_IS, row)?;
             let passcode =
@@ -397,7 +476,10 @@ fn aprs_spec(
             )
         }
         "kiss-serial" | "kiss-tcp" => {
-            // **Refused, not clamped.** `RadioInterval` has the whole argument.
+            // **Refused, not clamped.** `RadioInterval` has the whole argument. The default
+            // is the floor itself, so a NULL interval plans and only a configured sub-floor
+            // value is refused.
+            let configured = configured_interval(row, RadioInterval::FLOOR);
             let interval =
                 RadioInterval::new(configured).map_err(|source| OutputPlanError::RadioTooFast {
                     name: row.name.clone(),
@@ -492,7 +574,7 @@ fn aprs_spec(
         SharedSink::new(sink),
         target,
         period,
-    );
+    )?;
     Ok(spec(id, period, builder, digest))
 }
 
@@ -522,31 +604,43 @@ fn spec(id: ComponentId, period: Duration, build: Builder, digest: ConfigDigest)
 
 /// One occurrence's deadline.
 ///
-/// The retry budget has to fit inside it (§4b.5) and it has to be `<= period`
-/// (`PlanError::DeadlineExceedsPeriod`). The budget needs
-/// `(retries + 1) x (attempt_timeout + limit_period)` = 39 s at the defaults, which fits
-/// inside every period this program plans except a 60-second one — so the deadline is the
-/// smaller of the two and the budget is reduced to match rather than the period being
-/// refused.
+/// The retry budget has to fit inside it ([`budget_for`], §4b.5) and it has to be
+/// `<= period` (`PlanError::DeadlineExceedsPeriod`), which is what the `min` is for. The
+/// budget needs `(retries + 1) x (attempt_timeout + limit_period)` = 39 s at the defaults,
+/// and the smallest period this program plans is 60 s — so the deadline is 45 s for every
+/// plannable configuration and the budget fits with six seconds to spare.
 fn deadline(period: Duration) -> Duration {
     let wanted = Duration::from_secs(45);
     wanted.min(period)
 }
 
-/// How many retries fit inside `deadline`.
+/// The retry budget, checked against `deadline` — §4b.5's own rule.
 ///
-/// `plan()`'s check in §4b.5 is "refuse a budget that cannot fit"; this reduces it instead,
-/// and the reason is which of the two values an operator configured. The period is theirs;
-/// the attempt timeout and the limiter period are this crate's. Refusing a 60-second
-/// Weather Underground upload — which is its documented floor — because *our* retry budget
-/// does not fit inside *our* deadline would be refusing a valid configuration for an
-/// internal arithmetic. So the budget shrinks, and a 60-second uploader makes three
-/// attempts in 45 s rather than being unplannable.
-fn budget_for(deadline: Duration) -> u8 {
-    (0..=DEFAULT_BUDGET)
-        .rev()
-        .find(|retries| uploader::budget_fits(deadline, *retries, ATTEMPT_TIMEOUT, LIMIT_PERIOD))
-        .unwrap_or(0)
+/// > *"`deadline >= retries × (attempt_timeout + rate_limit_period)` must hold, and it is
+/// > checked in `plan()` alongside `deadline <= period`… A retry budget that cannot fit
+/// > inside the deadline is a configuration error, not a mysterious stream of
+/// > `deadline_exceeded`."*
+///
+/// **It fits for every period this program can plan**, so this is a backstop rather than a
+/// branch an operator reaches: the smallest plannable period is 60 s (Weather Underground's
+/// and PWS Weather's floor), [`deadline`] is 45 s there, and three attempts need 39 s. The
+/// check is here because the three constants it relates live in two files — lowering
+/// `WU_FLOOR`, raising [`ATTEMPT_TIMEOUT`] or raising [`DEFAULT_BUDGET`] would each break it
+/// silently, and the symptom would be the stream of `deadline_exceeded` §4b.5 names.
+///
+/// An earlier version of this function *shrank* the budget to fit instead. That read better
+/// as prose and was dead code: it could not fire for any representable configuration, and it
+/// was a departure from a named mechanism with nothing to show for it.
+fn budget_for(deadline: Duration) -> Result<u8, OutputPlanError> {
+    let per_attempt = ATTEMPT_TIMEOUT.saturating_add(LIMIT_PERIOD);
+    if uploader::budget_fits(deadline, DEFAULT_BUDGET, ATTEMPT_TIMEOUT, LIMIT_PERIOD) {
+        return Ok(DEFAULT_BUDGET);
+    }
+    Err(OutputPlanError::BudgetExceedsDeadline {
+        deadline_s: deadline.as_secs(),
+        attempts: u32::from(DEFAULT_BUDGET) + 1,
+        per_attempt_s: per_attempt.as_secs(),
+    })
 }
 
 /// The builder closure, shared by all three kinds.
@@ -559,13 +653,14 @@ fn tick_builder<E, T>(
     transport: T,
     target: Target,
     period: Duration,
-) -> Builder
+) -> Result<Builder, OutputPlanError>
 where
     E: crate::encoder::OutputEncoder + Clone,
     T: uploader::Transmit<Payload = E::Payload>,
 {
-    let budget = budget_for(deadline(period));
-    Builder::tick(move |_cx| {
+    let budget = budget_for(deadline(period))?;
+    let service = encoder.service();
+    Ok(Builder::tick(move |_cx| {
         // **The `WindowedView` handle comes from the registrar, not from `BuildCx`.** It is
         // a root resource `main` owns (`OutputConfig::windowed_view`), the same arrangement
         // `mw_pipeline::rollup`'s two writers have -- and the `Hard` need is still declared,
@@ -577,6 +672,9 @@ where
         let transport = transport.clone();
         let target = target.clone();
         async move {
+            // Zero this component's series before the first occurrence, so "nothing
+            // uploaded yet" is visible rather than being an absent series (§5.10).
+            crate::metrics::arm(&id, service);
             Ok(Uploader::new(
                 id,
                 encoder,
@@ -586,7 +684,7 @@ where
                 budget,
             ))
         }
-    })
+    }))
 }
 
 /// The paired station, or the reason this uploader has nothing to upload.
@@ -872,6 +970,62 @@ pub enum OutputPlanError {
         kind: String,
     },
 
+    /// A pairing whose station this node maintains no windows for.
+    ///
+    /// Reachable, and the one refusal here that is about another component's station set: a
+    /// station with no `transport_kind` is one a peer forwards readings for, and
+    /// `window:rollup` maintains windows only for the stations this node collects from. The
+    /// configuration schema's **D-45**/**A-W7-2** comment endorses a collector uploading on
+    /// behalf of a satellite, so this refusal is the honest report of a gap rather than a
+    /// rule: making it work means widening the rollup's station set, which is M3-4's
+    /// component. Refusing is still better than the alternative, which is a component in
+    /// permanent tick failure with the reason in `last_error`.
+    #[error(
+        "uploader `{name}` ({kind}) shares station `{station}`, and this node maintains no \
+         windows for it -- `window:rollup` accumulates windows only for the stations this \
+         node collects from, so a station a peer forwards readings for has none. An \
+         uploader sends windows, so this pairing cannot work: remove the `station_service` \
+         row, or share a station this node collects."
+    )]
+    StationNotCollected {
+        /// `uploader.name`.
+        name: String,
+        /// `uploader.kind`.
+        kind: String,
+        /// The station.
+        station: String,
+    },
+
+    /// An endpoint that would send the credential in clear.
+    #[error(
+        "uploader `{name}` has the plaintext endpoint `{endpoint}`, and this service sends \
+         `ID` and `PASSWORD` as query parameters -- so the credential would cross the \
+         internet in clear. Use `https`, or leave `uploader.api_endpoint` NULL for the \
+         service's own endpoint."
+    )]
+    PlaintextCredential {
+        /// `uploader.name`.
+        name: String,
+        /// The configured endpoint, which carries no query (`crate::error::Target`).
+        endpoint: String,
+    },
+
+    /// A retry budget that cannot fit inside an occurrence's deadline.
+    #[error(
+        "a {deadline_s} s occurrence deadline cannot hold {attempts} delivery attempt(s) of \
+         up to {per_attempt_s} s each. This is an arithmetic error between this crate's own \
+         constants rather than a configuration problem -- `docs/component-model.md` §4b.5 \
+         requires `deadline >= attempts x (attempt_timeout + rate_limit_period)`."
+    )]
+    BudgetExceedsDeadline {
+        /// The occurrence deadline.
+        deadline_s: u64,
+        /// How many attempts were asked for.
+        attempts: u32,
+        /// What one attempt may cost.
+        per_attempt_s: u64,
+    },
+
     /// A row with no credential.
     #[error(
         "uploader `{name}` has no `{column}`, and the service will not accept an upload \
@@ -1047,6 +1201,11 @@ mod tests {
     struct Cfg {
         rows: Vec<UploaderRow>,
         windows: Option<Arc<dyn WindowedView>>,
+        /// Stations this node maintains no windows for and that are not merely disabled —
+        /// a station a peer forwards readings for.
+        not_collected: Vec<String>,
+        /// Stations whose collection is switched off.
+        disabled: Vec<String>,
     }
 
     impl OutputConfig for Cfg {
@@ -1056,6 +1215,15 @@ mod tests {
 
         fn windowed_view(&self) -> Option<&Arc<dyn WindowedView>> {
             self.windows.as_ref()
+        }
+
+        fn maintains_windows_for(&self, station: &StationKey) -> bool {
+            !self.not_collected.iter().any(|s| s == station.as_str())
+                && !self.disabled.iter().any(|s| s == station.as_str())
+        }
+
+        fn station_is_disabled(&self, station: &StationKey) -> bool {
+            self.disabled.iter().any(|s| s == station.as_str())
         }
     }
 
@@ -1071,6 +1239,8 @@ mod tests {
             latitude: None,
             longitude: None,
             aprs_callsign: None,
+            station_enabled: Some(true),
+            station_transport_kind: Some("serial".to_string()),
             aprs_passcode: None,
             aprs_symbol_table: None,
             aprs_symbol_code: None,
@@ -1106,6 +1276,8 @@ mod tests {
         let cfg = Cfg {
             rows,
             windows: Some(view()),
+            not_collected: Vec::new(),
+            disabled: Vec::new(),
         };
         let mut out = Vec::new();
         register(&cfg, &mut out)?;
@@ -1300,6 +1472,275 @@ mod tests {
         }
     }
 
+    /// **A KISS row with no configured interval plans**, at the floor.
+    ///
+    /// `uploader.interval_seconds` being NULL means "the kind's default", and before the
+    /// default was made transport-dependent that default was 300 s for every APRS row — so
+    /// an operator who created a KISS uploader through the admin surface and left the
+    /// interval blank got a daemon that refused to start, naming an interval they never
+    /// configured. The refusal is for a value somebody *wrote* below the floor.
+    #[test]
+    fn a_kiss_row_with_no_configured_interval_plans_at_the_floor() {
+        for transport in ["kiss-serial", "kiss-tcp"] {
+            let specs = plan(vec![UploaderRow {
+                interval_seconds: None,
+                aprs_transport: Some(transport.to_string()),
+                aprs_kiss_serial_device: Some("/dev/ttyUSB0".to_string()),
+                aprs_kiss_tcp_address: Some("tnc.lan:8001".to_string()),
+                ..aprs_row()
+            }])
+            .unwrap_or_else(|e| panic!("{transport}: {}", mw_types::DisplayChain(&e)));
+            match &specs[0].trigger {
+                Trigger::Every { period, .. } => {
+                    assert_eq!(*period, RadioInterval::FLOOR, "{transport}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // An APRS-IS row with no interval still gets the Go default, not the RF floor.
+        let specs = plan(vec![UploaderRow {
+            interval_seconds: None,
+            aprs_transport: Some("aprs-is".to_string()),
+            ..aprs_row()
+        }])
+        .expect("plans");
+        match &specs[0].trigger {
+            Trigger::Every { period, .. } => assert_eq!(*period, APRS_DEFAULT),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **A pairing this node maintains no windows for is refused, and a disabled station is
+    /// skipped.** Two causes, two answers.
+    #[test]
+    fn a_station_this_node_does_not_collect_cannot_be_shared() {
+        // A station a peer forwards readings for: refused, naming the row and the station.
+        let cfg = Cfg {
+            rows: vec![wu_row()],
+            windows: Some(view()),
+            not_collected: vec!["backyard".to_string()],
+            disabled: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let e = register(&cfg, &mut out).expect_err("the pairing cannot work");
+        assert!(
+            matches!(e, OutputPlanError::StationNotCollected { .. }),
+            "{e}"
+        );
+        assert!(e.to_string().contains("backyard"), "{e}");
+        assert!(e.to_string().contains("window:rollup"), "{e}");
+        assert!(out.is_empty());
+
+        // A disabled station: skipped with a warning, because disabling a station is a
+        // reversible operator action and refusing to start over one would make it
+        // irreversible without editing the uploader too.
+        let cfg = Cfg {
+            rows: vec![wu_row()],
+            windows: Some(view()),
+            not_collected: Vec::new(),
+            disabled: vec!["backyard".to_string()],
+        };
+        let mut out = Vec::new();
+        register(&cfg, &mut out).expect("a disabled station is not a refusal");
+        assert!(out.is_empty(), "and no component is planned for it");
+    }
+
+    /// **A plaintext endpoint would put the credential on the wire in clear.**
+    #[test]
+    fn a_plaintext_endpoint_is_refused_for_a_credentialled_uploader() {
+        let e = plan(vec![UploaderRow {
+            api_endpoint: Some("http://wx.example/submit".to_string()),
+            ..wu_row()
+        }])
+        .expect_err("plaintext");
+        assert!(
+            matches!(e, OutputPlanError::PlaintextCredential { .. }),
+            "{e}"
+        );
+        assert!(e.to_string().contains("in clear"), "{e}");
+        // The message names the endpoint and carries no query.
+        assert!(e.to_string().contains("http://wx.example/submit"), "{e}");
+        assert!(!e.to_string().contains('?'), "{e}");
+        // `https` plans.
+        assert!(plan(vec![UploaderRow {
+            api_endpoint: Some("https://wx.example/submit".to_string()),
+            ..wu_row()
+        }])
+        .is_ok());
+    }
+
+    /// **W7 D-38's arity**, which the `station_service` table's own comment predicts by
+    /// name and nothing asserted.
+    #[test]
+    fn one_uploader_paired_with_two_stations_is_refused() {
+        let first = UploaderRow {
+            station_key: Some("backyard".to_string()),
+            ..wu_row()
+        };
+        let second = UploaderRow {
+            station_key: Some("roof".to_string()),
+            ..wu_row()
+        };
+        let e = plan(vec![first, second]).expect_err("two pairings on one account");
+        assert!(matches!(e, OutputPlanError::Arity { .. }), "{e}");
+        let text = e.to_string();
+        assert!(text.contains("backyard") && text.contains("roof"), "{text}");
+        assert!(text.contains("more than one station"), "{text}");
+    }
+
+    /// **Every value the builder closes over changes the fingerprint.** The digest is the
+    /// whole of the plan diff's accuracy (`ComponentSpec::fingerprint`), so a column that
+    /// is read and not folded in is a configuration change that does not restart the
+    /// component — with no symptom until somebody notices the old value still going out.
+    #[test]
+    fn every_folded_column_changes_the_fingerprint() {
+        let base = plan(vec![aprs_row()]).expect("plans")[0].fingerprint();
+        let mutations: Vec<(&str, UploaderRow)> = vec![
+            (
+                "interval_seconds",
+                UploaderRow {
+                    interval_seconds: Some(1800),
+                    ..aprs_row()
+                },
+            ),
+            (
+                "aprs_passcode",
+                UploaderRow {
+                    aprs_passcode: Some("12345".to_string()),
+                    ..aprs_row()
+                },
+            ),
+            (
+                "aprs_symbol_table",
+                UploaderRow {
+                    aprs_symbol_table: Some("\\".to_string()),
+                    ..aprs_row()
+                },
+            ),
+            (
+                "aprs_comment",
+                UploaderRow {
+                    aprs_comment: Some("Suncrest WA".to_string()),
+                    ..aprs_row()
+                },
+            ),
+            (
+                "aprs_server",
+                UploaderRow {
+                    aprs_server: Some("rotate.aprs2.net:14580".to_string()),
+                    ..aprs_row()
+                },
+            ),
+            (
+                "aprs_transport",
+                UploaderRow {
+                    interval_seconds: Some(900),
+                    aprs_transport: Some("kiss-tcp".to_string()),
+                    aprs_kiss_tcp_address: Some("tnc.lan:8001".to_string()),
+                    ..aprs_row()
+                },
+            ),
+            (
+                "latitude",
+                UploaderRow {
+                    latitude: Some(45.2),
+                    ..aprs_row()
+                },
+            ),
+            (
+                "longitude",
+                UploaderRow {
+                    longitude: Some(-122.0),
+                    ..aprs_row()
+                },
+            ),
+            (
+                "aprs_callsign",
+                UploaderRow {
+                    aprs_callsign: Some("W1AW".to_string()),
+                    ..aprs_row()
+                },
+            ),
+            (
+                "station_key",
+                UploaderRow {
+                    station_key: Some("roof".to_string()),
+                    ..aprs_row()
+                },
+            ),
+        ];
+        for (what, row) in mutations {
+            let changed = plan(vec![row])
+                .unwrap_or_else(|e| panic!("{what}: {}", mw_types::DisplayChain(&e)))[0]
+                .fingerprint();
+            assert_ne!(
+                base, changed,
+                "changing `{what}` must restart the component"
+            );
+        }
+
+        // The KISS columns, which need a KISS row to be read at all.
+        let kiss = |row: UploaderRow| plan(vec![row]).expect("plans")[0].fingerprint();
+        let radio = UploaderRow {
+            interval_seconds: Some(900),
+            aprs_transport: Some("kiss-tcp".to_string()),
+            aprs_kiss_tcp_address: Some("tnc.lan:8001".to_string()),
+            ..aprs_row()
+        };
+        let base_kiss = kiss(radio.clone());
+        for (what, row) in [
+            (
+                "aprs_kiss_tcp_address",
+                UploaderRow {
+                    aprs_kiss_tcp_address: Some("other.lan:8001".to_string()),
+                    ..radio.clone()
+                },
+            ),
+            (
+                "aprs_kiss_path",
+                UploaderRow {
+                    aprs_kiss_path: Some("WIDE2-2".to_string()),
+                    ..radio.clone()
+                },
+            ),
+            (
+                "aprs_kiss_destination",
+                UploaderRow {
+                    aprs_kiss_destination: Some("APZ001".to_string()),
+                    ..radio.clone()
+                },
+            ),
+        ] {
+            assert_ne!(
+                base_kiss,
+                kiss(row),
+                "changing `{what}` must restart the component"
+            );
+        }
+        // And the serial pair, which needs a serial row.
+        let serial = UploaderRow {
+            interval_seconds: Some(900),
+            aprs_transport: Some("kiss-serial".to_string()),
+            aprs_kiss_serial_device: Some("/dev/ttyUSB0".to_string()),
+            aprs_kiss_serial_baud: Some(9600),
+            ..aprs_row()
+        };
+        assert_ne!(
+            kiss(serial.clone()),
+            kiss(UploaderRow {
+                aprs_kiss_serial_device: Some("/dev/ttyUSB1".to_string()),
+                ..serial.clone()
+            })
+        );
+        assert_ne!(
+            kiss(serial.clone()),
+            kiss(UploaderRow {
+                aprs_kiss_serial_baud: Some(19200),
+                ..serial
+            })
+        );
+    }
+
     /// A node with no rollup plans nothing, and says so rather than refusing: `uploader`
     /// rows are configuration a collector would have.
     #[test]
@@ -1307,6 +1748,8 @@ mod tests {
         let cfg = Cfg {
             rows: vec![wu_row()],
             windows: None,
+            not_collected: Vec::new(),
+            disabled: Vec::new(),
         };
         let mut out = Vec::new();
         register(&cfg, &mut out).expect("not an error");
@@ -1316,6 +1759,8 @@ mod tests {
         let cfg = Cfg {
             rows: Vec::new(),
             windows: Some(view()),
+            not_collected: Vec::new(),
+            disabled: Vec::new(),
         };
         let mut out = Vec::new();
         register(&cfg, &mut out).expect("not an error");
@@ -1375,23 +1820,28 @@ mod tests {
     /// configuration unplannable.
     #[test]
     fn the_retry_budget_fits_inside_the_deadline() {
-        // The 45-second deadline of a 300-second period holds three attempts.
-        assert_eq!(budget_for(Duration::from_secs(45)), DEFAULT_BUDGET);
-        // A 60-second Weather Underground upload -- its documented floor -- has a
-        // 45-second deadline, which also holds three.
-        assert_eq!(deadline(Duration::from_secs(60)), Duration::from_secs(45));
-        // A hypothetical 20-second period holds one.
-        assert_eq!(deadline(Duration::from_secs(20)), Duration::from_secs(20));
-        assert_eq!(budget_for(Duration::from_secs(20)), 0);
-        for period in [60, 120, 300, 600, 1800] {
+        // Every period this program can plan: the deadline is 45 s and the full budget
+        // fits, with six seconds to spare at the defaults.
+        for period in [60, 120, 300, 600, 900, 1800] {
             let d = deadline(Duration::from_secs(period));
+            assert_eq!(d, Duration::from_secs(45), "period {period}");
+            assert_eq!(budget_for(d).expect("fits"), DEFAULT_BUDGET);
             assert!(uploader::budget_fits(
                 d,
-                budget_for(d),
+                DEFAULT_BUDGET,
                 ATTEMPT_TIMEOUT,
                 LIMIT_PERIOD
             ));
         }
+        // The backstop. A deadline this program cannot currently produce -- it would take a
+        // floor below 39 s -- is a named refusal rather than a stream of
+        // `deadline_exceeded`, which is §4b.5's own rule.
+        let e = budget_for(Duration::from_secs(20)).expect_err("does not fit");
+        assert!(
+            matches!(e, OutputPlanError::BudgetExceedsDeadline { .. }),
+            "{e}"
+        );
+        assert!(e.to_string().contains("4b.5"), "{e}");
     }
 
     /// The defaults for a KISS row: destination `APRS`, path `WIDE1-1,WIDE2-1`, 9600 baud.

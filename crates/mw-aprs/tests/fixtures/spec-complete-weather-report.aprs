@@ -1,3 +1,4 @@
+# CAPTURE: normative bytes, quoted verbatim from the specification.
 # APRS Protocol Reference v1.0.1, Chapter 12 ("Weather Reports"), the worked example of a
 # complete weather report with position. Normative bytes: the specification's own statement
 # of the format, which makes it the reference every other capture here is read against.

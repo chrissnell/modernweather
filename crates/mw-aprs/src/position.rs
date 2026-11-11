@@ -98,14 +98,25 @@ impl Position {
     /// The uncompressed latitude field: `DDMM.hhN`, eight bytes.
     pub fn latitude_text(self) -> String {
         let (degrees, minutes) = dms(self.lat);
-        let hemisphere = if self.lat < 0.0 { 'S' } else { 'N' };
+        // `is_sign_negative` rather than `< 0.0`, so that the `-0.0` a southern field
+        // parses to keeps its hemisphere: `0000.00S` would otherwise re-encode as
+        // `0000.00N` and the round trip would not be total at the equator.
+        let hemisphere = if self.lat.is_sign_negative() {
+            'S'
+        } else {
+            'N'
+        };
         format!("{degrees:02}{minutes:05.2}{hemisphere}")
     }
 
     /// The uncompressed longitude field: `DDDMM.hhW`, nine bytes.
     pub fn longitude_text(self) -> String {
         let (degrees, minutes) = dms(self.lon);
-        let hemisphere = if self.lon < 0.0 { 'W' } else { 'E' };
+        let hemisphere = if self.lon.is_sign_negative() {
+            'W'
+        } else {
+            'E'
+        };
         format!("{degrees:03}{minutes:05.2}{hemisphere}")
     }
 

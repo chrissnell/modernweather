@@ -125,20 +125,32 @@ impl<'a> Observation<'a> {
     pub fn value(&self, declaration: Declaration) -> Result<Option<f64>, EncodeError> {
         match self.values.value(declaration) {
             Ok(v) => Ok(v.filter(|f| f.is_finite())),
-            Err(_) => Err(EncodeError::MissingWindow {
-                service: self.service,
-                metric: declaration.0,
-                window: declaration.1,
-                agg: declaration.2,
+            // Matched explicitly rather than caught: `Resolved::value` constructs only this
+            // variant today, and a catch-all would accuse a future one of being an
+            // encoder's bug. Anything else is a fact about the declaration or the station,
+            // which is what `EncodeError::Window` says.
+            Err(mw_component::WindowError::NotDeclaredInRequest { .. }) => {
+                Err(EncodeError::MissingWindow {
+                    service: self.service,
+                    metric: declaration.0,
+                    window: declaration.1,
+                    agg: declaration.2,
+                })
+            }
+            Err(source) => Err(EncodeError::Window {
+                station: self.station.clone(),
+                source,
             }),
         }
     }
 
     /// How many of the resolved declarations hold a value.
     ///
-    /// What decides `EncodeError::NothingToSend`: a station that has just started reporting
-    /// resolves every declaration to `None`, and there is no point telling a service about
-    /// that once a period.
+    /// **Not** what decides `EncodeError::NothingToSend` — that is each encoder's own count
+    /// of the parameters it actually wrote (`Form::measurements`), which differs: Weather
+    /// Underground writes twelve parameters from eleven declarations. This is the view from
+    /// the other side, for a test or a log line that wants "how much did this station
+    /// report", and the two counts are deliberately not unified.
     pub fn present(&self) -> usize {
         self.values
             .iter()
@@ -204,26 +216,85 @@ mod tests {
         s.parse().expect("an RFC 3339 instant")
     }
 
-    /// The windows this crate names are the ones `window:rollup` maintains, which is what
-    /// stops a declaration table from being unresolvable.
+    /// **Every declaration in all three tables is resolvable against the registry.**
     ///
-    /// `window:rollup` holds an hour of 1-minute buckets and maintains the calendar windows
-    /// and 24/48/72 hours as totals, so every rolling window here is inside the ring and
-    /// every long one is in its maintained set.
+    /// This is the half of the check that needs no provider: `mw_pipeline::rollup::ring`'s
+    /// `ColumnPlan` is built from `mw_types::LEVELS`' 1-minute level and nothing else, so a
+    /// `(metric, agg)` pair the registry does not declare there is
+    /// `WindowError::NotDeclared` — which classifies **`Fatal`**, so the component would
+    /// fail every occurrence forever. Nothing with a stubbed `WindowedView` can see that,
+    /// which is why it is asserted against the generated tables directly.
+    ///
+    /// The window half — "is this window inside the ring, or in the maintained set with
+    /// `Agg::Sum`" — needs `mw-pipeline`'s constants and is asserted in
+    /// `crates/modernweather`, the one crate that may name both.
     #[test]
-    fn every_window_this_crate_declares_is_one_the_rollup_maintains() {
-        const RING_SPAN: Duration = Duration::from_secs(3600);
-        for w in [CURRENT, TWO_MINUTES, FIVE_MINUTES, TEN_MINUTES, ONE_HOUR] {
-            let length = w.length().expect("a clock window");
-            assert!(length <= RING_SPAN, "{w} is longer than the ring");
+    fn every_declaration_resolves_against_the_metric_registry() {
+        let one_minute = mw_types::LEVELS
+            .iter()
+            .find(|l| l.name == "1m")
+            .expect("the registry declares a 1-minute level");
+        let declared = |metric: mw_types::MetricKey, agg: Agg| {
+            one_minute
+                .columns
+                .iter()
+                .any(|c| c.metric == metric && c.strategy == agg.strategy())
+        };
+        for table in [cwop::REQUIRED, wu::REQUIRED, pws::REQUIRED] {
+            for (metric, window, agg) in table.iter().copied() {
+                assert!(
+                    declared(metric, agg),
+                    "`({metric:?}, {window}, {agg})` is declared by an encoder and \
+                     `metrics/registry.toml` does not declare `{agg}` for `{metric:?}` at \
+                     the 1-minute level -- `window:rollup` would answer `NotDeclared`, \
+                     which is Fatal, every occurrence"
+                );
+            }
         }
-        // The one long window, which is maintained rather than resolved from the ring --
-        // and therefore only resolvable with `Agg::Sum`.
+    }
+
+    /// The window lengths this crate names, pinned — the values the service documentation
+    /// and the protocol specification are read against.
+    #[test]
+    fn the_declared_windows_are_the_ones_the_protocols_name() {
+        assert_eq!(CURRENT.length(), Some(Duration::from_secs(60)));
+        assert_eq!(TWO_MINUTES.length(), Some(Duration::from_secs(120)));
+        assert_eq!(FIVE_MINUTES.length(), Some(Duration::from_secs(300)));
+        assert_eq!(TEN_MINUTES.length(), Some(Duration::from_secs(600)));
+        assert_eq!(ONE_HOUR.length(), Some(Duration::from_secs(3600)));
         assert_eq!(
             ONE_DAY_ROLLING.length(),
             Some(Duration::from_secs(24 * 3600))
         );
-        assert_eq!(CURRENT.length(), Some(Duration::from_secs(60)));
+    }
+
+    /// **Every window the three tables name is one a long-window declaration can resolve
+    /// with**, which is the rule `RollupState::maintained` enforces: a maintained window
+    /// answers only `Agg::Sum`.
+    ///
+    /// The ring's span is `mw-pipeline`'s constant and is asserted in the binary; what is
+    /// asserted here is the consequence that does not need it — a window longer than an
+    /// hour must be a total.
+    #[test]
+    fn a_window_longer_than_the_ring_is_only_ever_a_total() {
+        const RING_SPAN: Duration = Duration::from_secs(3600);
+        for table in [cwop::REQUIRED, wu::REQUIRED, pws::REQUIRED] {
+            for (metric, window, agg) in table.iter().copied() {
+                let maintained = match window.length() {
+                    Some(length) => length > RING_SPAN,
+                    // A calendar or storm window is always maintained.
+                    None => true,
+                };
+                if maintained {
+                    assert_eq!(
+                        agg,
+                        Agg::Sum,
+                        "`({metric:?}, {window})` is longer than the ring, and a \
+                         maintained window resolves only `Agg::Sum`"
+                    );
+                }
+            }
+        }
     }
 
     /// An encoder cannot read outside its own table, and the failure says so.

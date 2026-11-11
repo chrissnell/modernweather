@@ -1,3 +1,4 @@
+# CONSTRUCTED conformance vector (not a capture).
 # A packet carrying an operator comment after the software identifier. This is the one part
 # of a captured field this program does not generate and still has to reproduce byte for
 # byte, which is why `parse_info` returns the trailer rather than discarding it.

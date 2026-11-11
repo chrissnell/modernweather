@@ -77,6 +77,23 @@ impl std::fmt::Display for Outcome {
 /// The label an attempt that succeeded carries.
 pub const ATTEMPT_OK: &str = "ok";
 
+/// Every label `mw_output_attempts_total` can carry — [`ATTEMPT_OK`] and every
+/// `UploadError::reason`.
+///
+/// Here rather than derived, because `UploadError::reason`'s set is a `match` and a `const`
+/// list is what [`arm`] can iterate. `crate::error`'s own test asserts the two agree.
+pub const ATTEMPT_OUTCOMES: &[&str] = &[
+    ATTEMPT_OK,
+    "connect",
+    "tls",
+    "malformed",
+    "rejected",
+    "rate_limited",
+    "timeout",
+    "login_refused",
+    "cancelled",
+];
+
 /// Describe the series. Called once, by the binary, beside the other `register`s.
 pub fn register() {
     metrics::describe_counter!(
@@ -90,6 +107,38 @@ pub fn register() {
         "Delivery attempts, by outcome. One occurrence can make several: the retry budget \
          re-enters the rate limiter, so each attempt takes its own permit."
     );
+}
+
+/// Zero every series for one component, so a component that has sent nothing is
+/// distinguishable from one whose metrics are broken.
+///
+/// `register` cannot do this: the `component` label is not known until `plan()` has run, so
+/// arming is per component and happens in the builder. The same shape
+/// `mw_station::metrics::arm` has, and for the same reason — a counter that only appears
+/// after the first event makes "no uploads yet" and "this component was never planned" the
+/// same observation, which is the question an operator asks first.
+pub fn arm(id: &ComponentId, service: &'static str) {
+    for outcome in Outcome::ALL {
+        metrics::counter!(
+            "mw_output_uploads_total",
+            "component" => id.to_string(),
+            "service" => service,
+            "outcome" => outcome.as_str(),
+        )
+        .increment(0);
+    }
+    // The attempt series' failure labels are `UploadError::reason`'s closed set; `ok` is
+    // the other one. Armed from the same list the error type owns, so a new variant cannot
+    // be armed and uncounted or counted and unarmed.
+    for reason in ATTEMPT_OUTCOMES {
+        metrics::counter!(
+            "mw_output_attempts_total",
+            "component" => id.to_string(),
+            "service" => service,
+            "outcome" => *reason,
+        )
+        .increment(0);
+    }
 }
 
 /// Count one occurrence.
@@ -131,13 +180,68 @@ mod tests {
         assert_eq!(Outcome::ALL.len(), 5);
     }
 
-    /// `register` describes both series and does not panic without a recorder installed,
-    /// which is what a unit test runs without.
+    /// `register` describes both series and `arm` zeroes them; neither panics without a
+    /// recorder installed, which is what a unit test runs without.
     #[test]
-    fn the_series_can_be_described_without_a_recorder() {
+    fn the_series_can_be_described_and_armed_without_a_recorder() {
         register();
         let id = ComponentId::new("wu:backyard").expect("a component id");
+        arm(&id, "wunderground");
         occurrence(&id, "wunderground", Outcome::Sent);
         attempt(&id, "wunderground", ATTEMPT_OK);
+    }
+
+    /// **The armed labels and the emitted ones are the same set.** A failure label that is
+    /// emitted and not armed is a series that appears only after something has gone wrong,
+    /// which is the observation `arm` exists to prevent.
+    #[test]
+    fn every_emitted_attempt_label_is_armed() {
+        use crate::error::{Target, UploadError};
+        use std::time::Duration;
+        let target = || Target::peer("test", 1);
+        let every = [
+            UploadError::Connect {
+                what: "x",
+                target: target(),
+                source: std::io::Error::other("x"),
+            },
+            UploadError::Tls {
+                target: target(),
+                source: Box::new(std::io::Error::other("x")),
+            },
+            UploadError::Malformed {
+                target: target(),
+                expected: "x",
+                why: "x",
+            },
+            UploadError::Rejected {
+                target: target(),
+                status: 400,
+                body: String::new(),
+            },
+            UploadError::RateLimited {
+                target: target(),
+                retry_after: None,
+            },
+            UploadError::Timeout {
+                target: target(),
+                after: Duration::ZERO,
+            },
+            UploadError::LoginRefused {
+                target: target(),
+                response: String::new(),
+            },
+            UploadError::Cancelled { target: target() },
+        ];
+        for e in &every {
+            assert!(
+                ATTEMPT_OUTCOMES.contains(&e.reason()),
+                "`{}` is emitted and not armed",
+                e.reason()
+            );
+        }
+        // Nine labels: `ok` plus one per variant, and the count is what catches a variant
+        // added to the error type without a label here.
+        assert_eq!(ATTEMPT_OUTCOMES.len(), every.len() + 1);
     }
 }

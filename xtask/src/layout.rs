@@ -1108,6 +1108,7 @@ mod tests {
             // than asserted.
             "go-number-digits",
             "one-logging-path",
+            "webpki-roots-only-for-the-uploaders",
         ] {
             assert!(decl.dep_rules.iter().any(|r| r.id == id), "dep_rule {id}");
         }

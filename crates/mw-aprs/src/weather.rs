@@ -2,8 +2,9 @@
 //! and the only thing in this crate a packet actually carries.
 //!
 //! `CreateCompleteWeatherReport` and `buildWeatherReportInfo` in the Go controller are one
-//! `bytes.Buffer` and eleven `fmt.Sprintf` calls over a `database.FetchedBucketReading`,
-//! which is why the encoder cannot be tested without a database. Here the input is a
+//! `bytes.Buffer` and eleven `buffer.Write*` calls -- six of them formatting a value -- over
+//! a `database.FetchedBucketReading`, which is why the encoder cannot be tested without a
+//! database. Here the input is a
 //! struct of `Option`s in the units `metrics/registry.toml` declares, and the output is an
 //! [`InformationField`] — the payload **both** framings share, which is where
 //! `docs/component-model.md` §4b.4 puts the split.
@@ -76,11 +77,23 @@ impl Symbol {
         code: b'_',
     };
 
+    /// The symbol code a complete weather report must carry.
+    ///
+    /// Not a stylistic default. A position report is read as a weather report **because**
+    /// its symbol code is `_` (Ch. 12); under any other code the bytes that follow are
+    /// parsed as the course/speed extension, so `.../004g...t...` becomes a course of 0 at
+    /// 4 knots and the rest becomes comment text. The weather data is destroyed silently.
+    pub const WEATHER_CODE: u8 = b'_';
+
     /// A symbol from a configured table selector and code.
     ///
     /// Both must be single printable ASCII bytes. A table selector is `/`, `\` or an
     /// overlay character; a code is any printable byte. Validated rather than indexed,
     /// because the alternative is the Go behaviour.
+    ///
+    /// **This does not require [`Symbol::WEATHER_CODE`]**, because the same type is what
+    /// [`parse_info`] reports for a packet somebody else sent.
+    /// [`WeatherReport::encode_info`] is where the requirement is enforced.
     pub fn new(table: char, code: char) -> Result<Self, SymbolError> {
         for (what, c) in [("table selector", table), ("code", code)] {
             if !c.is_ascii_graphic() {
@@ -163,6 +176,14 @@ impl WeatherReport {
         software: &str,
         comment: Option<&str>,
     ) -> Result<InformationField, EncodeError> {
+        // The one precondition this encoder has, and it is about the *protocol* rather than
+        // about the bytes: see `Symbol::WEATHER_CODE`. The table selector is free -- an
+        // overlay is legal and some operators use one -- and the code is not.
+        if symbol.code() != Symbol::WEATHER_CODE {
+            return Err(EncodeError::NotAWeatherSymbol {
+                code: char::from(symbol.code()),
+            });
+        }
         let mut out = String::with_capacity(MAX_INFORMATION_BYTES);
         out.push('!');
         out.push_str(&position.latitude_text());
@@ -266,6 +287,11 @@ fn hundredths(inches: f64) -> f64 {
 /// A vane with a configured correction can report 370 after the correction is applied, and
 /// `wind_dir_correction_degrees` is applied at ingest by three drivers — so the fold is
 /// here rather than relying on every producer.
+///
+/// `360` folds to `000`, which in a **weather** report is north: the "000 means unknown"
+/// convention belongs to the course/speed extension of a non-weather position report, which
+/// is [`crate::position::compress_course`]'s field and not this one. An unknown direction
+/// here is `None`, which renders dots.
 fn wrap_degrees(degrees: f64) -> f64 {
     if !degrees.is_finite() {
         return degrees;
@@ -346,6 +372,19 @@ pub enum EncodeError {
         limit: usize,
     },
 
+    /// A symbol code under which weather data is not weather data.
+    #[error(
+        "the APRS symbol code `{code}` is not `_`, and a position report is read as a \
+         weather report only under `_` (protocol reference Ch. 12). Under any other code a \
+         receiver parses the wind field as a course and speed and the rest as a comment, so \
+         the weather data would be silently destroyed. Set `uploader.aprs_symbol_code` to \
+         `_` or leave it NULL; the symbol TABLE may be overlaid freely."
+    )]
+    NotAWeatherSymbol {
+        /// What was configured.
+        code: char,
+    },
+
     /// A byte a framing cannot carry.
     #[error(
         "the APRS information field contains `{bad:?}`, which is not printable ASCII. A \
@@ -370,7 +409,10 @@ pub enum EncodeError {
 /// this program has no use for: the observation instant is the pipeline's, not the packet's.
 pub fn parse_info(text: &str) -> Result<Parsed, ParseError> {
     let bytes = text.as_bytes();
-    // `!` lat(8) table(1) lon(9) code(1) = 20 bytes, then `ddd/sssgggg` = at least 12.
+    // `!` lat(8) table(1) lon(9) code(1) = 20 bytes, which is all this checks: the
+    // mandatory wind and temperature block after it is a further 15 (`ddd/sssgNNNtNNN`)
+    // and is checked field by field below, because a packet that stops inside it is a
+    // different complaint from one that is not a position report at all.
     const HEADER: usize = 20;
     match bytes.first() {
         Some(b'!' | b'=') => {}
@@ -381,14 +423,22 @@ pub fn parse_info(text: &str) -> Result<Parsed, ParseError> {
         }
         None => return Err(ParseError::Short { bytes: 0 }),
     }
-    if bytes.len() < HEADER {
-        return Err(ParseError::Short { bytes: bytes.len() });
-    }
     // `!` lat(8) table(1) lon(9) code(1): the offsets are the protocol's, written out
     // rather than computed so that an off-by-one is visible beside the layout above.
-    let position = parse_position(&text[1..9], &text[10..19])?;
-    let symbol =
-        Symbol::new(char::from(bytes[9]), char::from(bytes[19])).map_err(|_| ParseError::Symbol)?;
+    //
+    // **Taken as bytes and checked for ASCII first.** An information field is printable
+    // ASCII by construction ([`InformationField::new`]), but this is a `pub fn` over an
+    // arbitrary `&str` and the next caller of it is a receive path (W2a §4a.7's APRS-IS
+    // input). Slicing `&text[1..9]` on a multi-byte character panics — `"!€€€€€€€"` is 22
+    // bytes and byte 9 falls inside a `€` — so the length check is not sufficient and a
+    // `debug_assert` would only move the panic to release.
+    let header = bytes
+        .get(..HEADER)
+        .filter(|h| h.is_ascii())
+        .ok_or(ParseError::Short { bytes: bytes.len() })?;
+    let position = parse_position(&header[1..9], &header[10..19])?;
+    let symbol = Symbol::new(char::from(header[9]), char::from(header[19]))
+        .map_err(|_| ParseError::Symbol)?;
 
     let rest = &text[HEADER..];
     let mut report = WeatherReport::default();
@@ -405,11 +455,20 @@ pub fn parse_info(text: &str) -> Result<Parsed, ParseError> {
     let mut rest = rest;
     while let Some(indicator) = rest.as_bytes().first().copied() {
         let width = match indicator {
-            b'g' | b't' | b'r' | b'p' | b'P' | b'L' | b'l' | b's' | b'#' => 3,
+            b'g' | b't' | b'r' | b'p' | b'P' | b'L' | b'l' => 3,
             b'h' => 2,
             b'b' => 5,
             // Anything else is the software identifier and the comment, which is where the
             // weather data ends.
+            //
+            // **`s` (snowfall) and `#` (the raw rain counter) are deliberately NOT
+            // consumed**, although they are three-digit weather fields and common in live
+            // CWOP traffic. This program holds neither metric, so parsing them would read
+            // a value it then discards -- and a discarded field cannot be re-emitted, which
+            // would make any capture containing one unable to round trip. Breaking here
+            // instead puts them in the trailer, so they survive an encode byte for byte.
+            // The cost is that a `b` or `L` field *after* an `s` is not parsed; the
+            // protocol's field order puts both before it.
             _ => break,
         };
         let Some((value, tail)) = take(&rest[1..], width) else {
@@ -417,17 +476,25 @@ pub fn parse_info(text: &str) -> Result<Parsed, ParseError> {
             // letter, which is legal and common (`g` is also the first letter of a word).
             break;
         };
-        // A field letter followed by something that is neither digits nor dots is also a
-        // comment rather than a field.
+        // A field letter followed by something that is neither digits, dots, spaces nor a
+        // sign is also a comment rather than a field.
+        //
+        // **Spaces are accepted because the protocol permits them for an unavailable
+        // value**, alongside dots (Ch. 12: "unknown or invalid data may be represented by
+        // spaces, dots or a software-specific value"). Rejecting them made the scan stop at
+        // the first space-padded field and silently drop every field after it -- so
+        // `t   r000p000P000h50b09900` lost the rain, the humidity and the barometer with no
+        // error. This program always *emits* dots, so such a packet parses and re-encodes
+        // to the dotted form rather than byte-identically.
         if !value
             .bytes()
-            .all(|b| b.is_ascii_digit() || b == b'.' || b == b'-')
+            .all(|b| b.is_ascii_digit() || b == b'.' || b == b'-' || b == b' ')
         {
             break;
         }
         match indicator {
             b'g' => report.wind_gust_mph = digits(value),
-            b't' => report.temperature_f = signed(value),
+            b't' => report.temperature_f = digits(value),
             b'r' => report.rain_last_hour_in = digits(value).map(|v| v / 100.0),
             b'p' => report.rain_last_24h_in = digits(value).map(|v| v / 100.0),
             b'P' => report.rain_since_midnight_in = digits(value).map(|v| v / 100.0),
@@ -472,17 +539,25 @@ pub struct Parsed {
 }
 
 /// `DDMM.hhN` and `DDDMM.hhW` back to decimal degrees.
-fn parse_position(lat: &str, lon: &str) -> Result<Position, ParseError> {
+///
+/// Over **bytes**, which the caller has already established are ASCII: a `&str` slice at a
+/// fixed offset is a panic on a multi-byte character and these offsets are fixed by the
+/// protocol rather than by the input.
+fn parse_position(lat: &[u8], lon: &[u8]) -> Result<Position, ParseError> {
     let latitude = parse_degrees(lat, 2, b'N', b'S')?;
     let longitude = parse_degrees(lon, 3, b'E', b'W')?;
     Position::new(latitude, longitude).map_err(|_| ParseError::Position)
 }
 
 /// One `DD[D]MM.hhH` field.
-fn parse_degrees(text: &str, degree_digits: usize, plus: u8, minus: u8) -> Result<f64, ParseError> {
-    let bytes = text.as_bytes();
+fn parse_degrees(
+    bytes: &[u8],
+    degree_digits: usize,
+    plus: u8,
+    minus: u8,
+) -> Result<f64, ParseError> {
     // degrees + `MM.hh` + hemisphere.
-    if bytes.len() != degree_digits + 6 {
+    if bytes.len() != degree_digits + 6 || !bytes.is_ascii() {
         return Err(ParseError::Position);
     }
     let hemisphere = *bytes.last().ok_or(ParseError::Position)?;
@@ -493,12 +568,16 @@ fn parse_degrees(text: &str, degree_digits: usize, plus: u8, minus: u8) -> Resul
     } else {
         return Err(ParseError::Position);
     };
-    let degrees: f64 = text[..degree_digits]
-        .parse()
-        .map_err(|_| ParseError::Position)?;
-    let minutes: f64 = text[degree_digits..text.len() - 1]
-        .parse()
-        .map_err(|_| ParseError::Position)?;
+    let text = |slice: &[u8]| -> Result<f64, ParseError> {
+        std::str::from_utf8(slice)
+            .map_err(|_| ParseError::Position)?
+            .parse()
+            .map_err(|_| ParseError::Position)
+    };
+    let degrees = text(&bytes[..degree_digits])?;
+    let minutes = text(&bytes[degree_digits..bytes.len() - 1])?;
+    // `-0.0` for a southern or western field whose value is exactly zero, which is what
+    // makes the hemisphere survive a round trip -- see `Position::latitude_text`.
     Ok(sign * (degrees + minutes / 60.0))
 }
 
@@ -507,14 +586,16 @@ fn take(text: &str, n: usize) -> Option<(&str, &str)> {
     text.is_char_boundary(n).then(|| text.split_at(n))
 }
 
-/// Digits, or `None` for a dotted field.
+/// Digits, or `None` for a dotted or space-padded field.
+///
+/// Trimmed first, because the protocol's "unavailable" is dots *or spaces* and a partially
+/// padded value (`  5`) is a real reading in a fixed-width field.
 fn digits(text: &str) -> Option<f64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
     text.parse::<f64>().ok().filter(|v| v.is_finite())
-}
-
-/// Digits with an optional leading `-`, for the temperature field.
-fn signed(text: &str) -> Option<f64> {
-    digits(text.trim_start_matches(' '))
 }
 
 /// Why an information field did not parse.
@@ -769,6 +850,108 @@ mod tests {
         for (table, code) in [(' ', '_'), ('/', '\n'), ('/', '\u{e9}')] {
             assert!(Symbol::new(table, code).is_err(), "{table:?}{code:?}");
         }
+    }
+
+    /// **The parser does not panic on any input.** It is a `pub fn` over an arbitrary
+    /// `&str`, and the offsets it slices at are the protocol's rather than the input's.
+    ///
+    /// Each of these panicked before the header was taken as ASCII bytes: the first two at
+    /// the position slice (byte 9 and byte 10 fall inside a multi-byte character) and the
+    /// third inside `parse_degrees`.
+    #[test]
+    fn a_multi_byte_character_in_the_header_is_a_refusal_and_not_a_panic() {
+        for text in [
+            "!\u{20ac}\u{20ac}\u{20ac}\u{20ac}\u{20ac}\u{20ac}\u{20ac}",
+            "!\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
+            "!\u{20ac}aaaaN/12203.00W_000/000",
+            "\u{20ac}",
+            "!4507.40N/12227.40W\u{20ac}181/005",
+        ] {
+            // `is_err` rather than a specific variant: what matters is that it returns.
+            assert!(parse_info(text).is_err(), "{text:?} should be refused");
+        }
+        // And a field VALUE that is not ASCII stops the scan rather than slicing into a
+        // character, because the trailer is taken from a byte offset too.
+        let parsed =
+            parse_info("!4507.40N/12227.40W_181/005t\u{20ac}0").expect("the header is ASCII");
+        assert_eq!(parsed.weather.temperature_f, None);
+    }
+
+    /// **A space-padded absent field is the protocol's other "unavailable", and dropping it
+    /// used to take every field after it.**
+    #[test]
+    fn a_space_padded_field_is_an_absence_and_does_not_swallow_the_rest() {
+        let parsed = parse_info("!4903.50N/07201.75W_220/004g005t   r000p000P000h50b09900wRSW")
+            .expect("parses");
+        assert_eq!(parsed.weather.temperature_f, None);
+        // The four fields that used to be lost with no error.
+        assert_eq!(parsed.weather.rain_last_hour_in, Some(0.0));
+        assert_eq!(parsed.weather.rain_last_24h_in, Some(0.0));
+        assert_eq!(parsed.weather.rain_since_midnight_in, Some(0.0));
+        assert_eq!(parsed.weather.humidity_percent, Some(50.0));
+        assert!(parsed.weather.barometer_in_hg.is_some());
+        assert_eq!(parsed.trailer, "wRSW");
+        // A partially padded value is a reading, not an absence.
+        let parsed = parse_info("!4903.50N/07201.75W_220/004g005t 72").expect("parses");
+        assert_eq!(parsed.weather.temperature_f, Some(72.0));
+    }
+
+    /// **Snowfall and the raw rain counter stay in the trailer**, so a capture carrying one
+    /// still re-encodes byte for byte — which it could not if they were parsed and then
+    /// discarded.
+    #[test]
+    fn a_field_this_program_does_not_hold_survives_in_the_trailer() {
+        let captured = "!4903.50N/07201.75W_220/004g005t077r000p000P000h50b09900s050#123wRSW";
+        let parsed = parse_info(captured).expect("parses");
+        assert_eq!(parsed.trailer, "s050#123wRSW");
+        let encoded = parsed
+            .weather
+            .encode_info(parsed.position, parsed.symbol, &parsed.trailer, None)
+            .expect("encodes");
+        assert_eq!(encoded.as_str(), captured);
+    }
+
+    /// **The symbol code is not a style choice.** A position report is read as a weather
+    /// report only under `_`; under anything else the wind field becomes a course and speed
+    /// and the rest becomes comment text, so the weather data is destroyed silently.
+    #[test]
+    fn weather_data_cannot_be_encoded_under_a_non_weather_symbol() {
+        let report = WeatherReport {
+            wind_speed_mph: Some(4.0),
+            temperature_f: Some(72.0),
+            ..WeatherReport::default()
+        };
+        let car = Symbol::new('/', '>').expect("a valid symbol");
+        let e = report
+            .encode_info(position(), car, ".mw", None)
+            .expect_err("refused");
+        assert!(
+            matches!(e, EncodeError::NotAWeatherSymbol { code: '>' }),
+            "{e}"
+        );
+        assert!(e.to_string().contains("aprs_symbol_code"), "{e}");
+        // An overlaid TABLE is legal and still encodes: only the code is fixed.
+        assert_eq!(Symbol::WEATHER_CODE, b'_');
+        let overlay = Symbol::new('\\', '_').expect("a valid symbol");
+        assert!(report.encode_info(position(), overlay, ".mw", None).is_ok());
+    }
+
+    /// The hemisphere survives a value of exactly zero, which is the one boundary a
+    /// `< 0.0` test gets wrong — `-0.0` is not less than zero.
+    #[test]
+    fn a_southern_or_western_zero_keeps_its_hemisphere() {
+        let captured = "!0000.00S/00000.00W_000/000g000t000";
+        let parsed = parse_info(captured).expect("parses");
+        let encoded = parsed
+            .weather
+            .encode_info(parsed.position, parsed.symbol, "", None)
+            .expect("encodes");
+        assert_eq!(encoded.as_str(), captured);
+        // And a configured `0.0` is northern and eastern, which is what an operator typing
+        // zero means.
+        let p = Position::new(0.0, 0.0).expect("a position");
+        assert_eq!(p.latitude_text(), "0000.00N");
+        assert_eq!(p.longitude_text(), "00000.00E");
     }
 
     /// The parser's refusals, each of which is a packet from somewhere else rather than a

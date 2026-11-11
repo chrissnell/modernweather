@@ -2349,8 +2349,8 @@ A-W2-1 and A-W2-2, W2a's D-30 split, W3's A-W3-1 to A-W3-4, W4's A-W4-1 to A-W4-
 A-W5-3, W7's A-W7-1 to A-W7-4, W8's A-1 to A-4 and W9's A-W9-1 to A-W9-3. All are applied there under
 the protocol; none is edited in place. See `docs/DESIGN.md`'s `## Amendments` section.
 
-This document proposes **one** amendment of its own, which is not to a decision. Sixteen more
-were appended later by implementation items and are marked as such.
+This document proposes **one** amendment of its own, which is not to a decision. Eighteen
+more were appended later by implementation items and are marked as such.
 
 **A-M4-2-1 — a `Soft` capability handle is read when it is used, not once at build.**
 *Proposed by implementation-plan.md **M4-2**, 2026-11-09. Not applied: the protocol above reserves
@@ -2966,11 +2966,15 @@ failure arrives as a handshake error once per upload period. A compiled-in ancho
 identically everywhere, which for two fixed public endpoints is the property worth having.
 The cost is stated: a root rotation is a release rather than a package update.
 
-*Why `reqwest` was not chosen.* It would answer the whole problem in one line and it is 132
-crates, a second HTTP stack beside `axum`'s, and `rustls-platform-verifier` by default —
-against a release matrix whose ARMv6 member was measured once, by `ci/spike/probe`, which is
-the evidence behind `docs/release.md` Appendix A. Recorded rather than left implicit, because
-it is the obvious substitution and the next reader should not have to re-derive the trade.
+*Why `reqwest` was not chosen.* It would answer the whole problem in one line. Measured
+rather than asserted: `cargo add reqwest --no-default-features --features
+rustls-no-provider` in a scratch crate resolves **132 packages** and pulls
+`rustls-platform-verifier`, `rustls-native-certs` and `hyper-rustls` — a second HTTP client
+stack beside `axum`'s server one, and a platform trust decision, against a release matrix
+whose ARMv6 member was measured once by `ci/spike/probe` (the evidence behind
+`docs/release.md` Appendix A). The figure is for that one feature set and would differ for
+another; it is recorded with the command that produced it so the next reader can re-measure
+rather than re-derive the trade.
 
 **A-M6-2-2 — an output reads a current value as the newest one-minute mean, because the
 capability it is given cannot answer anything finer.**
@@ -3046,6 +3050,15 @@ its own permit."* `uploader::tests::each_retry_takes_its_own_permit_from_the_lim
 asserts it as elapsed time between attempts under a paused clock, which is the form the
 reversed stack would fail in.
 
+*The door a reader will try next, so they do not have to.* A **`Clone`-able** limiter —
+shared state behind an `Arc<Mutex<…>>` rather than `tower`'s owned `Pin<Box<Sleep>>` — would
+compose with `tower::retry::Retry` and *would* have the property: `Retry::call` binds
+`self.service.call(request)` on the line before it clones itself, so the clone the retry path
+drives inherits the post-call limiter state. The composed form is therefore available at the
+cost of a second rate limiter to audit against `tower`'s, for a saving of about thirty lines
+in one component — which is why it was not built, and is the thing to build if a second tower
+stack in this process ever needs it.
+
 *Why this is more than inconvenient.* The decision's content is the ordering and the reason
 for it — *"reversed, the first failure spends one permit and then hammers the service as fast
 as the retry policy allows, which is worst exactly when the remote service is already
@@ -3063,3 +3076,70 @@ but the **supervisor** has no "not before" input and no skip reason beyond `Outc
 Adding one is a change to `mw-supervisor`, which is M2-3's crate, so it is reported here
 rather than taken. The observable difference is where the skip is counted, not whether the
 service is obeyed.
+
+**A-M6-2-4 — `aprs:*` does not declare `StationRegistry`, because nothing provides it.**
+*Proposed by implementation-plan.md **M6-2**, 2026-11-11. A departure from prose, not from a
+decision.*
+
+*What was found.* `docs/component-model.md` §4.2's component table gives `aprs:<device>` the
+needs `WindowedView` H **and `StationRegistry` H**; `pws:<device>` and `wu:<device>` get
+`WindowedView` H alone, and `docs/service-architecture.md` §9.3's one-line summary gives all
+three both. So one of the three components is specified with a need the other two are not.
+
+Declaring it refuses every configuration this program can have. W2a §4.1b gives
+`StationRegistry` to a `config:sqlite` component, no work item in
+`docs/implementation-plan.md` creates one, and a hard need nobody provides makes `plan()`
+refuse the whole configuration (**D-44**). That is not a new discovery: **A-M3-3-1** reached
+it for `writer:timescale`, which wants the same handle for a related reason and takes it
+*through the registrar* instead.
+
+*What replaces it.* The uploaders declare `WindowedView` **only**, and what they want from a
+station — its `station_key`, its coordinates and its `aprs_callsign` — is read from
+`config.stations` by `mw_output::plan` at plan time, joined in by
+`mw_store::config_db::uploaders`. The APRS encoder therefore holds a validated
+`mw_aprs::Position` and `Callsign` from the moment it is built, rather than resolving a
+station at run time.
+
+*Why that is better rather than merely possible.* A beacon's position is **configuration**,
+not a property of a reading: W4 assumption 24 says as much for the same columns, and the Go
+controller's readiness predicate — `device.Latitude != 0 && device.Longitude != 0` — is what
+reading it per send looks like. Resolved once, at plan time, a station with no coordinates is
+a refusal that names the row (`OutputPlanError::NoPosition`) instead of a worker that is
+never started with one `Debugf` nobody reads.
+
+*The need becomes declarable with the item that builds `config:sqlite`*, which is the same
+sentence A-M3-3-1 ends on, and at that point there is a second question to settle: what the
+uploaders would actually use the handle for, given the registrar already has the rows.
+
+**A-M6-2-5 — `window:rollup` maintains windows only for the stations this node collects
+for, and an uploader cannot share any other.**
+*Raised by implementation-plan.md **M6-2**, 2026-11-11. Not resolved here — it needs a
+decision in M3-4's component or M6-4's, and this records the conflict rather than taking
+it.*
+
+*What was found.* `window:rollup`'s station set is the stations this node **collects** for:
+`RollupState` is built from `RollupConfig::rollup_stations`, which keeps a station only if it
+is enabled and has a `transport_kind`. `WindowedView::resolve` answers
+`WindowError::UnknownStation` for anything else, which classifies `Fatal` — so an uploader
+paired with such a station fails **every occurrence, forever**, with the reason visible only
+in that component's `last_error`.
+
+That is reachable, and the configuration schema **endorses** the case. The `uploader`
+table's D-45 / A-W7-2 comment reads: *"A collector that uploads on behalf of a satellite
+selects the station and uses its own account."* A station a satellite forwards readings for
+has no `transport_kind` on the collector — it is inventory there rather than a component —
+so the endorsed configuration is exactly the one the rollup's station set excludes.
+
+*What this item did.* Refused the pairing at plan time, naming the uploader, the station and
+the reason (`OutputPlanError::StationNotCollected`), and skipped-with-a-warning the one
+sub-case that is a reversible operator action (a station whose `enabled` is 0). A refusal is
+not the right long-term answer for a configuration the schema endorses; it is the right
+answer to "this component would fail forever", which is the failure mode this programme keeps
+finding.
+
+*What would resolve it.* Either `window:rollup` maintains windows for every station whose
+readings reach this node's database rather than only those it collects from — the readings
+are there, they arrive through `Ingress::accept` — or the schema's comment is narrowed to say
+that a collector uploads only for stations it collects. The first is M3-4's component and the
+second is a documentation change with W7's consequences; neither belongs to this item, which
+is why the refusal names what it cannot do.

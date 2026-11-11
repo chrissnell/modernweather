@@ -272,12 +272,21 @@ mod tests {
         assert!(!rendered.contains(&p.expose().to_string()));
         // `Passcode` has no `Display`, so `{}` does not compile; `{:?}` is the only way to
         // put one in a message and it redacts. The same property for the errors:
+        // The structural property, which is what actually guarantees it: neither variant
+        // has a field that could carry the configured text. `NotANumber` carries a length
+        // and `OutOfRange` carries nothing, so there is no value of the input that could
+        // reach either message -- an assertion over one literal would not say that.
         for e in [
             PasscodeError::NotANumber { len: 7 },
             PasscodeError::OutOfRange,
         ] {
-            assert!(!e.to_string().contains("hunter2"), "{e}");
             assert!(e.to_string().len() > 60, "{e}");
+            assert!(!e.to_string().contains("passcode is 7"), "{e}");
         }
+        assert_eq!(
+            Passcode::parse("hunter2").expect_err("refused"),
+            PasscodeError::NotANumber { len: 7 },
+            "the only thing the error carries about the input is how long it was"
+        );
     }
 }

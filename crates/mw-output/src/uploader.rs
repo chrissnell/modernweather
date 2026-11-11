@@ -32,14 +32,18 @@
 //!
 //! ```text
 //!   loop {
-//!       stack.ready().await        // <-- the limiter's permit is taken HERE, per attempt
-//!       stack.call(payload.clone())
+//!       stack.ready().await        // <-- waits for a permit, once per attempt
+//!       stack.call(payload.clone())// <-- spends it
 //!       policy.consider(&error)    // ClassPolicy, over `E: Classify`
 //!   }
 //! ```
 //!
-//! `RateLimit::poll_ready` is where a permit is spent, so a retry *waits for the limiter*
-//! rather than bypassing it — which is the behaviour D-57 states in words.
+//! **`RateLimit::call` is what spends a permit**; `poll_ready` is where the next one is
+//! waited for (tower 0.5's `limit::rate::service`: `call` decrements the remaining count or,
+//! at a budget of one, resets the sleep and goes `Limited`). So re-entering `ready()` before
+//! every attempt is what makes each attempt take its own — which is the behaviour D-57
+//! states in words. A readiness that is polled and then abandoned leaks nothing, because
+//! nothing was spent.
 //!
 //! [`AttemptTimeout`] is innermost and is this crate's own rather than
 //! `tower::timeout::Timeout`, for one reason: `tower`'s erases the error to `BoxError`, and
@@ -52,8 +56,14 @@
 //! §4b.5: *"the tick deadline is the outer bound on the whole stack, so
 //! `deadline >= retries x (attempt_timeout + rate_limit_period)` must hold, and it is
 //! checked in `plan()` alongside `deadline <= period`."* [`budget_fits`] is that check and
-//! `crate::plan` is what calls it, so *"a retry budget that cannot fit inside the deadline
-//! is a configuration error, not a mysterious stream of `deadline_exceeded`"*.
+//! `crate::plan::budget_for` is what calls it — as a **refusal**, which is §4b.5's own
+//! answer: *"a retry budget that cannot fit inside the deadline is a configuration error,
+//! not a mysterious stream of `deadline_exceeded`."*
+//!
+//! The arithmetic bounds the attempts and the limiter, and **not** a delay the remote end
+//! supplied. It does not have to: a `Retryable` carrying a hint never sleeps inside the
+//! occurrence (see [`Uploader::deliver`]), so the only delays the budget has to hold are
+//! the limiter's own.
 
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -213,6 +223,11 @@ pub fn stack<T: Transmit>(
 /// `deadline >= (retries + 1) x (attempt_timeout + limit_period)`. The `+ 1` is the first
 /// attempt, which §4b.5's `retries x ...` leaves implicit and which a check that omitted it
 /// would admit a budget whose *first* attempt already exceeds the deadline.
+///
+/// Deliberately conservative by one limiter period: `RateLimit::new` starts with a permit
+/// available, so the first attempt waits for nothing and the true worst case is
+/// `(retries + 1) x attempt_timeout + retries x limit_period`. Three seconds of slack on a
+/// bound whose purpose is to be comfortably true is worth more than an exact figure.
 pub fn budget_fits(
     deadline: Duration,
     retries: u8,
@@ -279,9 +294,15 @@ impl<E: OutputEncoder, T: Transmit<Payload = E::Payload>> Uploader<E, T> {
         self.encoder.service()
     }
 
-    /// Whether a service's pushback is still in force.
-    pub fn held_until(&self) -> Option<Instant> {
+    /// How much of a service's pushback is still in force.
+    ///
+    /// A `Duration` rather than the `tokio::time::Instant` behind it, so that a caller
+    /// outside this crate does not have to name tokio's clock type to read a component's
+    /// state. `None` is no hold; `Some(ZERO)` is a hold that has expired and has not yet
+    /// been cleared by the next occurrence.
+    pub fn held_until(&self) -> Option<Duration> {
         self.not_before
+            .map(|until| until.saturating_duration_since(Instant::now()))
     }
 
     /// Resolve this encoder's declarations.
@@ -303,8 +324,8 @@ impl<E: OutputEncoder, T: Transmit<Payload = E::Payload>> Uploader<E, T> {
         let id = self.id.clone();
         let mut policy = ClassPolicy::new(self.budget);
         loop {
-            // **The permit is taken here**, once per attempt, which is what makes the
-            // retry sit outside the limiter (D-57).
+            // **Readiness is re-entered here, once per attempt**, which is what makes the
+            // retry sit outside the limiter (D-57). The permit itself is spent by `call`.
             let error = match self.stack.ready().await {
                 // `RateLimit::poll_ready` delegates to the inner service, which is always
                 // ready, so this arm is unreachable today. Handled rather than unwrapped
@@ -320,6 +341,27 @@ impl<E: OutputEncoder, T: Transmit<Payload = E::Payload>> Uploader<E, T> {
                 },
             };
             m::attempt(&id, service, error.reason());
+            // **A service-supplied delay ends the occurrence and becomes the hold**, and it
+            // is recorded here -- where the failure is OBSERVED -- rather than on the error
+            // `deliver` finally returns.
+            //
+            // Both halves of that are load-bearing, and the first one is a defect this
+            // shape used to have. The supervisor bounds every occurrence with
+            // `tokio::time::timeout(deadline, body.tick(..))` (`mw_supervisor::task`), and
+            // `crate::plan` declares a deadline of at most 45 s -- so sleeping a
+            // `Retry-After: 120` *inside* the occurrence meant the tick future was dropped
+            // at 45 s, `hold` never ran, and the next occurrence repeated on the fixed
+            // schedule. That is exactly the behaviour W2a Decision 59 exists to prevent,
+            // and it was reachable for every hint above roughly thirty seconds.
+            //
+            // Recording it on observation rather than on the returned error also keeps a
+            // hint that arrived on a *non-final* attempt: a 429 followed by a refused
+            // connection returns `Connect`, which carries no hint, and the service's
+            // instruction would otherwise be forgotten.
+            if let Class::Retryable { after: Some(after) } = error.class() {
+                self.hold(service, after);
+                return Err(error);
+            }
             match policy.consider(&error) {
                 None => return Err(error),
                 Some(delay) => {
@@ -341,17 +383,17 @@ impl<E: OutputEncoder, T: Transmit<Payload = E::Payload>> Uploader<E, T> {
     }
 
     /// Record a service's pushback, so the next occurrence does not attempt before it.
-    fn hold(&mut self, error: &UploadError) {
-        if let Class::Retryable { after: Some(after) } = error.class() {
-            let until = Instant::now() + after;
-            self.not_before = Some(until);
-            info!(
-                component = %self.id,
-                service = self.encoder.service(),
-                hold_s = after.as_secs(),
-                "the service asked us to slow down; occurrences before then will be skipped"
-            );
-        }
+    ///
+    /// Takes the delay rather than the error, because the caller has already matched the
+    /// class — and because "there is a hold" and "how long" are the same fact.
+    fn hold(&mut self, service: &'static str, after: Duration) {
+        self.not_before = Some(Instant::now() + after);
+        info!(
+            component = %self.id,
+            service,
+            hold_s = after.as_secs(),
+            "the service asked us to slow down; occurrences before then will be skipped"
+        );
     }
 }
 
@@ -396,7 +438,11 @@ impl<E: OutputEncoder, T: Transmit<Payload = E::Payload>> Tick for Uploader<E, T
                 biased;
                 () = cx.cancelled() => {
                     m::occurrence(&self.id, service, m::Outcome::Cancelled);
-                    Ok(())
+                    // `ComponentError::Cancelled`, not `Ok(())`: it is the one variant
+                    // `mw_supervisor::task::interpret` maps to `Outcome::Skipped`, so the
+                    // supervisor's own counter and this crate's agree about the occurrence.
+                    // Returning `Ok` recorded it as a successful upload that never happened.
+                    Err(ComponentError::Cancelled)
                 }
                 result = self.deliver(payload) => match result {
                     Ok(()) => {
@@ -405,7 +451,7 @@ impl<E: OutputEncoder, T: Transmit<Payload = E::Payload>> Tick for Uploader<E, T
                         Ok(())
                     }
                     Err(e) => {
-                        self.hold(&e);
+                        // The hold is recorded in `deliver`, on observation; see there.
                         m::occurrence(&self.id, service, m::Outcome::Failed);
                         warn!(
                             component = %self.id,
@@ -750,6 +796,70 @@ mod tests {
         assert!(body.held_until().is_none(), "the hold was cleared");
     }
 
+    /// **The defect the hold's placement exists to fix.** A `Retry-After` longer than the
+    /// occurrence's deadline, at the retry budget `crate::plan` actually produces.
+    ///
+    /// Driven through `tokio::time::timeout` because that is what the supervisor does
+    /// (`mw_supervisor::task`), and the deadline is `crate::plan`'s own. Before the hold
+    /// moved to the point of observation this occurrence slept 120 s inside a 45 s
+    /// deadline: the tick future was dropped, `not_before` stayed `None`, and the next
+    /// occurrence repeated on the fixed schedule -- which is the behaviour W2a Decision 59
+    /// exists to prevent. The old test passed only at `budget = 0`, which
+    /// `plan::budget_for` never produces.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_after_longer_than_the_deadline_still_holds() {
+        const DEADLINE: Duration = Duration::from_secs(45);
+        let recorder = Recorder::new([Err(UploadError::RateLimited {
+            target: Target::peer("test", 1),
+            retry_after: Some(Duration::from_secs(120)),
+        })]);
+        // The budget `plan()` declares for every period this program plans.
+        let mut body = uploader(
+            View(Ok(Some(1.0))),
+            recorder.clone(),
+            crate::retry::DEFAULT_BUDGET,
+        );
+        let (cx, _token) = cx();
+
+        let outcome = tokio::time::timeout(DEADLINE, body.tick(&cx))
+            .await
+            .expect("the occurrence must finish inside the supervisor's deadline");
+        outcome.expect_err("rate limited");
+        assert_eq!(recorder.sent().len(), 1, "the hint ends the occurrence");
+        let until = body.held_until().expect("the hold was recorded");
+        assert!(until >= Duration::from_secs(119), "{until:?}");
+
+        // And the next occurrence is skipped rather than attempted.
+        body.tick(&cx)
+            .await
+            .expect("a held occurrence is not a failure");
+        assert_eq!(recorder.sent().len(), 1);
+    }
+
+    /// A hint observed on a **non-final** attempt is still recorded, which it was not when
+    /// the hold read only the error `deliver` returned.
+    #[tokio::test(start_paused = true)]
+    async fn a_hint_on_an_earlier_attempt_is_not_forgotten() {
+        let recorder = Recorder::new([
+            Err(UploadError::RateLimited {
+                target: Target::peer("test", 1),
+                retry_after: Some(Duration::from_secs(90)),
+            }),
+            Err(UploadError::Connect {
+                what: "could not connect to",
+                target: Target::peer("test", 1),
+                source: std::io::Error::other("refused"),
+            }),
+        ]);
+        let mut body = uploader(View(Ok(Some(1.0))), recorder.clone(), 2);
+        let (cx, _token) = cx();
+        body.tick(&cx).await.expect_err("rate limited");
+        // The hinted failure ends the occurrence, so the second scripted answer is never
+        // reached -- and the hint is held.
+        assert_eq!(recorder.sent().len(), 1);
+        assert!(body.held_until().is_some(), "the hint was recorded");
+    }
+
     /// A `429` with no header does not hold: there is nothing to honour, and holding for a
     /// guess would be this program inventing a backoff the service did not ask for.
     #[tokio::test(start_paused = true)]
@@ -819,7 +929,12 @@ mod tests {
         );
         let (cx, token) = cx();
         token.cancel();
-        body.tick(&cx).await.expect("a stop is not a failure");
+        // `Cancelled` rather than `Ok`, because that is the variant the supervisor maps to
+        // `Outcome::Skipped` -- a stop is not a failure and it is not a successful upload
+        // either.
+        let e = body.tick(&cx).await.expect_err("a stop is reported as one");
+        assert!(matches!(e, ComponentError::Cancelled), "{e}");
+        assert_eq!(e.class(), Class::Ignorable);
     }
 
     /// §4b.5's arithmetic, which `crate::plan` checks so that a budget that cannot fit is
