@@ -275,6 +275,128 @@ impl RouteManifest {
 /// impl in one crate, and `CapabilityHandle` is this one's.
 pub trait RouteProvider: Send + Sync + 'static {}
 
+/// How an inbound upload answered.
+///
+/// A closed enum rather than a status code, for [`Methods`]' reason: this crate sits below
+/// the transport layer, and `mw-http` is where these become `StatusCode`s. What a driver
+/// decides is *which of these four happened*, which is a smaller decision than "what
+/// number does an HTTP client get" and is the one it is qualified to make.
+///
+/// There is deliberately no "wrong method" variant. The declared [`Methods`] on the route
+/// is what decides which methods reach a handler at all, so the listener's own router
+/// answers that one and the driver never sees the request — which is the difference between
+/// a rule and a convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadStatus {
+    /// The readings were admitted. The station's own retry stops here.
+    Accepted,
+    /// The request is not one this protocol defines — a parameter the protocol requires is
+    /// missing, or a timestamp is not one.
+    Malformed,
+    /// The station this request claims to be is not one this node collects for, or the
+    /// secret it presented is not that station's.
+    ///
+    /// **One status for both**, deliberately: the reply does not say which, and
+    /// `mw_readings_rejected_total{reason}` tells the *operator* which it was
+    /// ([`crate::Reject`]).
+    ///
+    /// **What the reply withholds, the latency does not.** An unknown claim is two map
+    /// lookups; a known claim with a wrong secret reaches an Argon2 verification once per
+    /// station per interval, which is 19 MiB and tens of milliseconds on the hardware this
+    /// runs on. So a sender who times the two can tell them apart, and probing twice
+    /// separates "no such station" from "known station, this interval's attempt already
+    /// spent". Making them indistinguishable would mean verifying a dummy hash for every
+    /// unknown claim, which hands an unauthenticated sender a memory-hard computation per
+    /// request — a worse trade than the oracle. Recorded rather than claimed away:
+    /// `docs/reconciliation.md` A-M6-1-2 lists it among what the mechanism costs.
+    Unauthorised,
+    /// The request was well-formed and from a station this node collects for, and the
+    /// reading could not be **durably** accepted.
+    ///
+    /// The one outcome the station's own retry is the right answer to, which is why it is
+    /// distinct from [`UploadStatus::Malformed`]: an Ambient console buffers and retries,
+    /// so a spool that cannot be appended to should say "try again" rather than "your
+    /// request is wrong" — and a `4xx` tells a console to give up on data nobody else has.
+    Unavailable,
+}
+
+/// What an inbound upload endpoint answers with.
+///
+/// The body is `&'static str` because every one of them is a constant: a station firmware
+/// looks for a fixed string (Ambient's consoles want `success`) and an error body that
+/// quoted the request back would put a station's own password in an access log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UploadReply {
+    /// Which of the four happened.
+    pub status: UploadStatus,
+    /// The body, which is a constant.
+    pub body: &'static str,
+}
+
+impl UploadReply {
+    /// An accepted upload, answering `body`.
+    #[must_use]
+    pub const fn accepted(body: &'static str) -> Self {
+        Self {
+            status: UploadStatus::Accepted,
+            body,
+        }
+    }
+
+    /// A refusal.
+    #[must_use]
+    pub const fn refused(status: UploadStatus, body: &'static str) -> Self {
+        Self { status, body }
+    }
+}
+
+/// One inbound upload, as the one listener hands it over.
+///
+/// Only what a station protocol can use. There is no header map, no body and no method:
+/// `Methods` on the declared route is what decides which methods reach the handler at all,
+/// and a query-string protocol has nothing else to read. A protocol that needs a body gets
+/// a field here and a reason beside it.
+///
+/// **There is no peer address, and that is a gap rather than a decision.** A refusal log
+/// that said *who* was pointing a station at this node would be strictly better, and the one
+/// listener serves without `into_make_service_with_connect_info` (`mw_http::socket`), so no
+/// handler in this workspace can see one. Adding it is a change to how all three sockets are
+/// served — including the TLS listener's wrapper type — which is `http:listener`'s surface
+/// and not a driver's. Recorded so the next reader does not take the absence for a
+/// judgement: what a refusal names today is the station claim, which is the other half of
+/// the same sentence.
+#[derive(Clone)]
+pub struct Upload {
+    /// Everything after the `?`, undecoded. Decoding is the codec's
+    /// (`mw_codec::QueryParams`), so there is one implementation of it.
+    pub query: String,
+}
+
+/// Hand-written, because the query string **is** the credential.
+///
+/// An Ambient console sends `?PASSWORD=` in the clear on every upload, so a derived `Debug`
+/// puts a station's own password into any `{:?}` or `?upload` tracing field that is ever
+/// added -- twelve lines below [`UploadReply`]'s warning that an error body quoting the
+/// request back would put it in an access log. Nothing logs it today, which is exactly when
+/// this is cheap to make structural. The length is kept because it is the one thing worth
+/// seeing in a log line, and `mw_station::ambient::Handler` does the same.
+impl fmt::Debug for Upload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Upload")
+            .field("query_bytes", &self.query.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// An inbound upload endpoint, as the one listener calls it.
+///
+/// **A closure rather than a trait**, which is `mw_http::Render`'s reason stated once more:
+/// a trait would be a capability for one consumer, and **D-52** declined to add one of those
+/// for the log handle. The handle that *is* on the bus is `HttpRoutes`, which this endpoint
+/// provides like any other route table.
+pub type UploadEndpoint =
+    std::sync::Arc<dyn Fn(Upload) -> crate::BoxFuture<'static, UploadReply> + Send + Sync>;
+
 impl crate::cx::CapabilityHandle for std::sync::Arc<dyn RouteProvider> {
     const CAPABILITY: crate::capability::Capability = crate::capability::Capability::HttpRoutes;
 }
@@ -282,6 +404,22 @@ impl crate::cx::CapabilityHandle for std::sync::Arc<dyn RouteProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_upload_reply_carries_one_of_four_outcomes_and_a_constant_body() {
+        assert_eq!(
+            UploadReply::accepted("success"),
+            UploadReply {
+                status: UploadStatus::Accepted,
+                body: "success"
+            }
+        );
+        let refused = UploadReply::refused(UploadStatus::Unauthorised, "unauthorized\n");
+        assert_eq!(refused.status, UploadStatus::Unauthorised);
+        assert_eq!(refused.body, "unauthorized\n");
+        assert_ne!(UploadStatus::Malformed, UploadStatus::Unauthorised);
+        assert_ne!(UploadStatus::Unavailable, UploadStatus::Malformed);
+    }
 
     #[test]
     fn methods_only_conflict_when_they_overlap() {

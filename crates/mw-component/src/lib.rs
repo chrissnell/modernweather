@@ -94,7 +94,10 @@ pub use ingress::{
     AcceptError, Accepted, AdmitError, Admitted, FrameMeta, Ingress, Reject, StationMeta,
     StationProjection, StationRegistry,
 };
-pub use routes::{Match, Methods, RouteEntry, RouteManifest, RouteProvider, Scope};
+pub use routes::{
+    Match, Methods, RouteEntry, RouteManifest, RouteProvider, Scope, Upload, UploadEndpoint,
+    UploadReply, UploadStatus,
+};
 pub use schedule::{OccurrenceKey, OccurrenceRecord, ScheduleStore, ScheduleStoreError};
 pub use snapshot::{
     ETag, Encoding, LatestSnapshot, Payload, PayloadRev, RenderError, Snapshot, SnapshotKey,

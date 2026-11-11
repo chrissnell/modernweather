@@ -165,6 +165,76 @@ pub fn metrics_table(metrics: MetricsRoute) -> RouteTable {
     )
 }
 
+/// An inbound station upload as a route table, owned by the station component that
+/// provides it.
+///
+/// The counterpart of [`metrics_table`]: a provider in the `service` layer cannot name
+/// `axum` (`ci/layers.toml`), so what it hands over is a
+/// [`mw_component::UploadEndpoint`] — a closure — and this is where that becomes a route.
+/// `mw-station`'s Ambient driver is the one provider; `mw_component::routes` has why the
+/// handle is a closure rather than a capability trait.
+///
+/// **The declared methods are `READ`, and that is `axum`'s doing rather than a choice.**
+/// The Ambient "customized" protocol is a `GET` with the measurements in the query string,
+/// so `MethodFilter::GET` is what the route is mounted with — and `axum`'s `MethodRouter`
+/// answers `HEAD` with the `GET` handler whenever no `HEAD` handler is set, which cannot be
+/// turned off without mounting a second handler whose whole job is to refuse. So the
+/// manifest declares `GET|HEAD`, because the manifest is what route-conflict detection
+/// reads and a declaration that did not match what the router answers would be worse than
+/// an honest one. The consequence is bounded: a `HEAD` carrying a full query string is
+/// admitted exactly as the `GET` would be and its body is discarded by the protocol, and no
+/// station firmware sends one. Every other method is `405` from the router, which is why
+/// [`mw_component::UploadStatus`] has no "wrong method" variant.
+pub fn upload_table(
+    owner: ComponentId,
+    mount: &str,
+    manifest: RouteManifest,
+    endpoint: mw_component::UploadEndpoint,
+) -> RouteTable {
+    use axum::routing::{on, MethodFilter};
+
+    let router = Router::new().route(
+        mount,
+        on(MethodFilter::GET, move |query: axum::extract::RawQuery| {
+            let endpoint = Arc::clone(&endpoint);
+            async move {
+                let reply = endpoint(mw_component::Upload {
+                    // `RawQuery` is `None` for a request with no `?` at all, which is an
+                    // upload carrying no parameters -- a case the driver refuses by name
+                    // rather than one this layer should turn into a 404.
+                    query: query.0.unwrap_or_default(),
+                })
+                .await;
+                (status(reply.status), reply.body)
+            }
+        }),
+    );
+    RouteTable::new(owner, manifest, router)
+}
+
+/// One [`mw_component::UploadStatus`] as a status code.
+///
+/// The whole of the mapping, in one place, because a driver that chose its own numbers
+/// would be a driver with an opinion about HTTP.
+fn status(status: mw_component::UploadStatus) -> axum::http::StatusCode {
+    use axum::http::StatusCode;
+    use mw_component::UploadStatus as S;
+    match status {
+        S::Accepted => StatusCode::OK,
+        S::Malformed => StatusCode::BAD_REQUEST,
+        // `401` and not `403`: the station presented a credential and it was not accepted,
+        // which is what `WWW-Authenticate`-less `401` means on a protocol with no challenge.
+        // `403` would say "we know who you are and you may not", and one status for an
+        // unknown station and a bad secret says neither. The *timing* of the two still
+        // differs; `mw_component::UploadStatus::Unauthorised` is where that is recorded.
+        S::Unauthorised => StatusCode::UNAUTHORIZED,
+        // `503` and not `500`: the condition is "this node cannot durably accept a reading
+        // right now", which is temporary and which the station's own retry is the correct
+        // response to.
+        S::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
 /// Why the listener could not be bound or served.
 #[derive(Debug, thiserror::Error)]
 pub enum HttpError {
@@ -296,5 +366,100 @@ mod tests {
             .await
             .expect("a readable body");
         assert_eq!(&body[..], b"mw_up 1\n");
+    }
+
+    /// The upload route, driven end to end: the query reaches the endpoint verbatim, each
+    /// of the three outcomes becomes its status, and a method the route does not declare
+    /// never reaches the handler.
+    #[tokio::test]
+    async fn an_upload_endpoint_is_a_route_table_over_a_closure() {
+        use mw_component::{Upload, UploadReply, UploadStatus};
+
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let table = upload_table(
+            ComponentId::new("station:ambient").expect("a legal id"),
+            "/ingest/ambient",
+            // The shape the driver declares, built here because this crate may not name
+            // `mw-station`: the production caller passes `mw_station::ambient::manifest`.
+            RouteManifest::new(
+                Scope::Any,
+                vec![RouteEntry::exact("/ingest/ambient", Methods::READ)],
+            ),
+            Arc::new(move |upload: Upload| {
+                let log = Arc::clone(&log);
+                Box::pin(async move {
+                    log.lock().expect("not poisoned").push(upload.query.clone());
+                    match upload.query.as_str() {
+                        "" => UploadReply::refused(UploadStatus::Malformed, "missing\n"),
+                        q if q.contains("PASSWORD=wrong") => {
+                            UploadReply::refused(UploadStatus::Unauthorised, "unauthorized\n")
+                        }
+                        _ => UploadReply::accepted("success"),
+                    }
+                })
+            }),
+        );
+        assert_eq!(table.owner().as_str(), "station:ambient");
+        assert_eq!(table.scope(), Scope::Any);
+        assert_eq!(
+            table.manifest().entries,
+            vec![RouteEntry::exact("/ingest/ambient", Methods::READ)]
+        );
+
+        let (mount, _) = Mount::new(vec![table], HostTable::default()).expect("mounts");
+        let call = |method: &str, uri: &str| {
+            let router = mount.router();
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .expect("a legal request");
+            async move { router.oneshot(request).await.expect("infallible") }
+        };
+
+        let ok = call("GET", "/ingest/ambient?ID=roof&PASSWORD=right&tempf=68.4").await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(ok.into_body(), 1 << 16)
+            .await
+            .expect("a readable body");
+        assert_eq!(&body[..], b"success");
+
+        assert_eq!(
+            call("GET", "/ingest/ambient?ID=roof&PASSWORD=wrong")
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // No `?` at all: an upload with no parameters, refused by the driver rather than
+        // turned into a 404 by this layer.
+        assert_eq!(
+            call("GET", "/ingest/ambient").await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        // The method the route does not declare, answered by the router.
+        assert_eq!(
+            call("POST", "/ingest/ambient?ID=roof").await.status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        // `HEAD` reaches the handler, because `axum` answers it with the `GET` handler --
+        // which is why the manifest declares `GET|HEAD` rather than `GET`.
+        assert_eq!(
+            call("HEAD", "/ingest/ambient?ID=roof&PASSWORD=right")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            *seen.lock().expect("not poisoned"),
+            vec![
+                "ID=roof&PASSWORD=right&tempf=68.4".to_string(),
+                "ID=roof&PASSWORD=wrong".to_string(),
+                String::new(),
+                "ID=roof&PASSWORD=right".to_string(),
+            ],
+            "the POST never reached the endpoint, and each query arrived verbatim"
+        );
     }
 }

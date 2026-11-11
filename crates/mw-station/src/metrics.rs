@@ -35,6 +35,15 @@ pub enum FrameOutcome {
     /// Admission refused it. Counted here too, so that one series answers "what is this
     /// endpoint doing with the frames it receives" without a join.
     Refused,
+    /// The frame decoded and what it decoded to is a fault the station's own configuration
+    /// says it cannot be.
+    ///
+    /// One producer: a snow gauge reporting a distance greater than its configured base
+    /// distance (`mw_codec::SnowGaugeProto`). **DEV-9** makes that discard this item's
+    /// constraint, and a separate label is what makes it visible: a gauge whose base
+    /// distance is set two metres short otherwise reports nothing, counts nothing under a
+    /// name an operator would look at, and logs a line per reading.
+    Implausible,
 }
 
 impl FrameOutcome {
@@ -45,6 +54,7 @@ impl FrameOutcome {
             FrameOutcome::Undecodable => "undecodable",
             FrameOutcome::UnknownStation => "unknown_station",
             FrameOutcome::Refused => "refused",
+            FrameOutcome::Implausible => "implausible",
         }
     }
 
@@ -55,6 +65,7 @@ impl FrameOutcome {
         FrameOutcome::Undecodable,
         FrameOutcome::UnknownStation,
         FrameOutcome::Refused,
+        FrameOutcome::Implausible,
     ];
 }
 
@@ -70,6 +81,10 @@ pub fn register() {
         "mw_station_frames_total",
         "Frames a station endpoint received, by what became of them"
     );
+    metrics::describe_counter!(
+        "mw_station_resync_bytes_total",
+        "Bytes a station session discarded looking for a frame boundary"
+    );
 }
 
 /// Zero every outcome for one component, so a flat line is distinguishable from no line.
@@ -82,6 +97,32 @@ pub fn arm(component: &ComponentId) {
         )
         .increment(0);
     }
+}
+
+/// Zero the resynchronisation count for one component.
+///
+/// The same reason [`arm`] exists, and more load-bearing here: a flat zero is the whole
+/// signal. A station whose serial line is at the right rate never moves this series, so
+/// "absent" and "zero" have to be distinguishable or the number says nothing.
+pub fn arm_resync(component: &ComponentId) {
+    metrics::counter!(
+        "mw_station_resync_bytes_total",
+        "component" => component.as_str().to_string(),
+    )
+    .increment(0);
+}
+
+/// Count bytes a session dropped looking for a frame boundary.
+///
+/// A second series rather than a `FrameOutcome`, because these are **bytes** and the other
+/// series counts **frames**: adding them to one counter would make its total meaningless.
+/// `crate::driver` has why this number exists at all.
+pub fn resync(component: &ComponentId, bytes: u64) {
+    metrics::counter!(
+        "mw_station_resync_bytes_total",
+        "component" => component.as_str().to_string(),
+    )
+    .increment(bytes);
 }
 
 /// Count one frame.
@@ -107,7 +148,7 @@ mod tests {
         assert_eq!(labels.len(), before, "two outcomes share a label");
         assert_eq!(
             FrameOutcome::ALL.len(),
-            4,
+            5,
             "a new FrameOutcome needs a line in ALL"
         );
         assert_eq!(FrameOutcome::Decoded.to_string(), "decoded");

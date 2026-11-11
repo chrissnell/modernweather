@@ -69,6 +69,25 @@ pub struct StationRow {
     pub wll_sensor_mapping: Option<String>,
     /// `wll_poll_interval_seconds`.
     pub wll_poll_interval_seconds: Option<i64>,
+    /// `wind_dir_correction_degrees` — the vane's offset from north, which three drivers
+    /// apply (`mw_codec::WindDirCorrection`) and the WeatherLink Live one does not.
+    pub wind_dir_correction_degrees: i64,
+    /// `snow_base_distance_mm` — how far a snow gauge's sensor is from bare ground.
+    ///
+    /// The enrich stage derives `snowdepth` from it (`mw_pipeline::enrich`), and the snow
+    /// gauge driver uses it for the **discard** DEV-9 makes M6-1's constraint: a distance
+    /// greater than the base is a sensor fault, and without the discard it would store a
+    /// negative depth.
+    pub snow_base_distance_mm: Option<f64>,
+    /// Whether `ingest_secret_hash` is set.
+    ///
+    /// The hash itself is `mw-store`'s: this crate plans and never verifies, so what it
+    /// needs is the one bit that decides whether a station *can* be authenticated. An
+    /// Ambient station is `from_query`, its `?PASSWORD=` is the only credential the
+    /// transport has, and a row with no stored secret is one whose uploads nothing can
+    /// check -- so `crate::plan` refuses it rather than planning an endpoint that trusts
+    /// whatever arrives, which is the Go behaviour (W2a §4a.6).
+    pub has_ingest_secret: bool,
 }
 
 impl Hash for StationRow {
@@ -76,13 +95,23 @@ impl Hash for StationRow {
     /// (`mw_component::ConfigDigest`). Hand-written because `SecretString` is deliberately
     /// not `Hash`.
     ///
-    /// **The credential is folded in**, and that is a decision rather than an oversight. A
-    /// digest that omitted it would compare equal across a credential rotation, so the
-    /// component would not be restarted and would keep using the old one — which is the one
-    /// failure the digest exists to prevent, stated on `SpecFingerprint` about an APRS
-    /// callsign. What leaks is one bit of a 64-bit hash of twenty fields, and
-    /// `ConfigDigest::get` is a log field; a credential that has to survive that is a
-    /// credential that should not be in a database column.
+    /// **The transport credential is folded in**, and that is a decision rather than an
+    /// oversight. A digest that omitted it would compare equal across a rotation of
+    /// `transport_auth`, so the component would not be restarted and would keep using the
+    /// old one — which is the one failure the digest exists to prevent, stated on
+    /// `SpecFingerprint` about an APRS callsign. What leaks is one bit of a 64-bit hash of
+    /// twenty fields, and `ConfigDigest::get` is a log field; a credential that has to
+    /// survive that is a credential that should not be in a database column.
+    ///
+    /// **The ingest secret is not, and the digest therefore does not see its rotation.**
+    /// `has_ingest_secret` is a `bool`, so rotating `ingest_secret_hash` leaves this digest
+    /// unchanged and `station:ambient` is `unchanged` in the plan diff. That is correct
+    /// rather than a gap, because this component never holds that secret: it travels in the
+    /// query string and is compared by `mw_store::ConfigRegistry`, whose own cache keys
+    /// every verified secret to the hash it verified against. Restarting the endpoint would
+    /// drop two consoles' connections to no effect. What the bit *is* for is that a station
+    /// gaining or losing its secret changes what `plan` will accept, which is a different
+    /// configuration.
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.key.hash(state);
         self.name.hash(state);
@@ -92,6 +121,13 @@ impl Hash for StationRow {
         self.presented_key.hash(state);
         self.wll_sensor_mapping.hash(state);
         self.wll_poll_interval_seconds.hash(state);
+        self.wind_dir_correction_degrees.hash(state);
+        // `f64` is not `Hash`, and the bit pattern is: two base distances that compare
+        // equal have the same bits, which is what a digest needs. `NaN` would hash
+        // differently from itself through `to_bits` only if two distinct `NaN`s were
+        // written, and the column's own `CHECK (> 0)` rejects one.
+        self.snow_base_distance_mm.map(f64::to_bits).hash(state);
+        self.has_ingest_secret.hash(state);
         match &self.transport {
             None => false.hash(state),
             Some(t) => {
@@ -137,6 +173,35 @@ impl StationRow {
     pub fn auth(&self) -> Option<&SecretString> {
         self.transport.as_ref().and_then(|t| t.auth.as_ref())
     }
+
+    /// The vane calibration this station's codec applies.
+    ///
+    /// **No correction rather than refused**, for a value the column's own
+    /// `CHECK (BETWEEN -360 AND 360)` cannot hold: an `i64` that does not fit an `i16` is a
+    /// row no build of this schema wrote, and the choice is between a station that will not
+    /// start and a station whose vane is uncalibrated. The second is better, because a
+    /// Davis with an uncorrected vane still records every other measurement.
+    ///
+    /// It is silent, which the earlier wording here called "calibrated wrongly and
+    /// visibly". There is nothing visible about it. The case is unreachable from any
+    /// schema this repository has shipped -- `0` is the column's default and the `CHECK`
+    /// has been there since the initial migration -- so it is a fallback for a database
+    /// written by something else, and a startup warning for an impossible row would be a
+    /// line nobody ever sees.
+    pub fn wind_dir_correction(&self) -> mw_codec::WindDirCorrection {
+        mw_codec::WindDirCorrection::new(
+            i16::try_from(self.wind_dir_correction_degrees).unwrap_or(0),
+        )
+    }
+
+    /// The snow gauge's base distance as the codec takes it.
+    ///
+    /// `f32` because the column the depth lands in is `float4`; a base distance that is not
+    /// a positive number is no base distance, which `mw_codec::SnowGaugeProto::new` is what
+    /// decides.
+    pub fn snow_base_distance_mm(&self) -> Option<f32> {
+        self.snow_base_distance_mm.map(|mm| mm as f32)
+    }
 }
 
 /// What `mw-station`'s registrar reads out of the binary's configuration type.
@@ -152,6 +217,18 @@ pub trait StationConfig {
     /// the registrar then refuses to plan a station rather than planning one that cannot
     /// store anything. See this module's documentation for why the handle arrives here.
     fn ingress(&self) -> Option<&Arc<dyn Ingress>>;
+
+    /// The slot the Ambient ingest endpoint installs its handler into, when this process
+    /// has a listener.
+    ///
+    /// Arrives through the registrar for [`StationConfig::ingress`]' reason and one more:
+    /// `mw-http` builds the `axum` route over this slot and this crate may not name `axum`,
+    /// so the binary is the only place the two meet (§1.3 rule 1). `None` is a node with no
+    /// listener, and `crate::plan` then refuses an Ambient station rather than planning an
+    /// endpoint nothing serves.
+    fn ambient_upload_state(&self) -> Option<&Arc<crate::ambient::UploadState>> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -175,6 +252,9 @@ mod tests {
             }),
             wll_sensor_mapping: Some("th:1, wind:1".into()),
             wll_poll_interval_seconds: None,
+            wind_dir_correction_degrees: 0,
+            snow_base_distance_mm: None,
+            has_ingest_secret: false,
         }
     }
 
@@ -217,6 +297,18 @@ mod tests {
                     port: Some(22223),
                     ..TransportColumns::default()
                 }),
+                ..row()
+            },
+            StationRow {
+                wind_dir_correction_degrees: 10,
+                ..row()
+            },
+            StationRow {
+                snow_base_distance_mm: Some(1500.0),
+                ..row()
+            },
+            StationRow {
+                has_ingest_secret: true,
                 ..row()
             },
         ] {

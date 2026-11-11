@@ -17,6 +17,10 @@ mw-types.workspace = true
 
 thiserror.workspace = true
 zerocopy.workspace = true
+# The snow gauge's frame is a protobuf message. `prost` alone and not `mw-proto`: that crate
+# is in this one's own layer, so `ci/layers.toml` rejects the dependency, and what this needs
+# is two scalar fields of a four-field message (`crate::snowgauge`).
+prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # For the TYPE and not for the clock. A frame can carry the instant the station says it

@@ -16,9 +16,35 @@ workspace = true
 mw-component.workspace = true
 mw-types.workspace = true
 mw-proto.workspace = true
+# The pure decoders. `mw_codec::SnowGaugeProto` IS the snow gauge's schema, and this crate
+# hands it the message bytes rather than generating a second one (`crate::codec`).
+mw-codec.workspace = true
+# `Transport`, `Endpoint`, `StationRow`, `StationIdentity` and the two station components'
+# names. The gRPC drivers' bodies live here because `ci/layers.toml` forbids `mw-station`
+# from naming `tonic`; everything about them that is not gRPC lives there.
+mw-station.workspace = true
+# `RouteTable`, which is how a service reaches the one listener. `mw-api-legacy` takes the
+# same route for the same reason: the listener may not name the crates it serves, and this
+# crate is a higher layer than it is.
+mw-http.workspace = true
 
 tonic.workspace = true
 tonic-prost.workspace = true
 prost.workspace = true
+# The gRPC receiver's route is an `axum` one, like every other route table's.
+axum.workspace = true
+http.workspace = true
+# The slot the running receiver installs its handlers into, which is
+# `mw_api_legacy::RouteState`'s pattern (`crate::grpcrx`).
+arc-swap.workspace = true
+# The one receive loop, and the connect timeout the snow gauge client sets.
+tokio.workspace = true
+chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# `macros` for `#[tokio::test]`.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `CancellationToken`, to construct the `Cx` a `Serve` body is handed.
+tokio-util.workspace = true

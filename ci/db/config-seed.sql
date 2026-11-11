@@ -108,8 +108,13 @@ VALUES (6, 'satellite-b:lidar', x'0193f3c2c1607f0ad6c399fe24b71d53', 'lidar',
 -- docs/collector.md §8.3 verbatim: the gRPC listener names the CA and the REST one does
 -- not, with the same `peer_auth`. A per-row NOT NULL would make the second row
 -- unrepresentable, which is why there is no such constraint.
-INSERT INTO ingest (listen, peer_auth, ca_path)
-VALUES ('grpc', 'mtls-ca', '/etc/modernweather/peers-ca.pem');
+-- `allow_insecure` is set because this build serves the gRPC listener over plaintext and
+-- does not enforce `peer_auth` yet, and decision 35 makes that a plan error without the
+-- explicit opt-out (`mw_grpc::GrpcRxPlanError::InsecureIngest`). Set here so this fixture
+-- stays a configuration the daemon will actually start on; it comes back out when M6-4
+-- lands mTLS on the socket.
+INSERT INTO ingest (listen, peer_auth, ca_path, allow_insecure)
+VALUES ('grpc', 'mtls-ca', '/etc/modernweather/peers-ca.pem', 1);
 INSERT INTO ingest (listen, peer_auth)
 VALUES ('rest', 'mtls-ca');
 

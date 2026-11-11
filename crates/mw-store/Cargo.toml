@@ -29,6 +29,12 @@ tokio.workspace = true
 arc-swap.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+# An Ambient station's `?PASSWORD=` is verified against the stored `ingest_secret_hash`,
+# which is an Argon2id PHC string, and compared in constant time once it has verified
+# (D-33). `crate::registry::ConfigRegistry::verify` has the whole of how that is reconciled
+# with D-87's "nothing slow on the admit path".
+argon2.workspace = true
+subtle.workspace = true
 # `db:postgres` observes cancellation at an await inside its own `Serve` loop, which A-W6-1
 # makes explicitly not a second clock. The token is the supervisor's.
 tokio-util.workspace = true

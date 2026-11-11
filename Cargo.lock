@@ -1540,6 +1540,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "mw-types",
+ "prost",
  "serde",
  "serde_json",
  "thiserror",
@@ -1579,11 +1580,20 @@ dependencies = [
 name = "mw-grpc"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
+ "axum",
+ "chrono",
+ "http",
+ "mw-codec",
  "mw-component",
+ "mw-http",
  "mw-proto",
+ "mw-station",
  "mw-types",
  "prost",
  "thiserror",
+ "tokio",
+ "tokio-util",
  "tonic",
  "tonic-prost",
  "tracing",
@@ -1677,6 +1687,7 @@ dependencies = [
 name = "mw-station"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "chrono",
  "metrics",
  "mw-codec",
@@ -1694,12 +1705,14 @@ name = "mw-store"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "argon2",
  "chrono",
  "mw-component",
  "mw-types",
  "secrecy",
  "serde",
  "sqlx",
+ "subtle",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -3768,6 +3781,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "toml",
 ]
 

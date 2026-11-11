@@ -1125,6 +1125,12 @@ pub struct StationRow {
     pub timezone: Option<String>,
     /// `snow_base_distance_mm`: the distance the gauge reads with no snow under it.
     pub snow_base_distance_mm: Option<f64>,
+    /// `wind_dir_correction_degrees`: the vane's offset from north.
+    ///
+    /// Three drivers apply it -- Davis, Campbell and Ambient, which is the set that applies
+    /// it in the Go tree too -- and `mw_codec::WindDirCorrection` is the arithmetic. `0` is
+    /// the column's own default and means a vane that is aligned.
+    pub wind_dir_correction_degrees: i64,
     /// `presented_key` -- the identifier a non-`fixed` station presents.
     pub presented_key: Option<String>,
     /// `ingest_secret_hash` -- the protocol secret's hash, where the protocol has one.
@@ -1185,7 +1191,8 @@ pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbErro
     let rows = sqlx::query(
         "SELECT id, station_key, name, type, enabled, identity_kind, presented_key, \
                 ingest_secret_hash, latitude, longitude, altitude_m, timezone, \
-                snow_base_distance_mm, transport_kind, transport_dev, transport_baud, \
+                snow_base_distance_mm, wind_dir_correction_degrees, \
+                transport_kind, transport_dev, transport_baud, \
                 transport_host, transport_port, transport_url, transport_method, \
                 transport_auth, transport_streaming, transport_mount, transport_group, \
                 transport_topic, transport_tls_ca_path, transport_tls_cert_path, \
@@ -1214,6 +1221,7 @@ pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbErro
                 altitude_m: r.get("altitude_m"),
                 timezone: r.get("timezone"),
                 snow_base_distance_mm: r.get("snow_base_distance_mm"),
+                wind_dir_correction_degrees: r.get("wind_dir_correction_degrees"),
                 transport_kind: r.get("transport_kind"),
                 transport_dev: r.get("transport_dev"),
                 transport_baud: r.get("transport_baud"),
@@ -1423,6 +1431,52 @@ pub struct Node {
     /// the admit rate; it is the `mw_spool_time_remaining_seconds` gauge and a startup
     /// warning the spool itself emits.
     pub spool_max_lag_seconds: i64,
+}
+
+/// One `config.ingest` row.
+///
+/// W7 §8.3's `[[ingest]]`, and "the only thing that makes this node a collector -- no flag,
+/// no mode" (**D-44**) in the table's own words. A node with no row is a satellite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestRow {
+    /// `listen` -- `grpc` or `rest`.
+    pub listen: String,
+    /// `peer_auth` -- `mtls-ca`, `mtls-pinned` or `psk`.
+    pub peer_auth: String,
+    /// `ca_path`, which even an `mtls-*` row may omit: docs/collector.md §8.3 sets the CA on
+    /// the gRPC listener and omits it on the REST one with the same `peer_auth`, so it is a
+    /// node-level trust store a listener may name rather than a per-listener setting.
+    pub ca_path: Option<String>,
+    /// `allow_insecure` -- §5.4's explicit opt-out, which M6-4 is what refuses the absence
+    /// of.
+    pub allow_insecure: bool,
+}
+
+/// Every `config.ingest` row, in `listen` order.
+///
+/// Ordered for the digest's sake rather than for a reader's: `listen` is the primary key, so
+/// the order is total and stable, and a `ConfigDigest` over the rows is then a function of
+/// the table's contents rather than of the order SQLite happened to return them in.
+pub async fn ingest(pool: &SqlitePool) -> Result<Vec<IngestRow>, ConfigDbError> {
+    let rows = sqlx::query(
+        "SELECT listen, peer_auth, ca_path, allow_insecure FROM ingest ORDER BY listen",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|source| ConfigDbError::Query {
+        what: "the ingest rows",
+        source,
+    })?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(IngestRow {
+                listen: r.get("listen"),
+                peer_auth: r.get("peer_auth"),
+                ca_path: r.get("ca_path"),
+                allow_insecure: flag(&r, "allow_insecure")?,
+            })
+        })
+        .collect()
 }
 
 /// Read the node row, if this node has one.
