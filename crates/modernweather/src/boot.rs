@@ -75,7 +75,15 @@ use crate::spool;
 /// here and edits nothing else -- the shape `managers/controller.go` could not take, down to
 /// its `if con.Type == "management" { continue }`.
 const REGISTRARS: &[&dyn Registrar<Config>] = &[
-    &Stations, &Database, &Rollup, &Snapshot, &Legacy, &Web, &Listener,
+    &Stations,
+    &SnowGauges,
+    &ReadingReceiver,
+    &Database,
+    &Rollup,
+    &Snapshot,
+    &Legacy,
+    &Web,
+    &Listener,
 ];
 
 /// `mw-station`'s registrar.
@@ -102,6 +110,62 @@ impl Registrar<Config> for Stations {
         // `PlanError::Registrar` carries a `reason: String`, so a `#[source]` chain that
         // was not walked here would lose every level but the first.
         mw_station::register(cfg, out)
+            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
+    }
+}
+
+/// `mw-grpc`'s snow gauge registrar.
+///
+/// **A second station registrar, and `ci/layers.toml` is why.** `mw-station` may not name
+/// `tonic`, so the component that dials a gauge cannot live there — what lives there is
+/// everything about the gauge that is not gRPC: the `type` value, the component id, and the
+/// plan-time validation of the row (`mw_station::snowgauge`). So `mw_station::register`
+/// checks a `snowgauge` row and emits nothing, and this emits the component for the rows it
+/// checked.
+///
+/// The two therefore read the **same** rows and mint the **same** ids, which is the one
+/// property that has to hold: the registry resolves a `Fixed` frame *by its receiver*, so
+/// an id mismatch would be a gauge whose every reading is `unknown_station` with nothing
+/// naming it. `mw_station::fixed_receivers` is the third caller of that same function, and
+/// `crates/mw-station/tests/plan.rs` asserts the three agree.
+#[derive(Debug)]
+struct SnowGauges;
+
+impl Registrar<Config> for SnowGauges {
+    fn name(&self) -> &'static str {
+        "mw-grpc:snowgauge"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        mw_grpc::snowgauge::register(cfg, out)
+            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
+    }
+}
+
+/// `station:grpcrx` — `mw-grpc`'s reading receiver.
+///
+/// Conditional on a `config.ingest` row with `listen = 'grpc'`, which is the only thing
+/// that makes this node a collector (W7 **D-44**). The state slot it installs into is built
+/// beside the listener's route tables in [`attach_listener`], because the route has to exist
+/// before `plan()` runs — `mw_api_legacy::RouteState`'s reason, one more time.
+#[derive(Debug)]
+struct ReadingReceiver;
+
+impl Registrar<Config> for ReadingReceiver {
+    fn name(&self) -> &'static str {
+        "mw-grpc:grpcrx"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        mw_grpc::grpcrx::register(cfg, cfg.grpcrx_service.as_ref(), out)
             .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
     }
 }
@@ -518,6 +582,8 @@ fn attach_ingress(cfg: &mut Config, fanout: &spool::Fanout) -> anyhow::Result<()
 /// |---|---|
 /// | `/metrics` | none -- §5.10 puts it on the one listener, so every node has it |
 /// | the frozen REST surface | the same predicate `mw_api_legacy::register` plans on |
+/// | the Ambient ingest endpoint | the same predicate `mw_station::register` plans on |
+/// | the reading receiver's two methods | a `config.ingest` row with `listen = 'grpc'` |
 /// | the asset tree, `/privacy`, `/support` | none |
 /// | one per website | the same predicate `mw_web::register` plans on |
 ///
@@ -581,6 +647,22 @@ fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<
             state.endpoint(),
         ));
         cfg.set_ambient_upload(state);
+    }
+    // The reading receiver's two methods, on the same predicate `mw_grpc::grpcrx::register`
+    // plans on: a `config.ingest` row with `listen = 'grpc'`. A node with no such row is a
+    // satellite and mounts nothing, which is W7 D-44.
+    if cfg
+        .ingest
+        .iter()
+        .any(|row| row.listen == mw_grpc::IngestRow::GRPC)
+    {
+        let state = Arc::new(mw_grpc::grpcrx::ServiceState::new());
+        tables.push(
+            mw_grpc::grpcrx::route_table(Arc::clone(&state))
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .context("building the reading receiver's route table")?,
+        );
+        cfg.set_grpcrx_service(state);
     }
     tables.extend(mw_web::tables(cfg).context("building the website's route tables")?);
 
@@ -991,8 +1073,11 @@ mod tests {
             websites: Vec::new(),
             legacy_websites: Vec::new(),
             legacy_stations: Vec::new(),
+            ingest: Vec::new(),
+            declared_ingest: Vec::new(),
             legacy_routes: None,
             ambient_upload: None,
+            grpcrx_service: None,
             legacy_render: None,
             snapshot_render: None,
             ingress: None,

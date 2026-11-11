@@ -1443,6 +1443,52 @@ pub struct Node {
 /// the row it writes also needs a `spool_path`, which has no default in the schema and no
 /// value in any design document -- so inventing one here would be this work item deciding
 /// something implementation-plan.md M6-4 owns.
+/// One `config.ingest` row.
+///
+/// W7 §8.3's `[[ingest]]`, and "the only thing that makes this node a collector -- no flag,
+/// no mode" (**D-44**) in the table's own words. A node with no row is a satellite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestRow {
+    /// `listen` -- `grpc` or `rest`.
+    pub listen: String,
+    /// `peer_auth` -- `mtls-ca`, `mtls-pinned` or `psk`.
+    pub peer_auth: String,
+    /// `ca_path`, which even an `mtls-*` row may omit: docs/collector.md §8.3 sets the CA on
+    /// the gRPC listener and omits it on the REST one with the same `peer_auth`, so it is a
+    /// node-level trust store a listener may name rather than a per-listener setting.
+    pub ca_path: Option<String>,
+    /// `allow_insecure` -- §5.4's explicit opt-out, which M6-4 is what refuses the absence
+    /// of.
+    pub allow_insecure: bool,
+}
+
+/// Every `config.ingest` row, in `listen` order.
+///
+/// Ordered for the digest's sake rather than for a reader's: `listen` is the primary key, so
+/// the order is total and stable, and a `ConfigDigest` over the rows is then a function of
+/// the table's contents rather than of the order SQLite happened to return them in.
+pub async fn ingest(pool: &SqlitePool) -> Result<Vec<IngestRow>, ConfigDbError> {
+    let rows = sqlx::query(
+        "SELECT listen, peer_auth, ca_path, allow_insecure FROM ingest ORDER BY listen",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|source| ConfigDbError::Query {
+        what: "the ingest rows",
+        source,
+    })?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(IngestRow {
+                listen: r.get("listen"),
+                peer_auth: r.get("peer_auth"),
+                ca_path: r.get("ca_path"),
+                allow_insecure: flag(&r, "allow_insecure")?,
+            })
+        })
+        .collect()
+}
+
 pub async fn node(pool: &SqlitePool) -> Result<Option<Node>, ConfigDbError> {
     let row = sqlx::query(
         "SELECT node_id, node_name, timezone, spool_path, \

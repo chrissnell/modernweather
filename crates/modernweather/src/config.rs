@@ -39,6 +39,21 @@ pub struct Config {
     pub weather_database: Option<WeatherDatabase>,
     /// This node's identity, if it has started before. `None` is a first start.
     pub node: Option<Node>,
+
+    /// Every `config.ingest` row, as the columns hold it.
+    ///
+    /// **Its emptiness is meaningful**: a node with no row is a satellite and has no
+    /// receiver, which is W7 **D-44**'s "no flag, no mode" (`mw_grpc::grpcrx`).
+    pub ingest: Vec<config_db::IngestRow>,
+
+    /// The same rows in the shape `mw-grpc` plans from.
+    ///
+    /// `pub(crate)` for [`Config::declared_stations`]' reason, and a second type for the
+    /// same reason that one is: `mw-store` owns the query and may not name `mw-grpc`,
+    /// `mw-grpc` owns what an ingest row is and may not name `mw-store`, and the binary is
+    /// the one place they meet (§1.3 rule 1). The copy is four lines of nothing, and it is
+    /// what buys the property that neither crate can grow the other's job.
+    pub(crate) declared_ingest: Vec<mw_grpc::IngestRow>,
     /// Every `config.stations` row, as the columns hold it. The registry's snapshot is
     /// built from these, because it needs `ingest_secret_hash` -- which is not a station
     /// *driver's* concern and is deliberately absent from the row below.
@@ -120,6 +135,13 @@ pub struct Config {
     /// `station:ambient` installs its handler into it while the component is `Running`.
     pub(crate) ambient_upload: Option<Arc<mw_station::ambient::UploadState>>,
 
+    /// The reading receiver's state slot, once `main` has built it.
+    ///
+    /// A root resource for [`Config::ambient_upload`]'s reason exactly: the service is a
+    /// route on the one listener, built before `plan()` runs, and `station:grpcrx` installs
+    /// its handlers into this slot while it is `Running`.
+    pub(crate) grpcrx_service: Option<Arc<mw_grpc::grpcrx::ServiceState>>,
+
     /// The frozen DTO's serialiser, once `main` has built it.
     ///
     /// **This is the one line M4-1 said would change.** `snapshot:latest` and
@@ -199,6 +221,7 @@ impl Config {
     /// Read the configuration. Step 4 of the boot sequence.
     pub async fn load(pool: &SqlitePool) -> Result<Self, ConfigDbError> {
         let stations = config_db::stations(pool).await?;
+        let ingest = config_db::ingest(pool).await?;
         let websites = config_db::websites(pool).await?;
         // `aerisWeatherEnabled` is a `station_service` row with `service = 'aeris'` rather
         // than a column -- the `website` table's own comment says so -- and it is folded
@@ -212,6 +235,8 @@ impl Config {
             listener: config_db::listener(pool).await?,
             weather_database: config_db::weather_database(pool).await?,
             node: config_db::node(pool).await?,
+            declared_ingest: ingest.iter().map(declare_ingest).collect(),
+            ingest,
             declared_stations: stations.iter().map(declare).collect(),
             legacy_websites: websites.iter().map(declare_website).collect(),
             legacy_stations: stations.iter().map(declare_station).collect(),
@@ -224,6 +249,7 @@ impl Config {
             snapshot_windows: None,
             legacy_routes: None,
             ambient_upload: None,
+            grpcrx_service: None,
             legacy_render: None,
             snapshot_render: None,
             station_zones: Vec::new(),
@@ -289,6 +315,14 @@ impl Config {
         self.legacy_routes = Some(routes);
         self.snapshot_render = Some(Arc::clone(&render) as Arc<dyn mw_component::SnapshotRender>);
         self.legacy_render = Some(render);
+    }
+
+    /// Hand the configuration the reading receiver's state slot.
+    ///
+    /// Built beside the listener's route tables, for [`Config::set_ambient_upload`]'s
+    /// reason.
+    pub fn set_grpcrx_service(&mut self, state: Arc<mw_grpc::grpcrx::ServiceState>) {
+        self.grpcrx_service = Some(state);
     }
 
     /// Hand the configuration the Ambient ingest endpoint's state slot.
@@ -401,6 +435,7 @@ impl std::fmt::Debug for Config {
             .field("snapshot", &self.snapshot.is_some())
             .field("legacy_routes", &self.legacy_routes.is_some())
             .field("ambient_upload", &self.ambient_upload.is_some())
+            .field("grpcrx_service", &self.grpcrx_service.is_some())
             .field("generation", &self.generation)
             .finish()
     }
@@ -417,6 +452,28 @@ impl mw_station::StationConfig for Config {
 
     fn ambient_upload_state(&self) -> Option<&Arc<mw_station::ambient::UploadState>> {
         self.ambient_upload.as_ref()
+    }
+}
+
+impl mw_grpc::SnowGaugeConfig for Config {
+    fn stations(&self) -> &[mw_station::StationRow] {
+        // The same rows `mw_station::register` dispatches over, because the two registrars
+        // dispatch on the same `type` column (`mw_grpc::config`).
+        &self.declared_stations
+    }
+
+    fn ingress(&self) -> Option<&Arc<dyn Ingress>> {
+        self.ingress.as_ref()
+    }
+}
+
+impl mw_grpc::GrpcIngestConfig for Config {
+    fn ingest(&self) -> &[mw_grpc::IngestRow] {
+        &self.declared_ingest
+    }
+
+    fn ingress(&self) -> Option<&Arc<dyn Ingress>> {
+        self.ingress.as_ref()
     }
 }
 
@@ -673,6 +730,20 @@ fn declare_station(row: &config_db::StationRow) -> mw_api_legacy::StationView {
     }
 }
 
+/// One `config.ingest` row, as the gRPC crate declares its receiver from.
+///
+/// Column into field, and nothing else: every decision is `mw_grpc::grpcrx::register`'s,
+/// because the crate that owns what a receiver is is the crate that should decide whether
+/// to plan one.
+fn declare_ingest(row: &config_db::IngestRow) -> mw_grpc::IngestRow {
+    mw_grpc::IngestRow {
+        listen: row.listen.clone(),
+        peer_auth: row.peer_auth.clone(),
+        ca_path: row.ca_path.clone(),
+        allow_insecure: row.allow_insecure,
+    }
+}
+
 /// One `config.stations` row, as the station crate declares components from.
 ///
 /// Column into field, and nothing else: every validation is `mw_station`'s, because the
@@ -729,8 +800,11 @@ mod tests {
             websites: Vec::new(),
             legacy_websites: Vec::new(),
             legacy_stations: Vec::new(),
+            ingest: Vec::new(),
+            declared_ingest: Vec::new(),
             legacy_routes: None,
             ambient_upload: None,
+            grpcrx_service: None,
             legacy_render: None,
             snapshot_render: None,
             ingress: None,

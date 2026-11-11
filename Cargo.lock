@@ -1580,11 +1580,20 @@ dependencies = [
 name = "mw-grpc"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
+ "axum",
+ "chrono",
+ "http",
+ "mw-codec",
  "mw-component",
+ "mw-http",
  "mw-proto",
+ "mw-station",
  "mw-types",
  "prost",
  "thiserror",
+ "tokio",
+ "tokio-util",
  "tonic",
  "tonic-prost",
  "tracing",
