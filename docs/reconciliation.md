@@ -1204,6 +1204,7 @@ something it does not read. *Behavioural* — a byte a client does read, or coul
 | **DEV-9** | The enrich stage computes `windchill`, `heatindex`, `aqi_pm25_aqin`, `aqi_pm10_aqin`, `potentialsolarwatts` and `snowdepth` **at ingest and stores them**, for every station rather than for the one driver that computed each; `windchill` and `heatindex` are `NULL` rather than the air temperature where their formula does not apply; and the clear-sky model reads the **station's** longitude instead of the **server's** time zone | **R1** (W3 §2.5), applied by implementation-plan.md **M3-3** | behavioural — **changes what five stored series mean**, and **needs the owner's acknowledgement** | **On the wire: one key changes, and it is `potentialsolarwatts`. In the database: five columns change meaning.** The distinction is the whole of this entry and the first draft of it got it wrong, so it is stated before the parts: the Go **read path** already computed three of these per request, so the JSON a client sees for them does not change — what changes is the *column*, which is what `/span`'s aggregate levels and every future query read. Taken in four parts. **(1) `windchill`/`heatindex` — the column changes, the JSON cannot.** The Go drivers store the *air temperature* where the formula does not apply (`utils.go:CalculateWindChill` returns `tempF` above 50 °F or below 3 mph); this stores `NULL`. The frozen JSON is unaffected **because the frozen handler never reads the column**: `transform.go:18` recomputes both from `OutTemp` plus wind speed or humidity on every request, which is exactly what `metrics/registry.toml`'s `legacy_read_time_computed` flag records and what `docs/metric-registry.md` §6.1 means by "the column and the JSON key are not guaranteed to be the same number". **So M4-2 must recompute them too, and this entry is the reason that is now a constraint rather than an open question** — reading the column and zero-filling it would produce `mean(windchill)` where Go produces `windchill(mean(outtemp), mean(windspeed))`, and those differ by more than rounding: for a bucket of two readings at (40 °F, 10 mph) and (60 °F, 10 mph), Go emits 46.04 and the column-mean path emits 33.64. Recorded as a constraint on M4-2 in the plan. The column itself improves either way: a stored `windchill == outtemp` is indistinguishable from a real wind chill and makes the column's `min` and `mean` the temperature's for every summer bucket. **(2) `potentialsolarwatts` — the one key that changes on the wire.** Only the Go **Campbell** driver computed it, so the column is NULL for every other station type and the frozen DTO zero-fills it; it is now computed for any station whose configuration has **coordinates** and whose reading carries **`outtemp` and `outhumidity`** (the model needs all three, so a station with coordinates and no humidity sensor still stores NULL). Where the Go daemon's own time zone is the station's — the production configuration, and the only one in which the Go behaviour is correct — the two agree to **1.1 × 10⁻¹² W/m²** over five zones × 53 days × 24 hours, measured against the Go function. They differ in two cases, both Go defects: a daemon whose zone is not the station's (`pkg/solar/asce.go` reads `time.Local`, and D-24 already says every calendar quantity is the station's), and any station in the eastern hemisphere, where Go's meridian table maps `+7` to 105° exactly as it maps `-7` and the offset doubles instead of cancelling. **(3) `snowdepth` — column only.** Computed per request in Go from a per-website cache (`restserver/controller.go:903`), so the **column** and every aggregate bucket are NULL today while the **response** already carries a number for any snow site with a configured base distance. The arithmetic is unchanged (`base_distance - snowdistance`, with Go's own `snowdistance > 0` guard) and it now reaches storage, which is what gets it into the aggregate levels. One consequence Go does not have: the Go snow-gauge driver discards a distance greater than the base at the device (`snowgauge/station.go:172`), so Go never stored a negative depth and this will — a mis-set base distance now contaminates `min`/`mean`/`max` buckets rather than leaving a gap. The enrich stage is the wrong layer to filter at (it is handed an already-admitted reading), so the discard is recorded as a constraint on **M6-1**'s snow-gauge driver in the plan. **(4) The two AQI keys — column only, and one naming oddity worth knowing.** The Go handler reads the column only when it is greater than zero and **computes otherwise** on both `/latest` and `/span` (`transform.go:209`, called per bucket at `:80`), so a client was never charting a flat zero here; the column is now populated from the same EPA table in `pkg/aqi/aqi.go`, so the handler's stored branch returns the number its computed branch would have. The oddity: `aqi_pm25_aqin` is derived from **`pm25`** (the outdoor sensor) and not from `pm25_in_aqin`, because that is what `transform.go:216` does. Faithful, and newly *stored* — so a station with only an outdoor particulate sensor and no AQIN device now has a permanently populated `aqi_pm25_aqin` column where Go left it NULL and carried the number only in the response. Every formula, constant, guard condition and `f32` rounding is asserted bit-for-bit against values produced by **running** the Go code at `c3ec9f7`. |
 | **DEV-14** | The nine configuration values leave `/js/weather-app.js` and arrive as JSON: inline as `<script id="mw-config" type="application/json">`, plus an additive `GET /config.json` | **D-38**, as extended by A-3 and A-W3-3; applied by implementation-plan.md **M4-3** | behavioural — **changes the body of one coupled response and adds a block to another** | **Yes, and that is the point.** `text/template` has no JavaScript context awareness, so a station name containing an apostrophe broke the page and one containing `';alert(1);//` **executed**; the values now pass through a JSON encoder and never through a code generator. The affected response is `coupled` (**D-68**): server and website ship as one binary, so both halves moved in one commit. `contract/fixtures/asset-weather-app-js` therefore asserts three substrings that identify the module on **both** targets rather than four that identify the generated literal on one — the deviation mechanism cannot carry an assertion, only a recorded response (`contract/conformance/src/lib.rs:432`). What the suite stops checking is checked by `crates/mw-web`'s tests: the inline block's key set and order, its byte agreement with `/config.json`, and the byte diff against `html-weather-station`'s recorded body. `/latest` and the other four frozen endpoints are untouched. |
 | **DEV-15** | A static asset carries no `Accept-Ranges`, so a range request gets the whole file | implementation-plan.md **M4-3**, as a consequence of serving the embedded tree from a handler rather than from `http.ServeContent` | behavioural — **removes a capability** | **No shipped client uses it.** Go's `ServeContent` advertises `Accept-Ranges: bytes` and honours `Range` on every asset; `mw_web::assets` writes the whole body. The tree is CSS, JavaScript, fonts and three icons, the largest of which is 125 kB, and no fixture asserts the header. Recorded rather than left to be discovered, because it is a byte a client *could* read. Re-adding it is a `Range` parse and a slice, and the reason not to is that a partial-content path with no consumer is a code path nothing exercises. |
+| **DEV-16** | The five remaining drivers store **NULL** where the Go drivers store `0.0`, and four of them read a value Go reads wrongly or not at all | implementation-plan.md **M6-1**, under **D-3** and **D-26** | behavioural — **changes what the columns of five station types mean**, and **needs the owner's acknowledgement** | **On the wire: nothing. In the database: a great many columns.** The distinction is the whole of this entry and it is the same one DEV-9 draws. Every absent float on the frozen surface is zero-filled one layer later by `mw_api_legacy::zf` (§1.7), so `/latest` and `/span` are byte-identical; what changes is the **column**, which is what every aggregate level and every future query read. Taken in six parts. **(a) A sensor that is not connected is NULL.** Each of the Go drivers writes zero for an absent reading, by a different mechanism: Davis's eleven `conv*` helpers return `0` for the console's dashed value (`davis/station.go:720-780`), Campbell's and AirGradient's response structs are non-pointer `float32` so a key the device omits stays at its zero value, and Ambient's hundred-and-thirty `parseFloat` calls leave their target untouched on absence. The symptom is the same in all four: a Vantage with no leaf/soil station stores a tidy row of zeros, so `min(soiltemp1)` over a month is 0 °F rather than NULL, and an Ambient console with no indoor sensor stores `intemp = 0.0` — which is 0 °F — on every upload. **(b) Davis: the specification's dashed value, not only the one Go tests for.** The dashed value of a 16-bit temperature is `32767`; `convBigVal10` tests `-32768`. So a Vantage whose outdoor transmitter is out of range stores **3276.7 °F** under Go, and that enters `max(outtemp)` and every aggregate above it. Both values are refused here. **(c) Davis: a LOOP2 record is refused rather than decoded as a LOOP record.** The two share the header and the length and have different layouts; the Go driver's protection is that it never sends `LPS`, which is a property of a different file. **(d) Campbell: `wind_d` is read as a number.** The Go struct types it `uint16`, so one fractional degree fails `json.Unmarshal`, which returns an error from `ParseCampbellScientificPackets`, which closes the connection — the station is down until the datalogger's next whole-numbered output. **(e) AirGradient: the uncompensated field is read when the compensated one is absent.** Go reads only `atmpCompensated`, so an older firmware that reports `atmp` alone makes it store `celsiusToFahrenheit(0.0)` = **32 °F**, every three seconds, for a monitor that is working. This is the one part of this entry that is a **new behaviour** rather than a NULL: the raw field is the same sensor less one firmware-side correction, which is a better answer than both 32 °F and nothing. **(f) The snow gauge reports its distance when no base distance is configured.** `BaseSnowDistance` is a non-nullable `float64` in Go, so an unconfigured gauge has a base of zero and `reading.Distance > 0` discards **every** reading — a gauge that reports nothing until somebody notices. The column here is nullable with a `CHECK (> 0)`, so "not configured" is expressible: the distance is stored and `mw_pipeline::enrich` derives no depth from it, because it has no base either. **Every part is asserted against the Go emulators at the pinned commit** — `tests/emulators/manifest.toml` — rather than reasoned about. |
 
 
 **DEV-4 answers W9's OQ-W9-4 in the affirmative**, which is what W9 asked W6 to decide. It belongs
@@ -2307,7 +2308,7 @@ A-W2-1 and A-W2-2, W2a's D-30 split, W3's A-W3-1 to A-W3-4, W4's A-W4-1 to A-W4-
 A-W5-3, W7's A-W7-1 to A-W7-4, W8's A-1 to A-4 and W9's A-W9-1 to A-W9-3. All are applied there under
 the protocol; none is edited in place. See `docs/DESIGN.md`'s `## Amendments` section.
 
-This document proposes **one** amendment of its own, which is not to a decision. Eleven more
+This document proposes **one** amendment of its own, which is not to a decision. Thirteen more
 were appended later by implementation items and are marked as such.
 
 **A-M4-2-1 — a `Soft` capability handle is read when it is used, not once at build.**
@@ -2757,3 +2758,88 @@ knowingly changes a byte a shipped client could observe", and an alert code is s
 DEV-6 is **for** is unaffected: the Go version iterates a map and hands out an arbitrary certificate,
 which is non-deterministic between runs and produces a browser interstitial that blames the user. A
 refusal is diagnosable either way.
+
+**A-M6-1-1 — D-32's crate table has no row for a serial line rate, and this build cannot set one.**
+*Proposed by implementation-plan.md **M6-1**, 2026-11-11. Not applied: the protocol above reserves
+that for a work item that owns the ledger. **The implementation carries on under the existing
+decision**, which is what the protocol asks for — `crates/mw-station/src/stream.rs` records the gap
+at its one call site and warns once per connect, naming the station and the configured rate.*
+
+*What was found.* **D-32** names the default crate for each idiom the daemon needs and **A-W3-1**
+added seven rows for idioms it had not named, on the grounds that *"it should be complete for the
+daemon, or it is a list that answers some questions and silently delegates others"*. Opening a
+**serial port** is such an idiom, and no row names it. M6-1 is the item that needs one: W2a §4a.5
+gives both Davis and Campbell `Serial | TcpOut`, and implementation-plan.md M6-1 requires a `socat`
+pty pair for exactly that transport.
+
+What a serial port needs beyond a file descriptor is **`tcsetattr`** — the line rate, eight bits, no
+parity, raw mode — and reaching it needs either `libc` or a serial-port crate. Neither is in D-32's
+table, and `[workspace.lints.rust]` sets `unsafe_code = "warn"`, which `-D warnings` makes an error,
+so hand-rolling the `ioctl` is not available either.
+
+*What this build does instead.* `crates/mw-station/src/stream.rs` opens the character device with
+`O_NONBLOCK | O_NOCTTY` and polls it through `tokio::io::unix::AsyncFd`, which needs no new
+dependency. **`transport_baud` is therefore recorded and not applied**: the line discipline is
+whatever the device already has. Three consequences, each stated at that module rather than left to
+be discovered:
+
+- a **`socat` pty pair works completely**, because a pty has no line rate — which is the whole of W3
+  **D-83**'s test level, and `tests/emulators/manifest.toml`'s `davis` and `campbell` entries
+  exercise it against the pinned emulators;
+- a **`ser2net` bridge works completely**, because the bridge owns the line — which is **N-20**'s
+  production path, the owner's Campbell being on USB serial with the daemon moving into Kubernetes;
+- a **directly attached console works if and only if the line is already configured**, by a `udev`
+  rule, by `stty`, or because the kernel default matches. The symptom when it is not is *not*
+  silence: the bytes arrive framed wrong, so every Davis packet fails its CRC-16 and every Campbell
+  line fails to parse, and `mw_station_frames_total{outcome="undecodable"}` and
+  `mw_station_resync_bytes_total` both count every one. `open` also logs the configured rate and the
+  fact that it was not applied, once per connect, naming the station.
+
+*What replaces it.* D-32's table gains a row:
+
+| Concern | Crate | Why this one |
+|---|---|---|
+| Serial port configuration | `tokio-serial` | the `tokio` idiom for a `tcsetattr`-configured port; wraps `mio-serial`/`serialport`, so one crate covers the open, the line rate and the async read |
+
+*Why this is more than inconvenient.* It is the one transport in W2a §4a.5's table that this build
+cannot fully serve, and the failure mode is a station whose readings are all refused — which is the
+shape of defect this programme keeps finding. It is also a *one-line* fix once the row exists: the
+`AsyncFd` path becomes a `tokio_serial::SerialStream` and the `ByteStream` impl is unchanged.
+
+**A-M6-1-2 — D-87 and §4a.6 are both satisfiable for an Ambient secret, by verifying it once per
+snapshot rather than once per reading.**
+*Proposed by implementation-plan.md **M6-1**, 2026-11-11. An addition to D-87's reasoning rather
+than a contradiction of it; **applied in the code**, because `mw_store::registry`'s own comment
+assigned the reconciliation to this item.*
+
+*What was found.* Three decisions meet on one line of the admit path and the previous build could not
+satisfy all three. **W2a §4a.6** requires Ambient's `?PASSWORD=` to be compared against the
+registry's copy; the stored copy is an Argon2id PHC string, as `admin_credential.password_phc` is, so
+that a stolen `config.db` does not hand over a reusable secret; **D-33** requires the comparison to
+be constant-time; and **D-87** requires `admit` to do no I/O and nothing slow, which is why
+`StationRegistry::resolve` is a synchronous `fn` rather than a future. An Argon2 verification per
+reading is exactly what cannot go there, and `mw_store::registry`'s comment said so and returned
+`Reject::BadSecret` unconditionally — a correct answer that made the Ambient driver unusable.
+
+*What replaces it.* `ConfigRegistry::verify`:
+
+- the **first** upload that presents a secret pays for one Argon2 verification — once per station,
+  per published snapshot;
+- every **later** upload is a `subtle` constant-time comparison against the secret that verified. An
+  Ambient console sends the same string every minute for years, so the cache hits essentially always;
+- a **failure is never cached**, and while a station has no verified secret a verification is
+  attempted at most once per second. Without that bound, a flood of wrong passwords is a flood of
+  memory-hard hashes — one upload's worth of CPU per packet, which is a denial of service against a
+  node's own admission path. Refusals inside the interval are `bad_secret` and are counted like any
+  other, so the condition is visible;
+- `publish` clears the cache, so a rotated hash is what the next upload is verified against.
+
+*What it costs, stated.* A verified secret is held in memory in the clear for the life of the
+snapshot. It is the same material the console transmits in a query string on every upload, it is a
+`SecretString` so it redacts itself in every `Debug` and log field, and it never reaches a disk.
+
+*Why this is more than inconvenient.* Without it the Ambient driver cannot admit a reading at all,
+and §4a.6's entire argument is that the endpoint's authentication is the thing the Go version does
+not have. The parameters differ from the administrator password's deliberately —
+`mw_store::registry::hash_ingest_secret` has the three reasons — and the PHC string carries its own,
+so a hash written by any other tool still verifies.
