@@ -1696,12 +1696,14 @@ name = "mw-store"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "argon2",
  "chrono",
  "mw-component",
  "mw-types",
  "secrecy",
  "serde",
  "sqlx",
+ "subtle",
  "thiserror",
  "tokio",
  "tokio-util",

@@ -36,14 +36,19 @@
 //! (M7-1).
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use argon2::password_hash::PasswordHash;
+use argon2::{Argon2, PasswordVerifier};
 use mw_component::{
     ComponentId, FrameMeta, IdentitySource, Reject, StationMeta, StationProjection,
     StationRegistry, Zone, ZoneError,
 };
 use mw_types::StationKey;
+use secrecy::{ExposeSecret, SecretString};
+use subtle::ConstantTimeEq;
 
 use crate::config_db::StationRow;
 
@@ -70,8 +75,14 @@ pub struct StationEntry {
     /// is the only driver — but this is the authentication gate, and one field now is
     /// cheaper than auditing three drivers later.
     pub identity: IdentitySource,
-    /// Whether the protocol presents a secret that has to be verified.
-    pub has_secret: bool,
+    /// The stored `ingest_secret_hash`, for the one identity strategy that presents a
+    /// secret.
+    ///
+    /// An Argon2id PHC string, as `admin_credential.password_phc` is. `None` is a station
+    /// whose protocol has no secret — every transport but `from_query` — and a `from_query`
+    /// station with `None` here is a row [`crate::registry::RegistrySnapshot::secret_problems`]
+    /// reports and `mw_station::plan` refuses, because its uploads cannot be authenticated.
+    pub secret_phc: Option<String>,
     /// What the enrich stage reads (**R1**, W3 §2.5).
     pub meta: StationMeta,
     /// What the weather schema's `stations` projection should say (**D-56**, W4 §2.1).
@@ -190,10 +201,10 @@ impl RegistrySnapshot {
                 zone,
                 enabled: row.enabled,
                 identity,
-                has_secret: row
+                secret_phc: row
                     .ingest_secret_hash
-                    .as_deref()
-                    .is_some_and(|h| !h.is_empty()),
+                    .clone()
+                    .filter(|hash| !hash.trim().is_empty()),
                 meta: StationMeta {
                     latitude: row.latitude,
                     longitude: row.longitude,
@@ -269,23 +280,104 @@ impl RegistrySnapshot {
         self.by_receiver.len()
     }
 
-    /// The stations carrying a secret nothing can verify yet, for the startup warning.
+    /// Stored ingest secrets that will never verify anything, for the startup warning.
     ///
-    /// See [`ConfigRegistry::admit`]: such a station resolves to `BadSecret` on every
-    /// frame, which is the right answer and an invisible one until traffic arrives.
-    pub fn unverifiable_secrets(&self) -> Vec<&StationKey> {
-        self.by_claim
-            .values()
-            .filter(|e| e.has_secret)
-            .map(|e| &e.station)
-            .collect()
+    /// Both kinds are **reachable, not unreachable**, and neither is visible from the
+    /// counters alone: `mw_readings_rejected_total{bad_secret}` only moves when traffic
+    /// arrives, and a station that never reports looks exactly like a station that is
+    /// switched off. So they are reported once, at startup, by
+    /// `crates/modernweather/src/boot.rs`.
+    pub fn secret_problems(&self) -> Vec<SecretProblem> {
+        let mut out = Vec::new();
+        for entry in self.by_station.values() {
+            let Some(phc) = entry.secret_phc.as_deref() else {
+                continue;
+            };
+            if entry.identity != IdentitySource::FromQuery {
+                out.push(SecretProblem::NotConsulted {
+                    station: entry.station.clone(),
+                    identity: entry.identity,
+                });
+            } else if PasswordHash::new(phc).is_err() {
+                out.push(SecretProblem::Unparseable {
+                    station: entry.station.clone(),
+                });
+            }
+        }
+        out
     }
+}
+
+/// A stored ingest secret that cannot authenticate anything.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SecretProblem {
+    /// A secret on a station whose identity strategy presents none.
+    ///
+    /// Nothing ties `ingest_secret_hash` to `identity_kind` in the schema, so a hash pasted
+    /// onto a WeatherLink Live row is a row the schema accepts, `plan()` does not look at,
+    /// and no frame ever consults — a configured credential that is silently ignored.
+    #[error(
+        "station `{station}` has an ingest secret and its identity is `{identity}`, which \
+         presents none: only an `from_query` station's `?PASSWORD=` is verified against it, \
+         so this secret authenticates nothing. Clear `ingest_secret_hash`, or correct \
+         `identity_kind`."
+    )]
+    NotConsulted {
+        /// Which station.
+        station: StationKey,
+        /// Its configured strategy.
+        identity: IdentitySource,
+    },
+
+    /// A secret that is not a hash this build can verify against.
+    ///
+    /// Every upload from that station is then `bad_secret` for the life of the process, with
+    /// nothing naming the station — which is a station that reports nothing and an operator
+    /// who has no way to find out why.
+    #[error(
+        "station `{station}`'s `ingest_secret_hash` is not an Argon2 PHC string, so every \
+         upload from it will be refused. Set the secret again."
+    )]
+    Unparseable {
+        /// Which station.
+        station: StationKey,
+    },
+}
+
+/// How often one station's secret may be verified against its stored hash while no
+/// verification has succeeded.
+///
+/// The rate limit [`ConfigRegistry::verify`] exists for: see its documentation. One second
+/// is two orders of magnitude above an Ambient console's own upload cadence and two orders
+/// below what an Argon2 verification per request would cost.
+const VERIFY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What is known about one station's secret, after the first upload that presented one.
+#[derive(Debug, Default)]
+struct SecretState {
+    /// The secret that last verified against the stored hash.
+    ///
+    /// **Plaintext, in memory, for the life of the snapshot**, and that is the trade this
+    /// whole mechanism is: it is the same material the console puts in a query string on
+    /// every upload, it is a `SecretString` so it redacts itself in every `Debug` and log
+    /// field, and it never reaches a disk. What it buys is one Argon2 verification per
+    /// station per snapshot instead of one per reading, which is what makes a memory-hard
+    /// hash compatible with **D-87** at all.
+    verified: Option<SecretString>,
+    /// When a verification was last attempted while [`SecretState::verified`] was `None`.
+    last_attempt: Option<Instant>,
 }
 
 /// The `StationRegistry` the daemon runs on.
 #[derive(Debug)]
 pub struct ConfigRegistry {
     snapshot: ArcSwap<RegistrySnapshot>,
+    /// One [`SecretState`] per station that has presented a secret, cleared whenever a
+    /// snapshot is published -- because a published snapshot may carry a rotated hash, and
+    /// a cache that outlived it would keep accepting the old secret. That is the one
+    /// property the hand-written `Hash` on a station row exists for one layer up
+    /// (`mw_station::StationRow`), stated here for the other half of the same rotation.
+    secrets: Mutex<BTreeMap<StationKey, SecretState>>,
 }
 
 impl ConfigRegistry {
@@ -293,6 +385,7 @@ impl ConfigRegistry {
     pub fn new(snapshot: RegistrySnapshot) -> Self {
         Self {
             snapshot: ArcSwap::from_pointee(snapshot),
+            secrets: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -302,11 +395,107 @@ impl ConfigRegistry {
     /// module's documentation for what that costs and who owns closing it.
     pub fn publish(&self, snapshot: RegistrySnapshot) {
         self.snapshot.store(Arc::new(snapshot));
+        // Before or after the store, and it has to be after: a reader that verified
+        // against the old snapshot between the clear and the store would repopulate the
+        // cache with the old secret. Clearing second means the worst case is one extra
+        // Argon2 verification, which is the direction to be wrong in.
+        self.secrets
+            .lock()
+            .expect("the secret cache is not poisoned")
+            .clear();
     }
 
     /// The snapshot, for a test and for the startup log line.
     pub fn snapshot(&self) -> Arc<RegistrySnapshot> {
         self.snapshot.load_full()
+    }
+
+    /// Verify a presented secret against one station's stored hash.
+    ///
+    /// # The D-87 reconciliation, which is this item's to make
+    ///
+    /// **D-33** requires a credential comparison to be constant-time and **W2a §4a.6**
+    /// requires Ambient's `?PASSWORD=` to be compared against the registry's copy; the
+    /// stored copy is an Argon2id PHC string, as `admin_credential.password_phc` is, so
+    /// that a stolen configuration database does not hand over a reusable secret. **D-87**
+    /// requires `admit` to do no I/O and nothing slow, and `resolve` is synchronous
+    /// *because of that requirement* — so an Argon2 verification per reading is exactly
+    /// what cannot go here. This function is how the two are both satisfied:
+    ///
+    /// - **The first upload that presents a secret pays for an Argon2 verification.** Once
+    ///   per station, per published snapshot.
+    /// - **Every later upload is a `subtle` constant-time comparison** against the secret
+    ///   that verified. An Ambient console sends the same string every minute for years, so
+    ///   the cache hits essentially always.
+    /// - **A failure is never cached**, and while a station has no verified secret a
+    ///   verification is attempted at most once per [`VERIFY_INTERVAL`]. Without that, a
+    ///   flood of wrong passwords would be a flood of memory-hard hashes — one upload's
+    ///   worth of CPU per packet, which is a denial of service against a node's own
+    ///   admission path. Refusals inside the interval are `BadSecret` and are counted like
+    ///   any other (`mw_readings_rejected_total{reason}`), so the condition is visible.
+    ///
+    /// What this costs is written on [`SecretState::verified`]: a verified secret is held in
+    /// memory in the clear for the life of the snapshot. It is the same material the console
+    /// transmits in a URL on every upload.
+    fn verify(&self, entry: &StationEntry, presented: Option<&SecretString>) -> Result<(), Reject> {
+        let Some(phc) = entry.secret_phc.as_deref() else {
+            // No stored secret: there is nothing to compare against, so nothing can be
+            // authenticated. `mw_station::plan` refuses a `from_query` station in this
+            // state and `RegistrySnapshot::secret_problems` reports one that reached here
+            // anyway; failing closed is what makes those two a belt and a brace rather
+            // than the only thing standing between an unauthenticated upload and the spool.
+            return Err(Reject::BadSecret);
+        };
+        let Some(presented) = presented else {
+            // The protocol requires the parameter and the driver refuses an upload without
+            // one, so this is a frame from somewhere else entirely.
+            return Err(Reject::BadSecret);
+        };
+
+        let mut cache = self
+            .secrets
+            .lock()
+            .expect("the secret cache is not poisoned");
+        let state = cache.entry(entry.station.clone()).or_default();
+        if let Some(verified) = &state.verified {
+            // The hot path: constant-time, and `subtle` rather than `==` because a
+            // short-circuiting comparison on a credential is a timing oracle (**D-33**).
+            if verified
+                .expose_secret()
+                .as_bytes()
+                .ct_eq(presented.expose_secret().as_bytes())
+                .into()
+            {
+                return Ok(());
+            }
+            // A second secret for the same station cannot be right while this snapshot is
+            // live -- `publish` clears the cache -- so this is a wrong password and is
+            // refused without a verification. Rate-limiting it is unnecessary for the same
+            // reason: the expensive path is not reached.
+            return Err(Reject::BadSecret);
+        }
+
+        let now = Instant::now();
+        if let Some(last) = state.last_attempt {
+            if now.duration_since(last) < VERIFY_INTERVAL {
+                return Err(Reject::BadSecret);
+            }
+        }
+        state.last_attempt = Some(now);
+        let Ok(parsed) = PasswordHash::new(phc) else {
+            // Not a hash this build can verify against. Reported at startup by
+            // `RegistrySnapshot::secret_problems`, because the counter alone does not name
+            // the station.
+            return Err(Reject::BadSecret);
+        };
+        if Argon2::default()
+            .verify_password(presented.expose_secret().as_bytes(), &parsed)
+            .is_err()
+        {
+            return Err(Reject::BadSecret);
+        }
+        state.verified = Some(presented.clone());
+        Ok(())
     }
 
     fn admit(entry: &StationEntry, source: IdentitySource) -> Result<StationKey, Reject> {
@@ -320,24 +509,6 @@ impl ConfigRegistry {
         }
         if !entry.enabled {
             return Err(Reject::Disabled);
-        }
-        if entry.has_secret {
-            // Fail closed. A station with `ingest_secret_hash` set is an Ambient station,
-            // whose `?PASSWORD=` has to be verified in constant time against the stored
-            // hash (W2a §4a.6, **D-33**) -- and that verification is Argon2, which costs
-            // ~100 ms by design and therefore has to be reconciled with **D-87**'s "no I/O
-            // and nothing slow on the admit path" before it goes here. That is M6-1's, with
-            // the driver that presents a secret.
-            //
-            // **Reachable, not unreachable.** Nothing ties `ingest_secret_hash` to
-            // `identity_kind`, so a hash pasted onto a WeatherLink Live row is a row the
-            // schema accepts and `plan()` does not look at: the listener binds, the daemon
-            // reports ready, and every datagram is counted `bad_secret` with nothing naming
-            // the station. The counter alone only moves when traffic arrives, so
-            // `crates/modernweather/src/boot.rs` warns once per such row at startup
-            // instead. Refusing is still the right answer -- the alternative is a
-            // configured secret that is silently ignored.
-            return Err(Reject::BadSecret);
         }
         Ok(entry.station.clone())
     }
@@ -358,11 +529,19 @@ impl StationRegistry for ConfigRegistry {
                     .as_deref()
                     .ok_or(Reject::UnknownStation)?
                     .to_ascii_lowercase();
-                snapshot
+                let entry = snapshot
                     .by_claim
                     .get(&claim)
-                    .ok_or(Reject::UnknownStation)
-                    .and_then(|entry| Self::admit(entry, source))
+                    .ok_or(Reject::UnknownStation)?;
+                let station = Self::admit(entry, source)?;
+                // The secret check is **after** the strategy and the enabled flag and
+                // **before** the key is handed back, which is the only ordering that both
+                // fails closed and does not spend an Argon2 verification on a frame that
+                // was going to be refused anyway.
+                if source == IdentitySource::FromQuery {
+                    self.verify(entry, meta.presented_secret.as_ref())?;
+                }
+                Ok(station)
             }
         }
     }
@@ -415,6 +594,7 @@ mod tests {
             altitude_m: Some(1609.0),
             timezone: Some("America/Denver".into()),
             snow_base_distance_mm: Some(1500.0),
+            wind_dir_correction_degrees: 0,
             transport_kind: Some("udp_in".into()),
             transport_dev: None,
             transport_baud: None,
@@ -590,22 +770,187 @@ mod tests {
 
     /// Fail closed: a configured secret that nothing verifies would be worse than a refusal.
     #[test]
-    fn a_station_with_a_configured_secret_is_refused_until_something_verifies_it() {
-        let mut rows = vec![row("ambient:backyard", Some("KAMBIENT1"))];
-        // An Ambient station: `from_query`, because the strategy check runs first and a
-        // `from_payload` row presented on a query transport is `UnknownStation` before the
-        // secret is ever reached.
-        rows[0].identity_kind = "from_query".into();
-        rows[0].kind = "ambient-customized".into();
-        rows[0].ingest_secret_hash = Some("$argon2id$v=19$...".into());
-        let registry = ConfigRegistry::new(RegistrySnapshot::new(&rows, []));
-        let meta = FrameMeta::presenting(
+    fn a_station_whose_stored_secret_is_not_a_hash_refuses_every_upload() {
+        let registry = ConfigRegistry::new(RegistrySnapshot::new(
+            &[ambient_row("$argon2id$v=19$...")],
+            [],
+        ));
+        assert_eq!(
+            registry.resolve(&presenting_secret("hunter2")),
+            Err(Reject::BadSecret)
+        );
+        // ... and the startup check names it, because the counter alone does not.
+        let problems = registry.snapshot().secret_problems();
+        assert!(
+            matches!(&problems[..], [SecretProblem::Unparseable { station }]
+                     if station.as_str() == "ambient:backyard"),
+            "{problems:?}"
+        );
+    }
+
+    /// An Ambient station row: `from_query`, because the strategy check runs first and a
+    /// `from_payload` row presented on a query transport is `UnknownStation` before the
+    /// secret is ever reached.
+    fn ambient_row(phc: &str) -> StationRow {
+        let mut row = row("ambient:backyard", Some("KAMBIENT1"));
+        row.identity_kind = "from_query".into();
+        row.kind = "ambient-customized".into();
+        row.ingest_secret_hash = Some(phc.to_string());
+        row
+    }
+
+    fn presenting_secret(secret: &str) -> FrameMeta {
+        FrameMeta::presenting(
             id("station:ambient"),
             IdentitySource::FromQuery,
             "KAMBIENT1",
             at(),
+        )
+        .with_secret(SecretString::from(secret.to_string()))
+    }
+
+    /// An Argon2id PHC string for `secret`, at the cheapest parameters the crate permits --
+    /// which is what keeps this test file from spending a second per hash. The PHC carries
+    /// its own parameters, so what `verify` does with it is unaffected.
+    fn phc(secret: &str) -> String {
+        use argon2::password_hash::{PasswordHasher, SaltString};
+        let params = argon2::Params::new(
+            argon2::Params::MIN_M_COST,
+            argon2::Params::MIN_T_COST,
+            argon2::Params::MIN_P_COST,
+            None,
+        )
+        .expect("the crate's own minimum parameters");
+        let argon = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+        argon
+            .hash_password(
+                secret.as_bytes(),
+                &SaltString::encode_b64(b"0123456789abcdef").expect("a literal salt"),
+            )
+            .expect("hashing a literal")
+            .to_string()
+    }
+
+    /// The whole of the D-87 reconciliation, as behaviour: the right secret verifies, the
+    /// wrong one does not, and a station with no stored secret is refused rather than
+    /// admitted.
+    #[test]
+    fn the_right_secret_verifies_and_the_wrong_one_does_not() {
+        let registry =
+            ConfigRegistry::new(RegistrySnapshot::new(&[ambient_row(&phc("hunter2"))], []));
+        assert_eq!(
+            registry.resolve(&presenting_secret("hunter2")),
+            Ok(StationKey::new("ambient:backyard"))
         );
+        // Again, which is the cached path: constant-time, no hash.
+        assert_eq!(
+            registry.resolve(&presenting_secret("hunter2")),
+            Ok(StationKey::new("ambient:backyard"))
+        );
+        assert_eq!(
+            registry.resolve(&presenting_secret("hunter3")),
+            Err(Reject::BadSecret)
+        );
+        // No secret presented at all: the driver refuses such an upload, so this is a frame
+        // from somewhere else.
+        let mut meta = presenting_secret("hunter2");
+        meta.presented_secret = None;
         assert_eq!(registry.resolve(&meta), Err(Reject::BadSecret));
+    }
+
+    /// **The rate limit**, which is what stops a password flood becoming a flood of
+    /// memory-hard hashes. Nothing has verified yet, so the first attempt is the only one
+    /// inside the interval that reaches Argon2 -- and a later correct secret is refused
+    /// until the interval passes, which is the cost and is bounded.
+    #[test]
+    fn a_failed_verification_is_not_cached_and_is_rate_limited() {
+        let registry =
+            ConfigRegistry::new(RegistrySnapshot::new(&[ambient_row(&phc("hunter2"))], []));
+        assert_eq!(
+            registry.resolve(&presenting_secret("wrong")),
+            Err(Reject::BadSecret)
+        );
+        // Inside the interval, so this is refused WITHOUT a verification even though it is
+        // the right secret. Recorded as the behaviour rather than discovered: an operator
+        // who has just fixed a console's password waits up to one second.
+        assert_eq!(
+            registry.resolve(&presenting_secret("hunter2")),
+            Err(Reject::BadSecret)
+        );
+        // Reaching past the interval is what makes the next attempt verify. The interval is
+        // one second and the test does not sleep for it: the state is reached directly,
+        // which asserts the mechanism rather than the wall clock.
+        registry
+            .secrets
+            .lock()
+            .expect("not poisoned")
+            .get_mut(&StationKey::new("ambient:backyard"))
+            .expect("one attempt has been made")
+            .last_attempt = Some(Instant::now() - VERIFY_INTERVAL * 2);
+        assert_eq!(
+            registry.resolve(&presenting_secret("hunter2")),
+            Ok(StationKey::new("ambient:backyard"))
+        );
+    }
+
+    /// A rotated secret must not keep verifying against the cached one.
+    #[test]
+    fn publishing_a_snapshot_clears_the_verified_secret() {
+        let registry = ConfigRegistry::new(RegistrySnapshot::new(&[ambient_row(&phc("old"))], []));
+        assert!(registry.resolve(&presenting_secret("old")).is_ok());
+        registry.publish(RegistrySnapshot::new(&[ambient_row(&phc("new"))], []));
+        assert_eq!(
+            registry.resolve(&presenting_secret("old")),
+            Err(Reject::BadSecret),
+            "the rotated hash is what the next upload is verified against"
+        );
+        // And the new one verifies -- after the interval, because the attempt above spent
+        // this station's budget.
+        registry
+            .secrets
+            .lock()
+            .expect("not poisoned")
+            .get_mut(&StationKey::new("ambient:backyard"))
+            .expect("one attempt has been made")
+            .last_attempt = Some(Instant::now() - VERIFY_INTERVAL * 2);
+        assert!(registry.resolve(&presenting_secret("new")).is_ok());
+    }
+
+    /// A secret on a station whose strategy presents none authenticates nothing, and the
+    /// startup check is the only thing that would ever say so.
+    #[test]
+    fn a_secret_on_a_station_that_presents_none_is_reported_at_startup() {
+        let mut row = row("suncrest:roof", Some("001D0A700002"));
+        row.ingest_secret_hash = Some(phc("hunter2"));
+        let snapshot = RegistrySnapshot::new(&[row], []);
+        let problems = snapshot.secret_problems();
+        assert!(
+            matches!(&problems[..], [SecretProblem::NotConsulted { station, identity }]
+                     if station.as_str() == "suncrest:roof"
+                        && *identity == IdentitySource::FromPayload),
+            "{problems:?}"
+        );
+        assert!(problems[0].to_string().contains("authenticates nothing"));
+        // ... and it does not affect that station's own resolution, which has no secret.
+        let registry = ConfigRegistry::new(snapshot);
+        let meta = FrameMeta::presenting(
+            id("station:wll:udp:22222"),
+            IdentitySource::FromPayload,
+            "001D0A700002",
+            at(),
+        );
+        assert_eq!(
+            registry.resolve(&meta),
+            Ok(StationKey::new("suncrest:roof")),
+            "a secret nothing consults does not refuse the frames that do arrive"
+        );
+    }
+
+    #[test]
+    fn a_healthy_configuration_has_no_secret_problems() {
+        let snapshot = RegistrySnapshot::new(&[ambient_row(&phc("hunter2"))], []);
+        assert!(snapshot.secret_problems().is_empty());
+        assert!(registry().snapshot().secret_problems().is_empty());
     }
 
     #[test]

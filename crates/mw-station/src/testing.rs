@@ -213,11 +213,12 @@ impl Ingress for RecordingIngress {
 /// real character device rather than over a transcript. One end is the daemon's
 /// `transport_dev`; the other is where an emulator writes.
 ///
-/// **`socat` is a test dependency and `spawn` returns `None` without it**, rather than
-/// panicking. That is not a skipped check: `tests/emulators/manifest.toml`'s `davis` and
-/// `campbell` entries are the gate that fails loudly when the pair cannot be made, and a
-/// unit test that panicked on a developer's machine without `socat` would be a worse
-/// version of the same signal.
+/// **`socat` is a declared test dependency of this crate and every caller `expect`s the
+/// pair.** `spawn` returns `None` so that the caller's message can say what is missing and
+/// why, and **not** so that the test can skip: a check that silently does nothing is
+/// `docs/reconciliation.md` G-1, which is the failure this whole item's gate exists against.
+/// The cost is that `cargo test -p mw-station` needs `socat` on `PATH`, which is recorded
+/// here, in each caller's `expect` and in the pull request rather than discovered.
 #[derive(Debug)]
 pub struct PtyPair {
     child: tokio::process::Child,

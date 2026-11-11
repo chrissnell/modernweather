@@ -238,10 +238,11 @@ async fn a_station_whose_device_does_not_exist_is_a_build_failure() {
 /// emulator written in the test itself.
 #[tokio::test]
 async fn a_davis_station_over_a_pty_pair_wakes_the_console_and_admits_two_runs() {
-    let Some(pair) = PtyPair::spawn("driver-davis").await else {
-        eprintln!("skipping: socat is not on PATH");
-        return;
-    };
+    let pair = PtyPair::spawn("driver-davis").await.expect(
+        "`socat` is a test dependency of this crate: W3 D-83 requires the serial path to \
+         be exercised over a real character device, and a pty pair is how. Install it, or \
+         run `cargo test -p mw-station -- --skip pty`.",
+    );
     let ingress = RecordingIngress::accepting();
     let station = Box::new(
         StreamStation::connect(

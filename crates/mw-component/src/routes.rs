@@ -349,13 +349,13 @@ impl UploadReply {
 /// a field here and a reason beside it.
 ///
 /// **There is no peer address, and that is a gap rather than a decision.** A refusal log
-/// that said *who* was pointing a station at this node would be strictly better, and
-/// `axum::serve` is called without `into_make_service_with_connect_info`
-/// (`mw_http::socket`), so no handler in this workspace can see one. Adding it is a change
-/// to how all three sockets are served — including the TLS listener's wrapper type — which
-/// is `http:listener`'s surface and not a driver's. Recorded so the next reader does not
-/// take the absence for a judgement: what a refusal names today is the station claim, which
-/// is the other half of the same sentence.
+/// that said *who* was pointing a station at this node would be strictly better, and the one
+/// listener serves without `into_make_service_with_connect_info` (`mw_http::socket`), so no
+/// handler in this workspace can see one. Adding it is a change to how all three sockets are
+/// served — including the TLS listener's wrapper type — which is `http:listener`'s surface
+/// and not a driver's. Recorded so the next reader does not take the absence for a
+/// judgement: what a refusal names today is the station claim, which is the other half of
+/// the same sentence.
 #[derive(Debug, Clone)]
 pub struct Upload {
     /// Everything after the `?`, undecoded. Decoding is the codec's

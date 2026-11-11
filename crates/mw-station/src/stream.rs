@@ -435,12 +435,12 @@ mod tests {
     }
 
     // There is no unit test here that connects to a listener this crate bound, and that is
-    // `ci/layers.toml`'s `only-mw-http-binds-a-socket` rule rather than an omission: the
-    // needle list includes `TcpListener` and the scan covers `tests/` as well as `src/`, so
-    // only `mw-http` may open one anywhere in this workspace. What exercises the TCP path
-    // end to end is `tests/emulator.rs` against `cmd/davis-emulator` and
-    // `cmd/campbell-emulator`, which bind their own ports in their own processes -- which is
-    // the stronger test anyway, and is what W3 D-82's third level means.
+    // `ci/layers.toml`'s `only-mw-http-binds-a-socket` rule rather than an omission: its
+    // needle list names the listener types and the scan covers `tests/` as well as `src/`,
+    // so only `mw-http` may open one anywhere in this workspace. What exercises the TCP
+    // path end to end is `tests/emulator.rs` against `cmd/davis-emulator` and
+    // `cmd/campbell-emulator`, which bind their own ports in their own processes -- the
+    // stronger test anyway, and what W3 D-82's third level means.
 
     #[tokio::test]
     async fn the_two_configuration_mistakes_plan_refuses_are_still_named_here() {
@@ -475,10 +475,13 @@ mod tests {
     /// `tests/emulators/manifest.toml` is, and it fails loudly.
     #[tokio::test]
     async fn a_pty_pair_round_trips_bytes_in_both_directions() {
-        let Some(pair) = crate::testing::PtyPair::spawn("stream-roundtrip").await else {
-            eprintln!("skipping: socat is not on PATH");
-            return;
-        };
+        let pair = crate::testing::PtyPair::spawn("stream-roundtrip")
+            .await
+            .expect(
+                "`socat` is a test dependency of this crate: W3 D-83 requires the serial \
+                 path to be exercised over a real character device, and a pty pair is how. \
+                 Install it, or run `cargo test -p mw-station -- --skip pty`.",
+            );
         let serial = |dev: &Path| Transport::Serial {
             dev: dev.to_path_buf(),
             baud: 19_200,

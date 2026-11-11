@@ -112,6 +112,14 @@ pub struct Config {
     /// running" one fact (`mw_api_legacy::component`).
     pub(crate) legacy_routes: Option<Arc<mw_api_legacy::RouteState>>,
 
+    /// The Ambient ingest endpoint's state slot, once `main` has built it.
+    ///
+    /// A root resource for [`Config::legacy_routes`]' reason exactly: the route is an
+    /// `axum` one and `mw-station` may not name `axum`, so what travels is a closure over
+    /// this slot and the binary is the only place the two crates meet (§1.3 rule 1).
+    /// `station:ambient` installs its handler into it while the component is `Running`.
+    pub(crate) ambient_upload: Option<Arc<mw_station::ambient::UploadState>>,
+
     /// The frozen DTO's serialiser, once `main` has built it.
     ///
     /// **This is the one line M4-1 said would change.** `snapshot:latest` and
@@ -215,6 +223,7 @@ impl Config {
             snapshot: None,
             snapshot_windows: None,
             legacy_routes: None,
+            ambient_upload: None,
             legacy_render: None,
             snapshot_render: None,
             station_zones: Vec::new(),
@@ -280,6 +289,14 @@ impl Config {
         self.legacy_routes = Some(routes);
         self.snapshot_render = Some(Arc::clone(&render) as Arc<dyn mw_component::SnapshotRender>);
         self.legacy_render = Some(render);
+    }
+
+    /// Hand the configuration the Ambient ingest endpoint's state slot.
+    ///
+    /// Built beside the listener's route tables, because the route is one of them: the slot
+    /// has to exist before `plan()` runs, for [`Config::set_legacy`]'s reason.
+    pub fn set_ambient_upload(&mut self, state: Arc<mw_station::ambient::UploadState>) {
+        self.ambient_upload = Some(state);
     }
 
     /// Hand the configuration the per-website state slots.
@@ -383,6 +400,7 @@ impl std::fmt::Debug for Config {
             .field("rollup", &self.rollup.is_some())
             .field("snapshot", &self.snapshot.is_some())
             .field("legacy_routes", &self.legacy_routes.is_some())
+            .field("ambient_upload", &self.ambient_upload.is_some())
             .field("generation", &self.generation)
             .finish()
     }
@@ -395,6 +413,10 @@ impl mw_station::StationConfig for Config {
 
     fn ingress(&self) -> Option<&Arc<dyn Ingress>> {
         self.ingress.as_ref()
+    }
+
+    fn ambient_upload_state(&self) -> Option<&Arc<mw_station::ambient::UploadState>> {
+        self.ambient_upload.as_ref()
     }
 }
 
@@ -685,6 +707,14 @@ fn declare(row: &config_db::StationRow) -> mw_station::StationRow {
             }),
         wll_sensor_mapping: row.wll_sensor_mapping.clone(),
         wll_poll_interval_seconds: row.wll_poll_interval_seconds,
+        wind_dir_correction_degrees: row.wind_dir_correction_degrees,
+        snow_base_distance_mm: row.snow_base_distance_mm,
+        // The bit, not the hash: `mw-station` plans and never verifies, so what it needs is
+        // whether this station *can* be authenticated (`mw_station::StationRow`).
+        has_ingest_secret: row
+            .ingest_secret_hash
+            .as_deref()
+            .is_some_and(|hash| !hash.is_empty()),
     }
 }
 
@@ -700,6 +730,7 @@ mod tests {
             legacy_websites: Vec::new(),
             legacy_stations: Vec::new(),
             legacy_routes: None,
+            ambient_upload: None,
             legacy_render: None,
             snapshot_render: None,
             ingress: None,

@@ -1125,6 +1125,12 @@ pub struct StationRow {
     pub timezone: Option<String>,
     /// `snow_base_distance_mm`: the distance the gauge reads with no snow under it.
     pub snow_base_distance_mm: Option<f64>,
+    /// `wind_dir_correction_degrees`: the vane's offset from north.
+    ///
+    /// Three drivers apply it -- Davis, Campbell and Ambient, which is the set that applies
+    /// it in the Go tree too -- and `mw_codec::WindDirCorrection` is the arithmetic. `0` is
+    /// the column's own default and means a vane that is aligned.
+    pub wind_dir_correction_degrees: i64,
     /// `presented_key` -- the identifier a non-`fixed` station presents.
     pub presented_key: Option<String>,
     /// `ingest_secret_hash` -- the protocol secret's hash, where the protocol has one.
@@ -1185,7 +1191,8 @@ pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbErro
     let rows = sqlx::query(
         "SELECT id, station_key, name, type, enabled, identity_kind, presented_key, \
                 ingest_secret_hash, latitude, longitude, altitude_m, timezone, \
-                snow_base_distance_mm, transport_kind, transport_dev, transport_baud, \
+                snow_base_distance_mm, wind_dir_correction_degrees, \
+                transport_kind, transport_dev, transport_baud, \
                 transport_host, transport_port, transport_url, transport_method, \
                 transport_auth, transport_streaming, transport_mount, transport_group, \
                 transport_topic, transport_tls_ca_path, transport_tls_cert_path, \
@@ -1214,6 +1221,7 @@ pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbErro
                 altitude_m: r.get("altitude_m"),
                 timezone: r.get("timezone"),
                 snow_base_distance_mm: r.get("snow_base_distance_mm"),
+                wind_dir_correction_degrees: r.get("wind_dir_correction_degrees"),
                 transport_kind: r.get("transport_kind"),
                 transport_dev: r.get("transport_dev"),
                 transport_baud: r.get("transport_baud"),

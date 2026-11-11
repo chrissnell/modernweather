@@ -343,20 +343,14 @@ fn attach_registry(cfg: &mut Config) -> anyhow::Result<()> {
         receivers = snapshot.receivers(),
         "station registry published"
     );
-    // A station carrying `ingest_secret_hash` resolves to `Reject::BadSecret` on every
-    // frame until M6-1 brings the driver that verifies one (`mw_store::registry`). That is
-    // the correct answer and an invisible one: the counter only moves when the station
-    // sends something, so a hash pasted onto the wrong row is a station that reports
-    // nothing with nothing anywhere naming it. Said once, at startup, where an operator
-    // reading the boot log can act on it.
-    for station in snapshot.unverifiable_secrets() {
-        warn!(
-            %station,
-            "this station has an ingest secret configured and no driver in this build can \
-             verify one, so every reading from it will be refused. \
-             implementation-plan.md M6-1 adds the driver that presents one; until then, \
-             clear `ingest_secret_hash` for a station that does not need it."
-        );
+    // A stored ingest secret that will never verify anything. Both kinds are invisible
+    // from the counters alone -- `mw_readings_rejected_total{bad_secret}` only moves when
+    // the station sends something, so a hash pasted onto the wrong row is a station that
+    // reports nothing with nothing anywhere naming it. Said once, at startup, where an
+    // operator reading the boot log can act on it
+    // (`mw_store::registry::RegistrySnapshot::secret_problems`).
+    for problem in snapshot.secret_problems() {
+        warn!(problem = %problem, "a configured ingest secret authenticates nothing");
     }
     // **The validation the W4 migration's comment claimed the writer did.** The writer
     // copies `config.stations.timezone` and substitutes `'UTC'` for a NULL or blank one
@@ -572,6 +566,21 @@ fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<
         if let Some(state) = cfg.legacy_routes.as_ref().map(Arc::clone) {
             tables.push(mw_api_legacy::route_table(state)?);
         }
+    }
+    // The Ambient ingest endpoint: one route, however many consoles. Built from the
+    // registrar's own predicate (`mw_station::ambient_mount`) rather than from a second
+    // reading of the configuration, and `assert_route_tables_match_the_plan` checks after
+    // `plan()` that the two agreed -- which is the pairing M4-2's review found broken in
+    // the other direction on the frozen surface.
+    if let Some(mount) = mw_station::ambient_mount(cfg) {
+        let state = Arc::new(mw_station::ambient::UploadState::new());
+        tables.push(mw_http::upload_table(
+            mw_component::ComponentId::new(mw_station::ambient::ID)
+                .context("`station:ambient` is not a usable component id")?,
+            &mount,
+            state.endpoint(),
+        ));
+        cfg.set_ambient_upload(state);
     }
     tables.extend(mw_web::tables(cfg).context("building the website's route tables")?);
 
@@ -983,6 +992,7 @@ mod tests {
             legacy_websites: Vec::new(),
             legacy_stations: Vec::new(),
             legacy_routes: None,
+            ambient_upload: None,
             legacy_render: None,
             snapshot_render: None,
             ingress: None,
