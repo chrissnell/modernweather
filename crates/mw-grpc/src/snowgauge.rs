@@ -203,7 +203,17 @@ impl SnowGauge {
         // An empty `StreamRequest`: the message has one optional field and this build sets
         // none of it, so it encodes to no bytes (`crate::codec`).
         let request = tonic::Request::new(Vec::new());
-        let stream = tonic::client::Grpc::new(connected)
+        let mut grpc = tonic::client::Grpc::new(connected);
+        // **`ready` before the call**, which a generated client does and which `tonic`
+        // panics without: the channel is a `tower` service whose buffer has to be reserved
+        // before an item is sent. Observed as
+        // `send_item called without first calling poll_reserve` rather than as a `Status`,
+        // which is why it is a line of its own with this comment on it.
+        grpc.ready().await.map_err(|source| DialError::Stream {
+            authority: authority.clone(),
+            source: tonic::Status::unavailable(source.to_string()),
+        })?;
+        let stream = grpc
             .server_streaming(request, path, BytesCodec)
             .await
             .map_err(|source| DialError::Stream {

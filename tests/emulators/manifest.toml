@@ -34,20 +34,36 @@
 #                       `cargo xtask emulator-tests` refuses an emulator whose files have
 #                       moved.
 #
-#   this-repository     written here, beside the driver. Keeps everything on that list
-#                       except independent authorship, so it cannot catch a
-#                       misunderstanding the emulator and the driver share.
+#   this-repository     the emulator's BEHAVIOUR is written here, beside the driver. Keeps
+#                       everything on that list except independent authorship, so it cannot
+#                       catch a misunderstanding the emulator and the driver share.
+#
+#                       An entry with this origin may STILL carry `[emulator.files]`, and
+#                       two do: the snow gauge's and the satellite's generated protobuf
+#                       stubs are the reference's own, vendored and digest-verified, so
+#                       their PROTOCOL is independently defined and only their numbers are
+#                       not. `origin` describes the behaviour; `files` describes which
+#                       files came from the pin. `cargo xtask emulator-tests` prints which
+#                       half is which on every run.
 #
 #   reference           checked out of the pinned repository at test time. Nothing is this,
 #                       for the reason above; the value exists so that an entry which
 #                       becomes one has a name for it.
 #
-# **The reference repository has no WeatherLink Live, AirGradient or Ambient emulator at
-# that commit.** Its four are `cmd/davis-emulator`, `cmd/campbell-emulator`,
-# `cmd/weather-station-simulator` (Davis on TCP 22222 and Campbell on TCP 7000) and
-# `cmd/live-data-simulator` (Campbell packets from live data). The first two are vendored
-# below; the other three emulators here are written in this repository because there is
-# nothing to vendor and the repository is read-only to this programme.
+# **The reference repository has exactly two station emulators at that commit**, and both
+# are vendored below. Its `cmd/` holds four: `cmd/davis-emulator`,
+# `cmd/campbell-emulator`, `cmd/weather-station-simulator` (Davis on TCP 22222 and Campbell
+# on TCP 7000) and `cmd/live-data-simulator` (Campbell packets from live data) -- the last
+# two being other arrangements of the first two's devices. There is no WeatherLink Live,
+# AirGradient, Ambient, snow gauge or satellite emulator there, so those five are written
+# here; the repository is read-only to this programme, so one cannot be added there.
+#
+# **Two emulators are not standard-library-only.** `snowgauge` and `grpcrx` speak gRPC, so
+# `go build` needs a populated module cache or the network; each commits its `go.sum`, so the
+# build is reproducible but not offline on a machine that has never fetched `grpc-go`. The
+# alternative was hand-rolling HTTP/2 and HPACK from the standard library, which would not
+# exercise a gRPC client or a gRPC service at all. Recorded here because it is the one
+# property the other five have and these two do not.
 #
 # **For the WeatherLink Live that remains a decision for the programme owner.** The honest
 # fix is a `cmd/weatherlink-live-emulator` in the reference tree, written against the vendor
@@ -289,29 +305,128 @@ real spool. Only the configuration rows and the clock are stood in for.
       `success`, which is what the Go handler writes and what a console's firmware looks
       for."""
 
-# ---------------------------------------------------------------------------------------
-# Declared, not yet runnable. Each needs a driver this build does not have, and the gate
-# prints them so the set is visible on every run rather than remembered — the same reason
-# `cargo xtask gates` prints the deferred set.
-#
-# These are NOT skipped checks. There is nothing to check: `mw_station::plan` refuses a
-# station of any of these types by name, so a configuration that needed one fails at
-# startup rather than quietly collecting nothing.
-
-[[pending]]
+[[emulator]]
 id = "snowgauge"
-emulates = "The snow gauge — a gRPC server streaming `snowgauge.Reading`"
-reference_path = ""
-driver = "implementation-plan.md M6-1 (mw_grpc::snowgauge)"
+emulates = "The snow gauge -- `SnowGaugeService/StreamReading`, a gRPC server stream"
+driver = "mw_grpc::snowgauge + mw_codec::SnowGaugeProto (implementation-plan.md M6-1)"
+origin = "this-repository"
+path = "tests/emulators/snowgauge"
+package = "mw-grpc"
+test_target = "emulator_snowgauge"
+test_names = [
+    "every_message_becomes_a_reading_with_the_distance_the_gauge_sent",
+    "a_distance_past_the_base_is_discarded_and_the_stream_continues",
+    "an_unconfigured_gauge_still_reports_its_distance",
+    "a_gauge_that_closes_its_stream_is_a_retryable_failure",
+    "a_gauge_that_is_not_listening_is_a_build_failure",
+]
 note = """
-The codec and the discard are done and tested (`mw_codec::SnowGaugeProto`, including DEV-9's
-"a distance greater than the configured base distance is a fault"), and `mw_station::plan`
-validates a `snowgauge` row and mints its component id. What is pending is the gRPC
-**client** that dials the gauge and the emulator that answers it.
+`origin = "this-repository"` and **half of it is not**: the reference tree has no snow gauge
+emulator at the pinned commit, but it does have the generated stubs, and those are vendored
+here byte for byte and digest-verified below. So the PROTOCOL -- the service name, the method
+name, the field numbers, the wire types -- is the reference's own `protoc` output, and only
+the behaviour is written here. README.md in that directory has why that split is the one
+that matters: `mw_codec::SnowGaugeProto` declares two fields of a four-field message BY HAND
+(the layer rule puts `mw-proto` in its own layer), and nothing had checked that declaration
+against the schema a real gauge was generated from.
 
-Both belong to `mw-grpc`: `ci/layers.toml` forbids `mw-station` from naming `tonic`, because
-§1.4 gives the gRPC socket and every gRPC service to `mw-http` and `mw-grpc`. So this entry
-stays pending and `crates/mw-station/src/snowgauge.rs` records the split -- a `snowgauge`
-row is accepted by `plan()` and produces no component, which is a configured station that
-collects nothing. **That is the one gap in M6-1 and it is named in the pull request rather
-than left to be found here.**"""
+**It is also the first of two emulators here that are not standard-library-only.** It speaks
+gRPC, so `go build` needs a populated module cache or the network; `go.sum` is committed, so
+it is reproducible but not offline on a machine that has never fetched `grpc-go`. The
+alternative was hand-rolling HTTP/2 and HPACK, which would not exercise a gRPC client at all.
+
+  every_message_becomes_a_reading_with_the_distance_the_gauge_sent
+      five messages, five readings, with the distances in the range the emulator sends -- a
+      wrong field tag would be zero and a wrong wire type would not decode.
+  a_distance_past_the_base_is_discarded_and_the_stream_continues
+      `-fault 3`, which sends a distance GREATER than the configured base every third
+      reading. **DEV-9's constraint on this item**: `snowgauge/station.go:171` discards it at
+      the device, and M3-3 moved `snowdepth` to ingest -- so without the discard such a
+      reading stores a NEGATIVE depth into a column with min/mean/max aggregates over it.
+  an_unconfigured_gauge_still_reports_its_distance
+      and the same emulator flags with no base distance configured DO admit the faults, which
+      is what makes the test above non-vacuous. It is also the one departure from Go: an
+      unconfigured gauge there has a base of zero and reports nothing at all.
+  a_gauge_that_closes_its_stream_is_a_retryable_failure
+      `-hangup`. A gauge that has stopped reporting is not a gauge that has finished, so the
+      body returns an error the supervisor reconnects from (D-27) rather than `Ok`.
+  a_gauge_that_is_not_listening_is_a_build_failure
+      the emulator is killed and the driver dials its port. `BuildError::Resource` naming the
+      station and the address, which is a backoff -- where
+      `logger.Fatalf("SnowGauge station [%s] must define a hostname and port")` takes the
+      whole daemon down."""
+
+[emulator.files]
+"remoteweather/protocols/snowgauge/snowgauge.pb.go" = "7ea347c3b76445a80e95e7b4a10c2275dc6bdcfa6bc97570f28797ecdc45a3ec"
+"remoteweather/protocols/snowgauge/snowgauge_grpc.pb.go" = "ab2f0708777dc87377af9238b342f92767986aeda85d3a66b0d1e535c09e4878"
+
+[[emulator]]
+id = "grpcrx"
+emulates = "A Go-era satellite -- `WeatherV1/SendWeatherReadings`, a client stream"
+driver = "mw_grpc::grpcrx (implementation-plan.md M6-1)"
+origin = "this-repository"
+path = "tests/emulators/grpcrx"
+package = "modernweather"
+test_target = "emulator_grpcrx"
+test_names = [
+    "a_go_satellites_readings_decode_into_the_columns_they_were_sent_in",
+    "an_unregistered_satellite_is_refused_and_stores_nothing",
+    "a_satellite_that_sends_only_a_name_is_resolved_by_it",
+    "a_disabled_station_is_refused",
+    "enrolment_answers_unimplemented_and_names_the_work_item",
+]
+note = """
+The sixth driver, and the one whose emulator checks something no other test in this programme
+can. `metrics/registry.toml` says its field numbers were "bootstrapped from the Go
+implementation's own definition ... at remoteweather c3ec9f7", and **D-21** is the decision
+that a number is allocated once and never reused -- because "a reused number silently
+reinterprets historical data on every client that has not been rebuilt". Every protobuf field
+number in this programme rests on that bootstrap being faithful, and nothing had checked it
+on the wire.
+
+`remoteweather.pb.go` here is the reference's own `protoc` output, vendored and
+digest-verified. The satellite encodes with it; `mw_grpc::grpcrx` decodes the bytes as
+`modernweather.v1.Reading`, which is generated from the registry. One assertion per field the
+satellite sets is what notices a number that drifted.
+
+`package = "modernweather"`, for `ambient`'s reason: the test needs a socket (`mw-http`'s) and
+a service (`mw-grpc`'s), and the binary is the one place they meet. Not standard-library-only,
+for `snowgauge`'s reason.
+
+  a_go_satellites_readings_decode_into_the_columns_they_were_sent_in
+      the whole path -- the reference's generated Go client, a real socket on the gRPC port,
+      the route, the service, the real admit path, the registry and a real spool -- with one
+      assertion per field, the satellite's own observation instants, and D-89's presence bit
+      (a field it did not set is NULL and not a stored zero).
+  an_unregistered_satellite_is_refused_and_stores_nothing
+      **the defect §4a.6 names.** `grpcreceiver/station.go:174` pushes the reading into the
+      distributor and `:194` consults the registry afterwards, logging a `Debugf`. Here the
+      satellite is told `PermissionDenied` and the spool is empty -- structurally, because
+      `admit` resolves identity before an `Envelope` exists.
+  a_satellite_that_sends_only_a_name_is_resolved_by_it
+      a Go-era sender sets `stationName` and not `station_id`, which is the compatibility
+      this method exists for.
+  a_disabled_station_is_refused
+      `enabled` is about collection, and a satellite streaming at a switched-off station is
+      told rather than silently stored.
+  enrolment_answers_unimplemented_and_names_the_work_item
+      `RegisterRemoteStation` mints a station key, which needs Write on StationRegistry --
+      M6-4's, with the collector. `Unimplemented` with the work item in the message, where a
+      404 would look like the wrong address."""
+
+[emulator.files]
+"remoteweather/protocols/remoteweather/remoteweather.pb.go" = "227f47deb74c11df06e4c35ceeaed0db4168923ec9ec283f01f84a2b3d32b2b0"
+"remoteweather/protocols/remoteweather/remoteweather_grpc.pb.go" = "8d3c8096d6bad92152ab7cefa489a279390686061114bb894b4b15cf213c3cf3"
+
+# ---------------------------------------------------------------------------------------
+# Declared, not yet runnable.
+#
+# **Empty**, as of implementation-plan.md M6-1: all seven of docs/component-model.md §4a.5's
+# driver rows have an emulator and a test above. The list stays here, and the gate keeps
+# printing its length, because an empty `[[pending]]` set is a fact worth seeing on every run
+# -- and because the next driver this programme adds (§4a.7 offers four) starts as an entry
+# in it rather than as a gap.
+#
+# A pending entry is NOT a skipped check. `mw_station::plan` refuses a station of any type it
+# has no driver for, by name, so a configuration that needed one fails at startup rather than
+# quietly collecting nothing.

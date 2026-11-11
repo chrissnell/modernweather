@@ -66,11 +66,18 @@ struct Emulator {
     /// repository at test time.
     origin: String,
 
-    /// For `origin = "reference-vendored"`: every vendored file's path, relative to `path`,
-    /// and its SHA-256.
+    /// Every **vendored** file's path, relative to `path`, and its SHA-256.
     ///
-    /// Required and non-empty for that origin, and refused for the other two -- a digest
-    /// table on an emulator written here would be checking a file against itself.
+    /// Independent of `origin`, which describes the emulator's *behaviour*: this describes
+    /// which of its files came from the pinned commit. So it is
+    ///
+    /// - **required** for `reference-vendored`, where the whole emulator did;
+    /// - **optional** for `this-repository`, where part of one may have. The two gRPC
+    ///   emulators are that case: the behaviour is written here and the generated protobuf
+    ///   stubs are the reference's own, so the *protocol* is independently defined and only
+    ///   the numbers are not;
+    /// - **refused** for `reference`, where the checkout is the pin and a digest beside it
+    ///   would be a second answer to the same question.
     #[serde(default)]
     files: BTreeMap<String, String>,
     path: String,
@@ -153,10 +160,17 @@ pub fn main(args: &[String]) -> Result<ExitCode, String> {
             // D-40's rationale is that the emulator is not written by whoever wrote the
             // driver. An emulator in this repository does not have that property, and
             // saying so on every run is the difference between a recorded limitation and a
-            // forgotten one.
-            "this-repository" => println!(
+            // forgotten one. Where part of one IS vendored -- the two gRPC emulators carry
+            // the reference's own generated stubs -- the note says which half.
+            "this-repository" if emulator.files.is_empty() => println!(
                 "           NOTE: this emulator lives in THIS repository, so it is not \
                  the independently-written oracle D-40 asks for. See {MANIFEST}."
+            ),
+            "this-repository" => println!(
+                "           NOTE: this emulator's BEHAVIOUR lives in THIS repository, so \
+                 it is not the independently-written oracle D-40 asks for; its PROTOCOL \
+                 is the reference's own, in {} digest-verified file(s). See {MANIFEST}.",
+                emulator.files.len()
             ),
             "reference-vendored" => println!(
                 "           vendored from the pinned commit; {} file(s) digest-verified",
@@ -263,14 +277,13 @@ fn check(root: &Path, manifest: &Manifest) -> Result<(), String> {
             ));
         }
         match emulator.origin.as_str() {
-            "reference" | "this-repository" => {
+            "reference" => {
                 if !emulator.files.is_empty() {
                     return Err(format!(
-                        "emulator `{}` is `{}` and lists file digests. A digest table \
-                         belongs to `reference-vendored` alone: on an emulator written \
-                         here it would be checking a file against itself, and on one \
-                         checked out at test time the checkout is the pin.",
-                        emulator.id, emulator.origin
+                        "emulator `{}` is `reference` and lists file digests. For an \
+                         emulator checked out at test time the checkout IS the pin, so a \
+                         digest beside it would be a second answer to the same question.",
+                        emulator.id
                     ));
                 }
             }
@@ -286,6 +299,10 @@ fn check(root: &Path, manifest: &Manifest) -> Result<(), String> {
                 }
                 verify(&path, emulator)?;
             }
+            // Optional, and verified when it is there: the two gRPC emulators are written
+            // here and carry the reference's own generated stubs, so part of each one is
+            // vendored and the digests are what keep it that way.
+            "this-repository" => verify(&path, emulator)?,
             other => {
                 return Err(format!(
                     "emulator `{}` has origin `{other}`, which is not one of \
