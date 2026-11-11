@@ -95,13 +95,23 @@ impl Hash for StationRow {
     /// (`mw_component::ConfigDigest`). Hand-written because `SecretString` is deliberately
     /// not `Hash`.
     ///
-    /// **The credential is folded in**, and that is a decision rather than an oversight. A
-    /// digest that omitted it would compare equal across a credential rotation, so the
-    /// component would not be restarted and would keep using the old one — which is the one
-    /// failure the digest exists to prevent, stated on `SpecFingerprint` about an APRS
-    /// callsign. What leaks is one bit of a 64-bit hash of twenty fields, and
-    /// `ConfigDigest::get` is a log field; a credential that has to survive that is a
-    /// credential that should not be in a database column.
+    /// **The transport credential is folded in**, and that is a decision rather than an
+    /// oversight. A digest that omitted it would compare equal across a rotation of
+    /// `transport_auth`, so the component would not be restarted and would keep using the
+    /// old one — which is the one failure the digest exists to prevent, stated on
+    /// `SpecFingerprint` about an APRS callsign. What leaks is one bit of a 64-bit hash of
+    /// twenty fields, and `ConfigDigest::get` is a log field; a credential that has to
+    /// survive that is a credential that should not be in a database column.
+    ///
+    /// **The ingest secret is not, and the digest therefore does not see its rotation.**
+    /// `has_ingest_secret` is a `bool`, so rotating `ingest_secret_hash` leaves this digest
+    /// unchanged and `station:ambient` is `unchanged` in the plan diff. That is correct
+    /// rather than a gap, because this component never holds that secret: it travels in the
+    /// query string and is compared by `mw_store::ConfigRegistry`, whose own cache keys
+    /// every verified secret to the hash it verified against. Restarting the endpoint would
+    /// drop two consoles' connections to no effect. What the bit *is* for is that a station
+    /// gaining or losing its secret changes what `plan` will accept, which is a different
+    /// configuration.
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.key.hash(state);
         self.name.hash(state);

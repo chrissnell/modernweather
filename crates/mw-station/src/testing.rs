@@ -136,7 +136,23 @@ pub struct Admission {
 #[derive(Debug, Default)]
 pub struct RecordingIngress {
     admitted: Mutex<Vec<Admission>>,
-    refuse: Mutex<Option<Reject>>,
+    refuse: Mutex<Option<IngressFailure>>,
+}
+
+/// How a [`RecordingIngress`] fails, which is one per [`mw_types::Class`].
+///
+/// A double that could only produce `Rejected` could only exercise the `Ignorable` arm, so
+/// every caller's `Retryable` and `Fatal` handling went untested while reading as though it
+/// were covered. `AdmitError` is not `Clone`, which is why this is a separate enum rather
+/// than the error itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressFailure {
+    /// `Ignorable`: the gate refused the frame.
+    Rejected(Reject),
+    /// `Retryable`: the spool is at its ceiling.
+    SpoolFull,
+    /// `Fatal`: the spool could not be written.
+    Spool,
 }
 
 impl RecordingIngress {
@@ -150,8 +166,26 @@ impl RecordingIngress {
     pub fn refusing(reason: Reject) -> Arc<Self> {
         Arc::new(Self {
             admitted: Mutex::new(Vec::new()),
-            refuse: Mutex::new(Some(reason)),
+            refuse: Mutex::new(Some(IngressFailure::Rejected(reason))),
         })
+    }
+
+    /// An ingress that fails the way `how` says, which is how a caller's `Retryable` and
+    /// `Fatal` arms are reached at all.
+    pub fn failing(how: IngressFailure) -> Arc<Self> {
+        Arc::new(Self {
+            admitted: Mutex::new(Vec::new()),
+            refuse: Mutex::new(Some(how)),
+        })
+    }
+
+    /// Start or stop refusing, which is how a test models one gate decision per frame.
+    ///
+    /// The real gate answers per frame — a wrong secret is refused and the next frame from
+    /// the same console with the right one is admitted — and a double fixed at
+    /// construction cannot express the sequence that follows a refusal.
+    pub fn refuse(&self, reason: Option<Reject>) {
+        *self.refuse.lock().expect("not poisoned") = reason.map(IngressFailure::Rejected);
     }
 
     /// Every admission, in order.
@@ -175,8 +209,16 @@ impl Ingress for RecordingIngress {
         meta: &'a FrameMeta,
     ) -> BoxFuture<'a, Result<Admitted, AdmitError>> {
         Box::pin(async move {
-            if let Some(reason) = *self.refuse.lock().expect("not poisoned") {
-                return Err(AdmitError::Rejected(reason));
+            if let Some(how) = *self.refuse.lock().expect("not poisoned") {
+                return Err(match how {
+                    IngressFailure::Rejected(reason) => AdmitError::Rejected(reason),
+                    IngressFailure::SpoolFull => AdmitError::SpoolFull {
+                        depth_bytes: 1 << 30,
+                    },
+                    IngressFailure::Spool => AdmitError::spool(std::io::Error::from(
+                        std::io::ErrorKind::PermissionDenied,
+                    )),
+                });
             }
             let mut log = self.admitted.lock().expect("not poisoned");
             log.push(Admission {

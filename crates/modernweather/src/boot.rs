@@ -414,7 +414,12 @@ fn attach_registry(cfg: &mut Config) -> anyhow::Result<()> {
     // operator reading the boot log can act on it
     // (`mw_store::registry::RegistrySnapshot::secret_problems`).
     for problem in snapshot.secret_problems() {
-        warn!(problem = %problem, "a configured ingest secret authenticates nothing");
+        // One line per problem, each naming the station: a counter does not, and a station
+        // whose uploads are all refused is otherwise indistinguishable from one that is
+        // switched off. The message is deliberately about the *secret* rather than about
+        // the station, because `SecretProblem::Missing` is also reached by a station with
+        // no secret at all.
+        warn!(problem = %problem, "a configured ingest secret cannot authenticate anything");
     }
     // **The validation the W4 migration's comment claimed the writer did.** The writer
     // copies `config.stations.timezone` and substitutes `'UTC'` for a NULL or blank one

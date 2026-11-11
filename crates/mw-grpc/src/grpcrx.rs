@@ -100,6 +100,14 @@ pub const PEER_AUTH_NOTE: &str =
      that can reach this port can write readings for any station it knows the registered \
      key of, and not for one it does not.";
 
+/// What this build says, once, about the opt-out that let it start.
+pub const INSECURE_NOTE: &str =
+    "`config.ingest.allow_insecure = 1` is set, so this node serves its reading receiver \
+     over plaintext with no peer authentication: anyone who can reach the gRPC port can \
+     write readings for any station whose registered key they know. Decision 35 requires \
+     this to be said on every start. Reach it only over a private network or a tunnel \
+     until M6-4 lands mTLS.";
+
 /// The component id, which is a constant and is still validated.
 pub fn component_id() -> Result<ComponentId, ComponentIdError> {
     ComponentId::new(ID)
@@ -207,8 +215,11 @@ impl Handlers {
                     // An unknown sender is a **counted rejection**, not a debug log, and
                     // the satellite is told. `PermissionDenied` rather than `NotFound`, for
                     // `mw_http`'s reason about one status for an unknown station and a bad
-                    // secret: the two are distinguishable only to somebody probing for
-                    // registered keys.
+                    // secret: the status says neither. This method verifies no secret at
+                    // all -- a `from_registration` station presents a key and nothing else
+                    // -- so there is no second case here to be told apart from the first,
+                    // and the timing note on `mw_component::UploadStatus::Unauthorised`
+                    // does not apply to it.
                     Class::Ignorable => {
                         debug!(
                             claim,
@@ -436,7 +447,12 @@ impl Serve for Receiver {
             self.routes
                 .publish(Arc::new(Mounted) as Arc<dyn RouteProvider>);
             // Once, at startup, where an operator reading the boot log can act on it.
+            // Both lines, because they are two different admissions: the first is a column
+            // this build reads and does not honour, the second is the opt-out the operator
+            // had to set to get here at all (decision 35: "logged at `WARN` on every
+            // start").
             warn!(peer_auth = %self.peer_auth, "{PEER_AUTH_NOTE}");
+            warn!("{INSECURE_NOTE}");
             info!(
                 method = SEND_WEATHER_READINGS,
                 "the reading receiver is mounted"
@@ -475,6 +491,27 @@ pub enum GrpcRxPlanError {
          its handlers. `crate::boot` builds it beside the listener."
     )]
     NoServiceState,
+
+    /// Plaintext ingest with no explicit opt-out, which **decision 35** makes a plan error.
+    ///
+    /// The gRPC socket this build serves has no TLS branch at all
+    /// (`mw_http::socket::serve`), and `peer_auth` is read and not enforced, so the method
+    /// is reachable by anyone who can reach the port. `docs/collector.md` §5.4 and decision
+    /// 35 answer that shape with "a plan-time error unless `allow_insecure_ingest = true`
+    /// is set explicitly, in which case it is logged at `WARN` on every start", and the
+    /// column exists for it. Refusing here rather than deferring with the rest of D-46:
+    /// the alternative is a daemon that serves an unauthenticated write method while the
+    /// operator's own opt-out sits unread, which is worse than one that will not start.
+    #[error(
+        "`config.ingest.listen = 'grpc'` serves `{SEND_WEATHER_READINGS}` over plaintext \
+         in this build -- there is no TLS on the gRPC socket and `peer_auth = '{peer_auth}'` \
+         is not enforced until M6-4 -- so decision 35 requires the opt-out: set \
+         `config.ingest.allow_insecure = 1` to accept that, or remove the row"
+    )]
+    InsecureIngest {
+        /// What the row asked for, so the message names the setting being ignored.
+        peer_auth: String,
+    },
 }
 
 /// Plan `station:grpcrx`, or say why not.
@@ -482,6 +519,10 @@ pub enum GrpcRxPlanError {
 /// **One condition**: a `config.ingest` row with `listen = 'grpc'`. A node with no such row
 /// is a satellite and has no receiver, which is W7 **D-44** — "no flag, no mode" — and is
 /// not an error.
+///
+/// A row that *is* present must also carry `allow_insecure = 1`, because the socket this
+/// build serves it on is plaintext and `peer_auth` is not enforced: see
+/// [`GrpcRxPlanError::InsecureIngest`].
 pub fn register<C>(
     cfg: &C,
     state: Option<&Arc<ServiceState>>,
@@ -490,6 +531,22 @@ pub fn register<C>(
 where
     C: GrpcIngestConfig + ?Sized,
 {
+    // A listener this build has no driver for is said out loud rather than ignored. The
+    // schema permits `rest` and `POST /v1/ingest` is M6-4's, so a node whose only `ingest`
+    // row is that one boots, reports healthy and has **no ingest surface at all** -- which
+    // is the state `mw_station::plan` refuses by name for a station type with no driver,
+    // and which nothing else here would mention. A warning rather than a plan error
+    // because the row is a legitimate thing to have configured ahead of M6-4.
+    for row in cfg.ingest() {
+        if row.listen != IngestRow::GRPC {
+            warn!(
+                listen = %row.listen,
+                "a `config.ingest` row names a listener this build has no driver for, so \
+                 this node accepts nothing on it: only `listen = 'grpc'` is served until \
+                 implementation-plan.md M6-4 lands `POST /v1/ingest`"
+            );
+        }
+    }
     let Some(row) = cfg
         .ingest()
         .iter()
@@ -497,6 +554,15 @@ where
     else {
         return Ok(());
     };
+    // **Before anything is built**, because the point of a plan error is that the daemon
+    // does not start: decision 35's "plaintext ingest is a plan-time error unless
+    // `allow_insecure_ingest = true`". The column was plumbed through `IngestRow` and read
+    // by nobody, so the one switch an operator has for this did nothing.
+    if !row.allow_insecure {
+        return Err(GrpcRxPlanError::InsecureIngest {
+            peer_auth: row.peer_auth.clone(),
+        });
+    }
     let ingress = Arc::clone(cfg.ingress().ok_or(GrpcRxPlanError::NoIngress)?);
     let state = Arc::clone(state.ok_or(GrpcRxPlanError::NoServiceState)?);
     let id = component_id()?;
@@ -548,7 +614,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mw_station::testing::RecordingIngress;
+    use mw_station::testing::{IngressFailure, RecordingIngress};
 
     fn handlers(ingress: Arc<dyn Ingress>) -> Handlers {
         Handlers::new(component_id().expect("a legal component id"), ingress)
@@ -642,18 +708,35 @@ mod tests {
         }
     }
 
-    /// A spool that cannot be written is `Unavailable`, which a satellite retries.
+    /// Every refusal class, and the two answers they map to.
+    ///
+    /// The classification is the thing worth asserting -- `PermissionDenied` for a refusal
+    /// the satellite caused and `Unavailable` for a condition on this node, which is what
+    /// tells a satellite whether retrying can help. `Ignorable` was the only class a
+    /// `RecordingIngress` could produce, so the other two arms went untested under a test
+    /// named for the spool, which fed it an `Ignorable` reject and asserted
+    /// `PermissionDenied`.
     #[tokio::test]
-    async fn a_node_that_cannot_store_tells_the_satellite_to_retry() {
-        let ingress = RecordingIngress::refusing(mw_component::Reject::BatchTooLarge);
-        let status = handlers(ingress as Arc<dyn Ingress>)
-            .on_reading(&wire("satellite-a:backyard", "", 29.92))
-            .await
-            .expect_err("refused");
-        // `BatchTooLarge` is `Ignorable`, so this asserts the classification rather than
-        // the variant: what matters is that an `Ignorable` refusal is `PermissionDenied`
-        // and anything else is `Unavailable`.
-        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    async fn each_refusal_class_gets_the_answer_that_tells_the_satellite_what_to_do() {
+        for (how, want) in [
+            (
+                IngressFailure::Rejected(mw_component::Reject::BatchTooLarge),
+                tonic::Code::PermissionDenied,
+            ),
+            // The spool at its ceiling: the condition clears when a cursor catches up, so
+            // retrying is exactly the right thing for the satellite to do.
+            (IngressFailure::SpoolFull, tonic::Code::Unavailable),
+            // And a spool that cannot be written is fatal for this process, which is still
+            // `Unavailable` to the sender: it is this node's fault and not the frame's.
+            (IngressFailure::Spool, tonic::Code::Unavailable),
+        ] {
+            let ingress = RecordingIngress::failing(how);
+            let status = handlers(ingress as Arc<dyn Ingress>)
+                .on_reading(&wire("satellite-a:backyard", "", 29.92))
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), want, "{how:?}");
+        }
     }
 
     #[test]
@@ -719,6 +802,37 @@ mod tests {
         };
         register(&rest, Some(&state), &mut out).expect("a REST collector plans");
         assert!(out.is_empty(), "`POST /v1/ingest` is M6-4's");
+
+        // **Decision 35.** The same row without the opt-out does not plan: the socket is
+        // plaintext in this build and `peer_auth` is not enforced, so the alternative is a
+        // daemon serving an unauthenticated write method while the operator's own switch
+        // sits unread. The message names the column to set.
+        let plaintext = Cfg {
+            rows: vec![IngestRow {
+                listen: "grpc".into(),
+                peer_auth: "mtls-ca".into(),
+                ca_path: None,
+                allow_insecure: false,
+            }],
+            ingress: Some(RecordingIngress::accepting() as Arc<dyn Ingress>),
+        };
+        let e = register(&plaintext, Some(&state), &mut out)
+            .expect_err("plaintext ingest with no opt-out");
+        assert_eq!(
+            e,
+            GrpcRxPlanError::InsecureIngest {
+                peer_auth: "mtls-ca".into()
+            }
+        );
+        assert!(
+            e.to_string().contains("allow_insecure"),
+            "the refusal names the column that lifts it: {e}"
+        );
+        assert!(
+            out.is_empty(),
+            "and nothing was pushed before the refusal: a plan error is only a plan error \
+             if the caller can discard the whole plan"
+        );
 
         // And the gRPC row produces exactly one component, with the shape §4a.5 declares.
         let collector = Cfg {

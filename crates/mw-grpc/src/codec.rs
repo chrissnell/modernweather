@@ -140,9 +140,16 @@ impl Decoder for ReadingCodec {
 
 /// The whole of what [`ReadingCodec`] decodes, over any buffer. [`take_all`]'s reason.
 fn decode_reading(src: &mut impl Buf) -> Result<mw_proto::wire::Reading, Status> {
-    // A message a satellite sent that this build cannot parse is `InvalidArgument` and not
-    // a transport failure: the stream survives it, which is what lets one bad reading cost
-    // one reading.
+    // A message a satellite sent that this build cannot parse is `InvalidArgument` rather
+    // than an `Internal`: the fault is in what arrived, and the sender is the only party
+    // that can do anything about it.
+    //
+    // **It ends the stream.** `Streaming::message` surfaces a decoder error as `Err`, and
+    // `grpcrx::receive` returns it, so the cost of one bad message is the rest of the
+    // batch -- the same answer a refusal gets, for the same reason stated there: a sender
+    // emitting messages this build cannot parse is one to stop and reconnect rather than
+    // to read past. Continuing instead would be a decision about how many malformed
+    // messages a stream may contain, which nothing has asked for.
     prost::Message::decode(src)
         .map_err(|e| Status::invalid_argument(format!("the reading did not decode: {e}")))
 }
@@ -185,13 +192,13 @@ mod tests {
     }
 
     #[test]
-    fn a_message_that_is_not_a_reading_is_one_readings_worth_of_damage() {
+    fn a_message_that_is_not_a_reading_is_an_invalid_argument() {
         // A length-delimited field whose length runs off the end.
         let status = decode_reading(&mut &[0x0a, 0x40, 0x01][..]).expect_err("truncated");
         assert_eq!(
             status.code(),
             tonic::Code::InvalidArgument,
-            "one bad reading costs one reading, not the stream"
+            "the fault is in what arrived, so the sender is told"
         );
         assert!(status.message().contains("did not decode"), "{status}");
     }

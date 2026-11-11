@@ -296,10 +296,19 @@ pub enum UploadStatus {
     /// The station this request claims to be is not one this node collects for, or the
     /// secret it presented is not that station's.
     ///
-    /// **One status for both**, deliberately: "there is no such station" and "wrong
-    /// password" are distinguishable only to somebody probing for station identifiers, and
-    /// `mw_readings_rejected_total{reason}` already tells the *operator* which it was
+    /// **One status for both**, deliberately: the reply does not say which, and
+    /// `mw_readings_rejected_total{reason}` tells the *operator* which it was
     /// ([`crate::Reject`]).
+    ///
+    /// **What the reply withholds, the latency does not.** An unknown claim is two map
+    /// lookups; a known claim with a wrong secret reaches an Argon2 verification once per
+    /// station per interval, which is 19 MiB and tens of milliseconds on the hardware this
+    /// runs on. So a sender who times the two can tell them apart, and probing twice
+    /// separates "no such station" from "known station, this interval's attempt already
+    /// spent". Making them indistinguishable would mean verifying a dummy hash for every
+    /// unknown claim, which hands an unauthenticated sender a memory-hard computation per
+    /// request — a worse trade than the oracle. Recorded rather than claimed away:
+    /// `docs/reconciliation.md` A-M6-1-2 lists it among what the mechanism costs.
     Unauthorised,
     /// The request was well-formed and from a station this node collects for, and the
     /// reading could not be **durably** accepted.
@@ -356,11 +365,27 @@ impl UploadReply {
 /// and not a driver's. Recorded so the next reader does not take the absence for a
 /// judgement: what a refusal names today is the station claim, which is the other half of
 /// the same sentence.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Upload {
     /// Everything after the `?`, undecoded. Decoding is the codec's
     /// (`mw_codec::QueryParams`), so there is one implementation of it.
     pub query: String,
+}
+
+/// Hand-written, because the query string **is** the credential.
+///
+/// An Ambient console sends `?PASSWORD=` in the clear on every upload, so a derived `Debug`
+/// puts a station's own password into any `{:?}` or `?upload` tracing field that is ever
+/// added -- twelve lines below [`UploadReply`]'s warning that an error body quoting the
+/// request back would put it in an access log. Nothing logs it today, which is exactly when
+/// this is cheap to make structural. The length is kept because it is the one thing worth
+/// seeing in a log line, and `mw_station::ambient::Handler` does the same.
+impl fmt::Debug for Upload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Upload")
+            .field("query_bytes", &self.query.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// An inbound upload endpoint, as the one listener calls it.

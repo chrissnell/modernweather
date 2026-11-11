@@ -30,6 +30,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -115,10 +116,16 @@ func main() {
 		if err != nil {
 			log.Fatalf("upload %d failed: %v", i, err)
 		}
-		// Drained and closed, so that the connection is reused and the endpoint sees one
-		// client rather than N.
+		// Read to EOF before closing, which is what lets the transport reuse the
+		// connection -- a `Close` on an undrained body does not, so the endpoint would
+		// see N clients rather than one. The body is also what the console's own firmware
+		// keys off, so it is reported rather than discarded.
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			log.Fatalf("upload %d: reading the response: %v", i, err)
+		}
 		_ = response.Body.Close()
-		fmt.Printf("upload n=%d status=%d\n", i, response.StatusCode)
+		fmt.Printf("upload n=%d status=%d body=%q\n", i, response.StatusCode, string(body))
 		os.Stdout.Sync()
 
 		observed = observed.Add(time.Minute)

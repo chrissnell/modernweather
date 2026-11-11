@@ -290,18 +290,32 @@ impl RegistrySnapshot {
     pub fn secret_problems(&self) -> Vec<SecretProblem> {
         let mut out = Vec::new();
         for entry in self.by_station.values() {
-            let Some(phc) = entry.secret_phc.as_deref() else {
-                continue;
-            };
-            if entry.identity != IdentitySource::FromQuery {
-                out.push(SecretProblem::NotConsulted {
-                    station: entry.station.clone(),
-                    identity: entry.identity,
-                });
-            } else if PasswordHash::new(phc).is_err() {
-                out.push(SecretProblem::Unparseable {
-                    station: entry.station.clone(),
-                });
+            match entry.secret_phc.as_deref() {
+                // No stored secret. Only a problem for the one strategy that needs one,
+                // and for that one it is the problem with no other diagnostic at all: the
+                // station fails closed on every upload, `plan`'s own `NoSecret` guard
+                // passes because it measures a slightly different thing (an
+                // `ingest_secret_hash` of `' '` is non-empty to it and absent here), and
+                // nothing else names the station. The loop used to `continue` here, so the
+                // case this function documents as its own was the one it could not report.
+                None if entry.identity == IdentitySource::FromQuery => {
+                    out.push(SecretProblem::Missing {
+                        station: entry.station.clone(),
+                    });
+                }
+                None => {}
+                Some(_) if entry.identity != IdentitySource::FromQuery => {
+                    out.push(SecretProblem::NotConsulted {
+                        station: entry.station.clone(),
+                        identity: entry.identity,
+                    });
+                }
+                Some(phc) if PasswordHash::new(phc).is_err() => {
+                    out.push(SecretProblem::Unparseable {
+                        station: entry.station.clone(),
+                    });
+                }
+                Some(_) => {}
             }
         }
         out
@@ -371,6 +385,24 @@ pub enum SecretProblem {
         identity: IdentitySource,
     },
 
+    /// A station that authenticates by secret and has none stored.
+    ///
+    /// Fails closed, which is right, and silently, which is not: `ConfigRegistry::verify`
+    /// refuses every upload, the counter moves only when traffic arrives, and a station
+    /// that never reports looks exactly like a station that is switched off. The way to
+    /// reach it is an `ingest_secret_hash` that is not NULL and not a secret either — the
+    /// column has no `CHECK`, so `' '` is such a value, and it is non-empty to
+    /// `mw_station::plan`'s guard and absent to this snapshot.
+    #[error(
+        "station `{station}` resolves by `?PASSWORD=` and has no usable \
+         `ingest_secret_hash`, so every upload from it will be refused. Set the secret; a \
+         column holding only whitespace is not one."
+    )]
+    Missing {
+        /// Which station.
+        station: StationKey,
+    },
+
     /// A secret that is not a hash this build can verify against.
     ///
     /// Every upload from that station is then `bad_secret` for the life of the process, with
@@ -402,10 +434,40 @@ struct SecretState {
     /// **Plaintext, in memory, for the life of the snapshot**, and that is the trade this
     /// whole mechanism is: it is the same material the console puts in a query string on
     /// every upload, it is a `SecretString` so it redacts itself in every `Debug` and log
-    /// field, and it never reaches a disk. What it buys is one Argon2 verification per
-    /// station per snapshot instead of one per reading, which is what makes a memory-hard
-    /// hash compatible with **D-87** at all.
+    /// field, and nothing here writes it to `config.db`. What it buys is one Argon2
+    /// verification per station per snapshot instead of one per reading, which is what
+    /// makes a memory-hard hash compatible with **D-87** at all.
+    ///
+    /// "Never reaches a disk" would be the stronger claim and it is not this one's to make:
+    /// a plaintext secret held for the life of a process can reach a swap file or a core
+    /// dump, and this process is a daemon on a Raspberry Pi where swap is on by default.
+    /// The secret is not zeroized on drop either, and three earlier copies of it exist
+    /// before this one -- the raw query string, the decoded pair vector, and the frame --
+    /// so the redaction is real at the `SecretString` boundary and not before it.
     verified: Option<SecretString>,
+    /// The stored hash [`SecretState::verified`] was verified against.
+    ///
+    /// **What makes a cache entry belong to a snapshot.** Without it, a cache hit was
+    /// `Ok` on the strength of the cache alone, and a reader preempted between loading the
+    /// snapshot and taking this lock could verify against a hash `publish` had already
+    /// replaced and then store the result — so a rotated-away secret kept being accepted
+    /// until the next `publish`. Comparing it to the entry's current hash makes the
+    /// ordering inside `publish` stop mattering, which is a better answer than reasoning
+    /// about the ordering.
+    phc: Option<String>,
+    /// The secret that last **failed** against the stored hash, so that repeating it is
+    /// free.
+    ///
+    /// This is what stops a flood from starving the console. The budget below is one
+    /// verification per station per interval and is spent by whoever arrives first, so a
+    /// sender repeating a wrong password at any rate used to make the console's correct
+    /// upload succeed with probability roughly `1/(1+R)` per attempt — an outage lasting as
+    /// long as the flood. Remembering one rejected secret makes a *repeated* wrong password
+    /// cost one verification in total rather than one per interval, and the console's
+    /// correct one then finds the budget unspent. A flood of **distinct** secrets still
+    /// contends for it, which is the DoS bound this interval exists to be; see
+    /// `docs/reconciliation.md` A-M6-1-2.
+    rejected: Option<SecretString>,
     /// When a verification was last attempted while [`SecretState::verified`] was `None`.
     last_attempt: Option<Instant>,
 }
@@ -414,11 +476,15 @@ struct SecretState {
 #[derive(Debug)]
 pub struct ConfigRegistry {
     snapshot: ArcSwap<RegistrySnapshot>,
-    /// One [`SecretState`] per station that has presented a secret, cleared whenever a
-    /// snapshot is published -- because a published snapshot may carry a rotated hash, and
-    /// a cache that outlived it would keep accepting the old secret. That is the one
-    /// property the hand-written `Hash` on a station row exists for one layer up
-    /// (`mw_station::StationRow`), stated here for the other half of the same rotation.
+    /// One [`SecretState`] per station that has presented a secret. Each entry records the
+    /// hash it was verified against, which is what makes a rotation safe: a read whose
+    /// entry does not match the hash in hand is a miss. [`ConfigRegistry::publish`] also
+    /// clears the map, which frees a plaintext secret promptly and is not what the
+    /// correctness rests on.
+    ///
+    /// The rotation story is wholly here. One layer up, `mw_station::StationRow`'s
+    /// hand-written `Hash` carries only *whether* a station has a secret, and deliberately:
+    /// that component never holds one.
     secrets: Mutex<BTreeMap<StationKey, SecretState>>,
 }
 
@@ -437,10 +503,14 @@ impl ConfigRegistry {
     /// module's documentation for what that costs and who owns closing it.
     pub fn publish(&self, snapshot: RegistrySnapshot) {
         self.snapshot.store(Arc::new(snapshot));
-        // Before or after the store, and it has to be after: a reader that verified
-        // against the old snapshot between the clear and the store would repopulate the
-        // cache with the old secret. Clearing second means the worst case is one extra
-        // Argon2 verification, which is the direction to be wrong in.
+        // **Not what makes a rotation safe**, and that is deliberate: a reader preempted
+        // between loading the snapshot and taking the cache lock can repopulate the cache
+        // from the old snapshot whichever order these two statements are in, so an
+        // argument about the ordering is an argument that the window is narrow rather than
+        // that it is closed. What closes it is `SecretState::phc`: a cache entry records
+        // the hash it was verified against and a read that does not match it is a miss.
+        // The clear is kept because it releases a plaintext secret this process no longer
+        // has any use for, which is worth doing promptly and is not a correctness claim.
         self.secrets
             .lock()
             .expect("the secret cache is not poisoned")
@@ -494,50 +564,107 @@ impl ConfigRegistry {
             return Err(Reject::BadSecret);
         };
 
-        let mut cache = self
-            .secrets
-            .lock()
-            .expect("the secret cache is not poisoned");
-        let state = cache.entry(entry.station.clone()).or_default();
-        if let Some(verified) = &state.verified {
-            // The hot path: constant-time, and `subtle` rather than `==` because a
-            // short-circuiting comparison on a credential is a timing oracle (**D-33**).
-            if verified
-                .expose_secret()
-                .as_bytes()
-                .ct_eq(presented.expose_secret().as_bytes())
-                .into()
-            {
-                return Ok(());
+        // **The lock is held for the decision and released for the computation.** Three
+        // phases: read the cache, verify outside it, write the result back. Holding it
+        // across `verify_password` serialised every station's constant-time compare behind
+        // one station's memory-hard hash, on the worker thread the HTTP handler is running
+        // on -- and `admit` doing nothing slow is **D-87**.
+        enum Decision {
+            Accept,
+            Refuse,
+            Verify,
+        }
+        let decision = {
+            let mut cache = self
+                .secrets
+                .lock()
+                .expect("the secret cache is not poisoned");
+            let state = cache.entry(entry.station.clone()).or_default();
+            // A cache entry belongs to the hash it was verified against. One that does not
+            // match the hash in hand is from a superseded snapshot and is discarded rather
+            // than trusted -- see `SecretState::phc`.
+            if state.phc.as_deref() != Some(phc) {
+                *state = SecretState::default();
             }
-            // A second secret for the same station cannot be right while this snapshot is
-            // live -- `publish` clears the cache -- so this is a wrong password and is
-            // refused without a verification. Rate-limiting it is unnecessary for the same
-            // reason: the expensive path is not reached.
-            return Err(Reject::BadSecret);
+            match &state.verified {
+                // The hot path: constant-time, and `subtle` rather than `==` because a
+                // short-circuiting comparison on a credential is a timing oracle (**D-33**).
+                // `ct_eq` on a slice does short-circuit on *length*, which leaks the
+                // verified secret's length and nothing else.
+                Some(verified)
+                    if verified
+                        .expose_secret()
+                        .as_bytes()
+                        .ct_eq(presented.expose_secret().as_bytes())
+                        .into() =>
+                {
+                    Decision::Accept
+                }
+                // A second secret for the same station cannot be right while this
+                // snapshot's hash is the one in hand, so this is a wrong password and is
+                // refused without a verification.
+                Some(_) => Decision::Refuse,
+                None => {
+                    // A secret already known to be wrong costs nothing to refuse again,
+                    // and refusing it without spending the budget is what keeps a flood
+                    // from starving the console (see `SecretState::rejected`).
+                    let repeat = state.rejected.as_ref().is_some_and(|wrong| {
+                        wrong
+                            .expose_secret()
+                            .as_bytes()
+                            .ct_eq(presented.expose_secret().as_bytes())
+                            .into()
+                    });
+                    let now = Instant::now();
+                    let spent = state
+                        .last_attempt
+                        .is_some_and(|last| now.duration_since(last) < VERIFY_INTERVAL);
+                    if repeat || spent {
+                        Decision::Refuse
+                    } else {
+                        state.last_attempt = Some(now);
+                        Decision::Verify
+                    }
+                }
+            }
+        };
+        match decision {
+            Decision::Accept => return Ok(()),
+            Decision::Refuse => return Err(Reject::BadSecret),
+            Decision::Verify => {}
         }
 
-        let now = Instant::now();
-        if let Some(last) = state.last_attempt {
-            if now.duration_since(last) < VERIFY_INTERVAL {
-                return Err(Reject::BadSecret);
-            }
-        }
-        state.last_attempt = Some(now);
         let Ok(parsed) = PasswordHash::new(phc) else {
             // Not a hash this build can verify against. Reported at startup by
             // `RegistrySnapshot::secret_problems`, because the counter alone does not name
             // the station.
             return Err(Reject::BadSecret);
         };
-        if Argon2::default()
+        // Outside the lock, which is the whole point of the split above.
+        let verified = Argon2::default()
             .verify_password(presented.expose_secret().as_bytes(), &parsed)
-            .is_err()
-        {
-            return Err(Reject::BadSecret);
+            .is_ok();
+        let mut cache = self
+            .secrets
+            .lock()
+            .expect("the secret cache is not poisoned");
+        let state = cache.entry(entry.station.clone()).or_default();
+        // Stored with the hash it was computed against, unconditionally. A snapshot
+        // published while the hash above was being computed makes this entry stale the
+        // moment it is written, and that is safe without any further check here: every
+        // *read* compares `phc` against the hash in hand and discards an entry that does
+        // not match. Putting the invariant on the read side rather than on the write side
+        // is what makes it hold for every ordering rather than for the orderings somebody
+        // thought of.
+        state.phc = Some(phc.to_string());
+        if verified {
+            state.verified = Some(presented.clone());
+            state.rejected = None;
+            Ok(())
+        } else {
+            state.rejected = Some(presented.clone());
+            Err(Reject::BadSecret)
         }
-        state.verified = Some(presented.clone());
-        Ok(())
     }
 
     fn admit(entry: &StationEntry, source: IdentitySource) -> Result<StationKey, Reject> {
@@ -985,6 +1112,134 @@ mod tests {
             registry.resolve(&meta),
             Ok(StationKey::new("suncrest:roof")),
             "a secret nothing consults does not refuse the frames that do arrive"
+        );
+    }
+
+    /// A station that authenticates by secret and has none is reported, which is the case
+    /// with no other diagnostic at all.
+    ///
+    /// Reached by the value the schema permits and nothing refuses: `ingest_secret_hash`
+    /// has no `CHECK`, so `' '` is storable, and it is whitespace rather than a hash. The
+    /// loop that built this list used to skip every station with no usable secret, so the
+    /// one case it documents as its own was the one it could not report.
+    #[test]
+    fn a_station_that_resolves_by_secret_and_has_none_is_reported_at_startup() {
+        for stored in [None, Some(String::from("   "))] {
+            let mut row = ambient_row("unused");
+            row.ingest_secret_hash = stored.clone();
+            let snapshot = RegistrySnapshot::new(&[row], []);
+            let problems = snapshot.secret_problems();
+            assert!(
+                matches!(&problems[..], [SecretProblem::Missing { station }]
+                         if station.as_str() == "ambient:backyard"),
+                "for {stored:?}: {problems:?}"
+            );
+            // And it fails closed, which is the half that was already right.
+            let registry = ConfigRegistry::new(snapshot);
+            assert_eq!(
+                registry.resolve(&presenting_secret("hunter2")),
+                Err(Reject::BadSecret)
+            );
+        }
+    }
+
+    /// A wrong secret repeated does not **keep** the budget spent, so the console waits one
+    /// interval rather than racing for it.
+    ///
+    /// The budget is one verification per station per `VERIFY_INTERVAL` and is spent by
+    /// whoever arrives first. That part is the DoS bound and is deliberate; the defect was
+    /// that each interval's budget went to whoever arrived first *in that interval*, so a
+    /// sender repeating a wrong password at rate `R` made the console's correct upload
+    /// succeed with probability about `1/(1+R)` per attempt — an outage lasting as long as
+    /// the flood rather than the one second the reconciliation documents. Remembering one
+    /// rejected secret makes every repeat free, which is to say it does not renew
+    /// `last_attempt`, so the next interval's budget is still there when the console
+    /// arrives. A flood of **distinct** secrets still contends for it.
+    #[test]
+    fn a_repeated_wrong_secret_does_not_keep_the_budget_spent() {
+        let registry =
+            ConfigRegistry::new(RegistrySnapshot::new(&[ambient_row(&phc("right"))], []));
+        let station = StationKey::new("ambient:backyard");
+        // The flood's first attempt spends this interval's budget, which is the bound
+        // working as intended, and the console is told to come back.
+        assert_eq!(
+            registry.resolve(&presenting_secret("wrong")),
+            Err(Reject::BadSecret)
+        );
+        assert_eq!(
+            registry.resolve(&presenting_secret("right")),
+            Err(Reject::BadSecret),
+            "one verification per interval is the rate limit, not the defect"
+        );
+        // One interval passes, and the flood keeps going at whatever rate it likes.
+        let elapse = |registry: &ConfigRegistry| {
+            registry
+                .secrets
+                .lock()
+                .expect("not poisoned")
+                .get_mut(&station)
+                .expect("an attempt has been made")
+                .last_attempt = Some(Instant::now() - VERIFY_INTERVAL * 2);
+        };
+        elapse(&registry);
+        for _ in 0..200 {
+            assert_eq!(
+                registry.resolve(&presenting_secret("wrong")),
+                Err(Reject::BadSecret)
+            );
+        }
+        // The console now succeeds. Two hundred wrong attempts inside the interval used to
+        // mean two hundred chances to take the budget this upload needs.
+        assert_eq!(
+            registry.resolve(&presenting_secret("right")),
+            Ok(station.clone()),
+            "the repeats were free, so the budget they could not spend was still there"
+        );
+        // And a *different* wrong secret is still refused from the cache, without a
+        // verification, because a secret cannot be right while this hash is the one in hand.
+        assert_eq!(
+            registry.resolve(&presenting_secret("other")),
+            Err(Reject::BadSecret)
+        );
+    }
+
+    /// A cached secret is only ever accepted against the hash it was verified against.
+    ///
+    /// The window is a reader preempted between loading the snapshot and taking the cache
+    /// lock: it verifies against a hash `publish` has already replaced and then caches the
+    /// result, so clearing the cache in `publish` cannot close it whichever order the two
+    /// statements are in. Simulated here by writing the cache entry a reader in that window
+    /// would write, which is the only way to observe the state deterministically.
+    #[test]
+    fn a_cache_entry_from_a_superseded_snapshot_is_not_trusted() {
+        let registry = ConfigRegistry::new(RegistrySnapshot::new(&[ambient_row(&phc("old"))], []));
+        assert!(registry.resolve(&presenting_secret("old")).is_ok());
+        let cached = registry
+            .secrets
+            .lock()
+            .expect("not poisoned")
+            .get(&StationKey::new("ambient:backyard"))
+            .map(|state| state.phc.clone())
+            .expect("the verification cached its hash");
+        assert!(cached.is_some(), "the hash is recorded beside the secret");
+
+        // The rotation, and then the entry a racing reader leaves behind: the old secret,
+        // verified, with the old hash beside it.
+        let rotated = phc("new");
+        registry.publish(RegistrySnapshot::new(&[ambient_row(&rotated)], []));
+        registry.secrets.lock().expect("not poisoned").insert(
+            StationKey::new("ambient:backyard"),
+            SecretState {
+                verified: Some(SecretString::from("old".to_string())),
+                phc: cached,
+                rejected: None,
+                last_attempt: Some(Instant::now()),
+            },
+        );
+        assert_eq!(
+            registry.resolve(&presenting_secret("old")),
+            Err(Reject::BadSecret),
+            "the entry belongs to a hash that is no longer configured"
         );
     }
 

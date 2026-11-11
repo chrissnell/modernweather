@@ -224,8 +224,9 @@ fn status(status: mw_component::UploadStatus) -> axum::http::StatusCode {
         S::Malformed => StatusCode::BAD_REQUEST,
         // `401` and not `403`: the station presented a credential and it was not accepted,
         // which is what `WWW-Authenticate`-less `401` means on a protocol with no challenge.
-        // `403` would say "we know who you are and you may not", and the point of one status
-        // for an unknown station and a bad secret is that it says neither.
+        // `403` would say "we know who you are and you may not", and one status for an
+        // unknown station and a bad secret says neither. The *timing* of the two still
+        // differs; `mw_component::UploadStatus::Unauthorised` is where that is recorded.
         S::Unauthorised => StatusCode::UNAUTHORIZED,
         // `503` and not `500`: the condition is "this node cannot durably accept a reading
         // right now", which is temporary and which the station's own retry is the correct

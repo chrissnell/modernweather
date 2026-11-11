@@ -231,13 +231,35 @@ impl Handler {
                 return UploadReply::refused(UploadStatus::Malformed, MALFORMED_BODY);
             }
         };
-        self.apply_rain_counter(&params, &claim.to_ascii_lowercase(), &mut batch);
+        // The increment is computed from the remembered total and the new total is **not**
+        // stored yet: see `apply_rain_counter`. The upload has not been authenticated at
+        // this point, and storing would let an unauthenticated request write this
+        // station's counter.
+        let key = claim.to_ascii_lowercase();
+        let total = self.apply_rain_counter(&params, &key, &mut batch);
 
         let meta = StationIdentity::FromQuery
             .frame_meta(id, Some(&StationKey::new(claim)), at)
             .with_secret(SecretString::from(secret.to_string()));
         match self.ingress.admit(&batch, &meta).await {
             Ok(admitted) => {
+                // **Committed only now, because the gate has passed.** The remembered
+                // total is per-station driver state, and the decode lookup above is keyed
+                // on the claim alone -- no secret -- so writing it before `admit` meant one
+                // unauthenticated GET carrying `ID=<a configured key>` and a large
+                // `totalrainin` set the station's remembered total. `rain_since` returns
+                // nothing when the new total is below the remembered one, so the console's
+                // next genuine increment was discarded, and a sender repeating the request
+                // at the console's cadence suppressed its rainfall for as long as it kept
+                // sending. Read-then-commit is the same ordering the module header
+                // criticises Go for getting wrong, applied to driver state rather than to
+                // readings.
+                if let Some(total) = total {
+                    self.totals
+                        .lock()
+                        .expect("the rain counters are not poisoned")
+                        .insert(key, total);
+                }
                 m::frame(id, FrameOutcome::Decoded);
                 debug!(
                     station = %unit.station,
@@ -254,36 +276,42 @@ impl Handler {
         }
     }
 
-    /// Turn the console's all-time counter into this upload's increment.
+    /// Turn the console's all-time counter into this upload's increment, and return the
+    /// total the caller must remember **if** the upload is admitted.
     ///
     /// Overwrites whatever `rainin` put in `rainincremental`, which is the Go ordering
-    /// (`station.go:216` runs after `parseWeatherData`) — `rainin` is Ambient's **hourly**
+    /// (`station.go:222` runs after `parseWeatherData`) — `rainin` is Ambient's **hourly**
     /// rainfall and the increment is what the column means, so the counter wins wherever
     /// the console sends one.
+    ///
+    /// **Reads, and does not write.** The commit is the caller's, after the gate; this
+    /// function is reached before any secret has been compared, so a write here is a write
+    /// an unauthenticated request can make. Two genuine uploads racing can both compute
+    /// against the same remembered total, which costs one increment's accuracy once; an
+    /// unauthenticated write costs every increment until the next restart, which is not
+    /// the same order of mistake.
     fn apply_rain_counter(
         &self,
         params: &QueryParams,
         claim: &str,
         batch: &mut [mw_types::PartialReading],
-    ) {
-        let Some(total) = mw_codec::total_rain(params) else {
-            return;
-        };
+    ) -> Option<f32> {
+        let total = mw_codec::total_rain(params)?;
         // The lock is taken and released **before** the admission below: `admit` awaits the
         // spool's `fsync`, and a `std::sync::MutexGuard` held across an await would make
         // two concurrent uploads from the same console a deadlock risk rather than a
         // serialisation.
-        let previous = {
-            let mut totals = self
-                .totals
-                .lock()
-                .expect("the rain counters are not poisoned");
-            totals.insert(claim.to_string(), total)
-        };
+        let previous = self
+            .totals
+            .lock()
+            .expect("the rain counters are not poisoned")
+            .get(claim)
+            .copied();
         let increment = mw_codec::rain_since(previous, total);
         for reading in batch {
             reading.values.rain_incremental = increment;
         }
+        Some(total)
     }
 
     /// One admission failure as a reply, at the log level its class deserves.

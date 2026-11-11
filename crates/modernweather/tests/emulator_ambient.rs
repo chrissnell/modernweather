@@ -389,13 +389,6 @@ async fn an_upload_missing_a_required_parameter_is_a_bad_request() {
 #[ignore = "needs a Go toolchain; `cargo xtask emulator-tests` runs it"]
 async fn an_accepted_upload_answers_the_body_the_protocol_expects() {
     let endpoint = Endpoint::start("ambient-body").await;
-    // Through the same socket the console uses, so this is the response bytes rather than
-    // the handler's return value.
-    let url = format!(
-        "{}?ID=roof&PASSWORD={SECRET}&action=updateraw\
-         &dateutc=2026-11-10+22%3A49%3A09&tempf=68.4",
-        endpoint.url
-    );
     let mut emulator = GoEmulator::spawn(
         EMULATOR,
         &[
@@ -412,7 +405,14 @@ async fn an_accepted_upload_answers_the_body_the_protocol_expects() {
     .await;
     let line = emulator.next_line().await.expect("one upload");
     assert!(line.contains("status=200"), "{line}");
+    // **The bytes off the socket**, which is the point of asserting this at level 3 at all:
+    // the emulator reads the response to EOF and reports it, so this is what the console's
+    // firmware sees rather than what the handler returned. The assertion used to compare
+    // `ACCEPTED_BODY` with its own value and never read a body.
+    assert!(
+        line.contains(&format!("body={ACCEPTED_BODY:?}")),
+        "the accepted body is what an Ambient console looks for: {line}"
+    );
     emulator.finished().await;
-    assert_eq!(ACCEPTED_BODY, "success", "{url}");
     endpoint.stop().await;
 }

@@ -782,10 +782,17 @@ fn declare(row: &config_db::StationRow) -> mw_station::StationRow {
         snow_base_distance_mm: row.snow_base_distance_mm,
         // The bit, not the hash: `mw-station` plans and never verifies, so what it needs is
         // whether this station *can* be authenticated (`mw_station::StationRow`).
+        //
+        // `trim()` because `mw_store::RegistrySnapshot` uses `trim()`, and the two
+        // predicates have to be the same one. They were not: an `ingest_secret_hash` of
+        // `' '` -- the column has no `CHECK` -- was non-empty here and absent there, so
+        // `plan`'s `NoSecret` guard passed and the station then failed closed on every
+        // upload with nothing naming it. `SecretProblem::Missing` reports the case that
+        // still reaches the registry; this makes `plan` refuse the row that produces it.
         has_ingest_secret: row
             .ingest_secret_hash
             .as_deref()
-            .is_some_and(|hash| !hash.is_empty()),
+            .is_some_and(|hash| !hash.trim().is_empty()),
     }
 }
 

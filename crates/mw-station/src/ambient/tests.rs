@@ -279,6 +279,49 @@ async fn the_rain_counter_becomes_an_increment_across_uploads() {
     );
 }
 
+/// **A refused upload does not touch the station's remembered total.**
+///
+/// The decode lookup is keyed on the claim alone, so an unauthenticated request carrying a
+/// configured `?ID=` reaches `apply_rain_counter`. When that function stored, one such
+/// request set the remembered total to whatever it liked: `rain_since` yields nothing when
+/// the new total is below the remembered one, so the console's next genuine increment was
+/// discarded, and a sender repeating the request at the console's cadence suppressed the
+/// station's rainfall until the next restart. The sequence below is exactly that attack
+/// with one genuine upload on either side of it.
+#[tokio::test]
+async fn an_upload_that_is_refused_cannot_move_the_rain_counter() {
+    let ingress = RecordingIngress::accepting();
+    let handler = handler(
+        vec![unit("roof", "suncrest:roof", 0)],
+        Arc::clone(&ingress) as Arc<dyn Ingress>,
+    );
+    handler
+        .upload(&upload("roof", "p", "&totalrainin=118.70"), at())
+        .await;
+    // The wrong secret: the gate refuses it, and the enormous total it carries is the
+    // whole of the mischief.
+    ingress.refuse(Some(Reject::BadSecret));
+    let reply = handler
+        .upload(&upload("roof", "wrong", "&totalrainin=999999.00"), at())
+        .await;
+    assert_eq!(reply.status, UploadStatus::Unauthorised);
+    // And the console's next genuine upload still measures against 118.70.
+    ingress.refuse(None);
+    handler
+        .upload(&upload("roof", "p", "&totalrainin=118.75"), at())
+        .await;
+    let increments: Vec<Option<f32>> = ingress
+        .admissions()
+        .iter()
+        .map(|a| a.batch[0].values.rain_incremental)
+        .collect();
+    assert_eq!(
+        increments,
+        vec![None, Some(0.050_003_05)],
+        "the refused upload is absent from the admissions and from the counter"
+    );
+}
+
 /// Two consoles' counters do not interfere, which is what keying by claim buys.
 #[tokio::test]
 async fn each_consoles_rain_counter_is_its_own() {
@@ -376,7 +419,7 @@ fn the_manifest_declares_the_mount_and_the_id_is_the_one_the_design_names() {
 }
 
 #[test]
-fn the_handlers_debug_representation_carries_no_handle_and_no_secret() {
+fn the_handlers_debug_representation_names_the_endpoint_and_not_the_handle() {
     let rendered = format!(
         "{:?}",
         handler(
@@ -387,4 +430,64 @@ fn the_handlers_debug_representation_carries_no_handle_and_no_secret() {
     assert!(rendered.contains("station:ambient"), "{rendered}");
     assert!(rendered.contains("units: 1"), "{rendered}");
     assert!(!rendered.contains("Ingress"), "{rendered}");
+}
+
+/// The credential is not in a `Debug` anywhere on the path a `?upload` tracing field would
+/// take, which is the assertion the test above does not make: `Handler` holds no secret in
+/// any field, so "no secret" could not have failed there. `Upload` does hold one -- the raw
+/// query string **is** the credential -- and its `Debug` is hand-written for that reason.
+#[test]
+fn the_uploads_debug_representation_does_not_carry_the_password() {
+    let upload = mw_component::Upload {
+        query: upload("roof", "hunter2", "&tempf=70.0"),
+    };
+    let rendered = format!("{upload:?}");
+    assert!(
+        !rendered.contains("hunter2"),
+        "a derived `Debug` puts a station's own password in any log line that prints it: \
+         {rendered}"
+    );
+    assert!(!rendered.contains("PASSWORD"), "{rendered}");
+    assert!(
+        rendered.contains("query_bytes"),
+        "the length is worth seeing: {rendered}"
+    );
+}
+
+/// The three refusal classes and the two statuses they map to.
+///
+/// `Unavailable` is "come back" and `Unauthorised` is "do not": a console that retries the
+/// first and gives up on the second is the behaviour these replies are for, and the
+/// `Retryable` and `Fatal` arms had no test because a `RecordingIngress` could only
+/// produce an `Ignorable` refusal.
+#[tokio::test]
+async fn each_refusal_class_gets_the_status_that_tells_the_console_what_to_do() {
+    use crate::testing::IngressFailure;
+    for (how, want, body) in [
+        (
+            IngressFailure::Rejected(Reject::BadSecret),
+            UploadStatus::Unauthorised,
+            UNAUTHORISED_BODY,
+        ),
+        (
+            IngressFailure::SpoolFull,
+            UploadStatus::Unavailable,
+            UNAVAILABLE_BODY,
+        ),
+        (
+            IngressFailure::Spool,
+            UploadStatus::Unavailable,
+            UNAVAILABLE_BODY,
+        ),
+    ] {
+        let handler = handler(
+            vec![unit("roof", "suncrest:roof", 0)],
+            RecordingIngress::failing(how) as Arc<dyn Ingress>,
+        );
+        let reply = handler
+            .upload(&upload("roof", "p", "&tempf=70.0"), at())
+            .await;
+        assert_eq!(reply.status, want, "{how:?}");
+        assert_eq!(reply.body, body, "{how:?}");
+    }
 }

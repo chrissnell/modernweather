@@ -247,6 +247,18 @@ mod tests {
     use super::*;
     use mw_types::{Class, Classify};
 
+    /// A real `CodecError::Protobuf`, from the codec that produces them.
+    ///
+    /// Constructed by decoding rather than by hand: `prost::DecodeError::new` is deprecated
+    /// -- `prost` intends to remove it -- and a hand-built error would also be asserting
+    /// this module's own `From` impl rather than what a malformed frame actually produces.
+    /// The bytes are field 1 with a length that runs off the end.
+    fn protobuf_failure() -> CodecError {
+        crate::SnowGaugeProto::default()
+            .decode(&Frame::new(vec![0x0a, 0x40, 0x01]))
+            .expect_err("a truncated protobuf message")
+    }
+
     #[test]
     fn a_frame_hides_its_payload_from_debug() {
         let rendered = format!("{:?}", Frame::new(b"ID=roof&PASSWORD=hunter2".to_vec()));
@@ -306,13 +318,7 @@ mod tests {
             .class(),
             Class::Ignorable
         );
-        assert_eq!(
-            CodecError::Protobuf {
-                source: prost::DecodeError::new("a field that is not in the schema")
-            }
-            .class(),
-            Class::Ignorable
-        );
+        assert_eq!(protobuf_failure().class(), Class::Ignorable);
         assert_eq!(
             CodecError::Implausible {
                 what: "a snow-gauge distance",
@@ -341,17 +347,15 @@ mod tests {
         // message is the `#[source]`, which is where `DisplayChain` finds it. Asserted in
         // both halves, because a reader who sees only the top line gets "not protobuf" and
         // has to be able to rely on the detail being one link down.
-        let e = CodecError::Protobuf {
-            source: prost::DecodeError::new("buffer underflow"),
-        };
+        let e = protobuf_failure();
         assert_eq!(
             e.to_string(),
             "the frame is not the protobuf message this codec decodes"
         );
-        assert!(std::error::Error::source(&e)
+        let source = std::error::Error::source(&e)
             .expect("the decode failure is the source")
-            .to_string()
-            .contains("buffer underflow"));
+            .to_string();
+        assert!(source.contains("buffer underflow"), "{source}");
     }
 
     /// Each of the three framing-class variants says which it is, because `undecodable`
