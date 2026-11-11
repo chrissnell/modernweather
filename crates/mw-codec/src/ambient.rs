@@ -18,7 +18,7 @@
 //! # The parameter set
 //!
 //! A hundred and thirty-one measurements, which is Ambient's own "customized" vocabulary as
-//! `ambientcustomized/station.go:188-367` enumerates it, carried over one for one. Every one
+//! `ambientcustomized/station.go:204-381` enumerates it, carried over one for one. Every one
 //! is already in the registry's units — Ambient reports °F, inHg, mph and in — so there is no
 //! conversion anywhere in this file, which is why there is no conversion table in this
 //! comment. The groups:
@@ -192,7 +192,7 @@ impl Codec for AmbientQuery {
         let r = Reading {
             wind_dir: self.correction.apply(number(q, WIND_DIR_PARAM)),
             // `lowbatt` is a float in the protocol and an integer flag in the column, which
-            // is `uint8(parsed)` at `station.go:362` -- a truncation rather than a rounding,
+            // is `uint8(parsed)` at `station.go:176` -- a truncation rather than a rounding,
             // kept because the only values the protocol sends are 0 and 1.
             tx_battery_status: number(q, "lowbatt").map(|v| v as i32),
             tz: params_text(q, "tz"),
@@ -350,6 +350,16 @@ fn number(params: &QueryParams, key: &str) -> Option<f32> {
 /// Through `f64` for the values that arrive as `3.0`: Ambient sends `gdd` and the AQI
 /// figures as integers and `co2_in_aqin` as either, and `"612.0".parse::<i32>()` fails --
 /// which in Go leaves the field at zero and here would leave a sensor silently unreported.
+///
+/// **This is wider than Go for thirty-six of the keys, and the widening is recorded rather
+/// than claimed as parity.** Go reads `leak1`-`leak4`, `relay1`-`relay10` and the
+/// twenty-two battery flags with `parseUint8` -- `ParseUint(v, 10, 8)` at `station.go:176`
+/// -- so `?relay1=300` and `?battout=-1` are out of range over there and leave the field at
+/// its zero value, where this returns `Some(300)` and `Some(-1)`. The columns are `int4`
+/// here, so there is no range to enforce on this side, and a flag arriving out of range is
+/// a console sending something the protocol does not describe: storing what it sent is more
+/// honest than storing a zero that reads as "no leak". The `f64` path also truncates toward
+/// zero, so `?aqi_pm25_in=22.6` is `22` here and `0` in Go.
 fn integer(params: &QueryParams, key: &str) -> Option<i32> {
     let text = params.non_empty(key)?;
     if let Ok(value) = text.parse::<i32>() {

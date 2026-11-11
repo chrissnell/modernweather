@@ -10,9 +10,9 @@
 //!
 //! | Test | Go | Here |
 //! |---|---|---|
-//! | 99 bytes | `station.go:385` | [`wire::Loop::parse`] |
-//! | CRC-16 over all 99 is zero | `station.go:398` | [`crate::crc16::check`] |
-//! | the header is `LOO` | the scanner, `station.go:443` | here |
+//! | 99 bytes | `station.go:476` | [`wire::Loop::parse`] |
+//! | CRC-16 over all 99 is zero | `station.go:483` | [`crate::crc16::check`] |
+//! | the header is `LOO` | the scanner, `station.go:519-523` | here |
 //! | `packet_type` is a LOOP and not a LOOP2 | **not made** | here |
 //!
 //! The fourth is the one worth the sentence. A LOOP2 record carries the same header and the
@@ -34,7 +34,8 @@
 //! direction the design already decided. This is the Davis instance of **DEV-8**.
 //!
 //! **2. Both dash values for a 16-bit temperature, not one.** The specification's dashed
-//! value for the inside and outside temperature is `32767`; Go tests `-32768`. So a Vantage
+//! value for the inside and outside temperature is `32767`; `convBigVal10` tests `-32768`
+//! (`station.go:727-732`). So a Vantage
 //! with the outdoor transmitter out of range stores **3276.7 °F** under Go, which then
 //! enters `max(outtemp)` and every aggregate above it. Both values are refused here: 32767
 //! because it is the documented sentinel, and -32768 because it is what Go tested for and no
@@ -204,7 +205,7 @@ impl Codec for DavisLoop {
         // No `observed_at`: a LOOP record is the console's *current* state and carries no
         // timestamp at all, so admission substitutes the frame's arrival time -- which is
         // the honest answer and is what `r.Timestamp = time.Now()` approximates at
-        // `station.go:424`, one layer further from the wire.
+        // `station.go:501`, one layer further from the wire.
         Ok(vec![PartialReading::new(r)])
     }
 }
@@ -256,7 +257,7 @@ fn fill(r: &mut Reading, p: &Loop, correction: WindDirCorrection) {
 
     r.rain_rate = clicks(p.rain_rate.get(), DASH_U16_FULL);
     r.uv = byte_tenths(p.uv);
-    // Go's column, not `radiation`: `station.go:666` assigns the LOOP packet's solar
+    // Go's column, not `radiation`: `station.go:646` assigns the LOOP packet's solar
     // radiation to `SolarWatts`, and the WeatherLink Live driver assigns its own to
     // `radiation` (`data_transformer.go:222`). Two drivers, two columns, both frozen
     // keys -- faithful per driver is the only way M5-2's value diff can be read.

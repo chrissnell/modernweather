@@ -101,7 +101,7 @@ fn the_captured_records_decode_to_values_a_vantage_reports() {
             Some(23.730_469),
             "record {n}: the console battery"
         );
-        // Go's column, not `radiation` -- `station.go:666` assigns the LOOP packet's solar
+        // Go's column, not `radiation` -- `station.go:646` assigns the LOOP packet's solar
         // radiation to `SolarWatts` and the WeatherLink Live driver assigns its own to
         // `radiation`. Faithful per driver is the only way M5-2's value diff can be read.
         assert_eq!(r.radiation, None, "record {n}");

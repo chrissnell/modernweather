@@ -32,7 +32,7 @@
 //!
 //! # The discard, which is this item's inherited constraint
 //!
-//! **DEV-9**, as a constraint on M6-1: `snowgauge/station.go:171-174` discards a distance
+//! **DEV-9**, as a constraint on M6-1: `snowgauge/station.go:172-176` discards a distance
 //! **greater than the station's configured base distance** at the device, and M3-3 moved
 //! `snowdepth` to ingest — so without the discard such a reading stores a *negative* depth
 //! into a column with `min`/`mean`/`max` aggregates over it, where in Go it never reached

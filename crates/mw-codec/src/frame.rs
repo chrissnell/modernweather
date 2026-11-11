@@ -172,7 +172,7 @@ pub enum CodecError {
     ///
     /// The one variant that is not about the *bytes*. A snow gauge reporting a distance
     /// greater than its configured base distance has not sent a malformed frame; it has sent
-    /// a measurement that would store a negative depth, and `snowgauge/station.go:171`
+    /// a measurement that would store a negative depth, and `snowgauge/station.go:172`
     /// discards it at the device. Carried as an error so that the drop is counted with a
     /// reason an operator can act on rather than returned as an empty batch, which is
     /// indistinguishable from a frame that mapped nothing.

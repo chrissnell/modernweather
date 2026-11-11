@@ -45,7 +45,7 @@
 //! a station that reports nothing.
 //!
 //! **4. Every wait has a deadline.** The serial path in Go has none at all —
-//! `SetReadDeadline` is called only when `config.Hostname` is set (`station.go:376`) — so a
+//! `SetReadDeadline` is called only when `config.Hostname` is set (`station.go:325`, `:455`) — so a
 //! console that stops talking on a serial line hangs the read forever, and the component
 //! is neither failed nor running. Each of the three waits here has its own timeout and its
 //! own sentence.

@@ -160,7 +160,7 @@ impl Codec for CampbellAscii {
         // No `observed_at`: the packet carries no time. The datalogger has a clock and its
         // program does not output it, which is a CRBasic change rather than a decoder one;
         // admission substitutes the arrival instant, which is what `time.Now()` at
-        // `station.go:191` approximates.
+        // `station.go:199` approximates.
         Ok(vec![PartialReading::new(r)])
     }
 }

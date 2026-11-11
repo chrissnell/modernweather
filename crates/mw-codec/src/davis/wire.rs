@@ -34,7 +34,7 @@
 //!
 //! **Bytes 95 and 96 are read and not asserted**, and that is a deliberate hole. The
 //! specification puts `\n\r` there; `cmd/davis-emulator` writes the 3-hour trend at 95 and a
-//! zero at 96 (`main.go:415`). Requiring the specification's bytes would make this decoder
+//! zero at 96 (`main.go:362-363`). Requiring the specification's bytes would make this decoder
 //! reject every packet the pinned oracle produces, and the two check bytes already cover
 //! the whole packet — so the trailer is part of the structure, is covered by the CRC, and is
 //! not a validity test.

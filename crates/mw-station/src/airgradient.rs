@@ -7,7 +7,7 @@
 //! # Three seconds, and why it is not clamped per occurrence
 //!
 //! [`DEFAULT_POLL`] is the Go driver's `pollInterval` and the device's own measurement
-//! cadence — `station.go:67` with the comment *"AirGradient supports fast polling"*. The
+//! cadence — `station.go:64-65` with the comment *"AirGradient supports fast polling"*. The
 //! period is **not configurable** here, because there is no column for it: the schema's only
 //! interval column is `wll_poll_interval_seconds`, which is the WeatherLink Live's. Adding
 //! one is a migration and an owner decision about what a sensible floor is; three seconds is

@@ -53,7 +53,7 @@ use crate::transport::Transport;
 
 /// How long to wait for a TCP connection to a console or a bridge.
 ///
-/// The Go Davis driver's `net.DialTimeout` value (`station.go:271`), kept so that the two
+/// The Go Davis driver's `net.DialTimeout` value (`davis/station.go:308`), kept so that the two
 /// daemons give a bridge the same chance during the M5-2 comparison.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 

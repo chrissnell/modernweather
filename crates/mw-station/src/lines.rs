@@ -19,7 +19,7 @@
 //! TCP connection can deliver two records in one segment or half of one. A driver that
 //! treated a read as a frame would decode a truncated object as a parse failure and the
 //! other half as a second one — on a *correctly functioning* station. The Go driver gets
-//! this right by wrapping the connection in `bufio.Scanner` (`campbell/station.go:171`),
+//! this right by wrapping the connection in `bufio.Scanner` (`campbell/station.go:180`),
 //! and this is that scanner.
 //!
 //! # The bound, and what happens at it

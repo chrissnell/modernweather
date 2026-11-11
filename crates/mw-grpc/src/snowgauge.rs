@@ -23,7 +23,7 @@
 //! `logger.Fatalf` if the hostname or port is missing — which is a configuration mistake
 //! that takes the whole daemon down rather than one station.
 //!
-//! **2. The discard is the codec's, and it is counted.** `snowgauge/station.go:171` drops a
+//! **2. The discard is the codec's, and it is counted.** `snowgauge/station.go:172` drops a
 //! distance greater than the configured base distance at the device and logs it;
 //! `mw_codec::SnowGaugeProto` refuses it as `CodecError::Implausible`, which the driver
 //! counts as `mw_station_frames_total{outcome="implausible"}`. **DEV-9** makes that discard
@@ -39,7 +39,7 @@
 //! # The keepalive is the Go driver's, and it is the one thing kept verbatim
 //!
 //! Two minutes with a twenty-second timeout and `permit_without_stream`
-//! (`snowgauge/station.go:92`). A snow gauge reports when the distance *changes*, which in
+//! (`snowgauge/station.go:95-98`). A snow gauge reports when the distance *changes*, which in
 //! settled weather is not for hours, so without a keepalive a NAT or a firewall drops the
 //! connection and neither end notices until the next reading never arrives.
 

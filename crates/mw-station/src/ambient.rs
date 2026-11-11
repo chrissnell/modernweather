@@ -14,7 +14,7 @@
 //! | Station identity | **the port the request arrived on** | `?ID=`, against the registry |
 //! | Authentication | none: any request on that port is trusted as that station | `?PASSWORD=`, constant-time against the stored hash |
 //!
-//! The identity row is the defect. `ambientcustomized/station.go:131` builds a reading with
+//! The identity row is the defect. `ambientcustomized/station.go:136` builds a reading with
 //! `StationName: s.config.Name` — the station is whichever component's listener received
 //! the request — and `handleWeatherUpdate` reads `?ID=` and `?PASSWORD=` only to check that
 //! they are **non-empty**. So anything that can reach the port can write readings for that
@@ -44,7 +44,7 @@
 //! # `totalrainin` is the one piece of per-station state a driver holds
 //!
 //! The console's all-time rainfall counter, which the Go driver turns into an increment by
-//! remembering the previous upload (`station.go:216-230`) and overwriting whatever `rainin`
+//! remembering the previous upload (`station.go:222-236`) and overwriting whatever `rainin`
 //! put in `rainincremental`. A codec cannot remember anything — that is what makes it
 //! golden-testable — so the arithmetic is `mw_codec::rain_since` and the memory is
 //! [`Handler::totals`]. It is keyed by the **claim** rather than by the station, because the
@@ -83,7 +83,7 @@ pub const DEFAULT_MOUNT: &str = "/ingest/ambient";
 
 /// What an accepted upload answers.
 ///
-/// The Go handler's body (`station.go:148`). An Ambient console does not read it, and
+/// The Go handler's body (`station.go:153`). An Ambient console does not read it, and
 /// keeping it means a `curl` against the endpoint says the same thing on both
 /// implementations.
 pub const ACCEPTED_BODY: &str = "success";
@@ -187,7 +187,7 @@ impl Handler {
         }
 
         // The protocol's own required set, which is the Go handler's check
-        // (`station.go:117`) minus the part that treated a non-empty password as
+        // (`station.go:121`) minus the part that treated a non-empty password as
         // authentication.
         if params.get(mw_codec::ACTION_PARAM) != Some(mw_codec::ACTION_UPDATERAW) {
             m::frame(id, FrameOutcome::Undecodable);
