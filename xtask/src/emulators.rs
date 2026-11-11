@@ -7,13 +7,20 @@
 //! `docs/reconciliation.md` G-1 — the failure mode this gate was armed to avoid being
 //! another instance of.
 //!
-//! Three other things it checks, each because the manifest would otherwise be able to lie:
+//! Four other things it checks, each because the manifest would otherwise be able to lie:
 //!
 //! - the reference commit is a **full object name**, since "pinned" and "pinned to a
 //!   branch name" are different things (A-W8-4);
 //! - every emulator's `path` exists, so an entry cannot outlive the directory it names;
 //! - there is at least one runnable emulator, so emptying the `[[emulator]]` list is not a
-//!   way to make the gate pass.
+//!   way to make the gate pass;
+//! - every **vendored** emulator's files match the SHA-256 the manifest records. An
+//!   emulator copied from the pinned reference commit is only an independently-written
+//!   oracle while it is still that copy, and the realistic way an emulator test gets
+//!   "fixed" is by editing the oracle until it passes. The digest makes that a red gate.
+//!   It cannot catch the reference tree *moving*, and it does not need to: the commit is
+//!   pinned, so bumping it is a reviewed change to the manifest and to these digests in
+//!   one diff.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -45,10 +52,27 @@ struct Emulator {
     id: String,
     emulates: String,
     driver: String,
-    /// `"reference"` for an emulator checked out of the pinned reference repository, or
-    /// `"this-repository"` for one that lives here. The distinction is D-40's independent
-    /// authorship, and it is reported on every run rather than buried in the manifest.
+    /// Where this emulator came from, which is D-40's independent authorship and is
+    /// reported on every run rather than buried in the manifest.
+    ///
+    /// | Value | Meaning |
+    /// |---|---|
+    /// | `reference` | checked out of the pinned reference repository at test time |
+    /// | `reference-vendored` | **copied** from it, at the pinned commit, with every file's SHA-256 in `files` |
+    /// | `this-repository` | written here, beside the driver |
+    ///
+    /// Nothing is `reference` today and the reason is written out in the manifest: a test
+    /// that fetched the pinned commit would need the network and credentials for a private
+    /// repository at test time.
     origin: String,
+
+    /// For `origin = "reference-vendored"`: every vendored file's path, relative to `path`,
+    /// and its SHA-256.
+    ///
+    /// Required and non-empty for that origin, and refused for the other two -- a digest
+    /// table on an emulator written here would be checking a file against itself.
+    #[serde(default)]
+    files: BTreeMap<String, String>,
     path: String,
     package: String,
     test_target: String,
@@ -125,15 +149,20 @@ pub fn main(args: &[String]) -> Result<ExitCode, String> {
             "  RUN      {:<16} {} -- driving {} ({})",
             emulator.id, emulator.emulates, emulator.driver, emulator.origin
         );
-        if emulator.origin != "reference" {
+        match emulator.origin.as_str() {
             // D-40's rationale is that the emulator is not written by whoever wrote the
             // driver. An emulator in this repository does not have that property, and
             // saying so on every run is the difference between a recorded limitation and a
             // forgotten one.
-            println!(
+            "this-repository" => println!(
                 "           NOTE: this emulator lives in THIS repository, so it is not \
                  the independently-written oracle D-40 asks for. See {MANIFEST}."
-            );
+            ),
+            "reference-vendored" => println!(
+                "           vendored from the pinned commit; {} file(s) digest-verified",
+                emulator.files.len()
+            ),
+            _ => {}
         }
         if !emulator.note.is_empty() {
             println!("           {}", first_line(&emulator.note));
@@ -233,6 +262,38 @@ fn check(root: &Path, manifest: &Manifest) -> Result<(), String> {
                 emulator.id, emulator.path
             ));
         }
+        match emulator.origin.as_str() {
+            "reference" | "this-repository" => {
+                if !emulator.files.is_empty() {
+                    return Err(format!(
+                        "emulator `{}` is `{}` and lists file digests. A digest table \
+                         belongs to `reference-vendored` alone: on an emulator written \
+                         here it would be checking a file against itself, and on one \
+                         checked out at test time the checkout is the pin.",
+                        emulator.id, emulator.origin
+                    ));
+                }
+            }
+            "reference-vendored" => {
+                if emulator.files.is_empty() {
+                    return Err(format!(
+                        "emulator `{}` is vendored from the pinned commit and lists no \
+                         file digests, so nothing would notice it being edited -- which is \
+                         the way an emulator test actually gets \"fixed\". List every \
+                         vendored file under `[emulator.files]`.",
+                        emulator.id
+                    ));
+                }
+                verify(&path, emulator)?;
+            }
+            other => {
+                return Err(format!(
+                    "emulator `{}` has origin `{other}`, which is not one of \
+                     `reference`, `reference-vendored` or `this-repository`",
+                    emulator.id
+                ));
+            }
+        }
     }
     for pending in &manifest.pending {
         if seen.contains_key(pending.id.as_str()) {
@@ -250,6 +311,43 @@ fn check(root: &Path, manifest: &Manifest) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Every vendored file is still the copy the manifest recorded.
+fn verify(dir: &Path, emulator: &Emulator) -> Result<(), String> {
+    for (relative, expected) in &emulator.files {
+        if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!(
+                "emulator `{}` records `{expected}` for `{relative}`, which is not a \
+                 SHA-256",
+                emulator.id
+            ));
+        }
+        let path = dir.join(relative);
+        let bytes = std::fs::read(&path).map_err(|e| {
+            format!(
+                "emulator `{}` lists `{relative}`, which could not be read: {e}",
+                emulator.id
+            )
+        })?;
+        let found = sha256(&bytes);
+        if &found != expected {
+            return Err(format!(
+                "emulator `{}`: `{relative}` is {found} and the manifest records \
+                 {expected}. A vendored emulator that has been edited is no longer the \
+                 independently-written oracle D-40 asks for -- restore it from the pinned \
+                 commit, or bump the pin and this digest in one change.",
+                emulator.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Run one emulator's tests and assert the declared number passed.

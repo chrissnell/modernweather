@@ -37,7 +37,10 @@ pub mod writer;
 
 pub use crate::frozen::FrozenReads;
 pub use crate::reader::TimescaleReader;
-pub use crate::registry::{ConfigRegistry, RegistrySnapshot, StationEntry, ZoneProblem};
+pub use crate::registry::{
+    hash_ingest_secret, ConfigRegistry, RegistrySnapshot, SecretHashError, SecretProblem,
+    StationEntry, ZoneProblem,
+};
 pub use crate::schedule::SqliteScheduleStore;
 pub use crate::store::TimescaleStore;
 pub use crate::writer::TimescaleWriter;

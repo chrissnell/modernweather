@@ -308,6 +308,48 @@ impl RegistrySnapshot {
     }
 }
 
+/// Hash an ingest secret for storage in `config.stations.ingest_secret_hash`.
+///
+/// **Why there is a minting function here at all.** `ConfigRegistry::verify` compares a
+/// presented `?PASSWORD=` against a stored Argon2id PHC string, and nothing in this build
+/// writes one: `ConfigAdmin` is implementation-plan.md **M7-1**'s. Without this, an Ambient
+/// station is configurable only by someone who can produce a PHC string by hand — which is
+/// a driver that cannot be used and cannot be tested. So the one function M7-1's
+/// "set the station's ingest secret" needs is here, beside the one that verifies it, which
+/// is also the only arrangement in which the two cannot disagree about the algorithm.
+///
+/// **The parameters are `Argon2::default()`'s — m=19 MiB, t=2, p=1 — and not the
+/// administrator password's m=64 MiB, t=3, p=4** (W5 §3.2). Three reasons, and they are
+/// about the threat rather than about convenience. An ingest secret travels in a **query
+/// string in the clear** on every upload, so it is not a credential whose strength rests on
+/// never being seen; it is a device secret an operator sets once, not a password reused
+/// across sites; and the memory cost is paid on a Raspberry Pi, once per station per
+/// restart, by a process that is also holding a spool. What the hash is for is that a
+/// stolen `config.db` does not hand over a reusable secret, and 19 MiB of Argon2id is that.
+/// The PHC string carries its own parameters, so a hash written by any other tool — with
+/// any other parameters — still verifies.
+pub fn hash_ingest_secret(secret: &SecretString) -> Result<String, SecretHashError> {
+    use argon2::password_hash::rand_core::OsRng;
+    use argon2::password_hash::{PasswordHasher, SaltString};
+
+    let salt = SaltString::generate(&mut OsRng);
+    Ok(Argon2::default()
+        .hash_password(secret.expose_secret().as_bytes(), &salt)
+        .map_err(|_| SecretHashError)?
+        .to_string())
+}
+
+/// Why an ingest secret could not be hashed.
+///
+/// One variant and no cause, deliberately. `argon2::password_hash::Error`'s `Display`
+/// quotes the input in two of its variants, and the input here is a credential; the
+/// reachable causes are a salt the operating system's RNG refused to produce and a secret
+/// longer than Argon2's own input bound, neither of which a message about the secret would
+/// help with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the ingest secret could not be hashed")]
+pub struct SecretHashError;
+
 /// A stored ingest secret that cannot authenticate anything.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SecretProblem {
@@ -944,6 +986,29 @@ mod tests {
             Ok(StationKey::new("suncrest:roof")),
             "a secret nothing consults does not refuse the frames that do arrive"
         );
+    }
+
+    /// The minting function and the verifying one, as a round trip -- which is the only
+    /// property worth asserting about a hash whose parameters travel with it.
+    #[test]
+    fn a_minted_ingest_secret_verifies_and_a_different_one_does_not() {
+        let hash = hash_ingest_secret(&SecretString::from("hunter2".to_string()))
+            .expect("hashing a literal");
+        assert!(
+            hash.starts_with("$argon2id$"),
+            "the stored form is a PHC string: {hash}"
+        );
+        let registry = ConfigRegistry::new(RegistrySnapshot::new(&[ambient_row(&hash)], []));
+        assert_eq!(
+            registry.resolve(&presenting_secret("hunter2")),
+            Ok(StationKey::new("ambient:backyard"))
+        );
+
+        // Two mintings of the same secret differ, because the salt does -- which is what a
+        // stolen `config.db` not handing over a reusable secret rests on.
+        let again = hash_ingest_secret(&SecretString::from("hunter2".to_string()))
+            .expect("hashing a literal");
+        assert_ne!(hash, again);
     }
 
     #[test]

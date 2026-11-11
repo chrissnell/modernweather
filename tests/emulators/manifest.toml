@@ -16,31 +16,47 @@
 # DESIGN.md D-40 keeps the emulators in Go deliberately, because "a driver tested against a
 # simulator written in the same language from the same understanding tests that
 # understanding against itself", and A-W8-4 adds that they are consumed at a pinned commit
-# of the reference repository.
+# of the reference repository. `origin` is where each entry stands against that, and it is
+# printed on every run rather than buried here:
 #
-# **The reference repository has no WeatherLink Live emulator at that commit.** Its four
-# are `cmd/davis-emulator`, `cmd/campbell-emulator`, `cmd/weather-station-simulator` (Davis
-# on TCP 22222 and Campbell on TCP 7000) and `cmd/live-data-simulator` (Campbell packets
-# from live data); none of them speaks the WeatherLink Live local API or broadcasts its
-# datagrams. The repository is read-only to this programme, so one cannot be added there.
+#   reference-vendored  copied from the pinned commit, byte for byte, with every file's
+#                       SHA-256 in `[emulator.files]`. Keeps ALL of D-40: a separate
+#                       process, a different language, real sockets, the real bind, more
+#                       than one batch -- and independent authorship, because the file was
+#                       written years before this programme by somebody who was not writing
+#                       this driver.
 #
-# M3-1 is the item that arms this gate and the only driver that exists is WeatherLink Live,
-# so the choice was between a gate that runs nothing — G-1 — and an emulator written here.
-# The emulator is written here, in Go, as `tests/emulators/wll`, and `origin =
-# "this-repository"` records exactly which of D-40's properties that costs:
+#                       Why vendored rather than checked out at test time: that would need
+#                       the network and credentials for a private repository during
+#                       `cargo test`, which is a test that fails for a reason unrelated to
+#                       the driver. The digests are what stop a vendored oracle being
+#                       edited until a test passes, which is the realistic failure --
+#                       `cargo xtask emulator-tests` refuses an emulator whose files have
+#                       moved.
 #
-#   kept      a separate process, a different language, real sockets, the real bind, and a
-#             driver exercised for more than one batch
-#   lost      independent authorship. It was written in the same repository as the driver,
-#             from the same reading of the published API, so it cannot catch a
-#             misunderstanding the two share.
+#   this-repository     written here, beside the driver. Keeps everything on that list
+#                       except independent authorship, so it cannot catch a
+#                       misunderstanding the emulator and the driver share.
 #
-# **This is a decision for the programme owner, not a settled one.** The honest fix is a
-# `cmd/weatherlink-live-emulator` in the reference tree, written against the vendor
+#   reference           checked out of the pinned repository at test time. Nothing is this,
+#                       for the reason above; the value exists so that an entry which
+#                       becomes one has a name for it.
+#
+# **The reference repository has no WeatherLink Live, AirGradient or Ambient emulator at
+# that commit.** Its four are `cmd/davis-emulator`, `cmd/campbell-emulator`,
+# `cmd/weather-station-simulator` (Davis on TCP 22222 and Campbell on TCP 7000) and
+# `cmd/live-data-simulator` (Campbell packets from live data). The first two are vendored
+# below; the other three emulators here are written in this repository because there is
+# nothing to vendor and the repository is read-only to this programme.
+#
+# **For the WeatherLink Live that remains a decision for the programme owner.** The honest
+# fix is a `cmd/weatherlink-live-emulator` in the reference tree, written against the vendor
 # documentation by somebody who is not writing the driver, with the pin below bumped to the
-# commit that adds it — at which point this entry's `origin` becomes `"reference"` and the
+# commit that adds it -- at which point that entry becomes `reference-vendored` and the
 # local copy is deleted. Until then the gate runs real tests and says what they do not
-# prove.
+# prove. The same is true of `airgradient` and of `ambient`, and for `ambient` it is
+# weaker still: the station is the client, so the emulator is a hundred lines of query
+# string and the thing it cannot independently check is the parameter NAMES.
 #
 # ---------------------------------------------------------------------------------------
 
@@ -109,6 +125,170 @@ every name in it passed, and `cargo test -p xtask` fails unless every name in it
 the target. So a removed test, a renamed one, and a filter that matches nothing are each a
 red gate, and a half-finished rename is caught without a Go toolchain."""
 
+[[emulator]]
+id = "davis"
+emulates = "Davis Vantage Pro/Pro2 -- the wake handshake, `LOOP n`, 99-byte records, CRC-16"
+driver = "mw_station::davis + mw_codec::DavisLoop (implementation-plan.md M6-1)"
+origin = "reference-vendored"
+path = "tests/emulators/davis"
+package = "mw-station"
+test_target = "emulator_davis"
+test_names = [
+    "the_driver_keeps_reading_past_the_end_of_a_run_over_tcp",
+    "the_driver_wakes_the_console_and_reads_it_over_a_serial_line",
+    "a_flaky_console_costs_frames_and_not_the_station",
+    "a_console_that_drops_the_connection_is_reconnected_to",
+    "a_console_that_never_answers_ends_the_conversation_with_a_deadline",
+]
+note = """
+**The strongest oracle in this programme**: 695 lines written years before any of it, with a
+`-flaky` family of flags that exists to break a driver -- dropped bytes, corrupted bytes,
+deliberately wrong CRCs, truncated packets, disconnections, hangs, slow responses and
+ignored commands.
+
+  the_driver_keeps_reading_past_the_end_of_a_run_over_tcp
+      two runs of three packets, which means the driver RE-ISSUED `LOOP n` when the first
+      run ended. That is the Davis defect by name: `GetLoopPackets` returns from its
+      goroutine when `GetDavisLoopPackets` returns SUCCESSFULLY, so a console that delivers
+      twenty good packets stops being read, permanently, with no error and no log line.
+  the_driver_wakes_the_console_and_reads_it_over_a_serial_line
+      the same thing over a real character device: `socat` bridges a pty to the emulator's
+      port, so the wake handshake, the framing and the re-issue all happen over a tty. W3
+      D-83's "socat pty pair", with the pinned oracle on the far end of it.
+  a_flaky_console_costs_frames_and_not_the_station
+      dropped bytes, corrupted bytes, bad CRCs and truncated packets at 20% each. The
+      driver has to resynchronise on the next `LOO` header, drop what fails its checksum,
+      and keep producing readings whose values are in range -- which is what says the
+      resynchronisation found a real packet boundary rather than a plausible-looking offset.
+  a_console_that_drops_the_connection_is_reconnected_to
+      the other half of the flaky family: the connection is dropped mid-transmission at 30%
+      and the console hangs at 10%. Each of those ends the CONVERSATION, and what has to be
+      true is that the station keeps producing readings -- which is `Backoff` and a fresh
+      `connect`, not a loop inside the driver.
+  a_console_that_never_answers_ends_the_conversation_with_a_deadline
+      `-no-response-rate 1.0`: the console ignores every command, including the wake. The
+      driver returns a retryable failure naming the handshake rather than hanging, which the
+      Go serial path does not -- `SetReadDeadline` is called only when a hostname is
+      configured, so a serial console that stops talking hangs the read for ever."""
+
+# Byte-for-byte from `cmd/davis-emulator/main.go` and `pkg/crc16/crc16.go` at the pinned
+# commit. `cargo xtask emulator-tests` refuses the entry if either has moved; README.md in
+# that directory has the `git show` command that reproduces both.
+[emulator.files]
+"main.go" = "0de019b1802b23cd594d6a939fba8e5ea7a04783f2cba4db30359e0b2d013e28"
+"remoteweather/pkg/crc16/crc16.go" = "eb2300eb70abd6171df2ba6eb8323b0ddd404a7862e96f3c4831eff05cae7c5e"
+
+[[emulator]]
+id = "campbell"
+emulates = "Campbell Scientific datalogger -- newline-delimited JSON over a stream"
+driver = "mw_station::campbell + mw_codec::CampbellAscii (implementation-plan.md M6-1)"
+origin = "reference-vendored"
+path = "tests/emulators/campbell"
+package = "mw-station"
+test_target = "emulator_campbell"
+test_names = [
+    "the_driver_reads_a_datalogger_over_tcp",
+    "the_driver_reads_a_datalogger_over_a_serial_line",
+    "records_that_arrive_together_are_still_one_reading_each",
+    "a_datalogger_that_hangs_up_ends_the_conversation_retryably",
+]
+note = """
+The owner's own station type, and a `json.Encoder` on a socket -- which is the property the
+line framer exists for.
+
+  the_driver_reads_a_datalogger_over_tcp
+      N-20's production path: the station is on USB serial and the daemon is moving into
+      Kubernetes, so the line is terminated by `ser2net` and this end is a TCP socket.
+  the_driver_reads_a_datalogger_over_a_serial_line
+      the same driver over a `socat`-bridged pty, which is where the station physically is.
+  records_that_arrive_together_are_still_one_reading_each
+      the emulator at a 1 ms output period, so records arrive faster than reads and several
+      land in one. Two hundred records, two hundred complete readings: a driver that treated
+      a read as a frame would admit fewer and would admit partial ones.
+  a_datalogger_that_hangs_up_ends_the_conversation_retryably
+      the emulator is killed mid-stream. The failure is retryable, which is what makes the
+      supervisor reconnect (D-27) rather than the driver carrying two nested reconnect loops
+      and a `connecting` mutex."""
+
+# Byte-for-byte from `cmd/campbell-emulator/main.go` at the pinned commit.
+[emulator.files]
+"main.go" = "42e8049bcae5bf1fadbea229fe0dd1c23c37f59aedb35ed96fed8cf062af0dfb"
+
+[[emulator]]
+id = "airgradient"
+emulates = "AirGradient ONE -- `GET /measures/current`"
+driver = "mw_station::airgradient + mw_codec::AirGradientJson (implementation-plan.md M6-1)"
+origin = "this-repository"
+path = "tests/emulators/airgradient"
+package = "mw-station"
+test_target = "emulator_airgradient"
+test_names = [
+    "every_occurrence_produces_a_reading_and_the_values_move",
+    "an_older_firmware_reports_its_raw_temperature_rather_than_thirty_two_degrees",
+    "a_monitor_with_no_temperature_sensor_stores_no_temperature",
+    "a_device_that_answers_an_error_fails_the_occurrence",
+]
+note = """
+  every_occurrence_produces_a_reading_and_the_values_move
+      five occurrences, five readings, with the values moving -- the polling-driver shape of
+      the Davis "stops after one batch" defect.
+  an_older_firmware_reports_its_raw_temperature_rather_than_thirty_two_degrees
+      `-firmware old`, which omits every `*Compensated` field. The Go driver reads only the
+      compensated one, so it stores `celsiusToFahrenheit(0.0)` = 32 degF every three seconds
+      for a monitor that is working. This reads the raw field, and the test asserts the
+      number is not 32.
+  a_monitor_with_no_temperature_sensor_stores_no_temperature
+      `-sensor none`: absent, not zero (D-26). The particulate and CO2 sensors are separate
+      devices inside the monitor, so what the SHT module's absence costs is two metrics and
+      not the reading.
+  a_device_that_answers_an_error_fails_the_occurrence
+      `-status 503`. A failed OCCURRENCE, where `pollDevice` logs and returns -- three times
+      a second, with nothing an operator can alert on."""
+
+[[emulator]]
+id = "ambient"
+emulates = "Ambient Weather 'customized' -- the console as an HTTP CLIENT"
+driver = "mw_station::ambient (implementation-plan.md M6-1)"
+origin = "this-repository"
+path = "tests/emulators/ambient"
+package = "modernweather"
+test_target = "emulator_ambient"
+test_names = [
+    "two_consoles_on_one_route_resolve_to_two_stations",
+    "a_console_with_the_wrong_secret_is_refused_and_stores_nothing",
+    "a_console_this_node_has_no_row_for_is_refused",
+    "an_upload_missing_a_required_parameter_is_a_bad_request",
+    "an_accepted_upload_answers_the_body_the_protocol_expects",
+]
+note = """
+The only entry whose `package` is the binary, and the only one that is a whole PATH rather
+than a driver. The station is the CLIENT, so the test is a request against the route the
+driver mounts -- which needs a socket (`mw-http`'s) and a driver (`mw-station`'s), and those
+two crates are in the same layer. The binary is the one place they meet, which is the same
+seam `crates/modernweather/src/boot.rs` assembles in production.
+
+Every box on that path is the production implementation: `mw_http::bind`,
+`mw_http::upload_table`, `mw_station::ambient::Handler`, `mw_pipeline::SpoolIngress`,
+`mw_store::ConfigRegistry` -- including the Argon2 verification of `?PASSWORD=` -- and a
+real spool. Only the configuration rows and the clock are stood in for.
+
+  two_consoles_on_one_route_resolve_to_two_stations
+      the structural property: one component, one route, two stations, and the station each
+      upload resolves to comes from `?ID=` through the single gate. In the Go tree a second
+      station is a second `http.Server` on a second port and the identity IS the port. Also
+      asserts the console's own `dateutc` as the observation instant, the per-station vane
+      calibration, and `totalrainin` differenced across uploads.
+  a_console_with_the_wrong_secret_is_refused_and_stores_nothing
+      the Go defect: `handleWeatherUpdate` checks that `?PASSWORD=` is non-EMPTY and
+      nothing else, so anything that can reach the port can write readings for that station.
+  a_console_this_node_has_no_row_for_is_refused
+      an endpoint on a public address legitimately receives somebody else's console.
+  an_upload_missing_a_required_parameter_is_a_bad_request
+      `action=updateraw` and `dateutc`, which are two of the four the protocol requires.
+  an_accepted_upload_answers_the_body_the_protocol_expects
+      `success`, which is what the Go handler writes and what a console's firmware looks
+      for."""
+
 # ---------------------------------------------------------------------------------------
 # Declared, not yet runnable. Each needs a driver this build does not have, and the gate
 # prints them so the set is visible on every run rather than remembered — the same reason
@@ -119,37 +299,19 @@ red gate, and a half-finished rename is caught without a Go toolchain."""
 # startup rather than quietly collecting nothing.
 
 [[pending]]
-id = "davis"
-emulates = "Davis VantagePro/Vue — LOOP packets, CRC16, the wake handshake"
-reference_path = "cmd/davis-emulator"
-driver = "implementation-plan.md M6-1"
-note = """
-Exists in the reference tree and is the strongest oracle this programme has: 695 lines,
-written years before any of this. W8 assumption 15 expects the emulator tests to connect to
-a TCP port the harness supplies, which `davis-emulator -port` already does; the serial
-variant of the same driver needs a `socat` pty pair, and W2a decides per driver whether that
-is worth it."""
-
-[[pending]]
-id = "campbell"
-emulates = "Campbell Scientific datalogger — command/response over TCP"
-reference_path = "cmd/campbell-emulator"
-driver = "implementation-plan.md M6-1"
-note = "Also in the reference tree, and the owner's production station type."
-
-[[pending]]
-id = "ambient"
-emulates = "Ambient 'customized' — the vendor webhook into our own listener"
-reference_path = ""
-driver = "implementation-plan.md M6-1"
-note = """
-No emulator anywhere, and it needs none of this shape: the station is the client, so the
-test is a request against the route the driver mounts. Listed because leaving it off the
-manifest would be the quiet kind of gap — the one G-5 is about."""
-
-[[pending]]
 id = "snowgauge"
-emulates = "The snow gauge — a gRPC client stream"
+emulates = "The snow gauge — a gRPC server streaming `snowgauge.Reading`"
 reference_path = ""
-driver = "implementation-plan.md M6-3"
-note = "A gRPC server stub, which arrives with the driver that consumes one."
+driver = "implementation-plan.md M6-1 (mw_grpc::snowgauge)"
+note = """
+The codec and the discard are done and tested (`mw_codec::SnowGaugeProto`, including DEV-9's
+"a distance greater than the configured base distance is a fault"), and `mw_station::plan`
+validates a `snowgauge` row and mints its component id. What is pending is the gRPC
+**client** that dials the gauge and the emulator that answers it.
+
+Both belong to `mw-grpc`: `ci/layers.toml` forbids `mw-station` from naming `tonic`, because
+§1.4 gives the gRPC socket and every gRPC service to `mw-http` and `mw-grpc`. So this entry
+stays pending and `crates/mw-station/src/snowgauge.rs` records the split -- a `snowgauge`
+row is accepted by `plan()` and produces no component, which is a configured station that
+collects nothing. **That is the one gap in M6-1 and it is named in the pull request rather
+than left to be found here.**"""

@@ -289,6 +289,224 @@ impl Drop for PtyPair {
     }
 }
 
+/// A Go emulator from `tests/emulators/<name>`, built once per test binary and killed on
+/// drop.
+///
+/// Level 3 of W3 **D-82**'s three -- "the whole driver against the pinned Go emulator" --
+/// and the three properties it has that the two levels below it cannot: a separate
+/// process, a different language, and real sockets.
+/// `tests/emulators/manifest.toml` is what declares which emulators exist, which tests
+/// each one must run, and what each one's origin is.
+///
+/// **Built rather than `go run`**, and the reason is a hang rather than a preference.
+/// `go run` compiles to a cache directory and then execs the result as a child **of its
+/// own**, so `kill_on_drop` kills the wrapper and the emulator keeps the descriptors it
+/// inherited -- which means a harness reading this test's output through a pipe never sees
+/// end-of-file and waits forever. `cargo xtask emulator-tests` reads exactly that pipe, so
+/// the gate would hang rather than fail.
+#[derive(Debug)]
+pub struct GoEmulator {
+    child: tokio::process::Child,
+    name: String,
+    lines: Option<tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>>,
+}
+
+/// How long any one wait in an emulator test may take.
+///
+/// Generous, because this is a process start on a shared runner; every assertion is on a
+/// fact and never on a duration.
+pub const EMULATOR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl GoEmulator {
+    /// Build `tests/emulators/<name>` and hand back the executable, once per test binary.
+    pub fn binary(name: &str) -> std::path::PathBuf {
+        static BUILT: Mutex<Option<std::collections::BTreeMap<String, std::path::PathBuf>>> =
+            Mutex::new(None);
+        let mut cache = BUILT
+            .lock()
+            .expect("the emulator build cache is not poisoned");
+        let cache = cache.get_or_insert_with(std::collections::BTreeMap::new);
+        if let Some(path) = cache.get(name) {
+            return path.clone();
+        }
+        // `CARGO_MANIFEST_DIR` is this crate's and expands where this function is
+        // *compiled*, so it is the same answer for a test in this crate and for one in the
+        // binary's -- which is the reason this helper is here rather than copied into each
+        // test target.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/emulators")
+            .join(name)
+            .canonicalize()
+            .unwrap_or_else(|e| panic!("tests/emulators/{name} is in the tree: {e}"));
+        let out = std::env::temp_dir().join(format!("mw-emulator-{name}-{}", std::process::id()));
+        let status = std::process::Command::new("go")
+            .args(["build", "-o"])
+            .arg(&out)
+            .arg(".")
+            .current_dir(&dir)
+            .status()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "the `{name}` emulator needs a Go toolchain on PATH (every test that \
+                     uses one is `--ignored` for that reason): {e}"
+                )
+            });
+        assert!(status.success(), "the `{name}` emulator did not build");
+        cache.insert(name.to_string(), out.clone());
+        out
+    }
+
+    /// Start an emulator with `args`, its stdout piped.
+    pub async fn spawn(name: &str, args: &[String]) -> Self {
+        let mut child = tokio::process::Command::new(Self::binary(name))
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            // Not inherited: an inherited descriptor outlives a killed child's siblings and
+            // is what makes a harness's pipe never close. Every emulator here writes to
+            // stderr only when it cannot start, which surfaces as the port never answering.
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap_or_else(|e| panic!("the `{name}` emulator starts: {e}"));
+        let stdout = child.stdout.take().expect("stdout is piped");
+        Self {
+            child,
+            name: name.to_string(),
+            lines: Some(tokio::io::AsyncBufReadExt::lines(
+                tokio::io::BufReader::new(stdout),
+            )),
+        }
+    }
+
+    /// Start an emulator that listens on a TCP port it is **told**, and wait until the port
+    /// answers.
+    ///
+    /// The two vendored reference emulators take `-port` and do not report what they bound,
+    /// so a port has to be chosen here. Derived from the process id and then retried on the
+    /// next candidate, because a port another process holds is a flaky test and a port
+    /// chosen by the kernel is not available to ask for. The gate runs these one at a time
+    /// (`cargo xtask emulator-tests` passes `--test-threads=1`), so the only contention is
+    /// with something else on the machine.
+    pub async fn serving_tcp(name: &str, extra: &[&str]) -> (Self, u16) {
+        let base = 24_000 + u16::try_from(std::process::id() % 20_000).unwrap_or(0);
+        let mut tried = Vec::new();
+        for attempt in 0..8u16 {
+            let port = base.saturating_add(attempt);
+            let mut args = vec!["-port".to_string(), port.to_string()];
+            args.extend(extra.iter().map(|a| (*a).to_string()));
+            let emulator = Self::spawn(name, &args).await;
+            if answers(port).await {
+                return (emulator, port);
+            }
+            tried.push(port);
+        }
+        panic!("the `{name}` emulator did not answer on any of {tried:?}");
+    }
+
+    /// The next line the emulator printed.
+    pub async fn next_line(&mut self) -> Option<String> {
+        let name = self.name.clone();
+        let lines = self.lines.as_mut()?;
+        tokio::time::timeout(EMULATOR_DEADLINE, lines.next_line())
+            .await
+            .unwrap_or_else(|_| panic!("the `{name}` emulator printed a line"))
+            .unwrap_or_else(|e| panic!("the `{name}` emulator's stdout is readable: {e}"))
+    }
+
+    /// Wait for the emulator to exit, and assert that it did so successfully.
+    pub async fn finished(mut self) {
+        let name = self.name.clone();
+        let status = tokio::time::timeout(EMULATOR_DEADLINE, self.child.wait())
+            .await
+            .unwrap_or_else(|_| panic!("the `{name}` emulator exited"))
+            .unwrap_or_else(|e| panic!("waiting for the `{name}` emulator: {e}"));
+        assert!(status.success(), "the `{name}` emulator exited {status}");
+    }
+}
+
+impl Drop for GoEmulator {
+    fn drop(&mut self) {
+        // `kill_on_drop` covers the usual path; this makes it immediate rather than at the
+        // next runtime poll, which matters when a test fails and the next one wants the
+        // port.
+        let _ = self.child.start_kill();
+    }
+}
+
+/// Whether a TCP port answers, polled for a few seconds.
+async fn answers(port: u16) -> bool {
+    for _ in 0..60 {
+        if tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .is_ok()
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// A `socat` bridge from a pty to a TCP port: a **serial** station whose other end is a
+/// network emulator.
+///
+/// This is W3 **D-83**'s "`socat` pty pair" with the pinned oracle on the far side of it.
+/// The two vendored reference emulators speak TCP and a Davis or Campbell station on a
+/// serial line speaks the same bytes, so bridging is what makes the serial half of the
+/// driver testable against the emulator that was written for the hardware -- rather than
+/// against a second emulator written here, which is the independent-authorship property
+/// D-40 exists to protect.
+///
+/// What the bridge adds over connecting to the port directly is the thing the Go serial
+/// path gets wrong: a **character device**, with its own buffering, so a frame arrives in
+/// whatever pieces the line produces rather than in whatever pieces TCP produces.
+#[derive(Debug)]
+pub struct PtyBridge {
+    child: tokio::process::Child,
+    dir: std::path::PathBuf,
+    device: std::path::PathBuf,
+}
+
+impl PtyBridge {
+    /// Bridge a new pty to `127.0.0.1:port`. `None` if `socat` is not on `PATH`.
+    pub async fn spawn(name: &str, port: u16) -> Option<Self> {
+        let dir = std::env::temp_dir().join(format!("mw-bridge-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok()?;
+        let device = dir.join("device");
+        let child = tokio::process::Command::new("socat")
+            .arg(format!("PTY,raw,echo=0,link={}", device.display()))
+            .arg(format!("TCP:127.0.0.1:{port}"))
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        for _ in 0..200 {
+            if device.exists() {
+                return Some(Self { child, dir, device });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    /// The character device a station component opens as its `transport_dev`.
+    pub fn device(&self) -> &std::path::Path {
+        &self.device
+    }
+
+    /// `socat`'s process id, for a test that wants to say which process it is waiting on.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+}
+
+impl Drop for PtyBridge {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
 /// A [`StationRegistry`] that resolves one claim, for a test that needs the gate itself
 /// rather than a driver's view of it.
 #[derive(Debug)]
