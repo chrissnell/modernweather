@@ -176,6 +176,58 @@ fn a_dashed_sensor_is_absent_rather_than_zero() {
     assert_eq!(r.year_et, Some(0.0));
 }
 
+/// Every rain field is `raw / 100.0` and not `raw * 0.01`, which are different functions.
+///
+/// 0.01 is not representable in binary, so the nearest `f32` to it is not the reciprocal of
+/// 100: the two forms disagree in the last bit for 17 484 of the 65 536 possible raw
+/// values. The raws below are three of them, and 33 is the `monthrain` byte of
+/// `tests/frames/davis-loop-1.bin` -- the fixture captured from the oracle -- so this is a
+/// stored `float4` differing from Go's, not a theoretical concern. The expectations are
+/// written as the division rather than as a decimal literal on purpose: `0.33` parses to
+/// the same bits as the division and would hide a regression to the multiplication behind
+/// a rounded number that looks right.
+#[test]
+fn the_rain_fields_are_divided_by_a_hundred_the_way_go_divides() {
+    for raw in [10u16, 33, 2503] {
+        let mut bytes = dashed();
+        bytes[50..52].copy_from_slice(&raw.to_le_bytes()); // day rain
+        bytes[52..54].copy_from_slice(&raw.to_le_bytes()); // month rain
+        let r = decode(bytes);
+        let go = f32::from(raw) / 100.0;
+        assert_eq!(r.day_rain, Some(go), "day rain for raw {raw}");
+        assert_eq!(r.month_rain, Some(go), "month rain for raw {raw}");
+        // The multiplication this replaced, named so the test fails for the right reason.
+        let multiplied = f32::from(raw) * 0.01f32;
+        assert_ne!(
+            go.to_bits(),
+            multiplied.to_bits(),
+            "raw {raw} was chosen because the two forms differ"
+        );
+    }
+}
+
+/// Wind direction has two ways to say nothing and both are refused.
+///
+/// `0x7FFF` is the dash every other 16-bit field uses; `0` is this field's own, because the
+/// protocol gives it the range 1 to 360. Go stores the second as a direction, so a vane
+/// that is not reporting reads as due north -- the fourth disagreement. 360 is kept,
+/// because north is a direction a working vane reports.
+#[test]
+fn a_wind_direction_of_zero_is_absent_and_three_hundred_and_sixty_is_north() {
+    for absent in [0u16, DASH_U16_HIGH] {
+        let mut bytes = dashed();
+        bytes[16..18].copy_from_slice(&absent.to_le_bytes());
+        assert_eq!(
+            decode(bytes).wind_dir,
+            None,
+            "a wind direction of {absent} decoded to a value"
+        );
+    }
+    let mut bytes = dashed();
+    bytes[16..18].copy_from_slice(&360u16.to_le_bytes());
+    assert_eq!(decode(bytes).wind_dir, Some(360.0));
+}
+
 /// The second disagreement: `32767` is the specification's dashed value and `-32768` is
 /// what the Go driver tests for. Both are refused, and the Go behaviour on the first is
 /// what makes that worth a test of its own.

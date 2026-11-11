@@ -306,6 +306,52 @@ mod tests {
             .class(),
             Class::Ignorable
         );
+        assert_eq!(
+            CodecError::Protobuf {
+                source: prost::DecodeError::new("a field that is not in the schema")
+            }
+            .class(),
+            Class::Ignorable
+        );
+        assert_eq!(
+            CodecError::Implausible {
+                what: "a snow-gauge distance",
+                value: 3000.0,
+                limit: 2000.0
+            }
+            .class(),
+            Class::Ignorable
+        );
+    }
+
+    /// `Protobuf` and `Implausible` carry a sentence too, because both are reasons an
+    /// operator reads off a counter and then has to act on.
+    #[test]
+    fn the_protobuf_and_implausible_failures_name_what_they_refused() {
+        assert_eq!(
+            CodecError::Implausible {
+                what: "a snow-gauge distance",
+                value: 3000.0,
+                limit: 2000.0
+            }
+            .to_string(),
+            "a snow-gauge distance is 3000 and the station's own limit is 2000"
+        );
+        // `Protobuf`'s own sentence names the format and not the fault -- `prost`'s
+        // message is the `#[source]`, which is where `DisplayChain` finds it. Asserted in
+        // both halves, because a reader who sees only the top line gets "not protobuf" and
+        // has to be able to rely on the detail being one link down.
+        let e = CodecError::Protobuf {
+            source: prost::DecodeError::new("buffer underflow"),
+        };
+        assert_eq!(
+            e.to_string(),
+            "the frame is not the protobuf message this codec decodes"
+        );
+        assert!(std::error::Error::source(&e)
+            .expect("the decode failure is the source")
+            .to_string()
+            .contains("buffer underflow"));
     }
 
     /// Each of the three framing-class variants says which it is, because `undecodable`

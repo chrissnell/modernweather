@@ -51,7 +51,7 @@ pub use ambient::{
 };
 pub use campbell::CampbellAscii;
 pub use crc16::{check as crc16_check, crc16};
-pub use davis::{DavisLoop, INCHES_PER_CLICK, LOOP_BYTES, LOOP_HEADER};
+pub use davis::{DavisLoop, CLICKS_PER_INCH, LOOP_BYTES, LOOP_HEADER};
 pub use frame::{Codec, CodecError, Frame};
 pub use query::QueryParams;
 pub use snowgauge::{SnowGaugeProto, STREAM_READING};

@@ -109,6 +109,18 @@ fn a_key_the_generator_omitted_is_absent_rather_than_zero() {
     assert_eq!(r.solar_watts, None, "captured after dark");
     assert_eq!(r.solar_joules, None);
     assert_eq!(r.rain_incremental, None, "captured with no rain");
+    // The absence above holds for all four records, so the *presence* half of the same
+    // mapping is not exercised by the fixture at all. Asserted here on the same four keys,
+    // because "absent decodes to `None`" and "present decodes to the value" are two
+    // properties and a decoder that returned `None` for both would pass the first.
+    let daytime = r#"{"airtemp_f":70.0,"slr_w":812.0,"slr_mj":0.812,"rain_in":0.03,"wind_d":0}"#;
+    let r = decode(daytime);
+    assert_eq!(r.solar_watts, Some(812.0));
+    assert_eq!(r.solar_joules, Some(0.812));
+    assert_eq!(r.rain_incremental, Some(0.03));
+    // Zero is a *reported* zero here rather than an omitted key, and the difference
+    // between the two is the whole of DEV-8: this one is stored.
+    assert_eq!(r.wind_dir, Some(0.0));
 }
 
 /// Nothing this driver does not map, and nothing the enrich stage owns.

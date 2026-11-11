@@ -218,7 +218,10 @@ fn the_vane_calibration_moves_the_captured_direction_and_no_other_field() {
 /// computed and discarded.
 #[test]
 fn one_flipped_bit_in_a_captured_record_is_refused() {
-    for at in [3usize, 12, 44, 86, 97] {
+    // Byte 4 is the record-type discriminant, so flipping it is the one case that is
+    // refused as `Unsupported` before the checksum is reached -- which is what makes the
+    // second arm below reachable rather than decoration.
+    for at in [3usize, 4, 12, 44, 86, 97] {
         let mut corrupt = LOOP_1.to_vec();
         corrupt[at] ^= 0x01;
         let e = DavisLoop::default()

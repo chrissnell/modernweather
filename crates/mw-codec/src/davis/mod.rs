@@ -45,7 +45,14 @@
 //! `mw_pipeline::enrich` owns and which computes them for every station rather than for the
 //! drivers that remembered to. A codec that computed them would be the second implementation.
 //!
-//! **4. The console battery lands in `stationbatteryvoltage`, which is Go's column and not
+//! **4. Wind direction `0` is absent, not due north.** The serial protocol gives the field
+//! the range 1 to 360 and reserves `0` for "no wind direction data"; `convWindDir` stores it
+//! as a direction anyway, so a vane that is not reporting reads as due north and enters
+//! `min(winddir)` and every wind rose. Refused here. The cost is stated because it is
+//! measurable: the vendored emulator draws `uint16(rand.Float64() * 360)`, so about one
+//! packet in three hundred and sixty now has an absent direction where Go stored `0`.
+//!
+//! **5. The console battery lands in `stationbatteryvoltage`, which is Go's column and not
 //! the obvious one.** `station.go:679` assigns `convConsBatteryVoltage` to
 //! `StationBatteryVoltage`, and no Go driver writes `consbatteryvoltage` at all. Faithful on
 //! purpose: M5-2 diffs this driver against that one by value, and a column moved here would
@@ -80,24 +87,43 @@ pub const LOOP_BYTES: usize = Loop::BYTES;
 /// The three ASCII bytes a LOOP record starts with.
 pub const LOOP_HEADER: [u8; 3] = Loop::HEADER;
 
-/// Inches of rain per rain-collector click, as this decoder assumes it.
+/// Rain-collector clicks per inch, as this decoder assumes it.
 ///
 /// **The packet does not carry it.** A Vantage's collector is 0.01 in, 0.2 mm or 0.1 mm and
 /// which one is in the console's EEPROM, reachable only by a separate `EEBRD` command that
 /// neither implementation issues. So `rainrate`, `stormrain` and the three rain totals are
 /// clicks scaled by this constant, which is what `convVal100` and `convBigVal100` do.
 ///
+/// **A divisor, not a multiplier, and that is the whole point.** `convVal100` is
+/// `float32(v) / 100.0`; multiplying by the nearest `f32` to 0.01 is a different function,
+/// because 0.01 is not representable. The two disagree in the last bit for 17 484 of the
+/// 65 536 possible raw values -- raw 33, the `monthrain` byte of `davis-loop-1.bin`, gives
+/// 0.32999998 one way and 0.33000001 the other -- and both are stored in a `float4`
+/// column. M5-2 diffs this driver against that one by value, so the last bit is the unit
+/// of correctness here.
+///
 /// Compare the WeatherLink Live codec, which leaves rainfall **absent** when `rain_size` is
 /// missing (`crate::wll::map`): there the field exists in the payload and was being ignored,
 /// so the choice was between a right answer and a wrong one. Here there is no field at all,
 /// and the alternative to assuming the commonest collector is a Davis station that never
 /// reports rain. Recorded rather than silent, because a 0.2 mm collector reads 1.27x high.
-pub const INCHES_PER_CLICK: f32 = 0.01;
+pub const CLICKS_PER_INCH: f32 = 100.0;
+
+/// Wind direction's own "no data" value, which is not a dash.
+///
+/// The Vantage serial protocol gives this field the range **1 to 360**, with 360 for north
+/// and `0` reserved for "no wind direction data" -- so a vane that is not reporting sends a
+/// value the field's own documented range excludes. `convWindDir` stores it as a direction,
+/// which is 0 degrees, which is due north: a failed vane becomes a real reading that feeds
+/// `min(winddir)` and every wind rose. Refused here instead, which is **DEV-16(g)** and the
+/// same choice D-3/D-26 made for every other absent value. Note that it is not the
+/// 0x7FFF dash: the protocol gives this one field two distinct ways to say nothing.
+const NO_DIRECTION: u16 = 0;
 
 /// The dashed value of a 16-bit signed field, per the Davis specification.
 const DASH_I16: i16 = 32_767;
 
-/// What `davis/station.go` tests for instead. Refused as well; see this module's third
+/// What `davis/station.go` tests for instead. Refused as well; see this module's second
 /// disagreement.
 const GO_DASH_I16: i16 = i16::MIN;
 
@@ -315,7 +341,7 @@ fn offset_temp(raw: u8) -> Option<f32> {
 
 /// Wind direction in degrees.
 fn direction(raw: u16) -> Option<f32> {
-    (raw != DASH_U16_HIGH).then(|| f32::from(raw))
+    (raw != DASH_U16_HIGH && raw != NO_DIRECTION).then(|| f32::from(raw))
 }
 
 /// Watts per square metre.
@@ -327,7 +353,7 @@ fn radiation(raw: u16) -> Option<f32> {
 fn clicks(raw: u16, dash: impl Into<Option<u16>>) -> Option<f32> {
     match dash.into() {
         Some(dash) if raw == dash => None,
-        _ => Some(f32::from(raw) * INCHES_PER_CLICK),
+        _ => Some(f32::from(raw) / CLICKS_PER_INCH),
     }
 }
 

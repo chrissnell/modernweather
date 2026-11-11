@@ -50,6 +50,17 @@ impl QueryParams {
             if field.is_empty() {
                 continue;
             }
+            // Go 1.17 stopped accepting `;` as a separator and made a pair containing one
+            // a skipped pair with an error recorded (`net/url.parseQuery`), which
+            // `r.URL.Query()` drops on the floor -- so `ID=roof;x=1` yields no `ID` at all
+            // over there and the handler answers 400 for a missing identifier. Skipped
+            // here for the same reason it is skipped there: a reader who sees `;` cannot
+            // tell whether the sender meant a separator or a literal, and guessing would
+            // make `ID` resolve to a different station on the two implementations.
+            if field.contains(';') {
+                skipped += 1;
+                continue;
+            }
             let (key, value) = match field.split_once('=') {
                 Some((k, v)) => (k, v),
                 // `&flag&` is a key with an empty value in `net/url`, not a skipped pair.
@@ -199,6 +210,27 @@ mod tests {
     }
 
     /// `net/url`'s behaviour: the bad pair goes and the good ones stay.
+    #[test]
+    fn a_pair_carrying_a_semicolon_is_skipped_the_way_go_skips_it() {
+        // The dangerous case is the first one: an identifier that resolved here and not
+        // over there would be a station admitted on one implementation and refused on the
+        // other, off the same request.
+        let q = QueryParams::parse("ID=roof;x=1&PASSWORD=p&tempf=70.0");
+        assert_eq!(q.get("ID"), None);
+        assert_eq!(q.get("PASSWORD"), Some("p"));
+        assert_eq!(q.get("tempf"), Some("70.0"));
+        assert_eq!(q.skipped(), 1);
+        // A semicolon on the value's side is the same pair and the same skip.
+        let q = QueryParams::parse("a=1;b=2");
+        assert_eq!(q.get("a"), None);
+        assert_eq!(q.skipped(), 1);
+        // Percent-encoded, it is a literal and survives -- which is how a console sends
+        // one on purpose.
+        let q = QueryParams::parse("note=a%3Bb");
+        assert_eq!(q.get("note"), Some("a;b"));
+        assert_eq!(q.skipped(), 0);
+    }
+
     #[test]
     fn a_pair_with_an_invalid_escape_is_skipped_and_the_rest_survive() {
         for bad in ["x=%zz", "x=%2", "x=%", "%zz=1"] {
