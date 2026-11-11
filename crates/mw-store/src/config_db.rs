@@ -371,6 +371,92 @@ mod tests {
         }
     }
 
+    /// W2a Decision 36: the Go `sun_times` table is **not** carried forward, and sunrise
+    /// and sunset are evaluated per request from the station's coordinates instead
+    /// (`mw_api_legacy::sun`). Both schemas were authored without the table rather than
+    /// authored with it and then dropped, so there is no `DROP TABLE` anywhere and "the
+    /// table is gone" is a property of the *absence* of a statement. Nothing would notice
+    /// that being undone, which is why the deletion gets a test and not a migration.
+    ///
+    /// Scoped to every `.sql` under `migrations/`, not just `migrations/config/`: the
+    /// weather schema is the wrong home for it twice over, and therefore the likelier
+    /// place for it to reappear.
+    ///
+    /// This is a text assertion over the migration sources rather than a query against the
+    /// applied schema, because under D-8 `migrations/` is the only thing that creates an
+    /// object -- so a query would be the same assertion with a database in the way. The
+    /// *values* that would have been stored in the table are guarded elsewhere and by
+    /// measurement: `mw-api-legacy/tests/sun_times.rs` asserts that the per-request
+    /// evaluation reproduces the rows the Go daemon served, which is the check W2a OQ-B
+    /// made the deletion conditional on (N-10).
+    ///
+    /// **If the fallback is ever wanted**, W2a §4.3 specifies its shape -- a
+    /// `Calendar { yearly, Jan 1, Station }` component with a reactive rebuild on a
+    /// coordinate change -- and reinstating it starts by deleting this test. That is the
+    /// intended way to undo it: one deliberate edit rather than a silent one.
+    #[test]
+    fn the_sun_times_table_is_not_carried_forward() {
+        let config_dir = migrations_root().join("config");
+        let files = all_migration_sql();
+        assert!(!files.is_empty(), "migrations/ holds no .sql");
+        assert!(
+            files.iter().any(|(p, _)| p.starts_with(&config_dir)),
+            "migrations/config/ holds no .sql, so this guard is scanning the weather \
+             schema alone"
+        );
+        for (path, sql) in files {
+            // `all_migration_sql` has stripped `--` comments and upper-cased, so a comment
+            // explaining why the table is absent is not a use of it.
+            assert!(
+                !sql.contains("SUN_TIMES"),
+                "{}: `sun_times` is back in a migration. W2a D-36 deletes it in favour of \
+                 a per-request evaluation, and the fallback shape is W2a §4.3 -- adopting \
+                 it means deleting `the_sun_times_table_is_not_carried_forward`, not \
+                 slipping a table past it.",
+                path.display()
+            );
+        }
+    }
+
+    /// And the converse, in the same spirit as `re_running_a_migration_body_fails` above: a
+    /// guard over a name that is absent everywhere passes whether or not it works, so the
+    /// check above is worth having only if it can be made to fail. `strip_sql_comments` and
+    /// the upper-casing are the two steps that could silently defeat it, so the control
+    /// runs the real pipeline over a synthetic file rather than asserting on a literal.
+    #[test]
+    fn the_sun_times_guard_bites() {
+        let reinstated = "\
+CREATE TABLE sun_times (
+    station_name TEXT NOT NULL,
+    day_of_year INTEGER NOT NULL
+) STRICT;
+";
+        assert!(
+            strip_sql_comments(reinstated)
+                .to_uppercase()
+                .contains("SUN_TIMES"),
+            "the guard would not notice the Go table being pasted back in"
+        );
+        // Mixed case and a trailing comment, because that is what a hand-edit looks like.
+        let sneaky = "create table Sun_Times (x INTEGER) STRICT; -- reinstating W2a 4.3\n";
+        assert!(
+            strip_sql_comments(sneaky)
+                .to_uppercase()
+                .contains("SUN_TIMES"),
+            "the guard is case-sensitive, so the reinstatement only has to be typed in \
+             lower case to pass it"
+        );
+        // And it does not fire on prose about the absence, which is what every reference to
+        // the table in this repository now is.
+        let prose = "-- W2a D-36: there is no sun_times table here, deliberately.\n";
+        assert!(
+            !strip_sql_comments(prose)
+                .to_uppercase()
+                .contains("SUN_TIMES"),
+            "a comment explaining the deletion would fail the guard that enforces it"
+        );
+    }
+
     /// Foreign keys are per-connection and OFF by default in SQLite, so the pragma in
     /// `connect_options` is load-bearing rather than tidy. A pool that forgot it would make
     /// every reference in the schema decorative, and the symptom would be an uploader

@@ -1076,6 +1076,30 @@ already records the fallback component's shape.
 ### M5-4 — delete `sun_times`
 **Depends on:** M5-3 passing. One row out of the plan, a table and a capability deleted. Trivial, and
 deliberately gated on the previous item rather than bundled with it.
+**Deviation that lands here:** **DEV-17**.
+
+**What this item found, on running it: there was nothing to delete.** Neither schema ever carried
+the table and no capability was ever named for it — `migrations/config/` was authored from scratch
+without it, `Capability` has twelve variants and none is `SunTimes`, and `mw_api_legacy::sun`
+evaluates both values per request. `docs/rewrite/README.md`'s capability inventory already strikes the
+row through (reconciliation decision 30). So W2a Decision 36 was applied at the point each of those
+files was written, and this item is the **verification** of a deletion rather than the deletion: the
+gated action it was holding does not exist, and no `DROP TABLE` was or could be written.
+
+That makes the deletion a property of the *absence* of a statement, which nothing would notice being
+undone — so what this item adds is the guard that would:
+`mw_store::config_db::tests::the_sun_times_table_is_not_carried_forward` rejects the identifier in
+any `.sql` under `migrations/`, weather schema included, with
+`the_sun_times_guard_bites` as its negative control. Reinstating W2a §4.3's fallback starts by
+deleting that test, which is the point of it.
+
+**On the gate.** M5-3's ten assertions all pass, including the one OQ-B asked for —
+`the_served_strings_are_the_stored_go_tables`, which requires the per-request evaluation to reproduce
+the row the Go daemon served, and does, 6 of 6 byte for byte. M5-3's separate finding that the served
+values sit 4.52 min from a **textbook** evaluation is a property of the ported Go formula, shared by
+the table and the evaluation alike; it is recorded in DEV-17 and is not a reason to keep a table that
+computes it identically. The three cases where deletion *does* change a served value are all the
+stored table being stale, and all three are in DEV-17 with their measurements.
 
 ### M5-5 — drop `stationname` and `stationtype` from the raw table
 **Depends on:** M1-2, M5-1. Now safe: the `metadata` role exists, and the migration has proved
