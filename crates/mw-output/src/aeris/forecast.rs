@@ -76,11 +76,20 @@ struct Group {
 /// One forecast period, in the sixteen fields the Go struct declares plus the two it
 /// derives.
 ///
-/// Every field is `#[serde(default)]` by the struct-level attribute, which is the Go
-/// behaviour rather than a convenience: Go's struct is non-pointer scalars, so a key the
-/// upstream omits stays at its zero value and reaches the stored JSON as `0` or `""`. A
-/// missing `pop` is stored as `"pop":0` by the Go daemon, and reproducing that is the
-/// point — the website reads the key unconditionally.
+/// Every field is `#[serde(default)]` by the struct-level attribute **and**
+/// `deserialize_with = "nullable"` individually, which together are the Go behaviour rather
+/// than a convenience. Go's struct is non-pointer scalars, so `encoding/json` leaves such a
+/// field at its zero value for **both** of the two ways a key can be absent: omitted
+/// entirely, and present as `null`. The container attribute covers the first; the field
+/// attribute covers the second, and without it an explicit `null` is a hard
+/// `invalid type: null, expected i16` that fails the **whole envelope** — so one
+/// `"snowIN": null` in one period of a ten-period forecast discards the forecast, every
+/// occurrence, for as long as the vendor sends it. A missing or null `pop` is stored as
+/// `"pop":0` by the Go daemon, and reproducing that is the point: the website reads the key
+/// unconditionally.
+///
+/// `date_time_iso` needs no such attribute: it is an `Option`, which serde already maps a
+/// `null` onto.
 #[derive(Debug, Deserialize, Default, PartialEq)]
 #[serde(default)]
 struct Period {
@@ -94,41 +103,61 @@ struct Period {
     /// *about this field*, which a `serde` failure on the whole envelope is not.
     #[serde(rename = "dateTimeISO")]
     date_time_iso: Option<String>,
-    #[serde(rename = "maxTempF")]
+    #[serde(rename = "maxTempF", deserialize_with = "nullable")]
     max_temp_f: i16,
-    #[serde(rename = "minTempF")]
+    #[serde(rename = "minTempF", deserialize_with = "nullable")]
     min_temp_f: i16,
-    #[serde(rename = "avgTempF")]
+    #[serde(rename = "avgTempF", deserialize_with = "nullable")]
     avg_temp_f: i16,
     /// `pop` — probability of precipitation, per cent.
+    #[serde(deserialize_with = "nullable")]
     pop: i16,
-    #[serde(rename = "precipIN")]
+    #[serde(rename = "precipIN", deserialize_with = "nullable")]
     precip_in: f32,
-    #[serde(rename = "iceaccumIN")]
+    #[serde(rename = "iceaccumIN", deserialize_with = "nullable")]
     ice_accum_in: f32,
-    #[serde(rename = "snowIN")]
+    #[serde(rename = "snowIN", deserialize_with = "nullable")]
     snow_in: f32,
-    #[serde(rename = "maxFeelslikeF")]
+    #[serde(rename = "maxFeelslikeF", deserialize_with = "nullable")]
     max_feelslike_f: i16,
-    #[serde(rename = "minFeelslikeF")]
+    #[serde(rename = "minFeelslikeF", deserialize_with = "nullable")]
     min_feelslike_f: i16,
-    #[serde(rename = "windSpeedMPH")]
+    #[serde(rename = "windSpeedMPH", deserialize_with = "nullable")]
     wind_speed_mph: i16,
-    #[serde(rename = "windSpeedMaxMPH")]
+    #[serde(rename = "windSpeedMaxMPH", deserialize_with = "nullable")]
     wind_speed_max_mph: i16,
-    #[serde(rename = "windDir")]
+    #[serde(rename = "windDir", deserialize_with = "nullable")]
     wind_dir: String,
-    #[serde(rename = "windDirDEG")]
+    #[serde(rename = "windDirDEG", deserialize_with = "nullable")]
     wind_dir_deg: u16,
+    #[serde(deserialize_with = "nullable")]
     weather: String,
-    #[serde(rename = "weatherPrimaryCoded")]
+    #[serde(rename = "weatherPrimaryCoded", deserialize_with = "nullable")]
     weather_primary_coded: String,
+}
+
+/// `null` as the type's `Default`, which is what `encoding/json` does to a non-pointer
+/// scalar.
+///
+/// Needed because serde's `Deserialize` for `i16`, `f32`, `String` and `u16` all reject
+/// `null` outright, and the rejection is not scoped to the field — it fails the enclosing
+/// document. [`Period`]'s own documentation has the failure that follows from that.
+fn nullable<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// The eighteen keys, in the Go struct's declaration order.
 ///
-/// Asserted against the writer below by a unit test, so that a field added to [`Period`]
-/// and forgotten here is a test failure rather than a key that quietly stops being served.
+/// The length is the compiler's check — a nineteenth key added here without a matching
+/// `write_period` call is a `[&str; 18]` that does not fit — and
+/// `the_stored_text_carries_the_eighteen_keys_and_nothing_else` checks that the writer emits
+/// exactly this set. Neither catches a nineteenth field added to [`Period`] and forgotten in
+/// both places, which would be a key the vendor sends and this never stores; the Go struct
+/// is the specification for that, and a reader comparing the two is the check.
 const KEYS: [&str; 18] = [
     "dateTimeISO",
     "maxTempF",
@@ -203,8 +232,15 @@ fn write_period(out: &mut String, period: &Period) -> Result<(), AerisError> {
         // additionally strips *trailing* zeros inside a fraction (`.5`, not `.500`), which
         // `AutoSi` renders in groups of three -- unreachable with whole-second input and
         // recorded rather than worked around.
+        //
+        // `use_z = true`, which is the second argument. Go's layout is `...Z07:00`, so a
+        // **zero** offset renders as `Z` and not as `+00:00` -- and `time.Parse` normalises
+        // `+00:00` input to UTC, so Go emits `Z` for both spellings. With `false` here, a
+        // station at a zero-offset location put six different bytes per period into a
+        // column `/forecast` serves verbatim (**D-39**). The sign of a non-zero offset is
+        // unaffected either way: that is a property of the `DateTime<FixedOffset>`.
         Some(text) => match chrono::DateTime::parse_from_rfc3339(text) {
-            Ok(when) => when.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, false),
+            Ok(when) => when.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
             // Go's `json.Unmarshal` fails the **whole** response on an unparseable
             // `time.Time`, so the fetch produces nothing and the previous forecast keeps
             // being served. Same outcome, with the field named.
@@ -478,6 +514,46 @@ mod tests {
         );
     }
 
+    /// **The Critical the review found.** An explicit `null` in a non-`Option` field is
+    /// Go's zero value, not a failed fetch: serde rejects `null` into `i16`/`f32`/`String`
+    /// and the rejection fails the whole envelope, so one null would discard a ten-period
+    /// forecast on every occurrence for as long as the vendor sent it.
+    #[test]
+    fn an_explicit_null_stores_the_go_zero_value_rather_than_failing_the_fetch() {
+        let body = r#"{"success":true,"response":[{"periods":[
+            {"dateTimeISO":"2026-11-12T00:00:00-07:00","maxTempF":null,"pop":null,
+             "precipIN":null,"snowIN":null,"iceaccumIN":null,"windDir":null,
+             "windDirDEG":null,"weather":null,"weatherPrimaryCoded":"::SC"}]}]}"#;
+        let json = periods_json(body.as_bytes()).expect("nulls are zero values, not errors");
+        assert!(json.contains(r#""maxTempF":0"#), "{json}");
+        assert!(json.contains(r#""precipIN":0"#), "{json}");
+        assert!(json.contains(r#""windDir":"""#), "{json}");
+        assert!(json.contains(r#""windDirDEG":0"#), "{json}");
+        // A null `weatherPrimaryCoded` becomes `""`, which has fewer than three segments --
+        // so it is the one null that still refuses, by the same rule an empty string does.
+        let coded_null = r#"{"success":true,"response":[{"periods":[
+            {"dateTimeISO":"2026-11-12T00:00:00Z","weatherPrimaryCoded":null}]}]}"#;
+        let e = periods_json(coded_null.as_bytes()).expect_err("an empty code");
+        assert!(matches!(e, AerisError::Coded { .. }), "{e:?}");
+    }
+
+    /// A zero offset renders as `Z`, which is what Go's `...Z07:00` layout emits — and
+    /// `time.Parse` normalises `+00:00` input to UTC, so Go emits `Z` for both spellings.
+    #[test]
+    fn a_zero_offset_renders_as_z_the_way_go_renders_it() {
+        for input in ["2026-11-12T00:00:00Z", "2026-11-12T00:00:00+00:00"] {
+            let body = format!(
+                r#"{{"success":true,"response":[{{"periods":[
+                   {{"dateTimeISO":"{input}","weatherPrimaryCoded":"::SC"}}]}}]}}"#
+            );
+            let json = periods_json(body.as_bytes()).expect("a successful response");
+            assert!(
+                json.contains(r#""dateTimeISO":"2026-11-12T00:00:00Z""#),
+                "{input} -> {json}"
+            );
+        }
+    }
+
     #[test]
     fn an_absent_key_stores_the_go_zero_value() {
         let body = r#"{"success":true,"response":[{"periods":[
@@ -509,7 +585,14 @@ mod tests {
         assert!(e.is_none(), "two colons IS three segments");
     }
 
-    /// The other Go panic on this path: `response[0]` on an empty array.
+    /// Two refusals, and only the first is a Go panic.
+    ///
+    /// `response: []` is `response.AerisForecastData[0]` on an empty slice, which takes the
+    /// Go daemon down. `response: [{"periods": []}]` does **not** panic there: the icon loop
+    /// iterates nothing, `json.Marshal` of an empty slice yields `[]`, and the caller stores
+    /// it — so `/forecast` serves `{"lastUpdated": <now>, "data": []}`. Refusing it instead
+    /// leaves the previous forecast in place, which is the better behaviour and is a
+    /// deviation rather than fidelity; `docs/reconciliation.md` **A-M6-3-4** records it.
     #[test]
     fn an_empty_response_array_is_refused_rather_than_panicking() {
         let e = periods_json(br#"{"success":true,"response":[]}"#).expect_err("no group");

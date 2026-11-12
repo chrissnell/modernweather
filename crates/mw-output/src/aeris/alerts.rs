@@ -58,14 +58,29 @@ pub fn alerts(body: &[u8]) -> Result<Vec<Alert>, AerisError> {
             })
         }
     };
-    let mut out = Vec::with_capacity(found.len());
+    let mut out: Vec<Alert> = Vec::with_capacity(found.len());
     for item in found {
-        // A list that carries one unusable element is not a reason to discard the rest: a
-        // warning that is missing its id cannot be keyed, and the four that came with it
-        // can. Go `continue`s past a marshal failure for the same reason; this refuses the
-        // element rather than the fetch and the component counts it.
-        if let Some(alert) = row(item)? {
-            out.push(alert);
+        // An element that cannot be **keyed** is dropped and the rest are kept: a warning
+        // missing its `id` could not be upserted and would be re-inserted on every fetch.
+        // An element that is not an object at all fails the fetch, because that is a
+        // disagreement about the schema rather than one bad row. Neither is counted
+        // anywhere, which the caller's log line is honest about: it reports what was
+        // written.
+        let Some(alert) = row(item)? else {
+            continue;
+        };
+        // **Last occurrence wins, and the de-duplication is load-bearing.**
+        // `AlertStore::store_alerts` writes the whole list as one
+        // `INSERT ... SELECT ... FROM UNNEST(...) ... ON CONFLICT (station_id, alert_id)
+        // DO UPDATE`, and PostgreSQL raises `21000: ON CONFLICT DO UPDATE command cannot
+        // affect row a second time` when one statement's own source rows collide on the
+        // arbiter -- which no retry recovers. The vendor's `id` is the vendor's, and a
+        // point inside two overlapping wxzones for one warning is how it repeats; Go wrote
+        // per alert in a loop, so a repeat was simply an update. Last-wins reproduces that
+        // loop's outcome.
+        match out.iter_mut().find(|held| held.alert_id == alert.alert_id) {
+            Some(held) => *held = alert,
+            None => out.push(alert),
         }
     }
     Ok(out)
@@ -212,6 +227,27 @@ mod tests {
             let rows = alerts(body.as_bytes()).expect("a successful response");
             assert!(rows.is_empty(), "{body}");
         }
+    }
+
+    /// A repeated `id` in one response is one row, not a statement PostgreSQL refuses.
+    ///
+    /// The whole list becomes one `INSERT ... ON CONFLICT ... DO UPDATE`, and a source-row
+    /// collision on the arbiter is `21000`, unrecoverable by retry — so every alert in that
+    /// fetch would be lost, every fifteen minutes, for as long as the warning was active.
+    #[test]
+    fn a_repeated_alert_id_is_one_row_with_the_last_values() {
+        let body = r#"{"success":true,"response":[
+            {"id":"dup","details":{"name":"first"}},
+            {"id":"other","details":{"name":"unaffected"}},
+            {"id":"dup","details":{"name":"second"}}]}"#;
+        let rows = alerts(body.as_bytes()).expect("a successful response");
+        let ids: Vec<&str> = rows.iter().map(|a| a.alert_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["dup", "other"],
+            "one row per id, in first-seen order"
+        );
+        assert_eq!(rows[0].name, "second", "the last occurrence wins");
     }
 
     #[test]

@@ -3212,23 +3212,39 @@ outputs") nor `mw-pipeline`'s (which names `snapshot:latest`, `window:rollup`, `
 components in full and names no crate; §1.2 names eighteen crates and omits these four. That is the
 **G-2** class again — several documents assumed a home into existence and none of them created one.
 
-*What the choice actually turns on.* One capability, and it is not a preference. The Aeris components
-need an **outbound HTTPS request against a public endpoint with a public trust anchor**, which no
-crate in a lower layer has and which `ci/layers.toml`'s `webpki-roots-only-for-the-uploaders` rule
-confines to `mw-output` on the explicit grounds that a second crate verifying a public endpoint "would
-mean something had started verifying a public endpoint somewhere the design does not have one". The
-three alternatives, and why each is worse:
+*What the choice turns on, and what it does not.* The deciding fact is **where the outbound HTTP
+client already is**, not the `webpki-roots` rule — and the first draft of this amendment had that
+backwards, which is worth recording because the inverted version is circular. `ci/layers.toml`'s
+`webpki-roots-only-for-the-uploaders` rule is a one-element `only` list in the same file this item
+edits, added by M6-2; permitting a second crate is a one-word change to it. A rule this item could
+rewrite is not a constraint on this item. What the rule *is* is a statement of intent — "a crate
+CHOOSING to verify a public endpoint" should be a reviewable line — and the question it leaves is
+which crate should be making that choice.
 
-1. **`mw-pipeline`** is where §1.2 puts `snow:*`, and it is in the `service` layer — below
-   `mw-station`, whose `session::ByteStream` and `stream::open` the TLS client is built on, and below
-   `mw-output`, which already has the client. It would need its own copy of `connect`, its own
-   `webpki-roots` entry, and a second answer to "which TLS provider does this process use".
-2. **A nineteenth crate** (`mw-aeris`) is the tidiest-looking answer and costs a `[[crate]]` roster
-   entry, a second `webpki-roots` holder, and a second hand-written HTTP client — because a
-   surface-layer crate may not name `mw-output`, which is its own layer. Two HTTP clients in one
+`mw_output::https` is the answer because it is the hand-written client: a connect with a TLS
+handshake, a request builder, and all three of RFC 9112 §6's framings, written out rather than taken
+from a crate for reasons `crate::https`' own module documentation gives at length. This item
+generalised it (`get`, `parse_response`) so that an upload and a fetch share one of each. The four
+alternatives:
+
+1. **`mw-pipeline`** is where §1.2 puts `snow:*`. It is `mw-station`'s and `mw-output`'s **peer** in
+   the `service` layer — an earlier draft of this amendment said "below `mw-station`", which is wrong:
+   `ci/layers.toml` gives `mw-pipeline`, `mw-station` and `mw-store` all `layer = "service"`, and the
+   gate's rule is a *strictly lower* layer. So it may name neither, and would need its own copy of
+   `connect` and its own trust store — a second answer to "which TLS provider does this process use".
+2. **A nineteenth crate** (`mw-aeris`, surface layer) costs a `[[crate]]` roster entry and, because a
+   surface crate may not name `mw-output`, a second hand-written HTTP client. Two HTTP clients in one
    binary is the accretion W3 Decision 1 exists to prevent, arriving as the fix for a layering
    question.
-3. **The binary** is where a consumer and a provider meet (§1.3 rule 1), not where protocol code
+3. **Hoisting `crate::https` into a lower-layer crate** that both `mw-output` and a new `mw-aeris`
+   depend on, moving the `only` list with it. This is the alternative that actually dissolves (2)'s
+   objection, and it is the one worth revisiting if a third caller appears: a `service`-layer
+   `mw-http-client` beside `mw-station`, or a module inside `mw-station` itself, whose `http` module
+   is the sibling that refuses TLS today. It is not taken now because it is a refactor of shipped code
+   in service of one new caller, and the cheapest version of it — a module in `mw-station` — would put
+   a public trust store in the crate that talks to hardware on the LAN, which is the one placement the
+   `webpki-roots` rule's stated reason argues against.
+4. **The binary** is where a consumer and a provider meet (§1.3 rule 1), not where protocol code
    lives. `main` has no business parsing a vendor's JSON.
 
 *The decision.* `mw-output`'s declared responsibility becomes **"Third-party HTTPS integrations: the
@@ -3236,12 +3252,20 @@ rate-limited outputs, and the Aeris fetchers"**, in `ci/layers.toml`, in that cr
 `description` and in its module documentation. Its **`forbidden` list does not change** — `sqlx` and
 `mw-store` — and it covers the new half for exactly the reason it covers the old one: the fetchers
 write through capability handles and name no SQL, which is W2a Decision 50 applied to a component
-that happens to read rather than write. `crate::https` grew `get` and `parse_response` so that both
-halves use one connect, one request builder and one set of three RFC 9112 framings.
+that happens to read rather than write.
+
+*What the gate does and does not check, stated because the widening sounds like a loosening.*
+`xtask/src/layout.rs` reads `responsibility` **only as prose inside a violation message**;
+enforcement is `layer`, `forbidden`, `forbidden_source` and the `dep_rule`s, none of which this item
+relaxes. So the string is documentation and the boundary is unchanged — which also means the
+"narrow test" below has **no checker**, and calling it checkable would be exactly the
+degradation-into-code-review-preference that G-4 names. It is a rule for a reader, not a gate.
 
 *What this is not.* It is not a licence to put the next unhomed component here. The test it passed is
-narrow and checkable: *does this component need the one capability `ci/layers.toml` confines to this
-crate?* A component that needs a database, a socket to bind or a reading stream fails it.
+narrow and is a question for whoever proposes the next one: *does this component need the outbound
+HTTP client this crate hand-wrote, and nothing a lower layer could give it?* A component that needs a
+database, a socket to bind or a reading stream fails it, and a third caller for the client is the
+signal that alternative 3 above has become the right answer.
 
 **A-M6-3-3 — the snow decomposition, where §4.3 and §2a.7 disagree.**
 *Decided and applied 2026-11-12 by implementation-plan.md **M6-3**, under the same delegation.*
@@ -3256,11 +3280,26 @@ crate?* A component that needs a database, a socket to bind or a reading stream 
 | season total | `snow:season`, `Calendar { daily 00:10, Station }` | `snow:season`, `Every { 15 min }` **plus** that `Calendar` |
 
 Both tables have exactly four `snow:*` rows, which is the count A-M3-4-1's note uses ("those are four
-components over `Capability::SnowCache`"), and their union is five. **D-33** forbids the one row that
+components over `Capability::SnowCache`"), and their union is five. **Decision 33's own prose says
+three** — "the snow cache becomes three" — and that is a third disagreement, inside the document §4.3
+belongs to. It is read as counting the Go `snowcache` controller's three *tickers*, which is what the
+sentence is about ("because they have independent periods, failures and rate budgets"): the 30-second
+depth refresh, the 15-minute event pass and the 15-minute smoothing pass. `snow:season` is the fourth
+and comes from somewhere else entirely — `calculate_total_season_snowfall()`, which the Go handler
+calls per request on a cache miss and which scans months — so four components implement a decision
+that counted three tickers, and §4.3's table is the one that enumerates them. **D-33** forbids the one row that
 is internally impossible: `snow:season` cannot have two triggers, because "one component, one
 trigger" is the decision the whole Aeris decomposition rests on.
 
 *The resolutions, both applied.*
+
+A note on the decision labels used below, because this range of them collides. **D-33** here and
+throughout this amendment is `docs/component-model.md`'s Decision 33, "one component, one trigger";
+`DESIGN.md`'s own D-33 is the secrets decision, which this item also cites, correctly, where it wraps
+a credential in `SecretString`. **D-24** is `docs/service-architecture.md`'s Decision 24, "every
+calendar quantity is the station's"; `DESIGN.md` D-24 is "a component is a cancellable task". A-M4-1-1
+records the collision across these lists as systematic in this range, and these two amendments follow
+the convention of naming the document when the label is ambiguous.
 
 1. **`snowstorm` and `snowfallrate` belong to `snow:depth`, not to a fifth component.** §2a.7 calls
    them "the fast-moving members of the expensive set" and gives them five minutes; §4.3 gives
@@ -3313,7 +3352,9 @@ response; each is recorded because it changes a stored number or a detected even
    gauge returns its last known depth indefinitely", fixture `snow-device-stale`) without a recency
    filter anywhere. A gauge that has never reported gets **no row at all**, keeping
    `snow-device-never-reported`'s "no row" distinguishable from "a row of zeros".
-4. **The two longer event windows are detected at the hour level, not the 5-minute level.**
+4. **The three longer event windows are detected at the hour level, not the 5-minute level.**
+   `EVENT_WINDOWS` reads the 5-minute level for the 24-hour window alone; 72, 168 and 744 all read
+   the hour level.
    PELT over an RBF kernel is `O(n²)` in both time and memory in the bucket count, and Go reads
    `weather_5m` for every window up to 168 hours — which is 2 304 buckets, a **42 MiB** kernel matrix
    and a **21 MiB** distance vector, inside a 10-second budget, on a release target `ci/spike/probe`
@@ -3327,10 +3368,37 @@ response; each is recorded because it changes a stored number or a detected even
    exactly 1, and the dynamic program carries two arrays rather than a map of partitions
    (`the_dynamic_program_agrees_with_an_exhaustive_search`).
 
-*Two smaller ones, recorded for completeness.* The `alerts` table's primary key is
+5. **A `success: true` response whose one group carries no periods is refused, where Go stored `[]`.**
+   Two upstream shapes look alike and only one is a Go panic: `"response": []` is
+   `response.AerisForecastData[0]` on an empty slice, which takes the daemon down, and refusing it is
+   fidelity. `"response": [{"periods": []}]` does not panic there — the icon loop iterates nothing,
+   `json.Marshal` of an empty slice yields `[]`, and the caller stores it, so Go's `/forecast` serves
+   `{"lastUpdated": <now>, "data": []}`. Refusing it leaves the previous forecast and its older
+   `lastUpdated` in place, which is the better behaviour on a cache and is a **byte difference on a
+   frozen body** either way. A maintenance window is how it is reached.
+6. **`serving_from_inches` answers zero for a non-finite input, where `mmToInchesWithThreshold`
+   answers the non-finite value.** `math.Round(NaN)` is `NaN`, which `encoding/json` refuses to
+   marshal — so the Go path's answer to this input is a `500` on a frozen endpoint rather than a
+   number. Unreachable from a stored reading (the bare-ground filter drops every non-finite distance)
+   and recorded because the function is `pub` and the guard is not faithfulness.
+
+*Three smaller ones, recorded for completeness.* The `alerts` table's primary key is
 `(station_id, alert_id)` where Go's unique index is `alert_id` alone — so a county warning covering
 two configured stations is no longer a row whose `station_id` is rewritten every fifteen minutes by
 whichever component fetched last. And `alerts.data` stores the upstream object **as fetched** rather
 than Go's ten-struct subset, because nothing reads the column and dropping `includes.counties`,
 `place.name` and the polygon is the irreversible direction. Both are database-only: no response on any
-surface reads this table (§6.3, A-M6-3-1).
+surface reads this table (§6.3, A-M6-3-1). And a **repeated `id` within one alerts response** is
+de-duplicated last-wins before the write, which reproduces the outcome of Go's per-alert
+`First()`-then-`Create`/`Save` loop: the rows reach PostgreSQL as one
+`INSERT ... FROM UNNEST(...) ON CONFLICT ... DO UPDATE`, and a source-row collision on the arbiter is
+`21000: ON CONFLICT DO UPDATE command cannot affect row a second time`, which no retry recovers — so
+without it every alert in that fetch would be lost for as long as the warning was active.
+
+*One predicate moved **towards** Go rather than away from it*, which is worth noting beside the
+deviations: a paired station at exactly `(0, 0)` is refused, because Go's enablement test is
+`device.Latitude != 0 && device.Longitude != 0` and the schema permits the value. Treating it as a
+location would serve a Gulf of Guinea forecast as that station's on a frozen endpoint, indefinitely.
+DEV-17 records the same predicate mismatch for the sun times and notes it is unobservable there; here
+it is observable, so Go's predicate is reproduced — with a refusal naming the station in place of
+Go's silent skip.

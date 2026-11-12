@@ -145,10 +145,11 @@ pub const SEASON_AT: LocalTime = LocalTime::new(0, 10);
 
 /// `snow:season`'s per-occurrence deadline.
 ///
-/// One indexed aggregate over a season of 5-minute estimates — about 105 000 rows at the end
-/// of a long winter, which is a min/max over a hypertable index rather than a scan. Two
-/// minutes is the slack a month-spanning aggregate gets; Go's equivalent is a PL/pgSQL loop
-/// over the same range with a 10-second timeout, which is the thing this replaces.
+/// One aggregate over a season of estimates. `min(depth_in)`/`max(depth_in)` is **not** an
+/// index lookup — no index covers `depth_in`, so it is a scan of the range across the
+/// hypertable's chunks, which at the end of a long winter is on the order of tens of
+/// thousands of rows. Two minutes is three orders of magnitude of slack on that, and Go's
+/// equivalent is a PL/pgSQL loop over the same range with a 10-second timeout.
 pub const SEASON_DEADLINE: Duration = Duration::from_secs(120);
 
 /// How far back `snow:depth` looks for a reading, for the depth and the rate.
@@ -196,17 +197,54 @@ pub const SMOOTHING_OVERLAP: Duration = Duration::from_secs(6 * 3600);
 /// the newest buckets would never be estimated.
 pub const PASS_BUCKETS: usize = 8_000;
 
-/// How many passes one smoothing tick will make.
+/// How many passes one smoothing tick will make, per level.
 ///
 /// The steady state is **one** — a 15-minute tick plus a six-hour overlap is about 80
-/// buckets. The rest is the backfill: a station with no estimates starts from the season's
-/// first instant, which at the end of a long winter is about 105 000 5-minute buckets, so
-/// sixteen passes of 8 000 covers a season and a quarter in one tick.
+/// buckets. The rest is the backfill, which [`BACKFILL`] bounds: at those levels a whole
+/// season is 315 daily, 1 730 hourly and 3 744 five-minute buckets, so one pass per level
+/// covers it and eight is slack rather than the operating point.
 ///
 /// Go attempts the whole season in one pass, with its own `O(n²)` smoother, inside the same
 /// 15-minute tick. Chunking it is what makes the work per tick bounded — and what makes
 /// the deadline above a real bound rather than an aspiration.
-pub const MAX_PASSES: usize = 16;
+pub const MAX_PASSES: usize = 8;
+
+/// Which aggregate level the smoother reads for history of a given age, newest first.
+///
+/// **This is a retention constraint, not a resolution preference**, and getting it wrong is
+/// the one way the season total can be silently too small.
+/// `migrations/20261029234500_...sql` puts a retention policy on three of the four levels:
+///
+/// | Level | Retained | Read here for |
+/// |---|---|---|
+/// | `observations_5m` | 14 days | the newest 13 days |
+/// | `observations_1h` | 90 days | 13 to 85 days old |
+/// | `observations_1d` | **unbounded** | everything older |
+///
+/// A backfill that read the 5-minute level from the season's first instant — which is what
+/// the obvious one-level loop does — would find **nothing** before the retention horizon,
+/// write no estimate for it, and `snowseason` would then report only the newest fortnight:
+/// 3″ instead of 60″ on a node commissioned in February, permanently, because the
+/// incremental path never looks back further than [`SMOOTHING_OVERLAP`] again. Go does not
+/// have this problem because its own `weather_5m` retention is six months.
+///
+/// Each horizon is inside its level's policy with margin, for the reason that migration
+/// gives for sizing retention above the band it serves: a level is still being refreshed
+/// for a while after its band closes.
+///
+/// **What mixing levels costs, stated.** An hourly or daily bucket is a *mean* distance over
+/// its bucket, so a storm's peak inside one bucket is flattened — which makes the season
+/// total conservative rather than wrong, and is what the Go SQL function chose deliberately
+/// for the same number ("daily totals eliminate false positives from natural variance",
+/// migration 016). The 24-hour and 72-hour totals are unaffected: their windows never reach
+/// past the 5-minute band.
+pub const BACKFILL: [(BucketLevel, Duration); 3] = [
+    (BucketLevel::FiveMinute, Duration::from_secs(13 * 86_400)),
+    (BucketLevel::Hour, Duration::from_secs(85 * 86_400)),
+    // No horizon: `observations_1d` is "the only level read over all history", and is
+    // deliberately unbounded.
+    (BucketLevel::Day, Duration::MAX),
+];
 
 /// One chart range `snow:events` detects events for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -482,6 +520,21 @@ fn depth_spec(gauges: Arc<[Gauge]>) -> Result<ComponentSpec, SnowPlanError> {
         }),
     )
     .requires(needs())
+    // **W2a Decision 20's declaration for the snow half.** `/snow` depending on the gauge
+    // having been read is *data presence*, not capability availability: modelling it as a
+    // startup edge would mean the website does not serve until a gauge has reported, and
+    // `/snow` has no recency filter precisely so that it keeps answering when one stops. So
+    // it is declared here, rendered by `mw_api_mgmt::freshness` as "Snow totals last
+    // calculated 3 minutes ago", and **never read by the scheduler**.
+    //
+    // Twice the period, which on a 30-second tick is a minute: unlike a forecast, these
+    // numbers are cheap and a gauge that is reporting produces them every tick, so two
+    // missed occurrences is already a component that is not keeping up.
+    .freshness([mw_component::Freshness {
+        capability: Capability::SnowCache,
+        populated_by: component_id(DEPTH_ID)?,
+        expected_max_age: DEPTH_PERIOD * 2,
+    }])
     .config_digest(digest))
 }
 
@@ -617,14 +670,22 @@ impl std::fmt::Debug for Depth {
 }
 
 impl Tick for Depth {
-    fn tick<'a>(&'a mut self, _cx: &'a Cx) -> BoxFuture<'a, Result<(), ComponentError>> {
+    fn tick<'a>(&'a mut self, cx: &'a Cx) -> BoxFuture<'a, Result<(), ComponentError>> {
         Box::pin(async move {
             let now = self.clock.now();
             for gauge in self.gauges.iter() {
-                let patch = self
-                    .patch(gauge, now)
-                    .await
-                    .map_err(|e| ComponentError::tick("read the snow gauge's buckets", e))?;
+                // Four round trips per gauge, so cancellation is observed between them
+                // (**D-24**): a stop during a tick over six gauges should not wait for all
+                // twenty-four.
+                if cx.is_cancelled() {
+                    return Err(ComponentError::Cancelled);
+                }
+                let patch = self.patch(gauge, now).await.map_err(|e| {
+                    // The station is in the message, not only in a log field: a shared
+                    // component with two gauges fails for one of them, and an operator
+                    // reading `last_error` has no other way to learn which.
+                    ComponentError::tick(format!("read snow gauge `{}`'s buckets", gauge.key), e)
+                })?;
                 write(&self.cache, gauge, patch).await?;
             }
             Ok(())
@@ -749,22 +810,36 @@ fn rate(minutes: &[MeanBucket], now: DateTime<Utc>) -> Option<f32> {
 
 /// The dual-threshold walk over one bucket series, as the inches `/snow` serves.
 ///
-/// `None` for a window with **no usable reading in it**, which leaves the stored total
-/// alone; `Some(0.0)` for a window that had readings and no accumulation. The distinction is
-/// the one the depth column makes and for the same reason: a gauge that has stopped
-/// reporting has an *unknown* total for today, and writing zero would claim the snow had
-/// gone. Go's PL/pgSQL returns `0.0` for both, which is how a gauge that goes offline at
-/// noon reports no snow today by one o'clock.
+/// `None` only for a window **the gauge reported nothing in**, which leaves the stored total
+/// alone; `Some(0.0)` for a window it reported in and that holds no accumulation. That
+/// distinction is the one the depth column makes and for the same reason: a gauge that has
+/// stopped reporting has an *unknown* total, and writing zero would claim the snow had gone.
+///
+/// # The predicate is "did the gauge report", **not** "did the filter keep anything"
+///
+/// `threshold::depths_from` drops a bucket for two unrelated reasons — no reading in it, and
+/// a distance within 2 mm of the base (bare ground, which migration 011 excludes so that a
+/// zero depth cannot re-base the walk). Treating an empty *filtered* series as "unknown"
+/// conflates them, and the conflation is not harmless on `snowtoday`: that window **resets
+/// at local midnight**, so a gauge that is reporting bare ground all day never produces a
+/// kept depth, never writes a column, and `/snow` serves yesterday's `snowtoday` — 2.0
+/// inches on a clear Wednesday, and on every day after it until the next snowfall. The other
+/// totals slide continuously and reach `Some(0.0)` before their window empties, which is why
+/// this only ever showed up here.
+///
+/// So the emptiness that means "unknown" is counted on the **unfiltered** series, and bare
+/// ground is a known zero. Go answers `0.0` for both, which is the other half of the same
+/// trade: its gauge that goes offline at noon reports no snow today by one o'clock.
 fn accumulated(series: &[MeanBucket], base_distance_mm: f64) -> Option<f32> {
+    if !series.iter().any(|bucket| bucket.mean.is_some()) {
+        return None;
+    }
     let pairs: Vec<(DateTime<Utc>, Option<f64>)> =
         series.iter().map(|b| (b.bucket, b.mean)).collect();
     let depths: Vec<f64> = threshold::depths_from(&pairs, base_distance_mm)
         .into_iter()
         .map(|(_, mm)| mm)
         .collect();
-    if depths.is_empty() {
-        return None;
-    }
     Some(units::serving_inches(threshold::accumulated_mm(&depths)))
 }
 
@@ -796,10 +871,12 @@ async fn write(
         );
         return Ok(());
     }
-    cache
-        .store_totals(&gauge.key, patch)
-        .await
-        .map_err(|e| ComponentError::tick("write the snow totals cache", e))
+    cache.store_totals(&gauge.key, patch).await.map_err(|e| {
+        ComponentError::tick(
+            format!("write snow gauge `{}`'s totals cache", gauge.key),
+            e,
+        )
+    })
 }
 
 /// `snow:smoothing`'s body: the estimated depth series, and the totals read off it.
@@ -828,14 +905,18 @@ impl Tick for Smoothing {
                 if cx.is_cancelled() {
                     return Err(ComponentError::Cancelled);
                 }
-                let estimated = self
-                    .estimate(gauge, now)
-                    .await
-                    .map_err(|e| ComponentError::tick("estimate the snow depth series", e))?;
-                let patch = self
-                    .totals(gauge, now)
-                    .await
-                    .map_err(|e| ComponentError::tick("read the estimated depth series", e))?;
+                let estimated = self.estimate(gauge, now, cx).await.map_err(|e| {
+                    ComponentError::tick(
+                        format!("estimate snow gauge `{}`'s depth series", gauge.key),
+                        e,
+                    )
+                })?;
+                let patch = self.totals(gauge, now).await.map_err(|e| {
+                    ComponentError::tick(
+                        format!("read snow gauge `{}`'s estimated depth series", gauge.key),
+                        e,
+                    )
+                })?;
                 if estimated > 0 {
                     debug!(
                         station = %gauge.key,
@@ -852,58 +933,101 @@ impl Tick for Smoothing {
 
 impl Smoothing {
     /// Re-derive the estimate series, in bounded passes. Returns how many rows were written.
-    async fn estimate(&self, gauge: &Gauge, now: DateTime<Utc>) -> Result<usize, StoreError> {
-        let span = BucketLevel::FiveMinute.span();
-        let pass = Duration::from_secs(span.as_secs() * PASS_BUCKETS as u64);
-        let mut written = 0;
+    ///
+    /// One phase per level in [`BACKFILL`], oldest history first, each phase chunked into at
+    /// most [`MAX_PASSES`] passes of [`PASS_BUCKETS`]. In the steady state only the last
+    /// phase has anything to do and it is one pass of about eighty buckets; the earlier
+    /// phases exist for the cold start, where reading the 5-minute level over a whole season
+    /// would read a level the schema deletes after fourteen days.
+    async fn estimate(
+        &self,
+        gauge: &Gauge,
+        now: DateTime<Utc>,
+        cx: &Cx,
+    ) -> Result<usize, StoreError> {
         // Where this tick starts: six hours behind the newest estimate, or the season's
         // first instant for a station that has none.
-        let mut from = match self.cache.newest_estimate(&gauge.key).await? {
+        let start = match self.cache.newest_estimate(&gauge.key).await? {
             Some(newest) => newest.bucket - overlap(),
             None => match units::season_start(now, gauge.zone) {
-                Some(start) => {
+                Some(season) => {
                     info!(
                         station = %gauge.key,
-                        from = %start,
+                        from = %season,
                         "no smoothed depth estimates for this gauge, so backfilling from \
                          the season's first instant"
                     );
-                    start
+                    season
                 }
                 // Unreachable for the same reason `Depth::patch`'s is.
                 None => return Ok(0),
             },
         };
-        for _ in 0..MAX_PASSES {
-            let until = from + pass;
-            let series = self
-                .store
-                .mean_series(MeanSeriesQuery {
-                    station: gauge.key.clone(),
-                    metric: MetricKey::SnowDistance,
-                    level: BucketLevel::FiveMinute,
-                    since: from,
-                    until: Some(until),
-                    limit: PASS_BUCKETS,
-                })
-                .await?;
-            // The rate limiter's carried state: the newest estimate from **before** this
-            // pass's window. Re-read per pass, because the previous pass wrote one.
-            let previous = self.cache.estimate_before(&gauge.key, from).await?;
-            let rows = estimates(&series, gauge.base_distance_mm, previous);
-            // Written even when empty: the delete is the point. A window whose readings
-            // have been filtered out -- a gauge that went to bare ground -- must lose the
-            // estimates it had, which an upsert would never do.
-            self.cache
-                .replace_estimates(&gauge.key, from, &rows)
-                .await?;
-            written += rows.len();
-            if until >= now {
+        let mut written = 0;
+        // Each phase's window ends where the next finer level's begins, so the phases
+        // partition `[start, now]` with no gap and no double coverage beyond the overlap.
+        // Walked coarsest first, so the rate limiter's carried state always exists by the
+        // time a finer phase needs it.
+        let mut phases: Vec<(BucketLevel, DateTime<Utc>, DateTime<Utc>)> = Vec::new();
+        let mut phase_end = now;
+        for (level, horizon) in BACKFILL {
+            let phase_start = match horizon_start(now, horizon) {
+                // A bounded level: this phase covers its own band, and anything older
+                // belongs to the next, coarser one.
+                Some(boundary) => boundary.max(start),
+                // The unbounded level takes whatever is left.
+                None => start,
+            };
+            if phase_start < phase_end {
+                phases.push((level, phase_start, phase_end));
+            }
+            phase_end = phase_start;
+            if phase_end <= start {
                 break;
             }
-            // The next pass starts inside this one, by the smoothing overlap: its first
-            // samples are then limited against an estimate that is outside its own window.
-            from = until - overlap();
+        }
+        phases.reverse();
+        for (level, phase_start, phase_end) in phases {
+            let pass = Duration::from_secs(level.span().as_secs() * PASS_BUCKETS as u64);
+            let mut from = phase_start;
+            for _ in 0..MAX_PASSES {
+                // Observed inside the loop and not only between gauges: a cold-start
+                // backfill is three phases of up to eight passes, and a stop should not
+                // have to wait for all of them (**D-24**).
+                if cx.is_cancelled() {
+                    return Ok(written);
+                }
+                let until = (from + pass).min(phase_end);
+                let series = self
+                    .store
+                    .mean_series(MeanSeriesQuery {
+                        station: gauge.key.clone(),
+                        metric: MetricKey::SnowDistance,
+                        level,
+                        since: from,
+                        until: Some(until),
+                        limit: PASS_BUCKETS,
+                    })
+                    .await?;
+                // The rate limiter's carried state: the newest estimate from **before** this
+                // pass's window. Re-read per pass, because the previous pass wrote one.
+                let previous = self.cache.estimate_before(&gauge.key, from).await?;
+                let rows = estimates(&series, gauge.base_distance_mm, previous);
+                // **The replace is bounded above as well as below**, which the one-level
+                // version did not need: a coarse phase must not delete the finer estimates
+                // that follow it, and `until` is where the next phase begins.
+                self.cache
+                    .replace_estimates(&gauge.key, from, Some(until), &rows)
+                    .await?;
+                written += rows.len();
+                if until >= phase_end {
+                    break;
+                }
+                // The next pass starts inside this one, by the smoothing overlap: its first
+                // samples are then limited against an estimate that is outside its own
+                // window.
+                from = until - overlap();
+            }
         }
         Ok(written)
     }
@@ -923,15 +1047,15 @@ impl Smoothing {
             Some(start) => season_total(&self.cache, &gauge.key, start).await?,
             None => None,
         };
+        // **No `source_through`.** It has one owner, `snow:depth`, and the handle's own
+        // documentation has why: it is one column with one meaning, and two components whose
+        // newest buckets are at two cadences would overwrite each other's answer four times
+        // a minute -- 11:59 from the depth refresh, 11:45 from this one, 11:59 again. The
+        // fastest tier's is the one a staleness display wants.
         Ok(SnowPatch {
             last24,
             last72,
             season,
-            source_through: self
-                .cache
-                .newest_estimate(&gauge.key)
-                .await?
-                .map(|newest| newest.bucket),
             ..SnowPatch::NOTHING
         })
     }
@@ -949,6 +1073,12 @@ impl Smoothing {
         let spread = f64::from(window.max_in) - f64::from(window.min_in);
         Ok(Some(units::serving_from_inches(spread.max(0.0))))
     }
+}
+
+/// The instant a retention horizon begins, or `None` for an unbounded level.
+fn horizon_start(now: DateTime<Utc>, horizon: Duration) -> Option<DateTime<Utc>> {
+    let horizon = chrono::Duration::from_std(horizon).ok()?;
+    now.checked_sub_signed(horizon)
 }
 
 /// The smoothing overlap as a `chrono` duration.
@@ -994,13 +1124,30 @@ fn estimates(
 /// `SmoothedComputer::ComputeSeasonal`, and the subtrahend is the **first** estimate rather
 /// than the smallest: a season that began with snow on the ground did not have that pack
 /// fall during it.
+///
+/// # An empty window is a known zero when the gauge has a series at all
+///
+/// `None` here leaves the stored total alone, and the only state that deserves it is a gauge
+/// the smoother has never run for. A gauge **with** a series and nothing in this season is
+/// the 1 October case, and it is the one that bites: on the day the season boundary moves,
+/// every estimate is suddenly older than it, so an unconditional `None` leaves last season's
+/// 182 inches on a frozen response — beside a correct `snowtoday: 0` — for the whole of
+/// October, until the first flake. Go reports zero.
+///
+/// So the two are told apart by whether the gauge has a newest estimate at all, which is one
+/// indexed lookup and the same question `Smoothing::estimate` already asks.
 async fn season_total(
     cache: &Arc<dyn SnowCache>,
     station: &StationKey,
     start: DateTime<Utc>,
 ) -> Result<Option<f32>, StoreError> {
     let Some(window) = cache.estimate_window(station, start).await? else {
-        return Ok(None);
+        return match cache.newest_estimate(station).await? {
+            // A series exists and none of it is in this season: nothing has fallen yet.
+            Some(_) => Ok(Some(0.0)),
+            // The smoother has never run for this gauge, so the total is unknown.
+            None => Ok(None),
+        };
     };
     let accumulated = f64::from(window.max_in) - f64::from(window.first_in);
     Ok(Some(units::serving_from_inches(accumulated.max(0.0))))
@@ -1033,14 +1180,24 @@ impl Tick for Events {
                     if cx.is_cancelled() {
                         return Err(ComponentError::Cancelled);
                     }
-                    let detected = self
-                        .detect(gauge, window, now)
-                        .await
-                        .map_err(|e| ComponentError::tick("detect the snow events", e))?;
+                    let detected = self.detect(gauge, window, now).await.map_err(|e| {
+                        ComponentError::tick(
+                            format!(
+                                "detect snow gauge `{}`'s events over {} hours",
+                                gauge.key, window.hours
+                            ),
+                            e,
+                        )
+                    })?;
                     self.cache
                         .replace_events(&gauge.key, window.hours, &detected)
                         .await
-                        .map_err(|e| ComponentError::tick("write the snow events", e))?;
+                        .map_err(|e| {
+                            ComponentError::tick(
+                                format!("write snow gauge `{}`'s events", gauge.key),
+                                e,
+                            )
+                        })?;
                     debug!(
                         station = %gauge.key,
                         hours = window.hours,
@@ -1082,6 +1239,13 @@ impl Events {
             // week-old band would be worse than one with no band.
             return Ok(Vec::new());
         }
+        // Truncated to the newest buckets **here**, before the detector, because this is
+        // where the instants live: `pelt::segments` enforces the same cap on its own input
+        // (it is where the `O(n²)` matrices are allocated), and the segment indices it
+        // returns are indices into whatever it was given -- so the instant list has to have
+        // been cut the same way or a band would be labelled with another day's times.
+        // `EVENT_WINDOWS` keeps every window under 800 buckets, so this is a no-op today.
+        let depths = &depths[depths.len().saturating_sub(pelt::MAX_POINTS)..];
         let values: Vec<f64> = depths.iter().map(|&(_, mm)| mm).collect();
         let (_smoothed, segments) = pelt::segments(&values, window.kernel);
         Ok(segments
@@ -1130,7 +1294,15 @@ impl Tick for Season {
             };
             let season = season_total(&self.cache, &self.gauge.key, start)
                 .await
-                .map_err(|e| ComponentError::tick("read the estimated depth series", e))?;
+                .map_err(|e| {
+                    ComponentError::tick(
+                        format!(
+                            "read snow gauge `{}`'s estimated depth series",
+                            self.gauge.key
+                        ),
+                        e,
+                    )
+                })?;
             let patch = SnowPatch {
                 season,
                 ..SnowPatch::NOTHING

@@ -425,16 +425,25 @@ impl SnowCache for FrozenReads {
         &'a self,
         station: &'a StationKey,
         from: DateTime<Utc>,
+        until: Option<DateTime<Utc>>,
         rows: &'a [DepthEstimate],
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
             let mut tx = self.pool.begin().await.map_err(classify)?;
-            sqlx::query("DELETE FROM snow_depth_estimates WHERE station_id = $1 AND bucket >= $2")
-                .bind(station.as_str())
-                .bind(from)
-                .execute(&mut *tx)
-                .await
-                .map_err(classify)?;
+            // `COALESCE($3, 'infinity')` and not `($3 IS NULL OR ...)`: an absent upper
+            // bound then stays an index range rather than becoming a filter the planner
+            // applies after reading past it.
+            sqlx::query(
+                "DELETE FROM snow_depth_estimates \
+                 WHERE station_id = $1 AND bucket >= $2 \
+                 AND bucket < COALESCE($3::timestamptz, 'infinity'::timestamptz)",
+            )
+            .bind(station.as_str())
+            .bind(from)
+            .bind(until)
+            .execute(&mut *tx)
+            .await
+            .map_err(classify)?;
             if !rows.is_empty() {
                 let buckets: Vec<DateTime<Utc>> = rows.iter().map(|r| r.bucket).collect();
                 let depths: Vec<f32> = rows.iter().map(|r| r.depth_in).collect();
@@ -512,10 +521,14 @@ impl SnowCache for FrozenReads {
         events: &'a [SnowEvent],
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
+            // The message says what this check actually tests. The `CHECK (hours IN (24, 72,
+            // 168, 744))` is the schema's and reports itself; an earlier version of this
+            // message claimed to be that check, which is the kind of refusal that sends a
+            // reader looking in the wrong place.
             let hours = i32::try_from(hours).map_err(|_| {
                 StoreError::rejected(std::io::Error::other(format!(
-                    "a chart range of {hours} hours is not one of the four \
-                     `snow_events.hours` permits"
+                    "a chart range of {hours} hours does not fit `snow_events.hours`, which \
+                     is an `integer`"
                 )))
             })?;
             let mut tx = self.pool.begin().await.map_err(classify)?;

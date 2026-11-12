@@ -280,6 +280,7 @@ impl SnowCache for DeadPool {
         &'a self,
         _station: &'a StationKey,
         _from: chrono::DateTime<chrono::Utc>,
+        _until: Option<chrono::DateTime<chrono::Utc>>,
         _rows: &'a [mw_component::DepthEstimate],
     ) -> mw_component::BoxFuture<'a, Result<(), mw_component::StoreError>> {
         Self::gone()

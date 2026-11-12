@@ -51,9 +51,17 @@ webpki-roots.workspace = true
 # The Aeris payloads. `serde` reads the vendor's eighteen forecast fields and `serde_json`
 # parses the envelope and escapes one JSON string at a time -- `crate::aeris::forecast`
 # writes the stored array out by hand, because `serde_json` renders an integral `f32` as
-# `0.0` where Go's `encoding/json` renders it as `0`, and that text is a frozen response
-# body one storage round trip later (D-39). Both are already in D-32's table; neither is a
-# new dependency for the workspace.
+# `0.0` where Go's `encoding/json` renders it as `0`, and that text is a frozen response body
+# one storage round trip later (docs/service-architecture.md **Decision 39**, which is the
+# `/forecast`-caches-the-jsonb-verbatim one -- DESIGN.md's own D-39 is a different decision,
+# and the collision across those two lists is one docs/reconciliation.md A-M4-1-1 calls
+# systematic in this range).
+#
+# Neither is a new dependency for the WORKSPACE -- both are `[workspace.dependencies]`
+# entries already used by seven crates -- and neither is in DESIGN.md D-32's table, which
+# lists no serialisation crate at all. D-32 says an addition is an amendment, so the
+# responsibility change that brought this half of the crate into being records it:
+# docs/reconciliation.md A-M6-3-2.
 serde.workspace = true
 serde_json.workspace = true
 

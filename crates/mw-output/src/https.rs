@@ -546,7 +546,18 @@ pub fn parse_response(response: &[u8], target: &Target) -> Result<(Head, Vec<u8>
         dechunk(body)
     } else {
         match header(&head, "content-length").and_then(|v| v.trim().parse::<usize>().ok()) {
-            Some(len) => body[..len.min(body.len())].to_vec(),
+            // **A body shorter than its declared length is a framing violation, and saying
+            // so is the point.** Truncating silently and handing the short body on means a
+            // middlebox that drops the connection mid-response is diagnosed by whoever
+            // parses the payload -- which for `crate::aeris` is "the Aeris response was not
+            // the JSON this endpoint answers with", pointing at a vendor schema change.
+            // This is the layer that knows the declared length.
+            Some(len) if len > body.len() => {
+                return Err(malformed(
+                    "the body was shorter than its `Content-Length`, so the transfer was                      cut short",
+                ))
+            }
+            Some(len) => body[..len].to_vec(),
             None => body.to_vec(),
         }
     };

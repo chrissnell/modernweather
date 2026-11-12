@@ -23,8 +23,9 @@
 //!
 //! # The two exact reformulations, and the one deviation
 //!
-//! The port is value-for-value with the Go implementation **except** in three places, and
-//! the first two change no result:
+//! The port is value-for-value with the Go implementation **except** in three places. The
+//! first two are algebraically exact and change no result that is not already a tie; the
+//! third is a measured deviation.
 //!
 //! 1. **The segment cost is evaluated from a 2-D prefix sum rather than by summing the
 //!    sub-matrix.** `RBFCost::Error` is `sum(diagonal) - sum(all)/length` over
@@ -32,6 +33,17 @@
 //!    times. Two facts make it `O(1)`: the kernel's diagonal is **exactly 1**
 //!    (`exp(-gamma * 0)`), so `sum(diagonal)` is the segment's length; and a sub-matrix sum
 //!    is four lookups into a prefix sum. Same number, `O(n²)` total instead of `O(n⁴)`.
+//!
+//!    **Algebraically exact, and not bit-exact**, which is worth stating because the
+//!    difference is observable: a prefix sum accumulates in a different order from a direct
+//!    sum, and the deviation from Go's value grows with `n` — measured at 2.9e-12 at
+//!    n = 256, 6.8e-11 at 768 and 3.0e-10 at [`MAX_POINTS`]. On a signal whose partitions are
+//!    *exactly* tied that is enough to move the first-minimum tie-break: on `[0, 1, …, 9]`
+//!    at penalty 1.0 Go reports `[3, 6, 10]` and this reports `[4, 7, 10]`, and 60-digit
+//!    evaluation shows both partitions cost 4.591475553017844… — the same number. 31 of 634
+//!    exactly-linear signals diverge that way and **0 of 550** realistic ones (integer-mm
+//!    staircases, plateau-rise-plateau storms) do. The alternative is `O(n⁴)`, which is the
+//!    version that does not finish.
 //! 2. **The dynamic program carries two arrays rather than a map of partitions.** Go copies
 //!    the whole left partition for every candidate (`for k, v := range leftPartition`),
 //!    which is the same recurrence —
@@ -42,8 +54,9 @@
 //! 3. **The deviation: the longer windows are read at the hour level rather than the
 //!    5-minute level.** `super::EVENT_WINDOWS` has the whole of it. The short version is
 //!    that both matrices above are `O(n²)` in the bucket count, so Go's 8 days of 5-minute
-//!    buckets for the 168-hour window is 2304 points — a 42 MiB kernel matrix and a 21 MiB
-//!    distance vector, inside a 10-second budget, on a release target measured at ARM1176.
+//!    buckets for the 168-hour window is 2304 points — a 40.5 MiB kernel prefix sum and a
+//!    20.2 MiB distance vector, inside a 10-second budget, on a release target measured at
+//!    ARM1176.
 //!    The 5-minute series is median-filtered with a **61-bucket** kernel first, which is
 //!    five hours, so the signal being segmented is already hourly.
 
@@ -76,11 +89,17 @@ pub const MIN_ACCUMULATION_MM: f64 = 10.0;
 ///
 /// Both of the algorithm's matrices are `O(n²)`, so this is the bound that makes their size
 /// a property of the code rather than of how long a station has been reporting. At the cap,
-/// the prefix sum is 8.4 MiB and the distance vector 4.2 MiB; `super::EVENT_WINDOWS` chooses
-/// levels that stay under 800 buckets, so the cap is a backstop and not the operating point.
+/// the prefix sum is 8.02 MiB and the distance vector 4.00 MiB; `super::EVENT_WINDOWS`
+/// chooses levels that stay under 800 buckets, so the cap is a backstop and not the
+/// operating point.
 ///
-/// A series longer than this is **truncated to its newest buckets** by the query's own
-/// `limit`, which is the right end to keep: an event window is a trailing window.
+/// **A longer series is truncated to its newest buckets by [`segments`], not by the query.**
+/// `mw_component::ReadingStore::mean_series` is `ORDER BY bucket ... LIMIT`, so its `limit`
+/// keeps the **oldest** rows — the opposite of what an event window wants. An earlier
+/// version of this comment claimed the query did the right thing, which would have been a
+/// false safety rationale for anyone widening `EVENT_WINDOWS`: a 168-hour window read at the
+/// 5-minute level would have asked for 2 304 buckets and silently charted days eight to four
+/// as the current week. The truncation is enforced here instead, where the cap is.
 pub const MAX_POINTS: usize = 1024;
 
 /// A median filter with zero padding — `scipy.signal.medfilt`, as Go ports it.
@@ -95,6 +114,11 @@ pub const MAX_POINTS: usize = 1024;
 /// and a half hours at each end. It changes which segments the detector finds at the edges
 /// of every window, and it is kept because changing it would change every stored event
 /// without a specification saying what the new ones should be.
+/// **`sort_by(f64::total_cmp)` orders a NaN last where Go's `sort.Float64s` orders it
+/// first**, so a NaN in the input selects a different median here than there. Unreachable
+/// through this crate — `super::threshold::depths_from` filters every non-finite distance and
+/// is the only producer of a depth series — and recorded because this function is `pub` and
+/// the difference is silent rather than loud.
 pub fn median_filter(data: &[f64], kernel: usize) -> Vec<f64> {
     if data.is_empty() {
         return Vec::new();
@@ -384,7 +408,15 @@ pub fn classify(smoothed: &[f64], breakpoints: &[usize], min_accumulation_mm: f6
 }
 
 /// Detect and classify in one call, at this module's own constants.
+///
+/// **Truncates to the newest [`MAX_POINTS`] buckets**, which is where that cap is enforced:
+/// `RbfCost::fit` allocates `(n + 1)²` doubles, so a caller that handed it the store's own
+/// 10 000-row maximum would ask for 800 MB inside a component tick. The *newest* end is kept
+/// because an event window is a trailing window, and the segment indices the classifier
+/// returns are then indices into the truncated slice — which is what the caller maps back to
+/// instants, so it must truncate its own instant list the same way.
 pub fn segments(depths: &[f64], kernel: usize) -> (Vec<f64>, Vec<Segment>) {
+    let depths = &depths[depths.len().saturating_sub(MAX_POINTS)..];
     let smoothed = median_filter(depths, kernel);
     let cost = RbfCost::fit(&smoothed);
     let cuts = breakpoints(&cost, PENALTY, MIN_SIZE, JUMP);

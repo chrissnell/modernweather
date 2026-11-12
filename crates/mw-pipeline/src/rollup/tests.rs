@@ -340,12 +340,20 @@ mod driven {
 
         /// `window:rollup` maintains gusts, rates and calendar totals, every one of which
         /// is a `total` or a `max` -- so it has no caller for the `mean` shape the `snow:*`
-        /// components read. Empty rather than `unimplemented!`, for `FakeStore`'s own
-        /// reason.
+        /// components read.
+        ///
+        /// Recorded in `asked` **and** answered empty, which is `latest`'s arrangement one
+        /// line down and for its reason: a tick that started reading a mean series would
+        /// otherwise get a silent empty answer, compute a window value from nothing and
+        /// fail no assertion here. `asked` is where that becomes visible.
         fn mean_series<'a>(
             &'a self,
-            _q: mw_component::MeanSeriesQuery,
+            q: mw_component::MeanSeriesQuery,
         ) -> BoxFuture<'a, Result<Vec<mw_component::MeanBucket>, StoreError>> {
+            self.asked
+                .lock()
+                .expect("not poisoned")
+                .push(format!("mean_series {} since={}", q.level, q.since));
             Box::pin(async { Ok(Vec::new()) })
         }
 

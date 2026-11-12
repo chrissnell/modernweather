@@ -71,32 +71,38 @@ pub const BARE_GROUND_MM: f64 = 2.0;
 /// returns rather than its whole depth.
 pub fn accumulated_mm(depths: &[f64]) -> f64 {
     let mut total = 0.0;
-    let mut baseline = f64::NAN;
-    let mut previous = f64::NAN;
+    // `Option` and not a NaN sentinel. The PL/pgSQL tests `prev_depth IS NULL`, which a NaN
+    // *datum* does not satisfy — so a sentinel makes a NaN in the series indistinguishable
+    // from the start of it, re-bases the baseline and discards the sample after it. On
+    // `[27.91, NaN, 43.22, 29.09, 49.6]` that is 20.51 mm where the original walks 35.82.
+    // `depths_from` filters non-finite distances and is the only producer here, so this is
+    // a trap removed rather than a bug fixed — and this function is `pub`.
+    let mut baseline: Option<f64> = None;
+    let mut previous: Option<f64> = None;
     for &depth in depths {
-        if previous.is_nan() {
-            baseline = depth;
-            previous = depth;
+        let (Some(prior), Some(base)) = (previous, baseline) else {
+            baseline = Some(depth);
+            previous = Some(depth);
             continue;
-        }
-        let delta = depth - previous;
+        };
+        let delta = depth - prior;
         if delta > QUICK_MM {
             // A step inside one bucket. The whole step counts, and the baseline moves to
             // the new depth so the gradual rule does not count it a second time.
             total += delta;
-            baseline = depth;
-        } else if depth > baseline + GRADUAL_MM {
+            baseline = Some(depth);
+        } else if depth > base + GRADUAL_MM {
             // A slow rise. What counts is the distance from the baseline, not the last
             // delta -- which is how an hour of 5 mm increments becomes one 20 mm event
             // rather than four sub-threshold nothings.
-            total += depth - baseline;
-            baseline = depth;
-        } else if depth < baseline - MELT_MM {
+            total += depth - base;
+            baseline = Some(depth);
+        } else if depth < base - MELT_MM {
             // Settling, melt or wind. Nothing counts and the baseline follows the snow
             // down, so the next storm is measured from where the pack actually is.
-            baseline = depth;
+            baseline = Some(depth);
         }
-        previous = depth;
+        previous = Some(depth);
     }
     total
 }
@@ -132,6 +138,19 @@ mod tests {
             .into_iter()
             .map(|(_, d)| d)
             .collect()
+    }
+
+    /// A NaN in the series is a datum and not the start of it, which is what the PL/pgSQL's
+    /// `prev_depth IS NULL` test distinguishes and a NaN sentinel cannot.
+    #[test]
+    fn a_nan_in_the_series_does_not_rebase_the_baseline() {
+        // The original walks this to 35.82: the gradual rule fires at 43.22 against the
+        // baseline of 27.91 for 15.31, then the quick rule for 20.51.
+        let total = accumulated_mm(&[27.91, f64::NAN, 43.22, 29.09, 49.6]);
+        assert!(
+            (total - 35.82).abs() < 1e-9,
+            "{total} should be 35.82, not 20.51"
+        );
     }
 
     #[test]

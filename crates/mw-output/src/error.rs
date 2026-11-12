@@ -399,6 +399,15 @@ pub enum AerisError {
     },
 }
 
+/// **Read by nothing today, and that is worth knowing before trusting the split below.**
+///
+/// The only consumer of [`Classify`] in this crate is `crate::retry::ClassPolicy`, which is
+/// wired to the uploaders; the Aeris bodies wrap every failure in `ComponentError::tick`,
+/// whose own class is unconditionally `Retryable` (`mw_component::ComponentError`). So no
+/// classification here can cause a hot retry loop — there is no retry, and the period is the
+/// floor — and none can stop a component. What the impl is for is the day this path acquires
+/// a `tower` stack: the decision is made once, beside the error's definition, which is §4.2's
+/// mechanism and the reason `Fatal` is written down now rather than guessed at then.
 impl Classify for AerisError {
     fn class(&self) -> Class {
         match self {

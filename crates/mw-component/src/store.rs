@@ -946,7 +946,7 @@ pub trait SnowCache: Send + Sync + 'static {
         at: chrono::DateTime<chrono::Utc>,
     ) -> BoxFuture<'a, Result<Option<DepthEstimate>, StoreError>>;
 
-    /// Replace every estimate at or after `from` with `rows`, in one transaction.
+    /// Replace the estimates in `[from, until)` with `rows`, in one transaction.
     ///
     /// Delete-then-insert rather than upsert, and the reason is that a pass can produce
     /// **fewer** rows than it replaces: the source query drops a bucket whose distance is
@@ -955,13 +955,20 @@ pub trait SnowCache: Send + Sync + 'static {
     /// empty between the two statements and a reader in that gap would compute
     /// `max - min` over nothing.
     ///
-    /// `rows` must be sorted by bucket and must all be at or after `from`; the
+    /// `until` is **exclusive** and `None` is "everything from `from` onward". It is not
+    /// decoration: the smoother backfills in phases, each reading a different aggregate
+    /// level over its own slice of history, and a coarse phase whose delete was unbounded
+    /// would erase the finer estimates of every phase after it. `mw_pipeline::snow`'s
+    /// `BACKFILL` has why the phases exist.
+    ///
+    /// `rows` must be sorted by bucket and must all lie inside the window; the
     /// implementation does not sort them, because the smoother's output is already in order
     /// and a re-sort here would hide a caller that had lost it.
     fn replace_estimates<'a>(
         &'a self,
         station: &'a mw_types::StationKey,
         from: chrono::DateTime<chrono::Utc>,
+        until: Option<chrono::DateTime<chrono::Utc>>,
         rows: &'a [DepthEstimate],
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
@@ -1016,6 +1023,12 @@ impl CapabilityHandle for Arc<dyn SnowCache> {
 /// | `snow:season` | `Calendar { daily 00:10, Station }` | `season` |
 /// | `snow:events` | `Every { 15 min }` | *none* — it writes `snow_events` |
 ///
+/// `source_through` is **`snow:depth`'s alone**, and that is a choice rather than an
+/// omission from the table: it is one column with one meaning — "the newest bucket this
+/// row's numbers were computed from" — and two components whose newest buckets are at two
+/// cadences would write two different answers to it every half-minute, which is worse than
+/// one approximate answer. The fastest tier's is the one a staleness display wants.
+///
 /// **A `None` is "leave it", which is also how a failed sub-computation is reported.** The
 /// Go cache refresh reads its own previous row and writes the old value back when a
 /// calculation fails (`internal/snow/cache.go`'s three `keeping previous value` branches),
@@ -1043,12 +1056,19 @@ pub struct SnowPatch {
 }
 
 impl SnowPatch {
-    /// A patch that writes no column.
+    /// A patch that writes no column — the base every caller spreads over.
     ///
-    /// Not useless: it still stamps `computed_at`, so a tick that found nothing to compute
-    /// is distinguishable from a component that is not running. Named rather than written
-    /// as `SnowPatch::default()` at a call site, because "this tick deliberately wrote no
-    /// number" is a statement and `default()` is not.
+    /// Named rather than written as `SnowPatch::default()` at a call site, because "every
+    /// column I do not own is deliberately absent" is a statement and `default()` is not.
+    ///
+    /// **It is a base, not a message.** An earlier version of this comment claimed it
+    /// stamps `computed_at` so that "a tick that found nothing to compute is
+    /// distinguishable from a component that is not running"; it does not, because
+    /// [`SnowPatch::is_empty`] is true of it and every caller skips the write. That
+    /// distinction is the supervisor's — `mw_component_ticks_total{outcome="ok"}` and the
+    /// component's `last_run` both move on a tick that computed nothing — and putting a
+    /// second answer to it in a cache row would be the two-places defect this type exists
+    /// to avoid.
     pub const NOTHING: Self = Self {
         depth: None,
         today: None,
@@ -1061,6 +1081,11 @@ impl SnowPatch {
     };
 
     /// Whether this patch carries any column at all.
+    ///
+    /// `source_through` counts. It is a column like any other and a patch that carries only
+    /// it is a tick that learned which bucket it had consumed and nothing else — which is
+    /// exactly what the management UI's per-tier age reads, so dropping it would make
+    /// [`SnowPatch::NOTHING`]'s documented purpose unreachable.
     pub fn is_empty(&self) -> bool {
         self.depth.is_none()
             && self.today.is_none()
@@ -1069,6 +1094,7 @@ impl SnowPatch {
             && self.season.is_none()
             && self.storm.is_none()
             && self.fall_rate.is_none()
+            && self.source_through.is_none()
     }
 }
 

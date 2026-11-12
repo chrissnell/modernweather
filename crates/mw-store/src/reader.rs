@@ -316,9 +316,14 @@ impl ReadingStore for TimescaleReader {
             // out here would be a second answer to what the mean of an empty bucket is.
             let (sum, count) = mean_columns(q.metric, q.level)?;
             let sql = format!(
+                // `COALESCE($3, 'infinity')` rather than `($3 IS NULL OR bucket < $3)`:
+                // the latter is correct and is **not** a stop key, so a scan runs forward
+                // past `until` until the `LIMIT` fills or the station's rows run out --
+                // which on a backfill pass over a window the gauge was dead for means
+                // reading and discarding every later bucket it has.
                 "SELECT bucket, mw_mean({sum}, {count}) FROM {view} \
                  WHERE station_id = $1 AND bucket >= $2 \
-                 AND ($3::timestamptz IS NULL OR bucket < $3) \
+                 AND bucket < COALESCE($3::timestamptz, 'infinity'::timestamptz) \
                  ORDER BY bucket LIMIT $4",
                 view = view(q.level),
             );

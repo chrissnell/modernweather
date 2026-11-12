@@ -70,11 +70,19 @@
 //!   bill.
 //! - **No `Capability::ConfigStore`**, which §4.3's table declares. Nothing provides it:
 //!   `config:sqlite` has no work item and the configuration rows reach every registrar
-//!   through `main` as a root resource (**D-41**). A hard need on an unprovided capability
-//!   would make `plan()` refuse the whole configuration, so it is **dropped rather than
-//!   deviated from** — exactly what `docs/reconciliation.md` **A-M4-1-1** did with
-//!   `snapshot:latest`'s `SnowCache S`, and for the same reason. It comes back with
-//!   `config:sqlite`.
+//!   through `main` as a root resource (**D-41**). A **hard** need on an unprovided
+//!   component-class capability is `PlanError::Unprovided` from
+//!   `mw_supervisor::plan::check_requirements`, which aborts the whole plan — so declaring
+//!   it would mean a daemon that will not start. It is therefore **dropped rather than
+//!   deviated from**, and it comes back with `config:sqlite`.
+//!
+//!   `docs/reconciliation.md` **A-M4-1-2** is the nearest precedent and it is not the same
+//!   case, which is worth saying rather than implying: that one drops `snapshot:latest`'s
+//!   `SnowCache` **S**, a *soft* need `plan()` never refuses, on the honesty grounds that "a
+//!   `Staleness` that could name a capability nothing can revoke would be dishonest". Here
+//!   the reason is mechanical. (A-M4-1-**1** is a different amendment again —
+//!   `snapshot:warm`'s hard `ReadingStore` — and an earlier version of this comment cited
+//!   it.)
 
 pub mod alerts;
 pub mod forecast;
@@ -155,11 +163,20 @@ pub const GC_DEADLINE: Duration = Duration::from_secs(60);
 /// The most of an Aeris response this reads.
 ///
 /// A 24-period hourly forecast is about 12 KiB and a county's full warning text is a few
-/// KiB per alert, so this is roughly an order of magnitude of headroom. The cap exists for
-/// `crate::https::MAX_RESPONSE_BYTES`' reason: a captive portal or a misrouted request can
-/// answer with a page, and a bounded read is the difference between a surprising response
-/// and an out-of-memory daemon.
-pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// KiB per alert, so 256 KiB is roughly an order of magnitude of headroom. The cap exists
+/// for `crate::https::MAX_RESPONSE_BYTES`' reason: a captive portal or a misrouted request
+/// can answer with a page, and a bounded read is the difference between a surprising
+/// response and an out-of-memory daemon.
+///
+/// **Why not more.** `crate::https::read_response` rescans the accumulated buffer for the
+/// end of the head on every 4 KiB read, so the cap is also a quadratic term: at 256 KiB a
+/// captive portal's page costs about 8 million byte comparisons, and at 1 MiB it costs 134
+/// million — which on the ARM1176 `ci/spike/probe` measures would spend most of the attempt
+/// budget in the scan rather than on the wire. Bounded by `ATTEMPT_TIMEOUT` either way, so
+/// the worst case is a `Timeout` against a named target; the smaller cap is what keeps the
+/// real 12 KiB payload's cost and the pathological case's cost within an order of magnitude
+/// of each other.
+pub const MAX_BODY_BYTES: usize = 256 * 1024;
 
 /// The account this node fetches with.
 ///
@@ -211,6 +228,26 @@ impl AerisAccount {
         form
     }
 
+    /// The credential's contribution to a [`ConfigDigest`].
+    ///
+    /// **A rotated secret must restart the component**, and without this it does not:
+    /// `SpecFingerprint`'s contract is that "a registrar is responsible for folding into it
+    /// every configuration value its builder closes over", the builders close over the
+    /// query, and the query *is* the credential. An operator who regenerates the Xweather
+    /// secret and updates the row — the ordinary rotation — would otherwise get a plan diff
+    /// in which all three components compare equal, nothing restarts, and the running
+    /// instances keep sending the revoked secret until the process is restarted. Every
+    /// subsequent fetch is then a `success: false` blaming the credential they just fixed.
+    ///
+    /// Hashed to a `u64` here rather than exposed into the digest's input string, which is
+    /// the same shape `crate::plan`'s `secret_digest` takes and for the same reason: the
+    /// digest is compared within one process by the plan diff, never logged and never
+    /// persisted, and a `u64` cannot be printed back out by accident. `expose_secret` is
+    /// called once, into a hasher.
+    fn secret_digest(&self) -> u64 {
+        mw_component::stable_hash(self.client_secret.expose_secret().as_bytes())
+    }
+
     /// The base URL, defaulted.
     fn base(&self) -> &str {
         match self.api_endpoint.as_deref() {
@@ -232,14 +269,36 @@ pub struct AerisStation {
 }
 
 impl AerisStation {
-    /// The pair, when the station has both.
+    /// The pair, when the station has a usable one.
     ///
     /// `zip` rather than two `0.0` defaults, which is the predicate
     /// `mw_component::StationMeta::coordinates` uses and the one
     /// `docs/reconciliation.md` DEV-17 records the Go daemon getting wrong in two
     /// directions.
+    ///
+    /// # Exactly `(0, 0)` is **not** a usable pair, and that is Go's predicate
+    ///
+    /// The enablement test in `controller.go:260` is
+    /// `device.Latitude != 0 && device.Longitude != 0`, so Go skips such a device outright.
+    /// The schema permits the value — `latitude` is nullable with a `BETWEEN -90 AND 90`
+    /// check and no non-zero constraint — and M7-4's migration produces it from a Go
+    /// `devices` row whose non-nullable floats were never set.
+    ///
+    /// Treating it as a location is the one case here that puts a **wrong** value on a
+    /// frozen response rather than an absent one: `/forecasts/0.000000,0.000000` is a point
+    /// in the Gulf of Guinea, and `/forecast` would serve its equatorial-Atlantic forecast
+    /// as that station's, indefinitely, with no error anywhere. DEV-17 records the same
+    /// predicate mismatch for the sun times and notes it is unobservable there; here it is
+    /// observable, so the predicate is Go's.
+    ///
+    /// The *consequence* still differs from Go's, deliberately: this is a refusal naming the
+    /// station rather than a silent skip. [`register`] has why.
     fn coordinates(&self) -> Option<(f64, f64)> {
-        self.latitude.zip(self.longitude)
+        let (latitude, longitude) = self.latitude.zip(self.longitude)?;
+        if latitude == 0.0 && longitude == 0.0 {
+            return None;
+        }
+        Some((latitude, longitude))
     }
 }
 
@@ -324,10 +383,9 @@ pub trait AerisConfig {
 
     /// The deployment's own zone, for the sweep's `Calendar`.
     ///
-    /// `None` when `node.timezone` does not resolve, which is a [`Trigger::Calendar`] with
-    /// no zone and therefore a `PlanError::MissingTimeZone` naming the component —
-    /// deliberately, for `mw_pipeline::rollup::register`'s reason: a daily sweep that
-    /// silently never happens is the failure mode this programme keeps finding.
+    /// `None` when `node.timezone` does not resolve, which [`gc_spec`] refuses by name — a
+    /// daily sweep that silently never happens is the failure mode this programme keeps
+    /// finding, and `mw_pipeline::rollup::register` has the full argument.
     fn deployment_zone(&self) -> Option<Zone>;
 }
 
@@ -387,9 +445,9 @@ pub fn register<C: AerisConfig + ?Sized>(
         }
         out.push(alerts_spec(&account, &station.key, latitude, longitude)?);
     }
-    // One sweep for every station's rows. Planned last so that a configuration with
-    // pairings but a bad deployment zone still refuses on the zone rather than on the
-    // first station.
+    // One sweep for every station's rows, planned after them because it is the deployment's
+    // and they are the stations'. A configuration that is bad in two ways refuses on the
+    // first station rather than on the zone, which is the order the loop above gives it.
     out.push(gc_spec(cfg.deployment_zone())?);
     info!(
         stations = stations.len(),
@@ -405,15 +463,28 @@ pub fn register<C: AerisConfig + ?Sized>(
 pub enum AerisPlanError {
     /// A paired station with no latitude or no longitude.
     #[error(
-        "station `{station}` is paired with the Aeris service and has no latitude or no \
-         longitude, and the forecast API is queried by coordinates -- so this station can \
-         never be asked about. Set `config.stations.latitude` and `longitude`, or remove \
-         the `station_service` row with `service = 'aeris'`."
+        "station `{station}` is paired with the Aeris service and has no usable \
+         coordinates -- no latitude, no longitude, or both exactly zero, which is a point \
+         in the Gulf of Guinea rather than a station. The forecast API is queried by \
+         coordinates, so this station can never be asked about. Set \
+         `config.stations.latitude` and `longitude`, or remove the `station_service` row \
+         with `service = 'aeris'`."
     )]
     NoCoordinates {
         /// Which station.
         station: String,
     },
+
+    /// `node.timezone` does not resolve to an IANA zone.
+    #[error(
+        "this node's `node.timezone` is not a usable IANA zone, and the expired-alert \
+         sweep runs at 03:00 in it. The column is `NOT NULL DEFAULT 'UTC'` with no \
+         constraint validating it, so a value like `MST7MDT` or one with a trailing space \
+         boots fine until something reads it -- which this component is the first thing to \
+         do. Set `node.timezone` to a name like `America/Denver`, or switch the Aeris \
+         account off."
+    )]
+    DeploymentZone,
 
     /// A configured `api_endpoint` that is not a usable base URL.
     #[error("the configured Aeris `api_endpoint` is not usable")]
@@ -462,8 +533,9 @@ fn forecast_spec(
         );
     }
     let digest = ConfigDigest::of(&format!(
-        "{};{};{};{:.6},{:.6};{}",
+        "{};{};{};{};{:.6},{:.6};{}",
         account.client_id,
+        account.secret_digest(),
         account.base(),
         span.span_hours(),
         latitude,
@@ -541,8 +613,9 @@ fn alerts_spec(
     let id = component_id(&name)?;
     let endpoint = endpoint(account, "alerts", latitude, longitude)?;
     let digest = ConfigDigest::of(&format!(
-        "{};{};{:.6},{:.6}",
+        "{};{};{};{:.6},{:.6}",
         account.client_id,
+        account.secret_digest(),
         account.base(),
         latitude,
         longitude
@@ -591,7 +664,24 @@ fn alerts_spec(
 }
 
 /// Declare `aeris:alerts:gc`.
+///
+/// # A deployment with no usable zone is refused **here**, by name
+///
+/// `node.timezone` is `NOT NULL DEFAULT 'UTC'` with **no `CHECK`** validating that it is a
+/// resolvable IANA name, and until this component nothing in the tree read it — so a node
+/// carrying `MST7MDT` or a trailing space has always booted. Planning a zoneless
+/// `TzSource::Deployment` and letting `plan()` refuse works, and it tells the operator that
+/// an expired-alert sweep has a time-zone problem, moments after they entered a credential.
+///
+/// So the refusal is the registrar's and it names the column. It fires only when an Aeris
+/// account is enabled and a station is paired, so it cannot break a configuration that works
+/// today — which is the half a `CHECK` on the column, or a check in the boot sequence, would
+/// not have.
 fn gc_spec(zone: Option<Zone>) -> Result<ComponentSpec, AerisPlanError> {
+    let Some(zone) = zone else {
+        return Err(AerisPlanError::DeploymentZone);
+    };
+    let zone = Some(zone);
     let id = component_id(GC_ID)?;
     let digest = ConfigDigest::of(&format!(
         "{};{}",

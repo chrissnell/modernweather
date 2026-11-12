@@ -27,8 +27,10 @@
 //!
 //! So [`FreshnessView`] carries **no state**, by construction. It cannot be rendered as a
 //! badge colour derived from a lifecycle state, because it does not have one; and
-//! [`render`] takes the declaration and an observed instant and nothing else. W5 §1544's
-//! "last forecast and last alert fetch times (`Freshness`, §0.4)" is this type.
+//! [`render`] takes the declaration, an observed instant and a subject, and nothing else.
+//! `docs/management-ui-design.md`'s §7.1 page inventory asks `/share/forecasts` for "last
+//! forecast and last alert fetch **times** (`Freshness`, §0.4)" — plural, which is what the
+//! subject is for.
 //!
 //! # The observed instant is **data**, not the component's `last_run`
 //!
@@ -41,12 +43,14 @@
 //!
 //! # The vocabulary rule, which is **D-36**
 //!
-//! `mw-component`'s internal names must not reach a screen: *"Component `aeris:backyard` is
-//! Waiting on Capability ForecastStore" tells an operator nothing; W5 §0 owns the
-//! translation.* This is that translation for the freshness half, so [`Subject`] maps a
-//! `Capability` to an English noun and the rendered sentence contains neither a component id
-//! nor a capability name. A unit test asserts that, because it is the kind of rule that is
-//! true when written and false two refactors later.
+//! `mw-component`'s internal names must not reach a screen. `mw_component`'s own `lib`
+//! documentation puts it as *"Component `aprs:backyard` is Waiting on Capability
+//! WindowedView tells an operator nothing; W5 §0 owns the translation"*, and
+//! `docs/management-ui-design.md` §0's vocabulary table marks `Capability` *never shown*.
+//! This is that translation for the freshness half, so [`Subject`] maps a `Capability` to an
+//! English noun, the subject a caller supplies is a **station's own name** and never a
+//! component id, and the rendered sentence contains neither. A unit test asserts that,
+//! because it is the kind of rule that is true when written and false two refactors later.
 
 use std::time::Duration;
 
@@ -116,7 +120,7 @@ impl Subject {
 ///
 /// The absence of a state field is the design and not an omission; the module documentation
 /// has why.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct FreshnessView {
     /// The sentence, for the panel: "Forecast last updated 3 hours ago." or "Forecast has
     /// never been fetched."
@@ -125,7 +129,7 @@ pub struct FreshnessView {
     ///
     /// **Not a failure**, which is the whole point of rendering this separately: the thing
     /// is available and its contents are old. W5's own rule is that colour is never the only
-    /// signal (§1602), so this is what selects an *emphasis* and the sentence is what says
+    /// signal (§7.4), so this is what selects an *emphasis* and the sentence is what says
     /// the fact.
     pub stale: bool,
     /// Whether anything has ever populated it.
@@ -134,10 +138,14 @@ pub struct FreshnessView {
     /// differently: never-fetched is usually a credential or a pairing, and stale is usually
     /// a network.
     pub never: bool,
-    /// How old the contents are, for a caller that wants a number rather than a sentence —
-    /// the API serialises this beside `sentence` so a browser can count up without
-    /// re-parsing English.
-    pub age: Option<Duration>,
+    /// How old the contents are **in seconds**, for a caller that wants a number rather
+    /// than a sentence: the API serialises it beside `sentence` so a browser can count up
+    /// without re-parsing English.
+    ///
+    /// Seconds and not a `Duration`, because `serde` renders a `Duration` as
+    /// `{"secs":…,"nanos":…}` — two fields a client has to special-case to get one number,
+    /// on a schema M7-1 derives from this type with `utoipa`.
+    pub age_seconds: Option<u64>,
 }
 
 /// Render one [`Freshness`] declaration against the instant its contents were last written.
@@ -146,11 +154,23 @@ pub struct FreshnessView {
 /// "never" case and is **not** an error: a node whose Aeris credential was entered this
 /// morning has never fetched a forecast and nothing is wrong.
 ///
+/// `about` is **what this declaration is about**, in the operator's words — a station's own
+/// `name`, which is the user-facing name §0.2 asks for and the one §0.4's `{subject}`
+/// placeholder means. `None` renders the bare noun.
+///
+/// It is a parameter rather than something read off [`Freshness::populated_by`], and that is
+/// the point: the declaration carries a **component id**, which is internal vocabulary
+/// (**D-36**) and must not reach a screen. Without the parameter the sentence cannot
+/// distinguish one declaration from another at all — a node with two paired stations renders
+/// "Forecast last updated just now." beside "Forecast last updated 3 days ago." with nothing
+/// saying which station is which, which is the opposite failure from leaking the id.
+///
 /// `now` is passed in rather than read, because a sentence that says "3 hours ago" is a
 /// function of an instant and a rendering that could not be tested at a chosen one would be
 /// a rendering nobody checked.
 pub fn render(
     declaration: &Freshness,
+    about: Option<&str>,
     observed: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> FreshnessView {
@@ -163,11 +183,14 @@ pub fn render(
         verb: "updated",
         plural: false,
     });
+    let noun = match about {
+        Some(about) if !about.trim().is_empty() => format!("{} for {}", subject.noun, about.trim()),
+        _ => subject.noun.to_string(),
+    };
     let Some(observed) = observed else {
         return FreshnessView {
             sentence: format!(
-                "{} {} never been {}.",
-                subject.noun,
+                "{noun} {} never been {}.",
                 if subject.plural { "have" } else { "has" },
                 subject.verb
             ),
@@ -176,7 +199,7 @@ pub fn render(
             // has configured nothing is not looking at a stale forecast.
             stale: false,
             never: true,
-            age: None,
+            age_seconds: None,
         };
     };
     // A negative age is a clock that has gone backwards -- an NTP step, which W2a's
@@ -185,10 +208,10 @@ pub fn render(
     // seconds ago" is the kind of sentence that makes an operator distrust the whole page.
     let age = (now - observed).to_std().unwrap_or(Duration::ZERO);
     FreshnessView {
-        sentence: format!("{} last updated {}.", subject.noun, humanise(age)),
+        sentence: format!("{noun} last updated {}.", humanise(age)),
         stale: age > declaration.expected_max_age,
         never: false,
-        age: Some(age),
+        age_seconds: Some(age.as_secs()),
     }
 }
 
@@ -207,10 +230,16 @@ fn humanise(age: Duration) -> String {
         // Under a minute is "just now": the exact number of seconds since a forecast
         // refreshed is not a fact anybody acts on.
         0..=59 => "just now".to_string(),
-        60..=5399 => plural(seconds / 60, "minute"),
-        // From an hour and a half, round to the nearest hour rather than truncating: a
-        // forecast fetched 115 minutes ago is "2 hours ago" and not "1 hour ago".
-        5400..=86_399 => plural((seconds + 1800) / 3600, "hour"),
+        // Minutes up to the hour, truncating -- "59 minutes ago" and then "1 hour ago".
+        //
+        // An earlier version of this ladder ran minutes to 90 and started the hour band
+        // there, which made **"1 hour ago" unreachable**: the first hour value it could
+        // produce was 2. A unit's singular form being unreachable is the kind of thing that
+        // makes a page look unfinished, and `plural`'s own example claimed otherwise.
+        60..=3_599 => plural(seconds / 60, "minute"),
+        // Hours to the day, rounded to the nearest: a forecast fetched 115 minutes ago is
+        // "2 hours ago" and not "1 hour ago".
+        3_600..=86_399 => plural((seconds + 1_800) / 3_600, "hour"),
         _ => plural((seconds + 43_200) / 86_400, "day"),
     }
 }
@@ -246,12 +275,12 @@ mod tests {
     #[test]
     fn the_two_sentences_are_the_design_documents_own() {
         let declaration = forecast(Duration::from_secs(12 * 3600));
-        let three_hours_ago = render(&declaration, Some(at(0)), at(3 * 3600));
+        let three_hours_ago = render(&declaration, None, Some(at(0)), at(3 * 3600));
         assert_eq!(
             three_hours_ago.sentence,
             "Forecast last updated 3 hours ago."
         );
-        let never = render(&declaration, None, at(0));
+        let never = render(&declaration, None, None, at(0));
         assert_eq!(never.sentence, "Forecast has never been fetched.");
     }
 
@@ -263,6 +292,7 @@ mod tests {
     fn the_view_carries_no_lifecycle_state() {
         let view = render(
             &forecast(Duration::from_secs(60)),
+            None,
             Some(at(0)),
             at(3 * 3600),
         );
@@ -275,17 +305,22 @@ mod tests {
             sentence,
             stale,
             never,
-            age,
+            age_seconds,
         } = view;
         assert!(!sentence.is_empty());
-        assert!(stale && !never && age.is_some());
+        assert!(stale && !never && age_seconds.is_some());
     }
 
     /// **D-36**: no component id and no capability name reaches the sentence.
     #[test]
     fn the_sentence_carries_no_internal_vocabulary() {
         for observed in [None, Some(at(0))] {
-            let view = render(&forecast(Duration::from_secs(3600)), observed, at(7200));
+            let view = render(
+                &forecast(Duration::from_secs(3600)),
+                None,
+                observed,
+                at(7200),
+            );
             for internal in [
                 "ForecastStore",
                 "aeris:forecast",
@@ -303,25 +338,80 @@ mod tests {
         }
     }
 
+    /// **The subject is what distinguishes two declarations**, and it is a station's own
+    /// name rather than a component id — which is both halves of **D-36**: the sentence says
+    /// which station, and it does not say which component.
+    #[test]
+    fn the_subject_names_the_station_and_never_the_component() {
+        let declaration = forecast(Duration::from_secs(12 * 3600));
+        let backyard = render(&declaration, Some("Backyard"), Some(at(0)), at(0));
+        let summit = render(&declaration, Some("Summit"), None, at(0));
+        assert_eq!(
+            backyard.sentence,
+            "Forecast for Backyard last updated just now."
+        );
+        assert_eq!(
+            summit.sentence,
+            "Forecast for Summit has never been fetched."
+        );
+        assert_ne!(
+            backyard.sentence, summit.sentence,
+            "two declarations over one capability are distinguishable"
+        );
+        for sentence in [&backyard.sentence, &summit.sentence] {
+            assert!(
+                !sentence.contains("aeris:"),
+                "the component id is internal (D-36): {sentence}"
+            );
+        }
+        // A blank subject is the same as none, so a station with an empty `name` does not
+        // render "Forecast for  last updated".
+        assert_eq!(
+            render(&declaration, Some("   "), None, at(0)).sentence,
+            render(&declaration, None, None, at(0)).sentence
+        );
+    }
+
+    /// The view serialises as a flat object: a sentence, two flags and **one** number.
+    /// M7-1 derives its schema from this type, and a `Duration` would have arrived as
+    /// `{"secs":…,"nanos":…}`.
+    #[test]
+    fn the_view_serialises_with_the_age_as_one_number() {
+        let view = render(
+            &forecast(Duration::from_secs(3600)),
+            Some("Backyard"),
+            Some(at(0)),
+            at(7200),
+        );
+        let json = serde_json::to_value(&view).expect("the view serialises");
+        assert_eq!(json["age_seconds"], 7200);
+        assert_eq!(json["stale"], true);
+        assert_eq!(json["never"], false);
+        assert!(json["sentence"]
+            .as_str()
+            .is_some_and(|s| s.contains("Backyard")));
+        assert_eq!(json.as_object().map(|o| o.len()), Some(4));
+    }
+
     /// `stale` is the declaration's own `expected_max_age` and nothing else.
     #[test]
     fn stale_is_the_declared_age_and_not_a_guess() {
         let declaration = forecast(Duration::from_secs(3600));
-        assert!(!render(&declaration, Some(at(0)), at(3599)).stale);
+        assert!(!render(&declaration, None, Some(at(0)), at(3599)).stale);
         assert!(
-            !render(&declaration, Some(at(0)), at(3600)).stale,
+            !render(&declaration, None, Some(at(0)), at(3600)).stale,
             "at the edge"
         );
-        assert!(render(&declaration, Some(at(0)), at(3601)).stale);
+        assert!(render(&declaration, None, Some(at(0)), at(3601)).stale);
     }
 
     /// Never-fetched is **not** stale, so a fresh installation does not open with a warning.
     #[test]
     fn never_fetched_is_not_reported_as_stale() {
-        let view = render(&forecast(Duration::ZERO), None, at(0));
+        let view = render(&forecast(Duration::ZERO), None, None, at(0));
         assert!(view.never);
         assert!(!view.stale);
-        assert_eq!(view.age, None);
+        assert_eq!(view.age_seconds, None);
     }
 
     #[test]
@@ -331,7 +421,6 @@ mod tests {
         assert_eq!(humanise(Duration::from_secs(60)), "1 minute ago");
         assert_eq!(humanise(Duration::from_secs(119)), "1 minute ago");
         assert_eq!(humanise(Duration::from_secs(120)), "2 minutes ago");
-        assert_eq!(humanise(Duration::from_secs(5399)), "89 minutes ago");
         assert_eq!(
             humanise(Duration::from_secs(5400)),
             "2 hours ago",
@@ -346,10 +435,15 @@ mod tests {
     /// A clock that went backwards renders as "just now" rather than as a negative age.
     #[test]
     fn a_future_instant_renders_as_just_now() {
-        let view = render(&forecast(Duration::from_secs(3600)), Some(at(600)), at(0));
+        let view = render(
+            &forecast(Duration::from_secs(3600)),
+            None,
+            Some(at(600)),
+            at(0),
+        );
         assert_eq!(view.sentence, "Forecast last updated just now.");
         assert!(!view.stale);
-        assert_eq!(view.age, Some(Duration::ZERO));
+        assert_eq!(view.age_seconds, Some(0));
     }
 
     /// The four capabilities whose contents go stale have a noun; the rest do not, and a
@@ -376,7 +470,7 @@ mod tests {
             expected_max_age: Duration::from_secs(60),
         };
         assert_eq!(
-            render(&odd, Some(at(0)), at(30)).sentence,
+            render(&odd, None, Some(at(0)), at(30)).sentence,
             "Data last updated just now."
         );
     }
@@ -391,6 +485,7 @@ mod tests {
                     populated_by: ComponentId::new("x:y").expect("an id"),
                     expected_max_age: Duration::from_secs(900),
                 },
+                None,
                 None,
                 at(0),
             )

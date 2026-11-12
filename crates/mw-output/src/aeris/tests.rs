@@ -277,7 +277,15 @@ fn an_account_with_no_paired_station_plans_nothing() {
 /// an empty forecast panel and no diagnosis.
 #[test]
 fn a_paired_station_with_no_coordinates_is_refused_by_name() {
-    for (lat, lon) in [(Some(39.9), None), (None, Some(-105.5)), (None, None)] {
+    // Including `(0, 0)`, which is Go's own `lat != 0 && lon != 0` predicate: it is a point
+    // in the Gulf of Guinea, and treating it as a location would put a wrong forecast on a
+    // frozen response rather than an absent one.
+    for (lat, lon) in [
+        (Some(39.9), None),
+        (None, Some(-105.5)),
+        (None, None),
+        (Some(0.0), Some(0.0)),
+    ] {
         let cfg = Cfg {
             stations: vec![station("backyard", lat, lon)],
             ..Cfg::default()
@@ -292,6 +300,17 @@ fn a_paired_station_with_no_coordinates_is_refused_by_name() {
             e.to_string().contains("latitude"),
             "the message names the fix: {e}"
         );
+    }
+    // A station at zero latitude and a real longitude is a real place (the Gulf of Guinea's
+    // meridian aside), so only the exact pair is refused.
+    {
+        let cfg = Cfg {
+            stations: vec![station("equator", Some(0.0), Some(-105.5))],
+            ..Cfg::default()
+        };
+        let mut out = Vec::new();
+        register(&cfg, &mut out).expect("zero latitude alone is a location");
+        assert_eq!(out.len(), 4);
     }
 }
 
@@ -446,25 +465,57 @@ fn the_sweep_is_a_daily_calendar_in_the_deployment_zone() {
     assert_eq!(*deadline, GC_DEADLINE);
 }
 
-/// A deployment with no usable zone still **plans** the sweep, with no zone — so `plan()`
-/// refuses with `PlanError::MissingTimeZone` naming it, rather than the sweep silently not
-/// existing. The same shape `rain:rollover:<station>` takes, for the same reason.
+/// A deployment with no usable zone is refused **by name**, naming the column.
+///
+/// `node.timezone` has no `CHECK` and nothing read it before this component, so a malformed
+/// value has always booted. Letting `plan()` refuse instead would report a time-zone problem
+/// about an expired-alert sweep to an operator who had just entered a credential.
 #[test]
-fn a_deployment_with_no_zone_plans_the_sweep_for_plan_to_refuse() {
+fn a_deployment_with_no_zone_is_refused_by_name() {
     let cfg = Cfg {
         zone: None,
         ..Cfg::default()
     };
     let mut out = Vec::new();
-    register(&cfg, &mut out).expect("the registrar does not refuse this");
-    let spec = out
-        .iter()
-        .find(|s| s.id.as_str() == GC_ID)
-        .expect("the sweep is planned anyway");
-    let Trigger::Calendar { tz, .. } = &spec.trigger else {
-        panic!("not a Calendar");
+    let e = register(&cfg, &mut out).expect_err("the sweep has no zone to run in");
+    assert!(matches!(e, AerisPlanError::DeploymentZone), "{e:?}");
+    assert!(
+        e.to_string().contains("node.timezone"),
+        "the message names the column: {e}"
+    );
+}
+
+/// **A rotated secret restarts the components.** The builders close over the credential, so
+/// `SpecFingerprint`'s contract requires it in the digest — without it an operator who
+/// regenerates the Xweather secret gets a plan diff in which nothing restarts and three
+/// components that keep sending the revoked one.
+#[test]
+fn rotating_the_secret_moves_every_digest() {
+    let digests = |secret: &str| {
+        let cfg = Cfg {
+            account: Some(AerisAccount {
+                client_secret: SecretString::from(secret.to_string()),
+                ..account()
+            }),
+            ..Cfg::default()
+        };
+        let mut out = Vec::new();
+        register(&cfg, &mut out).expect("a plannable configuration");
+        out.iter()
+            .map(|s| (s.id.to_string(), s.config_digest))
+            .collect::<Vec<_>>()
     };
-    assert!(tz.zone().is_none(), "which plan() is what refuses");
+    let before = digests("sec");
+    let after = digests("rotated");
+    assert_eq!(before.len(), after.len());
+    for ((id, was), (_, now)) in before.iter().zip(&after) {
+        if id == GC_ID {
+            // The sweep closes over no credential: it deletes rows.
+            assert_eq!(was, now, "{id} does not depend on the secret");
+        } else {
+            assert_ne!(was, now, "{id} must restart when the secret rotates");
+        }
+    }
 }
 
 /// A digest that did not move is a component the plan diff does not restart. The credential

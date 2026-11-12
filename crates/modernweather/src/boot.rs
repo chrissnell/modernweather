@@ -71,9 +71,20 @@ use crate::spool;
 
 /// Which component crates contribute specs.
 ///
-/// One line per component crate, which is §1.3 rule 2: adding a component crate adds a line
-/// here and edits nothing else -- the shape `managers/controller.go` could not take, down to
-/// its `if con.Type == "management" { continue }`.
+/// One line per component **family**, which is §1.3 rule 2's property: adding one adds a
+/// line here and edits nothing else -- the shape `managers/controller.go` could not take,
+/// down to its `if con.Type == "management" { continue }`.
+///
+/// Rule 2's own wording is "each component crate contributes one `fn register(cfg, out)`",
+/// and three crates here contribute more than one: `mw-pipeline` through `Rollup`, `Snow`
+/// and `Snapshot`, `mw-output` through `Outputs` and `Aeris`, and `mw-station` through
+/// `Stations` and `SnowGauges`. Each split is one configuration table against another --
+/// `uploader` against `aeris_account`, the station rows against the ingest rows -- and the
+/// reason is the same every time: one registrar reading two tables is one `RegisterError`
+/// for two unrelated refusals, so an operator who mistyped a credential is told about a
+/// coordinate. The order is not load-bearing: `Phase::Spread` is derived from a hash of the
+/// component id and `plan()` orders by the hard-edge digraph, so position affects only
+/// which refusal surfaces first.
 const REGISTRARS: &[&dyn Registrar<Config>] = &[
     &Stations,
     &SnowGauges,

@@ -177,13 +177,16 @@ impl ReadingStore for Series {
     }
 }
 
+/// One `replace_estimates` call: the window it replaced and how many rows it wrote.
+type Replacement = (DateTime<Utc>, Option<DateTime<Utc>>, usize);
+
 /// A `SnowCache` that holds estimates in memory and records what it was told to write.
 #[derive(Debug, Default)]
 struct Cache {
     estimates: Mutex<BTreeMap<DateTime<Utc>, f32>>,
     patches: Mutex<Vec<SnowPatch>>,
     events: Mutex<Vec<(u32, Vec<SnowEvent>)>>,
-    replacements: Mutex<Vec<(DateTime<Utc>, usize)>>,
+    replacements: Mutex<Vec<Replacement>>,
 }
 
 impl Cache {
@@ -255,14 +258,17 @@ impl SnowCache for Cache {
         &'a self,
         _station: &'a StationKey,
         from: DateTime<Utc>,
+        until: Option<DateTime<Utc>>,
         rows: &'a [DepthEstimate],
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         self.replacements
             .lock()
             .expect("not poisoned")
-            .push((from, rows.len()));
+            .push((from, until, rows.len()));
         let mut estimates = self.estimates.lock().expect("not poisoned");
-        estimates.retain(|&bucket, _| bucket < from);
+        // The window, not the tail: a coarse backfill phase must not delete the finer
+        // estimates of the phases after it, which is what the bound exists for.
+        estimates.retain(|&bucket, _| bucket < from || until.is_some_and(|end| bucket >= end));
         for row in rows {
             estimates.insert(row.bucket, row.depth_in);
         }
@@ -720,19 +726,62 @@ fn every_event_window_fits_the_detectors_bound() {
     }
 }
 
-/// One pass of the smoother stays under the store's own row cap, so a backfill is chunked
-/// rather than silently truncated to its oldest buckets.
+/// One pass of the smoother stays under the store's own row cap, and the backfill's phases
+/// together cover a whole season at levels the schema still has.
+///
+/// **This is the Critical the review found, as an assertion.** The 5-minute level is
+/// retained for 14 days (`migrations/20261029234500_...sql`), so a one-level backfill from
+/// 1 October reads nothing before the horizon and `snowseason` silently reports only the
+/// newest fortnight. Each phase's window must therefore be inside its level's policy, and
+/// the phases must reach back far enough for the longest season.
 #[test]
-fn a_smoothing_pass_stays_under_the_stores_row_cap() {
+fn the_backfill_reads_each_level_only_as_far_back_as_it_is_retained() {
+    // The retention policies, from the migration. Day is unbounded.
+    let retained = |level: BucketLevel| -> Option<u64> {
+        match level {
+            BucketLevel::Minute => Some(7 * 86_400),
+            BucketLevel::FiveMinute => Some(14 * 86_400),
+            BucketLevel::Hour => Some(90 * 86_400),
+            BucketLevel::Day => None,
+        }
+    };
+    let mut previous: Option<Duration> = None;
+    for (level, horizon) in BACKFILL {
+        if let Some(policy) = retained(level) {
+            assert!(
+                horizon.as_secs() < policy,
+                "{level} is read over {} days and retained for {} -- the older part of \
+                 that window does not exist",
+                horizon.as_secs() / 86_400,
+                policy / 86_400
+            );
+            // One pass per phase, which is what `MAX_PASSES = 8` is slack on.
+            let buckets = horizon.as_secs() / level.span().as_secs();
+            assert!(
+                buckets <= (PASS_BUCKETS * MAX_PASSES) as u64,
+                "{level}'s phase is {buckets} buckets, over the {} a tick can read",
+                PASS_BUCKETS * MAX_PASSES
+            );
+        } else {
+            assert_eq!(horizon, Duration::MAX, "{level} is the unbounded one");
+        }
+        // Coarser levels reach further back, so the phases partition history with no gap.
+        if let Some(previous) = previous {
+            assert!(
+                horizon > previous,
+                "{level} must reach past the level before it"
+            );
+        }
+        previous = Some(horizon);
+    }
+    // The coarsest level is unbounded, so a season of any length is covered; the finest is
+    // the one the steady state uses and one pass of it is a week.
+    assert_eq!(BACKFILL[0].0, BucketLevel::FiveMinute);
+    assert_eq!(BACKFILL[BACKFILL.len() - 1].1, Duration::MAX);
     const _: () = assert!(
         PASS_BUCKETS <= 10_000,
         "a pass must stay under mw_store::reader::MAX_ROWS, or a backfill is silently \
          truncated to its oldest buckets"
-    );
-    let covered = PASS_BUCKETS * MAX_PASSES * BucketLevel::FiveMinute.span().as_secs() as usize;
-    assert!(
-        covered > 365 * 86_400,
-        "one tick covers a season: {covered} seconds"
     );
 }
 
@@ -960,16 +1009,31 @@ mod driven {
         body.tick(&cx()).await.expect("a successful occurrence");
 
         let replacements = cache.replacements.lock().expect("not poisoned").clone();
-        // Six weeks from 1 October at five-minute buckets is more than one pass's 8 000, so
-        // the backfill is chunked -- which is the bound `MAX_PASSES` exists to put on the work
-        // one tick does, and it still finished inside this tick.
+        // Two phases, one pass each: the hourly level from the season's first instant to
+        // the 5-minute level's retention horizon, then the 5-minute level to now.
+        // `BACKFILL` has why the phases exist.
         assert_eq!(replacements.len(), 2, "{replacements:?}");
         let season = units::season_start(now(), denver()).expect("a real boundary");
-        assert_eq!(replacements[0].0, season, "it started at the season");
-        // The second pass starts inside the first by the smoothing overlap.
-        assert!(replacements[1].0 > season, "{replacements:?}");
-        let written: usize = replacements.iter().map(|(_, rows)| rows).sum();
+        assert_eq!(
+            replacements[0].0, season,
+            "the coarse phase starts at the season"
+        );
+        // **Each phase's delete is bounded above**, so the coarse one cannot erase the fine
+        // one's estimates.
+        assert!(
+            replacements[0].1.is_some(),
+            "the coarse phase is bounded: {replacements:?}"
+        );
+        assert!(replacements[1].0 > season, "the fine phase starts later");
+        let written: usize = replacements.iter().map(|(_, _, rows)| rows).sum();
         assert!(written > 100, "it wrote the series: {written} rows");
+        // The reads went to the two levels `BACKFILL` names, coarsest first.
+        let levels: Vec<String> = store
+            .asked()
+            .iter()
+            .filter_map(|q| q.split(' ').next().map(str::to_string))
+            .collect();
+        assert_eq!(levels, vec!["1h", "5m"], "{:?}", store.asked());
 
         let patch = cache.only_patch();
         assert!(patch.last24.is_some(), "a 24-hour total");
@@ -1093,16 +1157,27 @@ mod driven {
             .map(|(_, events)| events.clone())
             .expect("the 72-hour range");
         assert!(!seventy_two.is_empty(), "the storm was detected");
+        // The detected accumulation is the storm's, which is the behaviour. (Asserting
+        // `class.contributes()` and `accumulation_mm.is_some()` here would restate the
+        // `.filter()` that produced the collection, and `end >= start` would restate
+        // `pelt::classify`'s own guard -- all three are the code under test's conditions
+        // rather than its answers. The table's `CHECK` is what holds them, and `db-tests`
+        // is where a violation would surface.)
+        let detected: f32 = seventy_two
+            .iter()
+            .filter_map(|event| event.accumulation_mm)
+            .sum();
+        assert!(
+            (120.0..=170.0).contains(&detected),
+            "about the 160 mm that fell: {detected} from {seventy_two:#?}"
+        );
+        // And every band lies inside the window it was detected for.
+        let since = now() - chrono::Duration::days(4);
         for event in &seventy_two {
             assert!(
-                event.class.contributes(),
-                "only the two contributing classes are stored: {event:?}"
+                event.start >= since && event.end <= now(),
+                "{event:?} is outside the 72-hour window's four days"
             );
-            assert!(
-                event.accumulation_mm.is_some_and(|mm| mm > 0.0),
-                "with an accumulation, which the table's CHECK requires: {event:?}"
-            );
-            assert!(event.end >= event.start, "{event:?}");
         }
     }
 
@@ -1160,5 +1235,122 @@ mod driven {
         .await
         .expect("a successful read");
         assert_eq!(total, Some(20.0), "thirty less the ten it started with");
+    }
+
+    /// **The Critical the review found.** A gauge whose history is older than the 5-minute
+    /// level's 14-day retention still gets a season total, because the backfill reads the
+    /// hour level for that part.
+    ///
+    /// Without the phases, a node commissioned in February reads `observations_5m` from
+    /// 1 October, finds nothing before the retention horizon, writes no estimate for it, and
+    /// `snowseason` reports the newest fortnight -- 3" instead of 60" -- until the next
+    /// October, because the incremental path never looks back past the overlap again.
+    #[tokio::test]
+    async fn a_season_older_than_the_five_minute_retention_is_still_backfilled() {
+        let season = units::season_start(now(), denver()).expect("a real boundary");
+        // Hourly buckets from the season's start to a fortnight ago: a hundred millimetres
+        // accumulating. Nothing at the 5-minute level at all, which is what retention
+        // leaves behind.
+        let hours = (now() - season).num_hours() - 14 * 24;
+        let hourly = buckets(
+            season,
+            chrono::Duration::hours(1),
+            &(0..hours)
+                .map(|i| Some(1500.0 - 100.0 * i as f64 / hours as f64))
+                .collect::<Vec<_>>(),
+        );
+        let cache = Arc::new(Cache::default());
+        let mut body = smoothing_body(
+            Series::default().with(BucketLevel::Hour, hourly),
+            Arc::clone(&cache),
+        );
+        body.tick(&cx()).await.expect("a successful occurrence");
+        let patch = cache.only_patch();
+        let season_total = patch.season.expect("a season total");
+        assert!(
+            season_total > 3.0,
+            "the whole season, not the retained fortnight: {season_total}"
+        );
+        assert!(
+            !cache.estimates.lock().expect("not poisoned").is_empty(),
+            "the hourly history reached the estimate series"
+        );
+    }
+
+    /// **`snowtoday` must fall back to zero on a snow-free day.** A gauge reporting bare
+    /// ground all day produces no *kept* depth, because the bare-ground filter drops every
+    /// bucket -- and an empty filtered series must not be read as "unknown", or yesterday's
+    /// total is served for ever.
+    #[tokio::test]
+    async fn a_snow_free_day_reports_no_new_snow_rather_than_yesterdays() {
+        // Buckets since midnight, every one within 2 mm of the 1500 mm base: bare ground,
+        // which `depths_from` filters out entirely.
+        let five = buckets(
+            midnight(),
+            chrono::Duration::minutes(5),
+            &[Some(1499.0), Some(1500.0), Some(1499.5), Some(1499.0)],
+        );
+        let minutes = buckets(
+            now() - chrono::Duration::minutes(1),
+            chrono::Duration::minutes(1),
+            &[Some(1499.0)],
+        );
+        let cache = Arc::new(Cache::default());
+        let mut body = depth_body(
+            Series::default()
+                .with(BucketLevel::FiveMinute, five)
+                .with(BucketLevel::Minute, minutes),
+            Arc::clone(&cache),
+        );
+        body.tick(&cx()).await.expect("a successful occurrence");
+        let patch = cache.only_patch();
+        assert_eq!(
+            patch.today,
+            Some(0.0),
+            "the gauge reported, and it reported no snow"
+        );
+        // And the contrast: a window the gauge reported nothing in is still unknown.
+        let silent = Arc::new(Cache::default());
+        let mut body = depth_body(
+            Series::default().with(
+                BucketLevel::FiveMinute,
+                buckets(midnight(), chrono::Duration::minutes(5), &[None, None]),
+            ),
+            Arc::clone(&silent),
+        );
+        body.tick(&cx()).await.expect("a successful occurrence");
+        assert!(
+            silent.patches().is_empty(),
+            "nothing reported, so nothing is claimed"
+        );
+    }
+
+    /// **`snowseason` must fall back to zero on 1 October.** Every estimate is suddenly
+    /// older than the new season's boundary, and an unconditional "unknown" leaves last
+    /// season's total on a frozen response for the whole of October.
+    #[tokio::test]
+    async fn the_first_day_of_a_season_reports_no_snow_rather_than_last_seasons() {
+        let cache = Arc::new(Cache::default());
+        let season = units::season_start(now(), denver()).expect("a real boundary");
+        // A series that is entirely in the PREVIOUS season.
+        cache.seed(season - chrono::Duration::days(30), 10, 48.0);
+        let total = season_total(
+            &(Arc::clone(&cache) as Arc<dyn SnowCache>),
+            &StationKey::new("snowgauge"),
+            season,
+        )
+        .await
+        .expect("a successful read");
+        assert_eq!(total, Some(0.0), "a new season has had no snow yet");
+        // And the contrast: a gauge the smoother has never run for is still unknown.
+        let fresh = Arc::new(Cache::default());
+        let total = season_total(
+            &(fresh as Arc<dyn SnowCache>),
+            &StationKey::new("snowgauge"),
+            season,
+        )
+        .await
+        .expect("a successful read");
+        assert_eq!(total, None);
     }
 }

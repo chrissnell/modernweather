@@ -39,11 +39,21 @@ pub const SERVING_THRESHOLD_IN: f64 = 0.1;
 /// the wire's: `/snow`'s seven numbers are Go `float32` (W1 §6), so narrowing here rather
 /// than at the DTO is what keeps the stored number and the served number the same bits.
 ///
+/// # The division is in `f32`, and that is not a detail
+///
+/// Go's signature is `mmToInchesWithThreshold(mm float32)`, so the division, the threshold
+/// comparison and the rounding's input are all single precision — and `float32(0.1)` is
+/// `0.100000001490116…`, not a tenth. Dividing in `f64` here and narrowing at the end is
+/// *more accurate* and disagrees with the served number: `24.13 mm` is `0.9` under Go and
+/// `1.0` in double precision, and there are 419 such disagreements on a 0.001 mm grid over
+/// 0–4000 mm, each a full tenth of an inch on a **frozen** response. **D-37** freezes the
+/// arithmetic including its rounding, so the narrowing happens first.
+///
 /// A negative input returns zero, which falls out of the threshold rather than needing a
 /// branch — and is worth knowing, because a mis-set `snow_base_distance_mm` produces
 /// exactly that (`docs/reconciliation.md` DEV-9, part 3).
 pub fn serving_inches(mm: f64) -> f32 {
-    serving_from_inches(mm / MM_PER_INCH)
+    serving_from_inches(f64::from(mm as f32 / MM_PER_INCH as f32))
 }
 
 /// The same threshold and rounding, for a value already in inches.
@@ -54,11 +64,21 @@ pub fn serving_inches(mm: f64) -> f32 {
 /// into `mmToInchesWithThreshold`; the two cancel in `f64` and not quite in Go's `float32`,
 /// which is the one place this function is more accurate than its ancestor rather than
 /// identical to it.
+///
+/// The threshold comparison is in `f32` for [`serving_inches`]' reason — `float32(0.1)` is
+/// not a tenth — and the rounding is `math.Round`'s rule, half away from zero, evaluated in
+/// double precision exactly as `float64(inches)*10` is.
+///
+/// **A non-finite input returns zero, where Go returns the non-finite value**, and that is
+/// deliberate rather than faithful: `math.Round(NaN)` is `NaN`, which `encoding/json`
+/// refuses to marshal, so the Go path's answer to this input is a `500` on a frozen
+/// endpoint. Recorded in `docs/reconciliation.md` **A-M6-3-4**.
 pub fn serving_from_inches(inches: f64) -> f32 {
-    if !inches.is_finite() || inches < SERVING_THRESHOLD_IN {
+    let inches = inches as f32;
+    if !inches.is_finite() || inches < SERVING_THRESHOLD_IN as f32 {
         return 0.0;
     }
-    ((inches * 10.0).round() / 10.0) as f32
+    ((f64::from(inches) * 10.0).round() / 10.0) as f32
 }
 
 /// The snow season's first instant, in the station's zone.
@@ -134,14 +154,28 @@ mod tests {
         assert_eq!(serving_from_inches(f64::NAN), 0.0);
     }
 
+    /// **The `f32` division is the Go one, and the `f64` one disagrees.** These four
+    /// values are from the 419 that differ on a 0.001 mm grid; each is a full tenth of an
+    /// inch on a frozen response, so the narrowing order is contract rather than taste.
     #[test]
-    fn the_two_entry_points_agree_on_the_same_quantity() {
-        for mm in [0.0, 2.54, 25.4, 100.0, 1234.5] {
-            assert_eq!(
-                serving_inches(mm),
-                serving_from_inches(mm / MM_PER_INCH),
-                "{mm} mm"
-            );
+    fn the_division_is_single_precision_the_way_go_computes_it() {
+        for (mm, go, double_precision) in [
+            (24.13_f64, 0.9_f32, 1.0_f32),
+            (29.21, 1.1, 1.2),
+            (39.37, 1.5, 1.6),
+            (49.53, 1.9, 2.0),
+        ] {
+            assert_eq!(serving_inches(mm), go, "{mm} mm is {go} under Go");
+            // What the obvious implementation would have answered, as the contrast.
+            let naive = {
+                let inches = mm / MM_PER_INCH;
+                if inches < SERVING_THRESHOLD_IN {
+                    0.0
+                } else {
+                    ((inches * 10.0).round() / 10.0) as f32
+                }
+            };
+            assert_eq!(naive, double_precision, "{mm} mm in double precision");
         }
     }
 

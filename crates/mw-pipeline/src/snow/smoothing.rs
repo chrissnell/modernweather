@@ -279,8 +279,13 @@ mod tests {
         assert!(mean < 11.2, "a mean would have been pulled down to {mean}");
     }
 
-    /// The band is the mean of up to three order statistics near the 85th percentile, and
-    /// the clamp reaches **downward** when the quantile index is at the top of the window.
+    /// The band is the mean of up to three order statistics near the 85th percentile.
+    ///
+    /// Go's `lowIdx > 0` guard is **dead code**, faithfully reproduced: enumerated over every
+    /// window size from 1 to 5 000, `high - low < 2` fires only when `idx == 0`, which
+    /// requires `last <= 1`, which makes `max(high - 2, 0)` equal to `idx` already. So no
+    /// input distinguishes its presence, and the `n = 2` and `n = 1` cases below exercise the
+    /// clamp rather than the guard.
     #[test]
     fn the_band_is_three_order_statistics_with_an_asymmetric_clamp() {
         // n = 11, last = 10, idx = floor(0.85 * 10) = 8, high = 10, low = 8: the top three.
@@ -447,14 +452,21 @@ mod tests {
         }
     }
 
-    /// `estimate` is the two passes in order and nothing else.
+    /// `estimate` is the two passes in order and nothing else — asserted on a signal with
+    /// a spike in it, so that a version which skipped the limiter would differ.
     #[test]
     fn estimate_is_the_quantile_then_the_limit() {
-        let samples = series(&[0.0, 1.0, 2.0, 30.0, 3.0, 4.0]);
+        // Long enough that the ±30-minute windows differ along it -- a six-sample series at
+        // five-minute spacing is one window, which the quantile flattens and the limiter
+        // then has nothing to do to.
+        let depths: Vec<f64> = (0..40).map(|i| if i < 20 { 0.0 } else { 40.0 }).collect();
+        let samples = series(&depths);
         let smoothed = local_quantile(&samples);
-        assert_eq!(
-            estimate(&samples, None),
-            rate_limit(&samples, &smoothed, None)
-        );
+        let limited = rate_limit(&samples, &smoothed, None);
+        assert_eq!(estimate(&samples, None), limited);
+        // The two passes are not the same function: a forty-inch step clears the 4 in/h cap
+        // by an order of magnitude, so a version that returned the smoothed values would
+        // fail here.
+        assert_ne!(limited, smoothed, "the rate limit did something");
     }
 }

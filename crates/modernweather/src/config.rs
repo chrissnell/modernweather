@@ -926,10 +926,35 @@ fn declare_station(row: &config_db::StationRow) -> mw_api_legacy::StationView {
 /// peer, by contrast, **does** get its forecasts fetched here -- a forecast is a property
 /// of a *location*, not of who collects the readings, and the node that serves a website
 /// for a remote station is the node that needs its forecast.
+///
+/// # The disabled case is logged, because the website does not agree with it
+///
+/// `declare_site` derives the rendered page's `aerisWeatherEnabled` from the **unfiltered**
+/// pairing list, so a disabled, paired station that is a website's primary still advertises
+/// forecasts -- while this function drops it and no component is planned. That is the exact
+/// state `mw_output::aeris::register` refuses the NULL-coordinates route to ("a website with
+/// `aerisWeatherEnabled: true`, an empty forecast panel, and nothing anywhere saying why"),
+/// reached by a different route.
+///
+/// It is **logged rather than refused or re-enabled**, and each of the three was considered:
+/// refusing would make switching a station off a configuration the daemon will not start on;
+/// planning the components anyway would fetch -- and bill -- for a station the operator
+/// turned off; and changing what the website renders would change a frozen page's bytes for
+/// a reason that has nothing to do with this item. So it is a `warn` naming the row and both
+/// fixes, which is what `mw_output::plan`'s `station_is_disabled` branch does for the same
+/// situation one table over.
 fn declare_aeris(
     stations: &[config_db::StationRow],
     paired: &[String],
 ) -> Vec<mw_output::AerisStation> {
+    for row in stations {
+        if !row.enabled && paired.contains(&row.station_key) {
+            tracing::warn!(
+                station = %row.station_key,
+                "this station is paired with the Aeris service and has collecting switched                  off, so NO forecast or alert component is planned for it -- while a website                  whose primary station it is still advertises forecasts. Re-enable the                  station, or remove its `station_service` row with `service = 'aeris'`."
+            );
+        }
+    }
     stations
         .iter()
         .filter(|r| r.enabled && paired.contains(&r.station_key))
