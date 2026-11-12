@@ -1,0 +1,24 @@
+# The weather database's own namespace. Nothing else goes in here.
+#
+# Pod Security Admission is set EXPLICITLY rather than inherited. The cluster's default
+# is `baseline` enforce / `restricted` warn, so an unlabelled namespace would have been
+# admitted and warned forever -- which is the state mw-ci is in. This workload does not
+# need anything `baseline` grants over `restricted`: the only privileged-looking thing it
+# wants is a writable data directory, and that is an `fsGroup` on an ordinary PVC, which
+# `restricted` allows. See 40-statefulset.yaml for the securityContext that satisfies it.
+#
+# A `local` PersistentVolume is NOT a `hostPath` volume as far as PSA is concerned -- the
+# pod mounts a PVC, and the host coupling lives in the PV's nodeAffinity. So `restricted`
+# costs nothing here and removes the standing warning.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: modernweather
+  labels:
+    app.kubernetes.io/name: modernweather
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest

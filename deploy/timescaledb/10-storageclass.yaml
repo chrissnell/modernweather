@@ -1,0 +1,18 @@
+# A statically provisioned class for node-local disks, copied from the shape that is
+# already proven in this cluster (`graywolf-tiles-local`): no provisioner, so every PV in
+# it is written by hand; `Retain`, so deleting a claim never deletes a decade of
+# observations; `WaitForFirstConsumer`, so the scheduler places the pod before the volume
+# is bound rather than binding to a volume the pod cannot reach.
+#
+# Its own class rather than reusing graywolf's, because reclaim policy and binding mode
+# are class-level properties and this database should not inherit a change made for tiles.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: modernweather-db-local
+  labels:
+    app.kubernetes.io/part-of: modernweather
+provisioner: kubernetes.io/no-provisioner
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: false

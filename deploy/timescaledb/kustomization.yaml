@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The Secret is not here on purpose; secret.example.yaml says why and gives the one
+# command that creates it.
+resources:
+  - 00-namespace.yaml
+  - 10-storageclass.yaml
+  - 20-persistentvolume.yaml
+  - 30-service.yaml
+  - 40-statefulset.yaml
+  - 50-poddisruptionbudget.yaml

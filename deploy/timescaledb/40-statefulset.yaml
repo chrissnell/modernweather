@@ -1,0 +1,161 @@
+# One replica. Not two.
+#
+# docs/reconciliation.md §7.4: a single replica on a `local` volume cannot reschedule, and
+# that was accepted deliberately. CloudNativePG was declined in the same place -- its HA
+# story wants two replicas on replicated storage, which is the thing §7.3 forbids.
+#
+# Image: timescale/timescaledb-ha:pg17, not the plain timescale/timescaledb image, which
+# ships no timescaledb_toolkit (DESIGN.md D-2 requires it; W8 D-17 is the reason). It is
+# also the image CI uses, so CI and this instance share an image family.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: modernweather-db
+  namespace: modernweather
+  labels:
+    app.kubernetes.io/name: modernweather-db
+    app.kubernetes.io/part-of: modernweather
+spec:
+  replicas: 1
+  serviceName: modernweather-db
+  # Retain, on both, for the same reason the StorageClass is Retain: deleting this
+  # StatefulSet must not be able to delete the data.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: modernweather-db
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: modernweather-db
+        app.kubernetes.io/part-of: modernweather
+    spec:
+      # The taint lil-bulky carries is Talos-owned (workload-class=database:NoSchedule) and
+      # exists so that nothing else lands on this node. The nodeSelector is the other half:
+      # the toleration lets this pod in, the selector keeps it from going anywhere else if
+      # the volume's nodeAffinity were ever loosened.
+      tolerations:
+        - key: workload-class
+          operator: Equal
+          value: database
+          effect: NoSchedule
+      nodeSelector:
+        workload-class: database
+      # No initContainer and no chown job. /var/mnt/modernweather-db is root:root 0755 as
+      # Talos mounts it, and the image runs as postgres (uid 1000), so a container writing
+      # straight to the mount gets EACCES. fsGroup is the fix that needs no privileged
+      # container: kubelet applies group ownership and the group write bit to the volume
+      # root, and PGDATA is then a subdirectory postgres creates itself.
+      #
+      # OnRootMismatch, not Always: the recursive walk runs once, on the empty volume, and
+      # is then skipped on every later start. At a decade of history an unconditional
+      # recursive chown is a startup cost that grows with the database for no reason.
+      #
+      # This securityContext is also exactly what PodSecurity `restricted` requires, which
+      # is why 00-namespace.yaml can set that level.
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      # Postgres takes its time to finish a checkpoint on shutdown. The default 30s can
+      # expire into a SIGKILL, which is an unclean shutdown and a crash recovery on the
+      # next start.
+      terminationGracePeriodSeconds: 300
+      containers:
+        - name: db
+          image: timescale/timescaledb-ha:pg17
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgresql
+              containerPort: 5432
+          env:
+            # PGDATA is a subdirectory of the mount, never the mount root. An xfs volume
+            # root is not an empty directory as far as initdb is concerned, and keeping
+            # the cluster one level down also leaves room for anything else this volume
+            # is ever asked to hold.
+            - name: PGDATA
+              value: /var/lib/postgresql/pgdata
+            - name: POSTGRES_DB
+              value: modernweather
+            # scram-sha-256 for host connections. The CI pod uses `trust`, which is right
+            # for a disposable emptyDir and wrong here.
+            - name: POSTGRES_HOST_AUTH_METHOD
+              value: scram-sha-256
+            - name: POSTGRES_INITDB_ARGS
+              # Detection, not tuning: a torn page is otherwise silent, and checksums
+              # cannot be turned on later without rewriting the cluster. This is the one
+              # initdb flag that is a one-way door, which is why it is set and the rest
+              # of the server's configuration is left at the image's defaults.
+              value: --data-checksums
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: modernweather-db-superuser
+                  key: password
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql
+            # The image puts its unix socket in /var/run/postgresql, which is not on the
+            # data volume. Without this the socket directory is unwritable and `psql -U
+            # postgres` inside the container -- which is how the probes and every
+            # verification in this item run -- cannot connect.
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+          # pg_isready against the real database rather than against `postgres`, so a
+          # server that came up without the database the client wants is not reported
+          # ready. Startup on an empty volume is initdb plus extension creation, so the
+          # startupProbe carries the slow first boot and the liveness probe stays tight.
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "modernweather"]
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "modernweather"]
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "modernweather"]
+            periodSeconds: 30
+            failureThreshold: 6
+          # Requests reserve the node; there is no CPU limit on purpose. The heaviest
+          # operation is a single-session aggregate refresh (§7.4) and CPU throttling
+          # lands directly on the refresh lag W4 D-26 budgets. The memory limit exists so
+          # a runaway query hits a limit before the kubelet starts evicting, and leaves
+          # the rest of the node's 32 GiB to the page cache.
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              memory: 24Gi
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: modernweather-db-local
+        volumeMode: Filesystem
+        resources:
+          requests:
+            storage: 350Gi

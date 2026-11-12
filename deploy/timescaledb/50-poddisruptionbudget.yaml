@@ -1,0 +1,19 @@
+# A single replica on a `local` volume cannot move. So an eviction is not a failover, it
+# is an outage for as long as the node is unavailable -- `kubectl drain` would otherwise
+# take the database down with no acknowledgement that it had.
+#
+# minAvailable: 1 against one replica means every VOLUNTARY eviction is refused until
+# somebody says so (`--disable-eviction`, or deleting this object). It does nothing about
+# involuntary disruption, which is M0-2's problem rather than this one's.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: modernweather-db
+  namespace: modernweather
+  labels:
+    app.kubernetes.io/part-of: modernweather
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: modernweather-db

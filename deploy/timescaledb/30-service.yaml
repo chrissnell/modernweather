@@ -1,0 +1,41 @@
+# Two services, which is the ordinary StatefulSet pair.
+#
+#   modernweather-db       headless, and the set's governing service. Gives the pod its
+#                          stable name, modernweather-db-0.modernweather-db.
+#   modernweather-db-rw    a ClusterIP. This is the name clients use -- the migration in
+#                          M5-1, the daemon, and the CronJob in M0-2 -- because a
+#                          ClusterIP survives the pod being replaced without the client
+#                          having to re-resolve a pod address.
+apiVersion: v1
+kind: Service
+metadata:
+  name: modernweather-db
+  namespace: modernweather
+  labels:
+    app.kubernetes.io/name: modernweather-db
+    app.kubernetes.io/part-of: modernweather
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: modernweather-db
+  ports:
+    - name: postgresql
+      port: 5432
+      targetPort: postgresql
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: modernweather-db-rw
+  namespace: modernweather
+  labels:
+    app.kubernetes.io/name: modernweather-db
+    app.kubernetes.io/part-of: modernweather
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: modernweather-db
+  ports:
+    - name: postgresql
+      port: 5432
+      targetPort: postgresql
