@@ -35,8 +35,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mw_component::{
-    Builder, Capability, ComponentError, ComponentId, ComponentSpec, Cx, ForecastStore, Provision,
-    Publisher, Serve, SnowCache, StationRegistry, Store, Trigger,
+    AlertStore, Builder, Capability, ComponentError, ComponentId, ComponentSpec, Cx, ForecastStore,
+    Provision, Publisher, Serve, SnowCache, StationRegistry, Store, Trigger,
 };
 use mw_types::{Class, Classify, DisplayChain};
 use secrecy::ExposeSecret as _;
@@ -105,12 +105,14 @@ pub fn spec(
             async move {
                 let publisher = cx.publisher::<Arc<dyn Store>>()?;
                 let forecasts = cx.publisher::<Arc<dyn ForecastStore>>()?;
+                let alerts = cx.publisher::<Arc<dyn AlertStore>>()?;
                 let snow = cx.publisher::<Arc<dyn SnowCache>>()?;
                 Ok(Pool {
                     url,
                     registry,
                     publisher,
                     forecasts,
+                    alerts,
                     snow,
                 })
             }
@@ -118,11 +120,13 @@ pub fn spec(
     )
     // No needs at all: W2a §4.1's table gives `db:postgres` none, which is what makes it a
     // root of the ordering graph and therefore unable to participate in a cycle.
-    // Three capabilities, one pool. W2a §4.1's table gives `db:postgres` `ReadingStore`;
-    // §2.1 gives `ForecastStore`, `AlertStore` and `SnowCache` the same provider, and two
-    // of the three have a consumer as of the frozen REST surface. `AlertStore` is still
-    // absent, because `/alerts` is not carried forward (**D-69**) and a capability with no
-    // consumer is a handle trait nobody has checked against a query.
+    // Four capabilities, one pool. W2a §4.1's table gives `db:postgres` `ReadingStore`;
+    // §2.1 gives `ForecastStore`, `AlertStore` and `SnowCache` the same provider. The last
+    // of the four used to be absent, because `/alerts` is not carried forward (**D-69**)
+    // and a capability with no consumer is a handle trait nobody has checked against a
+    // query. M6-3 gives it one: `docs/reconciliation.md` **A-M6-3-1** keeps the endpoint
+    // retired and builds the two components that WRITE alerts, so the trait now has the
+    // query set its two callers need and nothing else.
     //
     // Publishing them from one component rather than three is not a convenience: the
     // probe loop below is what decides whether the pool is usable, and a second component
@@ -131,6 +135,7 @@ pub fn spec(
     .provides([
         Provision::of(Capability::ReadingStore),
         Provision::of(Capability::ForecastStore),
+        Provision::of(Capability::AlertStore),
         Provision::of(Capability::SnowCache),
     ])
     // The URL is the only configuration this component closes over, so it is the whole of
@@ -162,6 +167,7 @@ struct Pool {
     registry: Arc<dyn StationRegistry>,
     publisher: Publisher<Arc<dyn Store>>,
     forecasts: Publisher<Arc<dyn ForecastStore>>,
+    alerts: Publisher<Arc<dyn AlertStore>>,
     snow: Publisher<Arc<dyn SnowCache>>,
 }
 
@@ -209,11 +215,12 @@ impl Pool {
             "the weather database is usable"
         );
         self.publisher.publish(Arc::new(store) as Arc<dyn Store>);
-        // The frozen surface's own two reads, over the same pool and published in the same
-        // breath: a consumer that resolved one and not the other would degrade an endpoint
-        // for a reason that is not about the database.
-        let (forecasts, snow) = Arc::new(FrozenReads::new(pool.clone())).handles();
+        // The three tables beside the aggregates, over the same pool and published in the
+        // same breath: a consumer that resolved one and not the other would degrade an
+        // endpoint for a reason that is not about the database.
+        let (forecasts, alerts, snow) = Arc::new(FrozenReads::new(pool.clone())).handles();
         self.forecasts.publish(forecasts);
+        self.alerts.publish(alerts);
         self.snow.publish(snow);
 
         // The probe loop. W2a §3.4's worked example is explicit about where this ends:
@@ -270,6 +277,7 @@ impl Pool {
                         // this component owes it, and it owes it on both exits.
                         self.publisher.revoke();
                         self.forecasts.revoke();
+                        self.alerts.revoke();
                         self.snow.revoke();
                         pool.close().await;
                         return Err(ComponentError::tick(
@@ -297,6 +305,7 @@ impl Pool {
         // the half this component owes it.
         self.publisher.revoke();
         self.forecasts.revoke();
+        self.alerts.revoke();
         self.snow.revoke();
         pool.close().await;
         info!("the weather database pool is closed");
@@ -453,6 +462,7 @@ mod tests {
             Arc::from(vec![
                 Capability::ReadingStore,
                 Capability::ForecastStore,
+                Capability::AlertStore,
                 Capability::SnowCache,
             ]),
             Vec::new(),
@@ -465,6 +475,9 @@ mod tests {
         let forecasts = build
             .publisher::<Arc<dyn ForecastStore>>()
             .expect("the spec declares this provision");
+        let alerts = build
+            .publisher::<Arc<dyn AlertStore>>()
+            .expect("the spec declares this provision");
         let snow = build
             .publisher::<Arc<dyn SnowCache>>()
             .expect("the spec declares this provision");
@@ -476,6 +489,7 @@ mod tests {
                 )),
                 publisher,
                 forecasts,
+                alerts,
                 snow,
             }),
             bus,
@@ -550,10 +564,11 @@ mod tests {
             vec![
                 Provision::of(Capability::ReadingStore),
                 Provision::of(Capability::ForecastStore),
+                Provision::of(Capability::AlertStore),
                 Provision::of(Capability::SnowCache),
             ],
-            "W2a §4.1 also gives it AlertStore; that one has no consumer, because /alerts \
-             is not carried forward (D-69)"
+            "all four of W2a §4.1's. AlertStore is here as of M6-3, whose aeris:alerts:* \
+             components write it -- the endpoint stays retired (D-69, A-M6-3-1)"
         );
         assert!(matches!(spec.trigger, Trigger::Service));
         assert!(

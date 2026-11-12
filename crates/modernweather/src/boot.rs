@@ -71,18 +71,31 @@ use crate::spool;
 
 /// Which component crates contribute specs.
 ///
-/// One line per component crate, which is §1.3 rule 2: adding a component crate adds a line
-/// here and edits nothing else -- the shape `managers/controller.go` could not take, down to
-/// its `if con.Type == "management" { continue }`.
+/// One line per component **family**, which is §1.3 rule 2's property: adding one adds a
+/// line here and edits nothing else -- the shape `managers/controller.go` could not take,
+/// down to its `if con.Type == "management" { continue }`.
+///
+/// Rule 2's own wording is "each component crate contributes one `fn register(cfg, out)`",
+/// and three crates here contribute more than one: `mw-pipeline` through `Rollup`, `Snow`
+/// and `Snapshot`, `mw-output` through `Outputs` and `Aeris`, and `mw-station` through
+/// `Stations` and `SnowGauges`. Each split is one configuration table against another --
+/// `uploader` against `aeris_account`, the station rows against the ingest rows -- and the
+/// reason is the same every time: one registrar reading two tables is one `RegisterError`
+/// for two unrelated refusals, so an operator who mistyped a credential is told about a
+/// coordinate. The order is not load-bearing: `Phase::Spread` is derived from a hash of the
+/// component id and `plan()` orders by the hard-edge digraph, so position affects only
+/// which refusal surfaces first.
 const REGISTRARS: &[&dyn Registrar<Config>] = &[
     &Stations,
     &SnowGauges,
     &ReadingReceiver,
     &Database,
     &Rollup,
+    &Snow,
     &Snapshot,
     &Legacy,
     &Outputs,
+    &Aeris,
     &Web,
     &Listener,
 ];
@@ -317,6 +330,59 @@ impl Registrar<Config> for Outputs {
         out: &mut Vec<mw_component::ComponentSpec>,
     ) -> Result<(), RegisterError> {
         mw_output::register(cfg, out)
+            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
+    }
+}
+
+/// `snow:*` -- the four components behind `/snow`'s seven numbers.
+///
+/// An adapter here for `Rollup`'s reason. Every decision belongs to
+/// `mw_pipeline::snow::register`: a node with no weather database plans nothing (**D-44**),
+/// a gauge with no `snow_base_distance_mm` is skipped because the schema makes that state
+/// representable on purpose, and a gauge with no usable zone is a refusal naming the
+/// station -- "today" and "this season" are both station-local (**D-24**).
+#[derive(Debug)]
+struct Snow;
+
+impl Registrar<Config> for Snow {
+    fn name(&self) -> &'static str {
+        "mw-pipeline (the snow cache)"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        mw_pipeline::snow::register(cfg, out)
+            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
+    }
+}
+
+/// `aeris:*` -- the two forecast spans, the alert fetch and the expired-alert sweep.
+///
+/// A **second** registrar over `mw-output`, beside `Outputs`, and the reason is that they
+/// are two component families with two configuration tables: an `uploader` row is an egress
+/// account and the `aeris_account` row is a fetch account (**D-66**'s split, one layer up).
+/// One registrar reading both would be one `RegisterError` for two unrelated refusals.
+///
+/// Every decision belongs to `mw_output::aeris::register`: no account or no pairing plans
+/// nothing, and a paired station with no coordinates is a refusal naming it -- the forecast
+/// API is queried by `latitude,longitude`, so such a station can never be asked about.
+#[derive(Debug)]
+struct Aeris;
+
+impl Registrar<Config> for Aeris {
+    fn name(&self) -> &'static str {
+        "mw-output (the Aeris components)"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        mw_output::aeris::register(cfg, out)
             .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
     }
 }
@@ -1114,6 +1180,8 @@ mod tests {
     fn config(with_database: bool) -> Config {
         let mut cfg = Config {
             declared_uploaders: Vec::new(),
+            aeris_account: None,
+            declared_aeris: Vec::new(),
             stations: Vec::new(),
             declared_stations: Vec::new(),
             websites: Vec::new(),

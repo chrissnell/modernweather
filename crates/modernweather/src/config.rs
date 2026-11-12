@@ -24,6 +24,7 @@
 //! that `mw-store` cannot grow a `Transport` and `mw-station` cannot grow a query.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use mw_component::{Generation, Ingress, Zone};
 use mw_store::config_db::{self, ConfigDbError, Listener, Node, WeatherDatabase, WebsiteRow};
@@ -223,6 +224,21 @@ pub struct Config {
     /// shape would be a field whose only purpose is to be converted.
     pub(crate) declared_uploaders: Vec<mw_output::UploaderRow>,
 
+    /// The `aeris_account` row, if this node has one.
+    ///
+    /// Read here rather than by the component that consumes it for the reason every other
+    /// row is: `mw-output` may not depend on `mw-store` (`ci/layers.toml`), so the query is
+    /// this crate's and the shape the registrar plans from is the component crate's. **Its
+    /// absence is the ordinary case** -- most deployments have no Aeris account.
+    pub aeris_account: Option<config_db::AerisAccountRow>,
+
+    /// Every station paired with the Aeris service, in the shape `mw-output` plans from.
+    ///
+    /// `pub(crate)` for [`Config::declared_stations`]' reason. The pairing itself is a
+    /// `station_service` row with `service = 'aeris'`; the coordinates come off the station
+    /// row, because the forecast API is queried by `latitude,longitude`.
+    pub(crate) declared_aeris: Vec<mw_output::AerisStation>,
+
     /// The generation these rows were read at (**D-53**).
     ///
     /// `ZERO` until something can bump it: a generation is assigned by `ConfigAdmin` on
@@ -245,6 +261,8 @@ impl Config {
         let uploaders = config_db::uploaders(pool).await?;
         Ok(Config {
             declared_uploaders: uploaders.iter().map(declare_uploader).collect(),
+            aeris_account: config_db::aeris_account(pool).await?,
+            declared_aeris: declare_aeris(&stations, &aeris_stations),
             web_sites: websites
                 .iter()
                 .map(|w| declare_site(w, &stations, &aeris_stations))
@@ -530,6 +548,92 @@ impl mw_pipeline::RollupConfig for Config {
 /// Column into field, like every other registrar trait here. The handle the uploaders need
 /// is the **same** `Arc<dyn WindowedView>` the snapshot components are given -- one object,
 /// so an uploader and `/latest` cannot disagree about what the five-minute wind average is.
+impl mw_pipeline::snow::SnowConfig for Config {
+    fn has_weather_database(&self) -> bool {
+        self.weather_database.is_some()
+    }
+
+    /// Every enabled snow gauge, with its calibration and its **resolved** zone.
+    ///
+    /// Three predicates, each with a reason the registrar cannot supply:
+    ///
+    /// - `kind == "snowgauge"`, which is the configured device type `/stationinfo` returns
+    ///   (`docs/legacy-api-contract.md` §3.1 is explicit that it and the driver's
+    ///   self-reported `stationtype` "are not the same set and must not be unified").
+    /// - `enabled`, which is W5 §1.2's "Collecting readings" toggle: a gauge with
+    ///   collection switched off has no buckets to read, so planning four components over
+    ///   it would mean four ticks a minute finding nothing, forever.
+    /// - a `transport_kind`, which is what distinguishes a station this node **collects
+    ///   from** from one a peer forwards readings for (`mw_station::config`). A gauge
+    ///   received from a peer is inventory on this node; its snow totals are computed on
+    ///   the node that owns it, and computing them here as well would be two answers to one
+    ///   question.
+    ///
+    /// The zone comes from [`Config::station_zones`] -- the registry snapshot's resolved
+    /// parse, for `rollup_stations`' reason: the parse **is** the validation (W2a Decision
+    /// 11) and it already happened there, so a second parse would be a second answer to
+    /// which midnight the station's day begins at.
+    fn snow_stations(&self) -> Vec<mw_pipeline::snow::SnowStation> {
+        let zones: std::collections::BTreeMap<&str, Option<Zone>> = self
+            .station_zones
+            .iter()
+            .map(|(key, zone)| (key.as_str(), *zone))
+            .collect();
+        self.stations
+            .iter()
+            .filter(|r| r.kind == "snowgauge" && r.enabled && r.transport_kind.is_some())
+            .map(|r| mw_pipeline::snow::SnowStation {
+                key: StationKey::new(r.station_key.as_str()),
+                base_distance_mm: r.snow_base_distance_mm,
+                zone: zones
+                    .get(r.station_key.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+            })
+            .collect()
+    }
+}
+
+impl mw_output::AerisConfig for Config {
+    /// The account, or `None` when there is no row **or it is switched off**.
+    ///
+    /// The `enabled` flag is read here rather than in the registrar because this is the
+    /// layer that holds the row: the trait's contract is "the account this node fetches
+    /// with", and a disabled account is not one. An enabled row with no credential is
+    /// unrepresentable -- the table's own `CHECK` rejects it -- and is answered as absent
+    /// anyway rather than unwrapped, because a frozen boot path may not panic over a
+    /// constraint.
+    fn aeris_account(&self) -> Option<mw_output::AerisAccount> {
+        let row = self.aeris_account.as_ref()?;
+        if !row.enabled {
+            return None;
+        }
+        Some(mw_output::AerisAccount {
+            client_id: row.client_id.clone()?,
+            client_secret: row.client_secret.clone()?,
+            api_endpoint: row.api_endpoint.clone(),
+            refresh_interval: row
+                .refresh_interval_seconds
+                .and_then(|seconds| u64::try_from(seconds).ok())
+                .map(Duration::from_secs),
+        })
+    }
+
+    fn aeris_stations(&self) -> Vec<mw_output::AerisStation> {
+        self.declared_aeris.clone()
+    }
+
+    /// The deployment's own zone, for `aeris:alerts:gc`'s `Calendar`.
+    ///
+    /// `node.timezone` is `NOT NULL DEFAULT 'UTC'`, so the `None` here is a *malformed*
+    /// value rather than an absent one -- and it is a `PlanError::MissingTimeZone` naming
+    /// the sweep rather than a silent fallback, which is `TzSource`'s own rule. A node with
+    /// no `node` row at all has not started before and has no components either.
+    fn deployment_zone(&self) -> Option<Zone> {
+        Zone::new(&self.node.as_ref()?.timezone).ok()
+    }
+}
+
 impl mw_output::OutputConfig for Config {
     fn uploaders(&self) -> Vec<mw_output::UploaderRow> {
         self.declared_uploaders.clone()
@@ -810,6 +914,58 @@ fn declare_station(row: &config_db::StationRow) -> mw_api_legacy::StationView {
     }
 }
 
+/// Every Aeris-paired station, joined to its coordinates.
+///
+/// The pairing is a `station_service` row with `service = 'aeris'` and the coordinates are
+/// the station's, which is the join `mw-output` cannot do: the two tables are `mw-store`'s
+/// and `ci/layers.toml` forbids that crate to it.
+///
+/// **A disabled station keeps its pairing and loses its components**, which is the same
+/// predicate `snow_stations` applies and for the same reason: an operator who switched a
+/// station off did not ask to keep paying for its forecasts. A station received from a
+/// peer, by contrast, **does** get its forecasts fetched here -- a forecast is a property
+/// of a *location*, not of who collects the readings, and the node that serves a website
+/// for a remote station is the node that needs its forecast.
+///
+/// # The disabled case is logged, because the website does not agree with it
+///
+/// `declare_site` derives the rendered page's `aerisWeatherEnabled` from the **unfiltered**
+/// pairing list, so a disabled, paired station that is a website's primary still advertises
+/// forecasts -- while this function drops it and no component is planned. That is the exact
+/// state `mw_output::aeris::register` refuses the NULL-coordinates route to ("a website with
+/// `aerisWeatherEnabled: true`, an empty forecast panel, and nothing anywhere saying why"),
+/// reached by a different route.
+///
+/// It is **logged rather than refused or re-enabled**, and each of the three was considered:
+/// refusing would make switching a station off a configuration the daemon will not start on;
+/// planning the components anyway would fetch -- and bill -- for a station the operator
+/// turned off; and changing what the website renders would change a frozen page's bytes for
+/// a reason that has nothing to do with this item. So it is a `warn` naming the row and both
+/// fixes, which is what `mw_output::plan`'s `station_is_disabled` branch does for the same
+/// situation one table over.
+fn declare_aeris(
+    stations: &[config_db::StationRow],
+    paired: &[String],
+) -> Vec<mw_output::AerisStation> {
+    for row in stations {
+        if !row.enabled && paired.contains(&row.station_key) {
+            tracing::warn!(
+                station = %row.station_key,
+                "this station is paired with the Aeris service and has collecting switched                  off, so NO forecast or alert component is planned for it -- while a website                  whose primary station it is still advertises forecasts. Re-enable the                  station, or remove its `station_service` row with `service = 'aeris'`."
+            );
+        }
+    }
+    stations
+        .iter()
+        .filter(|r| r.enabled && paired.contains(&r.station_key))
+        .map(|r| mw_output::AerisStation {
+            key: StationKey::new(r.station_key.as_str()),
+            latitude: r.latitude,
+            longitude: r.longitude,
+        })
+        .collect()
+}
+
 /// One `uploader` row, column into field.
 ///
 /// Field for field with no interpretation, which is the point: every default, every clamp
@@ -918,6 +1074,8 @@ mod tests {
     fn config(addr: &str, port: u16) -> Config {
         Config {
             declared_uploaders: Vec::new(),
+            aeris_account: None,
+            declared_aeris: Vec::new(),
             stations: Vec::new(),
             declared_stations: Vec::new(),
             websites: Vec::new(),

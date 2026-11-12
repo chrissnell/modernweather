@@ -94,6 +94,37 @@ pub const ATTEMPT_OUTCOMES: &[&str] = &[
     "cancelled",
 ];
 
+/// The label an Aeris occurrence that stored something carries.
+pub const FETCH_OK: &str = "ok";
+
+/// Every label `mw_aeris_fetches_total` can carry — [`FETCH_OK`], every
+/// `AerisError::reason`, and the two outcomes that are not an `AerisError`.
+///
+/// `store` is a [`mw_component::StoreError`] rather than an API failure, and it is its own
+/// label for the reason the two series above are two series: "the vendor answered and the
+/// database did not" and "the vendor did not answer" have different fixes, and an operator
+/// reading one `failed` counter cannot tell them apart. `cancelled` is a stop.
+pub const FETCH_OUTCOMES: &[&str] = &[
+    FETCH_OK,
+    // `AerisError::reason`'s own set, which includes the transport's.
+    "connect",
+    "tls",
+    "malformed",
+    "rejected",
+    "rate_limited",
+    "timeout",
+    "login_refused",
+    "decode",
+    "shape",
+    "refused",
+    "empty",
+    "coded",
+    "encode",
+    // Not an `AerisError`.
+    "store",
+    "cancelled",
+];
+
 /// Describe the series. Called once, by the binary, beside the other `register`s.
 pub fn register() {
     metrics::describe_counter!(
@@ -107,6 +138,39 @@ pub fn register() {
         "Delivery attempts, by outcome. One occurrence can make several: the retry budget \
          re-enters the rate limiter, so each attempt takes its own permit."
     );
+    metrics::describe_counter!(
+        "mw_aeris_fetches_total",
+        "Occurrences of an Aeris component, by outcome. `kind` separates the forecast \
+         fetch, the alert fetch and the expired-alert sweep, which is W2a D-33's \
+         \"alerts are failing, forecasts are fine\" as a query rather than as four log \
+         prefixes. `refused` is the upstream declining with success:false -- usually a \
+         credential -- and `store` is the database, not the API."
+    );
+}
+
+/// Zero `mw_aeris_fetches_total` for one component, for [`arm`]'s reason.
+pub fn arm_fetch(id: &ComponentId, kind: &'static str) {
+    for outcome in FETCH_OUTCOMES {
+        metrics::counter!(
+            "mw_aeris_fetches_total",
+            "component" => id.to_string(),
+            "kind" => kind,
+            "outcome" => *outcome,
+        )
+        .increment(0);
+    }
+}
+
+/// Count one Aeris occurrence. `outcome` is [`FETCH_OK`], an `AerisError::reason`, `store`
+/// or `cancelled`.
+pub fn fetch(id: &ComponentId, kind: &'static str, outcome: &'static str) {
+    metrics::counter!(
+        "mw_aeris_fetches_total",
+        "component" => id.to_string(),
+        "kind" => kind,
+        "outcome" => outcome,
+    )
+    .increment(1);
 }
 
 /// Zero every series for one component, so a component that has sent nothing is

@@ -1,5 +1,18 @@
-//! Rate-limited outputs: `OutputEncoder` implementations for APRS/CWOP, PWS Weather and
-//! Weather Underground over one shared `Uploader<E>` body.
+//! Third-party HTTPS integrations: the rate-limited outputs, and the Aeris fetchers.
+//!
+//! Two halves over one outbound HTTP stack. **Out:** `OutputEncoder` implementations for
+//! APRS/CWOP, PWS Weather and Weather Underground over one shared `Uploader<E>` body.
+//! **In:** [`aeris`]'s four components, which fetch forecasts and weather alerts.
+//!
+//! The crate's declared responsibility in `docs/service-architecture.md` §1.2 is the first
+//! half alone, and the second arrived with implementation-plan.md M6-3 — recorded as
+//! `docs/reconciliation.md` **A-M6-3-2** rather than taken quietly. The short version is
+//! that no document assigns the Aeris components a crate, the one thing they need that
+//! nothing else in a lower layer has is **an outbound HTTPS request with a public trust
+//! anchor**, and `ci/layers.toml` confines `webpki-roots` to this crate on the explicit
+//! grounds that a second crate verifying a public endpoint would mean "something had
+//! started verifying a public endpoint somewhere the design does not have one". Here is
+//! where the design does have one.
 //!
 //! An encoder is a declared `&[(MetricKey, Window, Agg)]` table and an `encode`; the
 //! scheduling, retry, rate limiting, backoff and SQL are all somewhere else
@@ -76,6 +89,7 @@
 //!   [`uploader::Transmit`], and every scheduling, retry, rate-limiting and pushback
 //!   property is asserted against a recording implementation of it.
 
+pub mod aeris;
 pub mod encoder;
 pub mod error;
 pub mod form;
@@ -87,12 +101,13 @@ pub mod plan;
 pub mod retry;
 pub mod uploader;
 
+pub use aeris::{AerisAccount, AerisConfig, AerisPlanError, AerisStation, Span};
 pub use encoder::account::Account;
 pub use encoder::cwop::Cwop;
 pub use encoder::pws::PwsWeather;
 pub use encoder::wu::WeatherUnderground;
 pub use encoder::{Observation, OutputEncoder};
-pub use error::{EncodeError, Target, UploadError};
+pub use error::{AerisError, EncodeError, Target, UploadError};
 pub use form::Form;
 pub use frame::{FrameSink, SharedSink};
 pub use https::{Endpoint, EndpointError, HttpUpload};

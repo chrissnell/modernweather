@@ -60,8 +60,8 @@ use std::fmt::Write as _;
 use chrono::{DateTime, Utc};
 use mw_component::{
     AlmanacQuery, AlmanacRecord, BoxFuture, Bucket, BucketLevel, BucketQuery, Bucketed,
-    LatestQuery, Piece, ReadingStore, SeriesQuery, Span, SpanBucket, SpanColumn, SpanQuery,
-    StoreError, TotalsQuery,
+    LatestQuery, MeanBucket, MeanSeriesQuery, Piece, ReadingStore, SeriesQuery, Span, SpanBucket,
+    SpanColumn, SpanQuery, StoreError, TotalsQuery,
 };
 use mw_types::{
     Agg, AggregateColumn, MetricKey, MetricValue, Reading, SqlType, Strategy, LEVELS, METRICS,
@@ -300,6 +300,47 @@ impl ReadingStore for TimescaleReader {
                     Ok(Bucketed {
                         bucket: row.try_get(0).map_err(StoreError::rejected)?,
                         total: row.try_get(1).map_err(StoreError::rejected)?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn mean_series<'a>(
+        &'a self,
+        q: MeanSeriesQuery,
+    ) -> BoxFuture<'a, Result<Vec<MeanBucket>, StoreError>> {
+        Box::pin(async move {
+            // `mw_mean(_sum, _count)` and not `_sum / _count`, for the same reason `span`
+            // uses it: the function is NULL-safe on a zero count, and a division written
+            // out here would be a second answer to what the mean of an empty bucket is.
+            let (sum, count) = mean_columns(q.metric, q.level)?;
+            let sql = format!(
+                // `COALESCE($3, 'infinity')` rather than `($3 IS NULL OR bucket < $3)`:
+                // the latter is correct and is **not** a stop key, so a scan runs forward
+                // past `until` until the `LIMIT` fills or the station's rows run out --
+                // which on a backfill pass over a window the gauge was dead for means
+                // reading and discarding every later bucket it has.
+                "SELECT bucket, mw_mean({sum}, {count}) FROM {view} \
+                 WHERE station_id = $1 AND bucket >= $2 \
+                 AND bucket < COALESCE($3::timestamptz, 'infinity'::timestamptz) \
+                 ORDER BY bucket LIMIT $4",
+                view = view(q.level),
+            );
+            let limit = i64::try_from(q.limit.min(MAX_ROWS)).unwrap_or(i64::from(i32::MAX));
+            let rows = sqlx::query(&sql)
+                .bind(q.station.as_str())
+                .bind(q.since)
+                .bind(q.until)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(classify)?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(MeanBucket {
+                        bucket: row.try_get(0).map_err(StoreError::rejected)?,
+                        mean: row.try_get(1).map_err(StoreError::rejected)?,
                     })
                 })
                 .collect()
@@ -698,6 +739,41 @@ fn total_column(
                  already declares."
             )))
         })
+}
+
+/// The `_sum` and `_count` columns one `mean`-strategy metric declares at one level.
+///
+/// Two columns rather than one, because that is what **D-11** stores: an aggregate level
+/// holds composable *state*, so the mean of a bucket is a division the reader performs and
+/// not a column the view carries. `Err` for [`total_column`]'s reason — a metric that
+/// declares no `mean` here is a request to fix, not a build that is broken.
+fn mean_columns(
+    metric: MetricKey,
+    level: BucketLevel,
+) -> Result<(&'static str, &'static str), StoreError> {
+    let declared: Vec<&AggregateColumn> = LEVELS
+        .iter()
+        .find(|l| l.name == level.as_str())
+        .map(|l| l.columns)
+        .unwrap_or(&[])
+        .iter()
+        .filter(|c| c.metric == metric && c.strategy == Strategy::Mean)
+        .collect();
+    let find = |suffix: &'static str| -> Result<&'static str, StoreError> {
+        declared
+            .iter()
+            .map(|c| c.column)
+            .find(|name| name.ends_with(suffix))
+            .ok_or_else(|| {
+                StoreError::rejected(std::io::Error::other(format!(
+                    "metrics/registry.toml does not declare a `mean`'s `{suffix}` for \
+                     {metric:?} at the {level} level, so there is no column to finalise. \
+                     Add `mean` to that metric's `aggregates` and re-run `cargo xtask \
+                     codegen`, or ask for a strategy it already declares."
+                )))
+            })
+    };
+    Ok((find("_sum")?, find("_count")?))
 }
 
 /// `SELECT <216 columns> FROM observations WHERE station_id = $1 AND time >= $2 ORDER BY
