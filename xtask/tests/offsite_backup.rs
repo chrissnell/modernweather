@@ -46,11 +46,12 @@ while [ $# -gt 0 ]; do
     *) shift ;;
   esac
 done
+printf '%s\n--\n' "$q" >> "$MW_STUB_DIR/queries"
 case "$q" in
   *"FROM pg_class c JOIN pg_namespace n"*)   cat "$MW_STUB_DIR/relations" ;;
   *"string_agg(quote_ident(attname)"*)       echo "col_a,col_b" ;;
-  *"extract(year from min(time))"*)          cat "$MW_STUB_DIR/year_lo" ;;
-  *"extract(year from max(time))"*)          cat "$MW_STUB_DIR/year_hi" ;;
+  *"year from (min(time) AT TIME ZONE 'UTC')"*) cat "$MW_STUB_DIR/year_lo" ;;
+  *"year from (max(time) AT TIME ZONE 'UTC')"*) cat "$MW_STUB_DIR/year_hi" ;;
   *"count(*) FROM observations"*)            echo 1000 ;;
   *"count(*) FROM public."*)                 echo 7 ;;
   *"COPY (SELECT"*)                          printf 'a-row\n' ;;
@@ -62,7 +63,8 @@ esac
 /// upstream of the pipeline never dies of SIGPIPE.
 const RCLONE_STUB: &str = r#"#!/usr/bin/env bash
 case "$1" in
-  rcat) printf '%s\n' "$2" >> "$MW_STUB_DIR/written"; cat >/dev/null ;;
+  rcat) printf '%s\n' "$2" >> "$MW_STUB_DIR/written"
+        cat > "$MW_STUB_DIR/objects/$(printf '%s' "$2" | tr '/:' '__')" ;;
   cat)  cat "$MW_STUB_DIR/objects/$(printf '%s' "$2" | tr '/:' '__')" 2>/dev/null || exit 1 ;;
   size) cat "$MW_STUB_DIR/size" 2>/dev/null || echo '{"count":1,"bytes":4242}' ;;
   lsl)  : ;;
@@ -95,6 +97,7 @@ impl Harness {
         fs::write(dir.join("year_hi"), format!("{year_hi}\n")).expect("hi");
         fs::write(dir.join("written"), "").expect("written");
         fs::write(dir.join("size"), "{\"count\":1,\"bytes\":4242}\n").expect("size");
+        fs::write(dir.join("queries"), "").expect("queries");
         Harness { dir }
     }
 
@@ -140,6 +143,25 @@ impl Harness {
             format!("{{\"count\":1,\"bytes\":{bytes}}}\n"),
         )
         .expect("size");
+    }
+
+    /// Every query the script sent to `psql`, in order.
+    fn queries(&self) -> Vec<String> {
+        fs::read_to_string(self.dir.join("queries"))
+            .unwrap_or_default()
+            .split("\n--\n")
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The body of an object the script wrote, so the manifest can be read rather than
+    /// inferred from the paths.
+    fn object_body(&self, path: &str) -> String {
+        let name: String = path
+            .chars()
+            .map(|c| if c == '/' || c == ':' { '_' } else { c })
+            .collect();
+        fs::read_to_string(self.dir.join("objects").join(name)).unwrap_or_default()
     }
 
     /// Seeds the archive with a manifest a later run will read as "the previous run".
@@ -255,6 +277,177 @@ fn an_unchanged_historical_year_is_not_re_uploaded_and_the_current_one_always_is
         out.contains("unchanged, and the existing object is still there"),
         "the dump did not say why it skipped a year:\n{out}"
     );
+}
+
+/// A manifest entry for a year that was **not** re-dumped has to describe the object that is
+/// in the archive, not today's database.
+///
+/// Both halves of this were wrong. The entry was rebuilt with the *current* `observations`
+/// column list, so one added metric column made `COPY observations (<new cols>) FROM STDIN`
+/// fail for every historical year — the exact case an explicit column list exists to survive.
+/// And it recorded the *live* row count beside the *stored* object's digest, so with
+/// `MW_BACKUP_VERIFY_HISTORY=0` the manifest described an object that does not exist, which
+/// the rehearsal then reports as a MISMATCH against a faithful restore.
+#[test]
+fn a_carried_years_manifest_entry_describes_the_stored_object() {
+    let this_year = current_year();
+    let last_year = (this_year.parse::<i32>().expect("a year") - 1).to_string();
+    let h = Harness::new("carried", AT_HEAD, &last_year, &this_year);
+    // `stored_bytes` is 4242 because that is what the `rclone size` stub answers: a year is
+    // only carried if `history_object_intact` finds the object still there at the recorded
+    // length, so a fixture that disagreed with the stub would be testing the re-dump path.
+    //
+    // The stored object was dumped when `observations` had two different columns, and it has
+    // 1000 rows. The stub's live `count(*)` answers 1000 as well, so the counts are made to
+    // differ by the only mechanism that carries a year without comparing them:
+    // MW_BACKUP_VERIFY_HISTORY=0, with a recorded count that is deliberately not the live one.
+    h.put_object(
+        "stub:bucket/modernweather/manifest/latest.json",
+        &format!(
+            r#"{{"layout_version":1,"run":"PREVIOUS","remote":"stub:bucket/modernweather",
+                 "history_verified":true,"absent":[],"not_backed_up":{{}},
+                 "config_db":{{"state":"unconfigured","sha256":null,"bytes":null,"stored_bytes":null}},
+                 "objects":{{"raw":{{"{last_year}":{{
+                     "path":"stub:bucket/modernweather/raw/observations-{last_year}.copy.gz",
+                     "rows":4242,"bytes":10,"stored_bytes":4242,"sha256":"deadbeef",
+                     "columns":["time","station_id","outtemp_only_back_then"],
+                     "carried_from_a_previous_run":false}}}},"tables":{{}},"pgdump":{{}}}}}}"#
+        ),
+    );
+
+    let (ok, out, err) = h.run(
+        &["dump"],
+        &[
+            ("MW_BACKUP_ALLOW_NO_CONFIG_DB", "1"),
+            ("MW_BACKUP_VERIFY_HISTORY", "0"),
+        ],
+    );
+    assert!(ok, "the dump failed\n{out}\n{err}");
+
+    let man = h.object_body("stub:bucket/modernweather/manifest/latest.json");
+    let entry = raw_entry(&man, &last_year);
+    assert!(
+        entry.contains("\"outtemp_only_back_then\""),
+        "the carried entry was rebuilt with today's columns. `COPY observations (<cols>) FROM \
+         STDIN` would then name columns the stored object does not have, and every historical \
+         year would fail to restore after one schema change.\nentry: {entry}"
+    );
+    assert!(
+        entry.contains("\"rows\": 4242") || entry.contains("\"rows\":4242"),
+        "the carried entry recorded the live row count beside the stored object's digest, so \
+         the manifest describes an object that is not in the archive.\nentry: {entry}"
+    );
+    assert!(
+        !entry.contains("\"rows\": 1000") && !entry.contains("\"rows\":1000"),
+        "the live count reached the carried entry\nentry: {entry}"
+    );
+
+    // And the count it no longer records is a count it no longer pays for: that is the whole
+    // purpose of MW_BACKUP_VERIFY_HISTORY=0 over a decade of history.
+    let per_year_counts = h
+        .queries()
+        .iter()
+        .filter(|q| q.contains("count(*) FROM observations") && q.contains(&last_year))
+        .count();
+    assert_eq!(
+        per_year_counts,
+        0,
+        "MW_BACKUP_VERIFY_HISTORY=0 still ran a per-year count(*) for {last_year}, which is \
+         the cost the flag exists to avoid\nqueries: {:?}",
+        h.queries()
+    );
+}
+
+/// A dump overwrites objects in place, so one that dies half way leaves new objects behind a
+/// manifest that describes the old ones. The marker is what makes that detectable instead of
+/// being reported as a restore defect.
+#[test]
+fn the_archive_records_whether_the_dump_finished() {
+    let h = Harness::new("state", AT_HEAD, "2026", "2026");
+    let (ok, out, err) = h.run(&["dump"], &[("MW_BACKUP_ALLOW_NO_CONFIG_DB", "1")]);
+    assert!(ok, "the dump failed\n{out}\n{err}");
+
+    let written = h.written();
+    let state = "stub:bucket/modernweather/manifest/state.json";
+    let first_state = written.iter().position(|p| p == state);
+    let first_object = written
+        .iter()
+        .position(|p| p.contains("/raw/observations-"));
+    let latest = written
+        .iter()
+        .position(|p| p.ends_with("manifest/latest.json"));
+    let last_state = written.iter().rposition(|p| p == state);
+
+    assert!(
+        matches!((first_state, first_object), (Some(s), Some(o)) if s < o),
+        "the marker has to be written before the first object, or an interrupted dump leaves \
+         nothing to tell it apart from a complete one\nwritten: {written:?}"
+    );
+    assert!(
+        matches!((latest, last_state), (Some(l), Some(s)) if l < s),
+        "the marker has to be rewritten after latest.json, so `complete` means the manifest \
+         and the objects are from the same run\nwritten: {written:?}"
+    );
+    assert!(
+        h.object_body(state).contains("\"status\": \"complete\"")
+            || h.object_body(state).contains("\"status\":\"complete\""),
+        "the finished dump did not mark the archive complete: {:?}",
+        h.object_body(state)
+    );
+}
+
+/// The digest is byte-exact, so the COPY that produces it needs a **total** order.
+///
+/// `ORDER BY 1` is not one for `station_metrics`, `almanac_cache` or `forecasts` — they all
+/// have duplicate first columns — and the tie order differs between the statistics-rich
+/// source and the freshly restored copy, which turns reconciliation into a coin toss.
+#[test]
+fn a_tables_copy_is_ordered_by_every_column() {
+    let h = Harness::new("order", AT_HEAD, "2026", "2026");
+    let (ok, out, err) = h.run(&["dump"], &[("MW_BACKUP_ALLOW_NO_CONFIG_DB", "1")]);
+    assert!(ok, "the dump failed\n{out}\n{err}");
+
+    let queries = h.queries();
+    let copies: Vec<&String> = queries
+        .iter()
+        .filter(|q| q.contains("COPY (SELECT") && q.contains("FROM public."))
+        .collect();
+    assert!(
+        !copies.is_empty(),
+        "no table was copied\nqueries: {queries:?}"
+    );
+    for q in copies {
+        assert!(
+            q.contains("ORDER BY col_a,col_b"),
+            "a table's COPY is not ordered by every column, so its digest depends on the \
+             plan's tie order:\n{q}"
+        );
+        assert!(
+            !q.contains("ORDER BY 1)"),
+            "a table's COPY still orders by the first column alone:\n{q}"
+        );
+    }
+}
+
+/// `date -u +%Y`, as the script sees it.
+fn current_year() -> String {
+    let out = Command::new("date")
+        .args(["-u", "+%Y"])
+        .output()
+        .expect("date");
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// The raw entry for one year, pulled out of a manifest body without a JSON dependency.
+fn raw_entry(manifest: &str, year: &str) -> String {
+    let flat: String = manifest.split_whitespace().collect::<Vec<_>>().join(" ");
+    let key = format!("\"{year}\":");
+    let at = flat
+        .find(&key)
+        .unwrap_or_else(|| panic!("no raw entry for {year} in {flat}"));
+    let rest = &flat[at + key.len()..];
+    let end = rest.find('}').map(|e| e + 1).unwrap_or(rest.len());
+    rest[..end].to_owned()
 }
 
 #[test]

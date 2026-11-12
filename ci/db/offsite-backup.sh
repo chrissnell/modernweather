@@ -214,10 +214,15 @@ table_present() { printf '%s\n' "$PRESENT" | grep -qx -- "$1"; }
 
 # The years raw covers. min()/max() rather than DISTINCT extract(year ...), which is a
 # sequential scan of a decade to learn something the two endpoints already say.
+# `AT TIME ZONE 'UTC'` is load-bearing: the slicing below is hard-coded `+00`, and
+# `extract(year from <timestamptz>)` reads it in the **session** zone. On a server whose
+# `TimeZone` is not UTC the two disagree at the year boundary, and the newest rows land in no
+# object at all -- silently, because the rehearsal iterates the manifest and so cannot see a
+# year the manifest never mentioned.
 raw_years() {
   local lo hi
-  lo="$(psqlv_ -c "SELECT coalesce(extract(year from min(time))::int, 0) FROM observations")"
-  hi="$(psqlv_ -c "SELECT coalesce(extract(year from max(time))::int, 0) FROM observations")"
+  lo="$(psqlv_ -c "SELECT coalesce(extract(year from (min(time) AT TIME ZONE 'UTC'))::int, 0) FROM observations")"
+  hi="$(psqlv_ -c "SELECT coalesce(extract(year from (max(time) AT TIME ZONE 'UTC'))::int, 0) FROM observations")"
   [ "${lo:-0}" -gt 0 ] 2>/dev/null || return 0
   seq "$lo" "$hi"
 }
@@ -237,6 +242,13 @@ obj_table()    { printf '%s/tables/%s.copy.gz' "$MW_BACKUP_REMOTE" "$1"; }
 obj_pgdump()   { printf '%s/legacy/%s.pgdump' "$MW_BACKUP_REMOTE" "$1"; }
 obj_configdb() { printf '%s/config/config.db.gz' "$MW_BACKUP_REMOTE"; }
 obj_manifest() { printf '%s/manifest/%s.json' "$MW_BACKUP_REMOTE" "$1"; }
+# Objects are overwritten in place, so a dump that dies half way leaves new objects behind a
+# manifest that describes the old ones -- and `--from-archive` would then report MISMATCH on
+# a restore that was perfectly faithful to what it was given. This marker is written before
+# the first object and rewritten after `latest.json`, so the two disagreeing is the signal
+# that a run was interrupted. A marker rather than a rename because a rename is a copy and a
+# delete, and nothing else in this script needs delete on the bucket.
+obj_state()    { printf '%s/manifest/state.json' "$MW_BACKUP_REMOTE"; }
 
 human() {
   case "${1:-}" in ''|*[!0-9]*) printf '%s' "${1:-?}"; return ;; esac
@@ -391,18 +403,23 @@ cmd_dump() {
   fi
 
   local verify="${MW_BACKUP_VERIFY_HISTORY:-1}"
-  local this_year raw_cols y rows prev_rows prev_dig prev_bytes prev_stored want
+  local this_year raw_cols y rows prev_rows prev_dig prev_bytes prev_stored prev_cols want
   this_year="$(date -u +%Y)"
   raw_cols="$(columns_of observations)"
 
+  printf '{"run": "%s", "status": "in-progress"}' "$STAMP" | rclone_ rcat "$(obj_state)"
+
   note "=== raw, one object per year (the current year, $this_year, is always re-dumped)"
   for y in $(raw_years); do
-    prev_rows=""; prev_dig=""; prev_bytes=""; prev_stored=""
+    prev_rows=""; prev_dig=""; prev_bytes=""; prev_stored=""; prev_cols=""
     if [ -n "$prev" ]; then
       prev_rows="$(man_get "$prev" "(m['objects']['raw'].get('$y') or {}).get('rows')")"
       prev_dig="$(man_get "$prev" "(m['objects']['raw'].get('$y') or {}).get('sha256')")"
       prev_bytes="$(man_get "$prev" "(m['objects']['raw'].get('$y') or {}).get('bytes')")"
       prev_stored="$(man_get "$prev" "(m['objects']['raw'].get('$y') or {}).get('stored_bytes')")"
+      # The column list the stored object was actually dumped with. A carried year's
+      # manifest entry has to describe that object, not today's `observations`.
+      prev_cols="$(man_get "$prev" "','.join((m['objects']['raw'].get('$y') or {}).get('columns') or [])")"
     fi
 
     # Two independent questions, and the order is deliberate.
@@ -439,9 +456,8 @@ cmd_dump() {
         fi
       fi
     fi
-    [ -n "$rows" ] || rows="$(year_rows "$y")"
-
     if [ "$want" = "1" ]; then
+      [ -n "$rows" ] || rows="$(year_rows "$y")"
       begin_meter
       psql_ -c "COPY (SELECT $raw_cols FROM observations
                        WHERE time >= '$y-01-01 00:00:00+00'::timestamptz
@@ -454,7 +470,11 @@ cmd_dump() {
              "$y" "$rows" "$(human "$METER_BYTES")" "$(human "$UPLOADED_BYTES")" "${METER_SHA:0:16}"
       MANIFEST_PARTS+=("raw|$y|$(obj_raw "$y")|$rows|$METER_BYTES|$UPLOADED_BYTES|$METER_SHA|$raw_cols|0")
     else
-      MANIFEST_PARTS+=("raw|$y|$(obj_raw "$y")|$rows|${prev_bytes:--}|${prev_stored:--}|$prev_dig|$raw_cols|1")
+      # Every field here describes the object that is already in the archive. Recording the
+      # live row count beside the stored object's digest would make the manifest describe
+      # something that does not exist -- which the rehearsal would then report as a
+      # MISMATCH against a faithful restore.
+      MANIFEST_PARTS+=("raw|$y|$(obj_raw "$y")|$prev_rows|${prev_bytes:--}|${prev_stored:--}|$prev_dig|${prev_cols:-$raw_cols}|1")
     fi
   done
 
@@ -483,7 +503,11 @@ cmd_dump() {
     else
       cols="$(columns_of "$r")"
       begin_meter
-      psql_ -c "COPY (SELECT $cols FROM public.$r ORDER BY 1) TO STDOUT" \
+      # Ordered by **every** column, not by the first one. `station_metrics`, `almanac_cache`
+      # and `forecasts` all have duplicate first columns, so `ORDER BY 1` leaves the tie
+      # order to the plan -- and the plan differs between the statistics-rich source and the
+      # freshly restored copy, which turns a byte-exact digest into a coin toss.
+      psql_ -c "COPY (SELECT $cols FROM public.$r ORDER BY $cols) TO STDOUT" \
         | meter | gzip -6 | rclone_ rcat "$(obj_table "$r")"
       end_meter
       stored_bytes "$(obj_table "$r")"
@@ -526,6 +550,7 @@ cmd_dump() {
   man="$(build_manifest "$cfg_state" "$cfg_dig" "$cfg_bytes" "$cfg_stored" "$verify")"
   printf '%s' "$man" | rclone_ rcat "$(obj_manifest "$STAMP")"
   printf '%s' "$man" | rclone_ rcat "$(obj_manifest latest)"
+  printf '{"run": "%s", "status": "complete"}' "$STAMP" | rclone_ rcat "$(obj_state)"
   printf '  %s\n  %s\n' "$(obj_manifest "$STAMP")" "$(obj_manifest latest)"
   rm -f "$prev_f"
   note "=== the archive now holds"
