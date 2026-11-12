@@ -44,6 +44,10 @@
 # records that it did, because a weekly job that is cheaper than it looks should say so in
 # the artefact rather than in a comment.
 #
+# A SECOND check, which is NOT skippable, asks the question a row count cannot: is the object
+# a skipped year is relying on still in the archive, at the length the manifest recorded?
+# history_object_intact below has the reason that is not paranoia.
+#
 # THE INVENTORY IS CLOSED, AND THAT IS THE POINT
 #
 # Every ordinary table in the weather database is named in RELATIONS below with a mode and a
@@ -68,7 +72,8 @@
 #   MW_CONFIG_DB                     the daemon's SQLite configuration database.
 #   MW_BACKUP_ALLOW_NO_CONFIG_DB=1   tolerate MW_CONFIG_DB not existing yet.
 #   MW_RESTORE_CONFIG_DB             where `restore` writes the configuration database.
-#   MW_BACKUP_VERIFY_HISTORY=0       skip the per-year immutability check.
+#   MW_BACKUP_VERIFY_HISTORY=0       skip the per-year row-count check. The object-presence
+#                                    check always runs; it is one HEAD per year.
 #   PSQL, PG_DUMP, PG_RESTORE, RCLONE   override a whole invocation, for a bastion or a test.
 
 set -euo pipefail
@@ -326,6 +331,42 @@ stored_bytes() {
   UPLOADED_BYTES="${UPLOADED_BYTES:-0}"
 }
 
+# Is the object a skippable year is relying on actually STILL THERE, and the size the
+# manifest recorded?
+#
+# This is the check that stops the per-year design from degrading into a single year of
+# backup. Skipping an unchanged year trusts the previous manifest, and a manifest describes
+# what was written -- not what survived. An R2 lifecycle rule, a mis-aimed `rclone purge` or
+# anything else that removes objects out of band leaves the manifest still claiming a decade
+# while the bucket holds one year, and NOTHING else in this script would notice: the row
+# counts still agree, because they are counts of rows in the database.
+#
+# Not hypothetical. The bucket this archive originally shared with the Vault raft snapshots
+# turned out to hold ZERO objects: that job's last successful upload was 2026-09-09 and every
+# snapshot it had ever written was gone. Whatever removed them would have removed historical
+# years here in exactly the same silence.
+#
+# One HEAD per historical year per week. A missing object re-dumps the year and says so; a
+# size that disagrees with the manifest also re-dumps, because an object of the wrong length
+# is not the object the digest was computed over.
+history_object_intact() { # <year> <stored-bytes-the-manifest-recorded>
+  local y="$1" expect="$2"
+  stored_bytes "$(obj_raw "$y")"
+  if [ "${UPLOADED_BYTES:-0}" = "0" ]; then
+    warn "$y is in the manifest and NOT IN THE ARCHIVE. Something removed it out of band --"
+    warn "    a lifecycle rule on the bucket is the first thing to check, then anything with"
+    warn "    delete permission on this token. Re-dumping the year; check the others too."
+    return 1
+  fi
+  if [ -n "$expect" ] && [ "$expect" != "-" ] && [ "$expect" != "$UPLOADED_BYTES" ]; then
+    warn "$y is $UPLOADED_BYTES bytes in the archive and the manifest recorded $expect."
+    warn "    An object of the wrong length is not the object the digest was computed over."
+    warn "    Re-dumping the year."
+    return 1
+  fi
+  return 0
+}
+
 cmd_dump() {
   : "${MW_BACKUP_REMOTE:?set MW_BACKUP_REMOTE to an rclone destination, e.g. r2:bucket/modernweather}"
   need_db
@@ -353,7 +394,6 @@ cmd_dump() {
 
   note "=== raw, one object per year (the current year, $this_year, is always re-dumped)"
   for y in $(raw_years); do
-    rows="$(year_rows "$y")"
     prev_rows=""; prev_dig=""; prev_bytes=""; prev_stored=""
     if [ -n "$prev" ]; then
       prev_rows="$(man_get "$prev" "(m['objects']['raw'].get('$y') or {}).get('rows')")"
@@ -362,20 +402,41 @@ cmd_dump() {
       prev_stored="$(man_get "$prev" "(m['objects']['raw'].get('$y') or {}).get('stored_bytes')")"
     fi
 
+    # Two independent questions, and the order is deliberate.
+    #
+    #   has the DATA moved?   one count(*) over the year -- a sequential scan, and the only
+    #                         thing MW_BACKUP_VERIFY_HISTORY=0 turns off.
+    #   is the OBJECT there?  one HEAD. Always asked, never skippable: an object removed out
+    #                         of band is exactly the failure a row count cannot see, because
+    #                         the rows are in the database either way.
     want=1
+    rows=""
     if [ "$y" = "$this_year" ] || [ -z "$prev_rows" ]; then
       want=1
-    elif [ "$verify" = "0" ]; then
-      want=0
-      note "  $y  $rows rows  skipped unverified (MW_BACKUP_VERIFY_HISTORY=0)"
-    elif [ "$prev_rows" = "$rows" ]; then
-      want=0
-      note "  $y  $rows rows  unchanged, the existing object stands"
     else
-      warn "$y moved: the archive recorded $prev_rows rows and the database has $rows."
-      warn "    Raw is supposed to be append-only, so this is a backfill or a write-path"
-      warn "    problem. The year is being re-dumped either way."
+      want=0
+      if [ "$verify" != "0" ]; then
+        rows="$(year_rows "$y")"
+        if [ "$prev_rows" != "$rows" ]; then
+          want=1
+          warn "$y moved: the archive recorded $prev_rows rows and the database has $rows."
+          warn "    Raw is supposed to be append-only, so this is a backfill or a write-path"
+          warn "    problem. The year is being re-dumped either way."
+        fi
+      fi
+      if [ "$want" = "0" ] && ! history_object_intact "$y" "$prev_stored"; then
+        want=1
+      fi
+      if [ "$want" = "0" ]; then
+        if [ "$verify" = "0" ]; then
+          rows="$prev_rows"
+          note "  $y  $rows rows (carried, unverified)  object present, $(human "$UPLOADED_BYTES")"
+        else
+          note "  $y  $rows rows  unchanged, and the existing object is still there"
+        fi
+      fi
     fi
+    [ -n "$rows" ] || rows="$(year_rows "$y")"
 
     if [ "$want" = "1" ]; then
       begin_meter

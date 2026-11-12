@@ -23,7 +23,6 @@
 //!     table in it.
 //!   * a missing configuration database stops the dump unless it is explicitly tolerated.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -65,7 +64,7 @@ const RCLONE_STUB: &str = r#"#!/usr/bin/env bash
 case "$1" in
   rcat) printf '%s\n' "$2" >> "$MW_STUB_DIR/written"; cat >/dev/null ;;
   cat)  cat "$MW_STUB_DIR/objects/$(printf '%s' "$2" | tr '/:' '__')" 2>/dev/null || exit 1 ;;
-  size) echo '{"count":1,"bytes":4242}' ;;
+  size) cat "$MW_STUB_DIR/size" 2>/dev/null || echo '{"count":1,"bytes":4242}' ;;
   lsl)  : ;;
   *)    : ;;
 esac
@@ -95,6 +94,7 @@ impl Harness {
         fs::write(dir.join("year_lo"), format!("{year_lo}\n")).expect("lo");
         fs::write(dir.join("year_hi"), format!("{year_hi}\n")).expect("hi");
         fs::write(dir.join("written"), "").expect("written");
+        fs::write(dir.join("size"), "{\"count\":1,\"bytes\":4242}\n").expect("size");
         Harness { dir }
     }
 
@@ -130,6 +130,16 @@ impl Harness {
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    /// What `rclone size` reports for every object. `0` is how an object that is no longer
+    /// in the archive looks from here.
+    fn set_stored_size(&self, bytes: u64) {
+        fs::write(
+            self.dir.join("size"),
+            format!("{{\"count\":1,\"bytes\":{bytes}}}\n"),
+        )
+        .expect("size");
     }
 
     /// Seeds the archive with a manifest a later run will read as "the previous run".
@@ -218,39 +228,11 @@ fn raw_is_one_object_per_calendar_year() {
 
 #[test]
 fn an_unchanged_historical_year_is_not_re_uploaded_and_the_current_one_always_is() {
-    let this_year = {
-        let out = Command::new("date")
-            .args(["-u", "+%Y"])
-            .output()
-            .expect("date");
-        String::from_utf8_lossy(&out.stdout).trim().to_owned()
-    };
-    let last_year = (this_year.parse::<i32>().expect("a year") - 1).to_string();
+    let (last_year, this_year) = years();
     let h = Harness::new("incremental", AT_HEAD, &last_year, &this_year);
-    // A previous manifest that agrees with the stub's row count for the historical year, so
-    // the only reason to re-dump it would be the schedule rather than the data.
-    let mut raw = BTreeMap::new();
-    for y in [&last_year, &this_year] {
-        raw.insert(
-            y.clone(),
-            format!(
-                r#"{{"path":"stub:bucket/modernweather/raw/observations-{y}.copy.gz",
-                     "rows":1000,"bytes":10,"stored_bytes":10,"sha256":"deadbeef",
-                     "columns":["col_a","col_b"],"carried_from_a_previous_run":false}}"#
-            ),
-        );
-    }
-    let objects: Vec<String> = raw.iter().map(|(y, e)| format!("\"{y}\": {e}")).collect();
-    h.put_object(
-        "stub:bucket/modernweather/manifest/latest.json",
-        &format!(
-            r#"{{"layout_version":1,"run":"PREVIOUS","remote":"stub:bucket/modernweather",
-                 "history_verified":true,"absent":[],"not_backed_up":{{}},
-                 "config_db":{{"state":"unconfigured","sha256":null,"bytes":null,"stored_bytes":null}},
-                 "objects":{{"raw":{{{}}},"tables":{{}},"pgdump":{{}}}}}}"#,
-            objects.join(",")
-        ),
-    );
+    // A previous manifest that agrees with the stub about the historical year's row count and
+    // its stored size, so the only reason left to re-dump it would be the schedule.
+    with_a_previous_manifest(&h, &last_year, &this_year, 4242);
 
     let (ok, out, err) = h.run(&["dump"], &[("MW_BACKUP_ALLOW_NO_CONFIG_DB", "1")]);
     assert!(ok, "the dump failed\n{out}\n{err}");
@@ -270,7 +252,7 @@ fn an_unchanged_historical_year_is_not_re_uploaded_and_the_current_one_always_is
         "the current year was not re-dumped\nwritten: {written:?}\n{out}"
     );
     assert!(
-        out.contains("unchanged, the existing object stands"),
+        out.contains("unchanged, and the existing object is still there"),
         "the dump did not say why it skipped a year:\n{out}"
     );
 }
@@ -378,5 +360,123 @@ fn plan_touches_nothing() {
     assert!(
         out.contains("ABSENT"),
         "plan did not mark the absent tables:\n{out}"
+    );
+}
+
+/// Seeds a previous manifest that agrees with the stub about both years, so the only reason
+/// left to re-dump a historical year is the state of the archive itself.
+fn with_a_previous_manifest(h: &Harness, last_year: &str, this_year: &str, stored: u64) {
+    let entries: Vec<String> = [last_year, this_year]
+        .iter()
+        .map(|y| {
+            format!(
+                r#""{y}": {{"path":"stub:bucket/modernweather/raw/observations-{y}.copy.gz",
+                           "rows":1000,"bytes":10,"stored_bytes":{stored},"sha256":"deadbeef",
+                           "columns":["col_a","col_b"],"carried_from_a_previous_run":false}}"#
+            )
+        })
+        .collect();
+    h.put_object(
+        "stub:bucket/modernweather/manifest/latest.json",
+        &format!(
+            r#"{{"layout_version":1,"run":"PREVIOUS","remote":"stub:bucket/modernweather",
+                 "history_verified":true,"absent":[],"not_backed_up":{{}},
+                 "config_db":{{"state":"unconfigured","sha256":null,"bytes":null,"stored_bytes":null}},
+                 "objects":{{"raw":{{{}}},"tables":{{}},"pgdump":{{}}}}}}"#,
+            entries.join(",")
+        ),
+    );
+}
+
+fn years() -> (String, String) {
+    let out = Command::new("date")
+        .args(["-u", "+%Y"])
+        .output()
+        .expect("date");
+    let this_year = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let last_year = (this_year.parse::<i32>().expect("a year") - 1).to_string();
+    (last_year, this_year)
+}
+
+/// The check that stops the per-year design from degrading into one year of backup.
+///
+/// Skipping an unchanged year trusts the previous manifest, and a manifest describes what was
+/// written rather than what survived. The row counts agree either way — they are counts of
+/// rows in the *database* — so nothing else in the dump can see an object that has been
+/// removed out of band. This is not hypothetical: the bucket this archive originally shared
+/// with the Vault raft snapshots was found holding zero objects, every snapshot that job had
+/// ever written gone, with the job itself failing unnoticed since 2026-09-09.
+#[test]
+fn a_historical_year_missing_from_the_archive_is_re_dumped() {
+    let (last_year, this_year) = years();
+    let h = Harness::new("vanished", AT_HEAD, &last_year, &this_year);
+    with_a_previous_manifest(&h, &last_year, &this_year, 4242);
+    // Nothing is there any more, however confidently the manifest describes it.
+    h.set_stored_size(0);
+
+    let (ok, out, err) = h.run(&["dump"], &[("MW_BACKUP_ALLOW_NO_CONFIG_DB", "1")]);
+    assert!(ok, "the dump failed\n{out}\n{err}");
+    assert!(
+        h.written()
+            .iter()
+            .any(|p| p.contains(&format!("observations-{last_year}"))),
+        "{last_year} is gone from the archive and the dump skipped it anyway, because the row \
+         count still agreed. That is how a decade of history becomes one year without anything \
+         going red.\nwritten: {:?}\n{out}\n{err}",
+        h.written()
+    );
+    assert!(
+        err.contains("NOT IN THE ARCHIVE") && err.contains(&last_year),
+        "the dump re-dumped the year without saying why. A missing object is worth a loud \
+         line: a lifecycle rule on the bucket would take the other years next week.\n{err}"
+    );
+}
+
+/// The row-count check is skippable because it is a sequential scan per year. The
+/// object-presence check is one HEAD, and is not.
+#[test]
+fn verify_history_off_still_checks_that_the_objects_are_there() {
+    let (last_year, this_year) = years();
+    let h = Harness::new("unverified-vanished", AT_HEAD, &last_year, &this_year);
+    with_a_previous_manifest(&h, &last_year, &this_year, 4242);
+    h.set_stored_size(0);
+
+    let (ok, out, err) = h.run(
+        &["dump"],
+        &[
+            ("MW_BACKUP_ALLOW_NO_CONFIG_DB", "1"),
+            ("MW_BACKUP_VERIFY_HISTORY", "0"),
+        ],
+    );
+    assert!(ok, "the dump failed\n{out}\n{err}");
+    assert!(
+        err.contains("NOT IN THE ARCHIVE"),
+        "MW_BACKUP_VERIFY_HISTORY=0 turned off the object-presence check as well as the row \
+         count. It must only turn off the row count — the cheap check is the one that catches \
+         history disappearing.\n{err}"
+    );
+}
+
+/// An object of the wrong length is not the object the recorded digest was computed over.
+#[test]
+fn a_historical_year_whose_size_disagrees_with_the_manifest_is_re_dumped() {
+    let (last_year, this_year) = years();
+    let h = Harness::new("wrong-size", AT_HEAD, &last_year, &this_year);
+    with_a_previous_manifest(&h, &last_year, &this_year, 4242);
+    h.set_stored_size(999);
+
+    let (ok, out, err) = h.run(&["dump"], &[("MW_BACKUP_ALLOW_NO_CONFIG_DB", "1")]);
+    assert!(ok, "the dump failed\n{out}\n{err}");
+    assert!(
+        h.written()
+            .iter()
+            .any(|p| p.contains(&format!("observations-{last_year}"))),
+        "the object is 999 bytes and the manifest recorded 4242, and the year was skipped \
+         anyway\nwritten: {:?}\n{out}",
+        h.written()
+    );
+    assert!(
+        err.contains("999") && err.contains("4242"),
+        "the mismatch was not reported with both lengths:\n{err}"
     );
 }

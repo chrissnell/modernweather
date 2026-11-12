@@ -71,8 +71,15 @@ upload. `MW_BACKUP_VERIFY_HISTORY=0` turns it off and records `history_verified:
 manifest, because a weekly job that is cheaper than it looks should say so in the artefact.
 
 **Measured, on the second consecutive run with nothing changed:** 2025 reported
-`unchanged, the existing object stands` and 2026 was re-uploaded — 27.7 MB of traffic instead
-of 110 MB, on a 1.38 M-row archive.
+`unchanged, and the existing object is still there` and 2026 was re-uploaded — 27.7 MB of
+traffic instead of 110 MB, on a 1.38 M-row archive.
+
+A row count is only half the question, and the other half is not skippable. A manifest
+describes what was **written**; the rows it counts live in the database and are there whether
+or not the object still is. So every historical year the run intends to skip also gets **one
+HEAD against the archive** — is the object there, at the length recorded? A missing or
+wrong-sized object re-dumps the year and says so loudly. §5 has the incident that put that
+check in.
 
 ---
 
@@ -198,28 +205,54 @@ different serialisation, so the ratios transfer and the absolute bytes are this 
 
 ---
 
-## 5. The destination, and the trade-off it carries
+## 5. The destination
 
-**A `modernweather/` prefix inside the existing `vault-snapshots-homelab` bucket**, reusing the
-existing `r2-vault-snapshots` credential (rclone remote `[r2]`).
+**A dedicated R2 bucket, `modernweather-backups`**, with a bucket-scoped token that can reach
+nothing else. `kube-cluster-helm-values` → `apps/modernweather-db/backup/README.md` has the
+exact Cloudflare and Vault steps; the requirements, because three of them are load-bearing:
 
-Not a dedicated bucket, because **that token cannot create one** — probed rather than assumed:
-`rclone lsd r2:` and any other bucket name are `403 AccessDenied`, while list, write and delete
-under `vault-snapshots-homelab/` all work. A prefix is reachable with zero new Cloudflare
-resources, and a dedicated bucket later is a new token plus a new `BUCKET` value — a
-configuration change, not a redesign.
+| | |
+|---|---|
+| Bucket | `modernweather-backups`, **private** — no public access, no custom domain |
+| Token | **Object Read & Write**, scoped to that bucket alone. `GetObject`, `PutObject`, `ListBucket` and `DeleteObject` are all used; nothing needs bucket-level admin |
+| **No lifecycle / expiry rule** | **The per-year design cannot survive one.** A historical year is written once and never rewritten, so a 30-day expiry deletes nine years of a decade and leaves the current one |
+| **No object versioning** | The current year is overwritten weekly. With versioning on, storage grows without bound for no benefit |
+| `no_check_bucket = true` in `rclone.conf` | so the job never calls `CreateBucket`/`HeadBucket` and the token needs no permission to |
 
-**The trade-off, recorded rather than discovered:** the Vault raft snapshots and the weather
-backups then share one bucket and one credential, so a leaked token exposes both. For two
-homelab backup sets in the same Cloudflare account either way, that is accepted.
+**An earlier revision of this document specified a prefix inside the bucket that holds the
+Vault raft snapshots.** That was not a preference — it was the only destination the *existing*
+credential could reach, because that token is bucket-scoped and cannot create a bucket. It
+carried a real cost (one leaked token would expose both backup sets) and the owner declined it.
+A dedicated bucket was always the better answer and it is a configuration change, not a
+redesign: one Vault path, two values, no manifest edit.
+
+### What that near-miss taught the design, which is the part worth keeping
+
+The shared bucket was checked before it was used, and the check found something unrelated and
+worse: **the bucket held zero objects.** The Vault snapshot job's last successful upload was
+2026-09-09 — it had been failing on `vault operator raft snapshot save` for over two months —
+and every snapshot it had ever written was gone from the bucket as well.
+
+Nothing in the first draft of this design would have noticed the same thing happening here. The
+per-year skip trusts the previous manifest, and **a manifest describes what was written, not
+what survived**: the row-count check compares counts of rows *in the database*, which are
+unaffected by an object disappearing from the archive. A lifecycle rule, a mis-aimed
+`rclone purge`, or anything else with delete permission would have quietly reduced a decade to
+one year, with every weekly run reporting success.
+
+So `history_object_intact` in `ci/db/offsite-backup.sh` asks the second question: **is the
+object a skipped year is relying on still there, at the length the manifest recorded?** One
+HEAD per historical year per week. It is *not* covered by `MW_BACKUP_VERIFY_HISTORY=0` — that
+flag exists to skip the sequential scan, and the cheap check is the one that catches history
+disappearing. A missing object re-dumps the year and says so loudly; a length that disagrees
+with the manifest also re-dumps, because an object of the wrong size is not the object the
+recorded digest was computed over.
 
 The credential reaches the job through an `ExternalSecret` against the existing `vault`
 `ClusterSecretStore`, which is the pattern every other credential in this cluster uses. The
 manifests — the weekly dump `CronJob`, the monthly `--from-archive` rehearsal `CronJob` and the
-`ExternalSecret` — are in `kube-cluster-helm-values` under `apps/modernweather-db/backup/`,
-not here: this repository is public and `/deploy/` is in `.gitignore` for that reason.
-
----
+`ExternalSecret` — are in `kube-cluster-helm-values` under `apps/modernweather-db/backup/`, not
+here: this repository is public and `/deploy/` is in `.gitignore` for that reason.
 
 ## 6. The gate, and what each half of it proves
 
@@ -257,12 +290,14 @@ nothing.
 | `LAYOUT_VERSION` bumped against an existing archive | the restore refused to run and nothing was restored, **exit 2** — no verdict, which is the correct classification |
 | an aggregate level moved from `skip` to `copy` | `xtask/tests/offsite_backup.rs` failed, naming the level |
 | the undeclared-relation check neutered | six of the seven tests in that file failed |
+| an archive object deleted while the manifest still claims it | the year was re-dumped and `NOT IN THE ARCHIVE` reported — and still reported with `MW_BACKUP_VERIFY_HISTORY=0` |
 
 `xtask/tests/offsite_backup.rs` drives the dump's *plan* with `PSQL`, `PG_DUMP` and `RCLONE`
 pointed at stubs, so the decisions the rehearsal cannot check — a table nobody declared stops
 the dump; the aggregate levels are never written; an unchanged historical year is not
-re-uploaded — are checked with no database and no network. A live database at HEAD has no
-undeclared table in it, which is precisely why that check needs a test rather than a run.
+re-uploaded; a historical year **missing from the archive** is — are checked with no database
+and no network. A live database at HEAD has no undeclared table in it, and a healthy archive
+has no missing object in it, which is precisely why those checks need tests rather than runs.
 
 ---
 
@@ -279,3 +314,9 @@ undeclared table in it, which is precisely why that check needs a test rather th
   in that list.
 - **N-21 is still open.** Suspending the background jobs is implemented for the restore path
   only. A plain `ci/db/rebuild-aggregates.sh` run still has the same exposure.
+- **The archive's own integrity is checked by presence and length, not by digest.** Verifying
+  a historical year's *content* means downloading and re-hashing it — free in egress on R2, but
+  a decade a week. The weekly run checks that each object is there and the right size; the
+  monthly `--from-archive` rehearsal is what actually reads one back and compares digests.
+  Nothing re-hashes every historical year on a schedule, and that is a deliberate gap rather
+  than an oversight.
