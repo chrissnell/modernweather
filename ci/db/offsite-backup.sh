@@ -48,6 +48,13 @@
 # a skipped year is relying on still in the archive, at the length the manifest recorded?
 # history_object_intact below has the reason that is not paranoia.
 #
+# AND NOTHING AGE-BASED MAY BE APPLIED TO THIS ARCHIVE FROM OUTSIDE. A historical year's
+# object is never rewritten, so its age only ever increases: an object-expiry rule on the
+# bucket deletes every year but the current one. The one thing here that does accumulate is
+# the timestamped manifests, and `prune_manifests` below is where that is handled -- in the
+# job, which only runs when there is a fresh backup to keep, rather than in the object store,
+# which would keep deleting after the job stopped.
+#
 # THE INVENTORY IS CLOSED, AND THAT IS THE POINT
 #
 # Every ordinary table in the weather database is named in RELATIONS below with a mode and a
@@ -77,6 +84,9 @@
 #   MW_RESTORE_CONFIG_DB             where `restore` writes the configuration database.
 #   MW_BACKUP_VERIFY_HISTORY=0       skip the per-year row-count check. The object-presence
 #                                    check always runs; it is one HEAD per year.
+#   MW_BACKUP_MANIFEST_RETENTION_DAYS  prune timestamped manifests older than this. Default
+#                                    90; 0 keeps them forever. `latest.json` is never
+#                                    touched, and nothing outside manifest/ ever is.
 #   PSQL, PG_DUMP, PG_RESTORE, RCLONE   override a whole invocation, for a bastion or a test.
 
 set -euo pipefail
@@ -106,6 +116,13 @@ LAYOUT_VERSION=1
 # A relation present in the database and absent here stops the dump. A relation here and
 # absent from the database is reported and recorded, which is how the legacy archive's
 # absence before M5-1 appears in the manifest as a fact rather than as nothing at all.
+#
+# THIS IS NOT A THEORETICAL MECHANISM. It fired within hours of M0-2 merging: M6-3 added
+# `alerts`, `snow_depth_estimates` and `snow_events`, and the next dump against a database at
+# HEAD stopped with all three named. That is the whole design working -- a migration that adds
+# a table arrives as a backup failure rather than as three tables quietly missing from every
+# archive until someone needs them -- and the fix is the three lines below, each with a reason
+# somebody had to think about rather than a mode somebody guessed.
 # ----------------------------------------------------------------------------------------
 RELATIONS=(
   "observations|raw-per-year|raw readings. Derived from nothing; D-4 retains them indefinitely"
@@ -116,6 +133,9 @@ RELATIONS=(
   "almanac_cache|copy|cache, included because excluding it is not worth the thought (7.5)"
   "snow_totals_cache|copy|cache, same reasoning"
   "forecasts|copy|the read side of the frozen forecast endpoint"
+  "alerts|copy|what the aeris:alerts:* components write. A cache of a live upstream feed that refills on its own and is swept by aeris:alerts:gc, so it is included for the reason the other caches are: small enough that excluding it is not worth the thought (7.5)"
+  "snow_depth_estimates|copy|snow:smoothing's output and snow:season's input. NOT regenerable by a refresh: each estimate carries the rate limit forward from the one before it, so it is recursive over its own output and no CREATE MATERIALIZED VIEW can express it. It is also what the numbers /snow serves are computed from"
+  "snow_events|copy|snow:events' changepoint output, which feeds the website's accumulation bands. A different algorithm over the same series, not a second copy of the estimates"
   "observations_1m|skip|aggregate level: disposable (D-15), rebuilt on restore, and A-W9-2 makes loading it impossible anyway"
   "observations_5m|skip|aggregate level, same"
   "observations_1h|skip|aggregate level, same"
@@ -208,6 +228,27 @@ columns_of() {
   psqlv_ -c "SELECT string_agg(quote_ident(attname), ',' ORDER BY attnum)
                FROM pg_attribute
               WHERE attrelid = 'public.$1'::regclass AND attnum > 0 AND NOT attisdropped"
+}
+
+# `ORDER BY 1,2,...,n` over the whole column list, for a stream whose byte order is
+# reproducible.
+#
+# This used to be `ORDER BY 1`, which is only a total order when the first column is unique.
+# It is not: `station_metrics` is keyed on (station_id, metric_key), and `alerts`,
+# `snow_depth_estimates` and `snow_events` all have composite primary keys too. With a
+# non-unique sort key PostgreSQL may return equal-keyed rows in any order, so the digest
+# recorded at dump time and the digest recomputed at restore time could differ on data that
+# restored perfectly -- a reconciliation that fails for no reason, which is worse than one
+# that does not run, because somebody has to decide whether to trust it.
+#
+# It had not bitten: the tables that carry rows today hold three of them and PostgreSQL
+# happened to return the same order twice. That is luck, and it would have run out at the
+# first table big enough for a parallel or hashed plan.
+#
+# Ordering by every column is a total order up to rows that are identical in all of them,
+# and two identical rows are interchangeable in a digest by definition.
+order_by_all() { # <comma-separated column list>
+  printf '%s' "$1" | awk -F, '{ for (i = 1; i <= NF; i++) printf "%s%d", (i > 1 ? "," : ""), i }'
 }
 
 table_present() { printf '%s\n' "$PRESENT" | grep -qx -- "$1"; }
@@ -483,7 +524,7 @@ cmd_dump() {
     else
       cols="$(columns_of "$r")"
       begin_meter
-      psql_ -c "COPY (SELECT $cols FROM public.$r ORDER BY 1) TO STDOUT" \
+      psql_ -c "COPY (SELECT $cols FROM public.$r ORDER BY $(order_by_all "$cols")) TO STDOUT" \
         | meter | gzip -6 | rclone_ rcat "$(obj_table "$r")"
       end_meter
       stored_bytes "$(obj_table "$r")"
@@ -528,8 +569,54 @@ cmd_dump() {
   printf '%s' "$man" | rclone_ rcat "$(obj_manifest latest)"
   printf '  %s\n  %s\n' "$(obj_manifest "$STAMP")" "$(obj_manifest latest)"
   rm -f "$prev_f"
+  prune_manifests
   note "=== the archive now holds"
   rclone_ size "$MW_BACKUP_REMOTE" || true
+}
+
+# ----------------------------------------------------------------------------------------
+# THE ONLY THING IN THIS ARCHIVE THAT GROWS WITHOUT BOUND, AND THEREFORE THE ONLY THING WITH
+# A RETENTION RULE.
+#
+# It is worth being exact about this, because "delete backups older than N days" is the
+# normal instinct and it is actively destructive here:
+#
+#   raw/observations-<YEAR>.copy.gz   a historical year is written ONCE and never rewritten.
+#                                     Its LastModified is frozen for as long as the archive
+#                                     exists, so an age-based rule over the bucket deletes
+#                                     every year but the current one. That is nine tenths of
+#                                     a decade, and it is the part D-4 retains indefinitely.
+#   tables/*, legacy/*, config/*      rewritten on every run, so always younger than the
+#                                     schedule. An age rule would not reach them -- WHILE THE
+#                                     JOB IS HEALTHY. That caveat is the whole problem: a
+#                                     backup job that stops, plus an age-based rule, deletes
+#                                     the archive. That is exactly what happened to the
+#                                     bucket this archive was nearly placed in.
+#   manifest/latest.json              same, and it is the entry point `restore` reads. An
+#                                     age rule that reaches it makes the archive unreadable.
+#   manifest/<stamp>.json             THE ONE THING THAT ACCUMULATES. ~3 KB a week, ~160 KB a
+#                                     year. Pruning it saves nothing measurable; it is worth
+#                                     doing so the prefix does not grow forever, and worth
+#                                     doing HERE rather than in the object store for the
+#                                     reason above -- this code only runs when the backup
+#                                     ran, so it cannot delete anything on a week when there
+#                                     was no new backup to replace it.
+#
+# Scoped twice on purpose: the path is the manifest prefix and `latest.json` is excluded by
+# name. Neither alone would be enough to make "this cannot reach the data" obvious to a
+# reader, and that is the property that matters in a function whose job is deleting things.
+# ----------------------------------------------------------------------------------------
+prune_manifests() {
+  local days="${MW_BACKUP_MANIFEST_RETENTION_DAYS:-90}"
+  case "$days" in
+    0) note "=== manifest retention off (MW_BACKUP_MANIFEST_RETENTION_DAYS=0)"; return 0 ;;
+    ''|*[!0-9]*) die "MW_BACKUP_MANIFEST_RETENTION_DAYS must be a whole number of days, not '$days'" ;;
+  esac
+  note "=== pruning timestamped manifests older than $days days (latest.json is never touched)"
+  rclone_ delete --min-age "${days}d" --exclude "latest.json" -v \
+          "$MW_BACKUP_REMOTE/manifest" 2>&1 | sed -n 's/^.*: *\(Deleted\)/  \1/p' || true
+  printf '  %s manifest(s) remain\n' \
+         "$(rclone_ lsf "$MW_BACKUP_REMOTE/manifest" 2>/dev/null | grep -c . || echo '?')"
 }
 
 # pg_dump with the connection expressed the way the caller gave it. Split out because the

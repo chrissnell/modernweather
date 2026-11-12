@@ -65,6 +65,7 @@ case "$1" in
   rcat) printf '%s\n' "$2" >> "$MW_STUB_DIR/written"; cat >/dev/null ;;
   cat)  cat "$MW_STUB_DIR/objects/$(printf '%s' "$2" | tr '/:' '__')" 2>/dev/null || exit 1 ;;
   size) cat "$MW_STUB_DIR/size" 2>/dev/null || echo '{"count":1,"bytes":4242}' ;;
+  delete) printf '%s\n' "$*" >> "$MW_STUB_DIR/deleted" ;;
   lsl)  : ;;
   *)    : ;;
 esac
@@ -95,6 +96,7 @@ impl Harness {
         fs::write(dir.join("year_hi"), format!("{year_hi}\n")).expect("hi");
         fs::write(dir.join("written"), "").expect("written");
         fs::write(dir.join("size"), "{\"count\":1,\"bytes\":4242}\n").expect("size");
+        fs::write(dir.join("deleted"), "").expect("deleted");
         Harness { dir }
     }
 
@@ -121,6 +123,15 @@ impl Harness {
             String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
+    }
+
+    /// Every `rclone delete` invocation, verbatim.
+    fn deletes(&self) -> Vec<String> {
+        fs::read_to_string(self.dir.join("deleted"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     /// Every object path `rclone rcat` was handed, in order.
@@ -479,4 +490,116 @@ fn a_historical_year_whose_size_disagrees_with_the_manifest_is_re_dumped() {
         err.contains("999") && err.contains("4242"),
         "the mismatch was not reported with both lengths:\n{err}"
     );
+}
+
+/// The retention rule, and the two things it must never be able to reach.
+///
+/// `delete` is the one verb in this script that destroys data, so its scope is asserted
+/// rather than reviewed. A historical year's object is written once and never rewritten, so
+/// anything age-based that can see it will eventually delete it — which is why the prune is
+/// pinned to the manifest prefix AND excludes `latest.json` by name, and why both are checked
+/// here. One of the two would be enough to be correct and neither alone is enough to be
+/// obviously correct.
+#[test]
+fn the_prune_is_scoped_to_timestamped_manifests_and_nothing_else() {
+    let h = Harness::new("prune-scope", AT_HEAD, "2020", "2026");
+    let (ok, out, err) = h.run(&["dump"], &[("MW_BACKUP_ALLOW_NO_CONFIG_DB", "1")]);
+    assert!(ok, "the dump failed\n{out}\n{err}");
+
+    let deletes = h.deletes();
+    assert_eq!(
+        deletes.len(),
+        1,
+        "expected exactly one delete — the manifest prune\ndeletes: {deletes:?}"
+    );
+    let d = &deletes[0];
+    assert!(
+        d.contains("stub:bucket/modernweather/manifest"),
+        "the prune is not scoped to the manifest prefix, so it can see the raw objects: {d}"
+    );
+    for forbidden in ["/raw", "/tables", "/legacy", "/config"] {
+        assert!(
+            !d.contains(forbidden),
+            "the prune's path can reach {forbidden}: {d}"
+        );
+    }
+    assert!(
+        d.contains("--exclude") && d.contains("latest.json"),
+        "the prune does not exclude latest.json, which is the entry point `restore` reads — \
+         an archive that loses it is unreadable: {d}"
+    );
+    assert!(
+        d.contains("--min-age 90d"),
+        "the prune did not default to 90 days: {d}"
+    );
+}
+
+/// Zero means "keep them all", and it has to mean that without issuing a delete at all.
+#[test]
+fn manifest_retention_can_be_switched_off_entirely() {
+    let h = Harness::new("prune-off", AT_HEAD, "2026", "2026");
+    let (ok, out, err) = h.run(
+        &["dump"],
+        &[
+            ("MW_BACKUP_ALLOW_NO_CONFIG_DB", "1"),
+            ("MW_BACKUP_MANIFEST_RETENTION_DAYS", "0"),
+        ],
+    );
+    assert!(ok, "the dump failed\n{out}\n{err}");
+    assert!(
+        h.deletes().is_empty(),
+        "retention is off and a delete was issued anyway: {:?}",
+        h.deletes()
+    );
+    assert!(
+        out.contains("manifest retention off"),
+        "switching retention off was silent:\n{out}"
+    );
+}
+
+/// A non-numeric retention is a typo in a CronJob, and a typo that silently becomes "off"
+/// is a retention rule nobody notices is absent.
+#[test]
+fn a_nonsense_retention_value_stops_the_dump() {
+    let h = Harness::new("prune-bad", AT_HEAD, "2026", "2026");
+    let (ok, _out, err) = h.run(
+        &["dump"],
+        &[
+            ("MW_BACKUP_ALLOW_NO_CONFIG_DB", "1"),
+            ("MW_BACKUP_MANIFEST_RETENTION_DAYS", "90 days"),
+        ],
+    );
+    assert!(!ok, "a nonsense retention value was accepted\n{err}");
+    assert!(
+        err.contains("whole number of days"),
+        "the failure did not say what was wrong:\n{err}"
+    );
+}
+
+/// The three tables implementation-plan.md M6-3 added are declared, and declared as data
+/// rather than as something a refresh rebuilds.
+///
+/// `snow_depth_estimates` is the one that matters: each estimate carries the rate limit
+/// forward from the one before it, so it is recursive over its own output and nothing in the
+/// database can rebuild it from raw. An archive without it loses the series `/snow`'s numbers
+/// are computed from.
+#[test]
+fn the_tables_m6_3_added_are_backed_up() {
+    let mut present: Vec<&str> = AT_HEAD.to_vec();
+    present.extend(["alerts", "snow_depth_estimates", "snow_events"]);
+    let h = Harness::new("m6-3", &present, "2026", "2026");
+    let (ok, out, err) = h.run(&["dump"], &[("MW_BACKUP_ALLOW_NO_CONFIG_DB", "1")]);
+    assert!(
+        ok,
+        "the dump failed, so M6-3's tables are still undeclared\n{out}\n{err}"
+    );
+    for t in ["alerts", "snow_depth_estimates", "snow_events"] {
+        assert!(
+            h.written()
+                .iter()
+                .any(|p| *p == format!("stub:bucket/modernweather/tables/{t}.copy.gz")),
+            "{t} was not written to the archive\nwritten: {:?}",
+            h.written()
+        );
+    }
 }

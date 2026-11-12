@@ -18,6 +18,13 @@ because a backup you hesitate to restore from is not a backup.
 
 ## 1. What is in the archive, and what is deliberately not
 
+> **The closed inventory fired for real within hours of M0-2 merging, which is the best
+> evidence it could have had.** M6-3 added `alerts`, `snow_depth_estimates` and `snow_events`,
+> and the next dump against a database at HEAD stopped with all three named rather than
+> quietly omitting them from every archive until someone needed them. The fix was three
+> declarations — one of which, `snow_depth_estimates`, needed somebody to work out that it is
+> *not* derived data a refresh can rebuild.
+
 The inventory is **closed**: every ordinary table in the weather database is named in
 `RELATIONS` in `ci/db/offsite-backup.sh` with a mode and a reason, and **a table that exists
 and is not named stops the dump**. That is not fussiness. "The legacy archive is the one that
@@ -30,7 +37,8 @@ is for. `ci/db/offsite-backup.sh plan` prints the inventory and touches nothing.
 | `observations` | one object **per calendar year** | Raw. Derived from nothing; D-4 retains it indefinitely |
 | `observations_1d_legacy`, `observations_1h_legacy` | `pg_dump -Fc`, **schema and data** | The only copy of the ~294 days of roll-up with no raw behind them (W9 D-4). `migrations/` does **not** create these, so an archive without their schema has nowhere to put the rows |
 | `stations` | full COPY | Raw's `station_id` means nothing without it |
-| `station_metrics`, `almanac_cache`, `snow_totals_cache`, `forecasts` | full COPY | Projections and caches. Small enough that excluding them is not worth the thought |
+| `station_metrics`, `almanac_cache`, `snow_totals_cache`, `forecasts`, `alerts` | full COPY | Projections and caches. Small enough that excluding them is not worth the thought; `alerts` refills from its upstream feed on its own |
+| `snow_depth_estimates`, `snow_events` | full COPY | **Not regenerable by a refresh.** Each depth estimate carries the rate limit forward from the one before it, so the series is recursive over its own output and no `CREATE MATERIALIZED VIEW` can express it — and it is what the numbers `/snow` serves are computed from. `snow_events` is a different algorithm over the same series, not a second copy |
 | `config.db` (SQLite) | verbatim | Station calibration, certificates, website configuration — the one thing a human cannot re-derive (D-66) |
 | `observations_1m` / `_5m` / `_1h` / `_1d` | **not backed up** | D-15 makes them disposable, W4 D-5 bounds their retention, and they would be the largest thing in the archive. **A-W9-2 is why they could not be loaded back even if they were dumped** |
 | `_sqlx_migrations`, `_mw_ci_applied` | **not backed up** | Migration ledgers. A restore applies `migrations/` itself; restoring a ledger would describe a history the restored database never had |
@@ -78,7 +86,7 @@ A row count is only half the question, and the other half is not skippable. A ma
 describes what was **written**; the rows it counts live in the database and are there whether
 or not the object still is. So every historical year the run intends to skip also gets **one
 HEAD against the archive** — is the object there, at the length recorded? A missing or
-wrong-sized object re-dumps the year and says so loudly. §5 has the incident that put that
+wrong-sized object re-dumps the year and says so loudly. §6 has the incident that put that
 check in.
 
 ---
@@ -205,7 +213,65 @@ different serialisation, so the ratios transfer and the absolute bytes are this 
 
 ---
 
-## 5. The destination
+## 5. Retention, and why nothing age-based may be applied to this bucket
+
+The normal instinct for a backup bucket is "delete anything older than N days". **On this
+archive that deletes the history and keeps only the present**, and it is worth being exact
+about why rather than asserting it.
+
+Raw is one object per calendar year and **a historical year is written once and never
+rewritten** — that is what makes a weekly backup cost ~3.4 GB instead of ~34 GB. So a
+historical year's `LastModified` is frozen and only ever gets older. Measured, two dumps a
+minute apart with nothing changed in the database:
+
+```
+  692  17:29:38  raw/observations-2024.copy.gz   <- first dump, never touched again
+  692  17:29:40  raw/observations-2025.copy.gz   <- first dump, never touched again
+  699  17:31:08  raw/observations-2026.copy.gz   <- the current year, rewritten
+   72  17:31:09  tables/stations.copy.gz         <- rewritten
+    …  17:31:2x  tables/…, manifest/latest.json  <- rewritten
+```
+
+An age-based rule sees those first two lines getting older every week forever. At 90 days it
+deletes every year but the current one.
+
+| Object | Under an age rule |
+|---|---|
+| `raw/observations-<YEAR>.copy.gz`, historical | **deleted.** Nine tenths of a decade, and the part D-4 retains indefinitely |
+| `tables/*`, `legacy/*`, `config/*`, `manifest/latest.json` | survive — **while the job is healthy.** That caveat is the whole problem |
+| `manifest/<stamp>.json` | the only thing that genuinely accumulates: ~3 KB a week, ~160 KB a year |
+
+**"While the job is healthy" is not a quibble.** A backup job that stops, plus an age-based
+rule that does not, equals an archive that deletes itself — and `manifest/latest.json` is the
+entry point `restore` reads, so it becomes *unreadable* before it becomes empty. §6 records
+the bucket where exactly that appears to have happened.
+
+### So the retention rule lives in the job, and covers one thing
+
+`prune_manifests` in `ci/db/offsite-backup.sh` deletes timestamped manifests older than
+`MW_BACKUP_MANIFEST_RETENTION_DAYS` (**default 90**; `0` keeps them forever). It is scoped
+twice — pinned to the `manifest/` prefix *and* excluding `latest.json` by name — because
+`delete` is the one verb here that destroys data and "this cannot reach the archive" should be
+obvious to a reader rather than inferred. `xtask/tests/offsite_backup.rs` asserts both, and
+both were watched failing.
+
+Putting it here rather than in the object store is the point: **this code only runs when a
+backup ran**, so it can never delete on a week when there was nothing new to replace what it
+removed. A lifecycle rule has no such property.
+
+It saves nothing measurable — 160 KB a year against a ~34 GB archive. Its value is that the
+prefix does not grow without bound, and that the question "where is retention handled?" has
+one answer.
+
+### If you want a rule in Cloudflare anyway
+
+Scope it to the `db/manifest/` prefix and nothing else, and know that it will delete
+`latest.json` too if the weekly job ever stops for longer than the rule's window. The
+in-job prune is strictly safer for the same outcome.
+
+---
+
+## 6. The destination
 
 **A dedicated R2 bucket, `modernweather-backups`**, with a bucket-scoped token that can reach
 nothing else. `kube-cluster-helm-values` → `apps/modernweather-db/backup/README.md` has the
@@ -215,7 +281,7 @@ exact Cloudflare and Vault steps; the requirements, because three of them are lo
 |---|---|
 | Bucket | `modernweather-backups`, **private** — no public access, no custom domain |
 | Token | **Object Read & Write**, scoped to that bucket alone. The jobs use `GetObject`, `PutObject` and `ListBucket`; nothing needs bucket-level admin |
-| **No lifecycle / expiry rule** | **The per-year design cannot survive one.** A historical year is written once and never rewritten, so a 30-day expiry deletes nine years of a decade and leaves the current one |
+| **No lifecycle / expiry rule** | **The per-year design cannot survive one** — §5 measures why. Retention is handled in the job instead |
 | **No object versioning** | The current year is overwritten weekly. With versioning on, storage grows without bound for no benefit |
 | `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` | so the job never calls `CreateBucket`/`HeadBucket` and the token needs no permission to |
 
@@ -270,7 +336,7 @@ The manifests — the weekly dump `CronJob`, the monthly `--from-archive` rehear
 `ExternalSecret` — are in `kube-cluster-helm-values` under `apps/modernweather-db/backup/`, not
 here: this repository is public and `/deploy/` is in `.gitignore` for that reason.
 
-## 6. The gate, and what each half of it proves
+## 7. The gate, and what each half of it proves
 
 `ci/gates.toml` declares **`db-restore-rehearsal`**, armed by `ci/db/offsite-backup.sh`'s
 existence. It has two modes and it always prints which one it ran.
@@ -317,7 +383,7 @@ has no missing object in it, which is precisely why those checks need tests rath
 
 ---
 
-## 7. Known gaps
+## 8. Known gaps
 
 - **`config.db` is not in the archive yet, and the dump says so on every run.** There is no
   daemon and therefore no configuration database; `MW_BACKUP_ALLOW_NO_CONFIG_DB=1` in the
@@ -330,6 +396,10 @@ has no missing object in it, which is precisely why those checks need tests rath
   in that list.
 - **N-21 is still open.** Suspending the background jobs is implemented for the restore path
   only. A plain `ci/db/rebuild-aggregates.sh` run still has the same exposure.
+- **Retention covers the manifests and nothing else, and that is the decision rather than an
+  omission.** There is no "delete backups older than N days" here because there is nothing to
+  delete: the archive is one current copy of an append-only dataset, not a rolling set of full
+  backups, and its oldest object is its most irreplaceable one. §5.
 - **The archive's own integrity is checked by presence and length, not by digest.** Verifying
   a historical year's *content* means downloading and re-hashing it — free in egress on R2, but
   a decade a week. The weekly run checks that each object is there and the right size; the

@@ -246,7 +246,7 @@ seed() {
 # kind of thing a restore is capable of doing on its own.
 # ----------------------------------------------------------------------------------------
 reconcile() {
-  local man="$1" db="$2" bad=0 y cols want got rows dbrows
+  local man="$1" db="$2" bad=0 y cols want got rows dbrows order
   step "reconciling the restored database against the archive's manifest"
   while IFS='|' read -r y cols want rows; do
     [ -n "$y" ] || continue
@@ -273,7 +273,12 @@ for y, e in sorted(m["objects"]["raw"].items()):
   local t
   while IFS='|' read -r t cols want rows; do
     [ -n "$t" ] || continue
-    got="$(onv "$db" -c "COPY (SELECT $cols FROM public.$t ORDER BY 1) TO STDOUT" \
+    # The SAME total order the dump used -- every column, not the first one. See
+    # `order_by_all` in ci/db/offsite-backup.sh: `ORDER BY 1` is not a total order on any of
+    # the tables with a composite primary key, and a digest comparison over a
+    # non-deterministic order fails on data that restored perfectly.
+    order="$(printf '%s' "$cols" | awk -F, '{ for (i = 1; i <= NF; i++) printf "%s%d", (i > 1 ? "," : ""), i }')"
+    got="$(onv "$db" -c "COPY (SELECT $cols FROM public.$t ORDER BY $order) TO STDOUT" \
            | sha256sum | cut -d' ' -f1)"
     dbrows="$(onv "$db" -c "SELECT count(*) FROM public.$t")"
     if [ "$got" = "$want" ] && [ "$dbrows" = "$rows" ]; then
@@ -379,7 +384,7 @@ GRAINS=('1 minute' '5 minutes' '1 hour' '1 day')
 anchor_sql() { if [ "$MODE" = "round-trip" ]; then printf 'now()'; else printf '(SELECT max(time) FROM observations)'; fi; }
 
 phase_1_and_assert_the_bands() {
-  local db="$1" i level band grain t0 t1 raw_n agg_n raw_s agg_s rel bad=0 anchor
+  local db="$1" i level band grain t0 t1 raw_n agg_n raw_s agg_s rel bad=0 asserted=0 anchor
   anchor="$(anchor_sql)"
   step "W4 D-23: phase 1 only -- the recent-first rebuild, not a full materialisation"
   t0="$(date -u +%s)"
@@ -427,11 +432,28 @@ phase_1_and_assert_the_bands() {
                           ELSE abs(r.s - a.s) / greatest(abs(r.s), 1) END, 'FM0.0999999999')
         FROM r, a")"
     if [ "$raw_n" = "0" ]; then
-      printf '  %-16s %-9s VACUOUS: no raw readings in the band\n' "$level" "$band" >&2
-      bad=1
+      # No raw rows in the band, so there is nothing for the level to be right or wrong
+      # about. What that MEANS depends on the mode, and conflating the two is how a check
+      # ends up either crying wolf or passing vacuously.
+      #
+      #   round-trip     the fixture is this script's own and puts readings in all four
+      #                  bands on purpose. An empty band is a defect here or in the
+      #                  fixture, so it fails.
+      #   --from-archive the archive's coverage is a property of the archive. A station
+      #                  that was offline, or a thin archive, legitimately has empty
+      #                  bands -- so the band is NOT ASSERTED and the run says so. The
+      #                  guard against vacuous green is below: if NO band could be
+      #                  asserted, the run has proved nothing and fails.
+      if [ "$MODE" = "round-trip" ]; then
+        printf '  %-16s %-9s VACUOUS: no raw readings in the band, and the fixture puts some in every band\n' "$level" "$band" >&2
+        bad=1
+      else
+        printf '  %-16s %-9s not asserted: the archive has no readings in this band\n' "$level" "$band"
+      fi
     elif [ "$raw_n" = "$agg_n" ] && python3 -c "import sys; sys.exit(0 if float('$rel') <= 1e-4 else 1)"; then
       printf '  %-16s %-9s %s readings, sum %s   match (float4 gap %s)\n' \
              "$level" "$band" "$raw_n" "$raw_s" "$rel"
+      asserted=$((asserted + 1))
     else
       printf '  %-16s %-9s raw %s/%s vs level %s/%s   relative gap %s   MISMATCH\n' \
              "$level" "$band" "$raw_n" "$raw_s" "$agg_n" "$agg_s" "$rel" >&2
@@ -441,6 +463,13 @@ phase_1_and_assert_the_bands() {
   [ "$bad" -eq 0 ] || verdict "phase 1 did not make every /span band correct. W4 D-23's whole claim
       is that the recent-first pass is what the charts need and the full rebuild is not, so a
       band that is wrong after phase 1 breaks the restore runbook rather than just this gate."
+  # The guard against a green that proved nothing. Four bands all reporting "not asserted"
+  # would otherwise read as success.
+  [ "$asserted" -gt 0 ] || verdict "not one of the four /span bands could be asserted -- every band
+      the archive covers is empty. Whatever this run restored, it has said nothing about
+      whether phase 1 makes the charts right, and reporting that as a pass is the one thing
+      this gate must never do."
+  printf '  %s of %s bands asserted against raw\n' "$asserted" "${#LEVELS[@]}"
   printf '\n  Phase 2 -- unbounded history -- was NOT run, and that is the point: at ten years\n'
   printf '  it is an hour-scale operation (A-W4-3, 0.87s against 467s) and the charts are\n'
   printf '  already correct without it. A restore runbook that blocks on it is an outage\n'
