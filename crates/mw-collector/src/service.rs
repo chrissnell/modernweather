@@ -83,6 +83,23 @@ pub const NODE_ID_HEADER: &str = "x-mw-node-id";
 /// How often one source address may attempt enrolment (§5.3).
 pub const ENROL_RATE: Duration = Duration::from_secs(5);
 
+/// How many distinct source addresses the limiter remembers.
+///
+/// Reaching it means a flood: more than this many distinct sources attempted enrolment
+/// inside one [`ENROL_RATE`] window. Enrolment is one operator action on one machine, so
+/// 1024 is three orders of magnitude above anything legitimate and still a trivial amount
+/// of memory.
+pub const ENROL_SOURCES: usize = 1024;
+
+/// How many stations one node may declare in a `Hello`.
+///
+/// The owner's fleet is four nodes with a handful of stations each, so this is two orders
+/// of magnitude above anything real — and it is what stops an unbounded repeated field
+/// from being an unbounded `config.stations` table. A peer that needs more than this has a
+/// topology nobody designed for, and should say so to an operator rather than to a `for`
+/// loop.
+pub const MAX_PEER_STATIONS: usize = 256;
+
 /// What `HelloAck.max_batch_envelopes` advertises, which is what `accept` enforces.
 pub const MAX_BATCH_ENVELOPES: u32 = mw_pipeline::MAX_BATCH_ENVELOPES as u32;
 
@@ -95,7 +112,7 @@ pub struct Handlers {
     gate: Gate,
     auth: PeerAuthKind,
     /// The last enrolment attempt per source address (§5.3's rate limit).
-    enrolments: Mutex<Vec<(IpAddr, Instant)>>,
+    enrolments: Mutex<std::collections::HashMap<IpAddr, Instant>>,
 }
 
 impl fmt::Debug for Handlers {
@@ -125,7 +142,7 @@ impl Handlers {
             spool,
             gate,
             auth,
-            enrolments: Mutex::new(Vec::new()),
+            enrolments: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -142,6 +159,24 @@ impl Handlers {
         headers: &http::HeaderMap,
     ) -> Result<Presented, Reject> {
         let connection = connection.ok_or(Reject::UnauthorizedPeer)?;
+        // **The two `mtls-*` kinds require an encrypted socket, and that is checked here
+        // rather than inferred from the absence of a certificate.** A plaintext ingest
+        // socket exists -- W7 **D-35**'s explicit opt-out puts one there -- and on it a
+        // certificate cannot have been presented, so without this the refusal below would
+        // read as "this peer sent no certificate" when the truth is "this socket could not
+        // have received one". `psk` is the one kind that works there, which is the whole
+        // content of the opt-out.
+        if self.auth.wants_client_certificate() && !connection.tls() {
+            warn!(
+                component = %self.receiver,
+                auth = self.auth.as_str(),
+                "a connection reached the ingest endpoint over a socket with no TLS, so no \
+                 certificate could have been presented and this `peer_auth` cannot \
+                 authenticate anybody. Only `peer_auth = 'psk'` is usable with \
+                 `config.ingest.allow_insecure = 1`."
+            );
+            return Err(Reject::UnauthorizedPeer);
+        }
         match self.auth {
             PeerAuthKind::MtlsCa => {
                 let leaf = connection.leaf().ok_or(Reject::UnauthorizedPeer)?;
@@ -233,6 +268,25 @@ impl Handlers {
             return Err(Status::permission_denied(
                 "`node_id` is not the node this connection authenticated as",
             ));
+        }
+        // **Bounded, and refused rather than truncated.** `NodeIdentity.stations` is an
+        // unbounded repeated field, and each entry becomes a `config.stations` row and a
+        // resident snapshot entry -- so a compromised leaf looping `Hello` with fresh keys
+        // would grow a table and this process's memory at one transaction per call.
+        // Refusing is what makes the limit visible to whoever has to raise it; truncating
+        // would register some of a satellite's stations and silently refuse envelopes for
+        // the rest.
+        if identity.stations.len() > MAX_PEER_STATIONS {
+            warn!(
+                peer = %peer.name,
+                declared = identity.stations.len(),
+                limit = MAX_PEER_STATIONS,
+                "a peer declared more stations than one node may own, so nothing was \
+                 registered"
+            );
+            return Err(Status::invalid_argument(format!(
+                "a node may declare at most {MAX_PEER_STATIONS} stations"
+            )));
         }
         let stations: Vec<PeerStation> =
             identity.stations.iter().filter_map(wire::station).collect();
@@ -340,6 +394,10 @@ impl Handlers {
 
         let now = Utc::now();
         let mut rejected = 0u32;
+        // Refusals this node's own state produced, as against refusals the bytes produced
+        // (`Reject::is_transient`). One of these is enough to stop the ack advancing, and
+        // that distinction is the difference between a bounded stall and silent loss.
+        let mut transient = 0u32;
         let mut candidates: Vec<Envelope> = Vec::with_capacity(batch.envelopes.len());
         for wire in &batch.envelopes {
             // The decode is where provenance is **re-sealed**: three of the six receive
@@ -368,13 +426,31 @@ impl Handlers {
             {
                 m::rejected(&peer.name, reason, 1);
                 rejected += 1;
-                debug!(
-                    peer = %peer.name,
-                    reason = reason.as_str(),
-                    origin = %envelope.provenance.origin(),
-                    seq = envelope.provenance.seq().get(),
-                    "an envelope was refused before anything was stored"
-                );
+                if reason.is_transient() {
+                    transient += 1;
+                    // At `WARN`, not `DEBUG`: every reason in this branch is something an
+                    // operator can fix, and the sender is about to be told to back off
+                    // rather than to carry on -- so the line that says why has to be
+                    // visible at the default level.
+                    warn!(
+                        peer = %peer.name,
+                        reason = reason.as_str(),
+                        origin = %envelope.provenance.origin(),
+                        seq = envelope.provenance.seq().get(),
+                        station = %envelope.station,
+                        "an envelope was refused for a reason this node's own configuration \
+                         or clock decides, so the sender is told to retry rather than to \
+                         advance past it"
+                    );
+                } else {
+                    debug!(
+                        peer = %peer.name,
+                        reason = reason.as_str(),
+                        origin = %envelope.provenance.origin(),
+                        seq = envelope.provenance.seq().get(),
+                        "an envelope was refused before anything was stored"
+                    );
+                }
                 continue;
             }
             candidates.push(envelope);
@@ -394,10 +470,18 @@ impl Handlers {
                 )));
             }
             Err(e) if matches!(e.class(), Class::Retryable { .. }) => {
-                // **The ceiling, and the one status whose `through` does not move.** The
-                // collector's spool being full is the collector's `Failed`, not the
-                // satellite's (§4.3), so the connection stays open and the sender backs
-                // off.
+                // **The ceiling, and one of the two statuses whose `through` does not
+                // move.** The collector's spool being full is the collector's `Failed`, not
+                // the satellite's (§4.3), so this answers rather than closing the stream
+                // and the sender is told to send the batch again.
+                //
+                // Whether the *connection* then survives is the sender's call and not
+                // this one's: `mw_collector::uplink` drops the session, because a
+                // `Trigger::OnReading` body reports a failed batch by returning `Err` and
+                // the supervisor's answer to that is `Failed -> Backoff -> Starting`
+                // (W2a Decisions 28 and 29) -- which tears the component down whatever this
+                // end does with the stream. Keeping it open here costs nothing and is what
+                // a different sender, or a REST one, would want.
                 warn!(
                     peer = %peer.name,
                     error = %DisplayChain(&e),
@@ -434,26 +518,58 @@ impl Handlers {
             accepted.accepted,
             accepted.duplicates,
         );
+        // The spool's own capacity refusal is a function of this node's state too, so it
+        // joins the transient count rather than the permanent one.
         let rejected = rejected + accepted.rejected;
+        let transient = transient + accepted.rejected;
 
-        // **`through` advances even when every envelope was refused**, and that reading is
-        // worth stating because §4.5's `422` suggests otherwise. A refused envelope is
-        // refused *permanently* -- a forged path and an unknown station do not become valid
-        // by being re-sent -- so a `through` that did not move would stall the sender's
-        // cursor for ever, which is exactly the stall W7 **D-9** exists to forbid.
-        // `ACK_REJECTED` therefore means "stop and look at your configuration", not "retry
-        // this": the sender logs it and exports it, and the batch does not come back.
+        // **The one thing an ack must never do is advance a sender past an envelope this
+        // node might have accepted.**
         //
-        // `ACK_RESOURCE_EXHAUSTED` is the one status that leaves `through` alone, above,
-        // because that condition *is* transient.
-        *acked_through = batch.through;
-        let status = if accepted.accepted == 0 && rejected > 0 {
+        // `through` is cumulative in the sender's log, so acknowledging a batch licenses the
+        // sender to advance past *every* envelope in it. That is correct for a refusal the
+        // envelope's own bytes earned -- a forged path does not become valid by being
+        // re-sent, and a sender that kept re-sending it would never drain, which is the
+        // stall W7 **D-9** forbids. It is **wrong** for a refusal this node's state earned:
+        // a wrong clock here, a station not yet registered here, an origin grant an operator
+        // has not written here. `Reject::is_transient` is that distinction and its
+        // documentation has the worked example.
+        //
+        // So: any transient refusal in the batch and `through` does not move. The sender
+        // backs off, the batch replays, and the envelopes that *were* accepted are absorbed
+        // by the dedup gate on the way through (W7 **D-29**) -- which is what makes the
+        // replay cheap enough for this to be the default.
+        let status = if transient > 0 {
+            // Not `ACK_REJECTED`: that tells a sender "do not retry blindly", and retrying
+            // is exactly what it should do. `ACK_RESOURCE_EXHAUSTED` already means "I could
+            // not take this; back off and send it again", which is the whole of what a
+            // transient refusal needs to say.
+            warn!(
+                peer = %peer.name,
+                transient,
+                permanent = rejected - transient,
+                accepted = accepted.accepted,
+                "{transient} envelope(s) in this batch were refused for a reason this node \
+                 can stop refusing, so the acknowledgement does NOT advance the sender's \
+                 cursor: it will re-send them. The per-envelope lines above name each one."
+            );
+            pb::AckStatus::AckResourceExhausted
+        } else if accepted.accepted == 0 && rejected > 0 {
+            // Every envelope was refused permanently. The sender advances, because nothing
+            // here will ever be acceptable -- and `ACK_REJECTED` is what tells it to stop
+            // and look rather than to retry.
+            *acked_through = batch.through;
             pb::AckStatus::AckRejected
         } else {
+            *acked_through = batch.through;
             pb::AckStatus::AckOk
         };
         Ok(pb::IngestAck {
-            through: batch.through,
+            // **Meaningless unless `status == ACK_OK`** (the field's own documentation in
+            // `collector.proto`). On either other status this is the last position that
+            // *was* durably acknowledged on this stream, which is `0` when none has been --
+            // so a sender must not move a cursor on anything but `ACK_OK`.
+            through: *acked_through,
             // Once per stream, on the first ack (W7 **D-23**).
             known_through: if first {
                 self.known_through(peer)
@@ -558,6 +674,7 @@ impl Handlers {
                     PeerWriteError::BadToken => "bad_token",
                     PeerWriteError::EnrolmentClosed => "closed",
                     PeerWriteError::NoMaterial => "no_material",
+                    PeerWriteError::TooManyStations { .. } => "too_many_stations",
                     PeerWriteError::CannotIssueCertificates => "cannot_issue",
                     PeerWriteError::Backend { .. } => "error",
                 };
@@ -582,19 +699,38 @@ impl Handlers {
     /// Per address rather than global, because a global limit lets one source lock every
     /// other operator out of enrolling — which is a denial of service with a one-line
     /// implementation.
+    /// **A map with a cap, not a scan.** The first version kept a `Vec` and ran a `retain`
+    /// plus a linear search on every attempt, so the cost of one request was proportional
+    /// to the number of *distinct* sources seen in the window — which an attacker with a
+    /// wide source range chooses, making the limiter quadratic in their own request rate.
+    /// A hash lookup is constant, and the sweep is amortised: it runs only when the table
+    /// reaches [`ENROL_SOURCES`], which also bounds the memory a spoofed-source flood can
+    /// cost. If a sweep frees nothing — more than `ENROL_SOURCES` distinct sources inside
+    /// one window — the attempt is refused rather than growing the table, because that
+    /// shape is a flood and not an operator.
     fn admit_enrolment(&self, source: IpAddr) -> bool {
         let now = Instant::now();
         let mut seen = self
             .enrolments
             .lock()
             .expect("the enrolment limiter is not poisoned");
-        // Pruned on every call, so the table is bounded by the sources that attempted in
-        // the last window rather than by every source that ever has.
-        seen.retain(|(_, at)| now.duration_since(*at) < ENROL_RATE);
-        if seen.iter().any(|(addr, _)| *addr == source) {
-            return false;
+        if let Some(at) = seen.get(&source) {
+            if now.duration_since(*at) < ENROL_RATE {
+                return false;
+            }
         }
-        seen.push((source, now));
+        if seen.len() >= ENROL_SOURCES {
+            seen.retain(|_, at| now.duration_since(*at) < ENROL_RATE);
+            if seen.len() >= ENROL_SOURCES {
+                warn!(
+                    sources = seen.len(),
+                    "more than {ENROL_SOURCES} distinct sources attempted enrolment inside \
+                     one rate window, so attempts are refused until it drains"
+                );
+                return false;
+            }
+        }
+        seen.insert(source, now);
         true
     }
 
@@ -646,14 +782,21 @@ fn node_id(bytes: &[u8]) -> Option<OriginId> {
 }
 
 /// A lower- or upper-case hex `NodeId` from [`NODE_ID_HEADER`].
+///
+/// Digit by digit rather than through `u8::from_str_radix`, which accepts a leading `+`:
+/// `+1+1…` is 32 characters and parses, so the same node would have had two spellings.
+/// Two spellings of one identity is how a revocation comes to miss.
 fn node_id_from_hex(text: &str) -> Option<OriginId> {
     let text = text.trim();
     if text.len() != 32 {
         return None;
     }
+    let bytes = text.as_bytes();
     let mut out = [0u8; 16];
     for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(text.get(i * 2..i * 2 + 2)?, 16).ok()?;
+        let hi = char::from(bytes[i * 2]).to_digit(16)?;
+        let lo = char::from(bytes[i * 2 + 1]).to_digit(16)?;
+        *byte = u8::try_from(hi * 16 + lo).ok()?;
     }
     Some(OriginId::new(out))
 }
@@ -860,9 +1003,21 @@ async fn unary_enrol(
     // enrolling has no `peers` row, so resolving one would make the bootstrap impossible.
     // The gate in its place is `enrolment_open`, which is closed unless an operator minted
     // a token.
-    let source = connection(&request)
-        .map(|c| c.remote().ip())
-        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    //
+    // **But it is confined to the ingest socket.** The router is shared (§6.1), so without
+    // this the one RPC that can add a peer would also answer on the website's port -- where
+    // there is no `ConnectInfo<PeerCerts>`, so §5.3's "1 attempt per 5 s **per source
+    // address**" would collapse to a single global bucket (the exact denial of service
+    // `admit_enrolment` is per-source to avoid) and §5.3's "every attempt is logged with
+    // the source" would log `0.0.0.0` for all of them. §5.4 mounts the ingest endpoint on
+    // the gRPC port; the bootstrap belongs with it.
+    let Some(connection) = connection(&request) else {
+        return Status::permission_denied(
+            "enrolment is served on this node's ingest endpoint only",
+        )
+        .into_http::<axum::body::Body>();
+    };
+    let source = connection.remote().ip();
     let mut grpc = tonic::server::Grpc::new(wire::EnrolCodec::default());
     grpc.unary(
         EnrolService {
@@ -983,7 +1138,15 @@ impl Session {
                     .await;
                 match ack {
                     Ok(ack) => {
-                        self.first = false;
+                        // **Cleared only when the ack actually carried it.** A first batch
+                        // that hits the ceiling, or one with a transient refusal in it,
+                        // answers `ACK_RESOURCE_EXHAUSTED` with an empty `known_through`
+                        // (that status does not compute one) -- so clearing the flag
+                        // unconditionally would mean a stream whose first batch was refused
+                        // never receives the vector at all, and §4.2's fast resume would be
+                        // silently unavailable for exactly the connections that most need
+                        // it: the ones reconnecting after an outage.
+                        self.first = ack.known_through.is_empty();
                         debug!(
                             peer = %self.peer.name,
                             envelopes,
@@ -1537,6 +1700,12 @@ mod tests {
             "too long"
         );
         assert_eq!(node_id_from_hex("zz93f3c27a107b649c2e4f1b8a6d0e11"), None);
+        assert_eq!(
+            node_id_from_hex("+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1"),
+            None,
+            "`u8::from_str_radix` accepts a leading sign, so one node would have had two \
+             spellings"
+        );
     }
 
     #[test]
@@ -1576,7 +1745,7 @@ mod tests {
                 OriginId::new([9; 16]),
             ),
             auth: PeerAuthKind::MtlsCa,
-            enrolments: Mutex::new(Vec::new()),
+            enrolments: Mutex::new(std::collections::HashMap::new()),
         };
         let a: IpAddr = "192.0.2.1".parse().expect("an address");
         let b: IpAddr = "192.0.2.2".parse().expect("an address");

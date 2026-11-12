@@ -445,6 +445,175 @@ async fn a_satellite_survives_a_collector_outage_and_resumes_without_duplicates(
     tokio::task::block_in_place(|| serving.partition());
 }
 
+/// **§9.3: a Rust satellite against a Go-era collector.**
+///
+/// The collector here serves `WeatherV1.SendWeatherReadings` and **not**
+/// `collector.v1.Collector`, which is exactly what a Go daemon looks like on the wire. The
+/// uplink's `Hello` gets `UNIMPLEMENTED`, it falls back, and the readings arrive.
+///
+/// `mw_grpc::grpcrx` is the server — the same compat shim a Go satellite would be talking
+/// to, driven from the other direction. That is the closest thing to the real oracle
+/// available without a Go daemon in the loop, and it tests the one thing a unit test cannot:
+/// that the fallback's method path, codec and message shape are the ones something else
+/// actually serves.
+///
+/// **At-most-once, and the test says so**: there is no ack on that wire, so what `Ok` from
+/// `readings` means here is "the collector accepted the stream". The degradation is a number
+/// rather than only a log line, which is what `require_ack = false` is for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_satellite_falls_back_to_the_go_method_when_hello_is_unimplemented() {
+    let satellite = build_satellite(&scratch("satellite-compat"));
+    // The Go-era collector: its own spool, its own ingress, and `station:grpcrx`'s route
+    // table -- which serves `SendWeatherReadings` and nothing from `collector.v1`.
+    let go_spool = spool(&scratch("collector-compat"), collector_node());
+    let go_registry = owned_station_registry(&[(STATION, collector_node())]);
+    let go_ingress: Arc<dyn mw_component::Ingress> = Arc::new(mw_pipeline::SpoolIngress::new(
+        Arc::clone(&go_spool),
+        Arc::clone(&go_registry),
+    ));
+    let go_state = Arc::new(mw_grpc::grpcrx::ServiceState::new());
+    go_state.install_for_test(Arc::new(mw_grpc::grpcrx::Handlers::new(
+        ComponentId::new(mw_grpc::grpcrx::ID).expect("a legal id"),
+        go_ingress,
+    )));
+    let table =
+        mw_grpc::grpcrx::route_table(Arc::clone(&go_state)).expect("the compat shim's route table");
+    // **The table's own router with a catch-all, not a `Mount`.** Two reasons, and the
+    // second cost one debugging round:
+    //
+    // 1. `grpc-go`'s server answers `Unimplemented` for any method it does not register,
+    //    and `axum`'s own fallback answers an HTTP `404` with a `text/plain` body that
+    //    `tonic` cannot read as a gRPC status at all — it reports a frame error about the
+    //    compression flag. A test using the default fallback would exercise a shape no Go
+    //    collector produces, and the first version of this test did.
+    // 2. `Mount` dispatches **by host through its own fallback**
+    //    (`mw_http::mount`'s diagram), so replacing that fallback does not add a catch-all,
+    //    it deletes the routing. `into_router_for_test` is the accessor that exists for a
+    //    test that wants one table's handlers without the listener's host dispatch.
+    //
+    // The uplink deliberately does **not** fall back on a bare `404`: that is
+    // indistinguishable from an endpoint pointed at the wrong server, and reporting a wrong
+    // address as a degraded link would hide a configuration mistake.
+    // `mw_collector::uplink::Uplink::hello` says so at the branch.
+    let router = mw_http::RouteTable::into_router_for_test(table).fallback(|| async {
+        tonic::Status::unimplemented("this collector does not implement that method")
+            .into_http::<axum::body::Body>()
+    });
+    let hosts = Arc::new(HostTable::default());
+
+    // Plaintext, because a Go daemon's gRPC port is: `grpcreceiver` configures server TLS
+    // only and this test is about the *protocol* fallback rather than about the handshake.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime for the Go-era listener");
+    let (tx, rx) = std::sync::mpsc::channel();
+    runtime.spawn(async move {
+        let bound = mw_http::bind_with_hosts(
+            &Listen {
+                addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                http_port: 0,
+                https_port: None,
+                grpc_port: 0,
+            },
+            router,
+            None,
+            hosts,
+            None,
+        )
+        .await
+        .expect("both ports bind");
+        let _ = tx.send(bound.grpc_addr().port());
+        let _ = bound.serve(std::future::pending::<()>()).await;
+    });
+    let port = tokio::task::block_in_place(|| {
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the Go-era listener binds")
+    });
+    settle().await;
+
+    let row = UplinkRow {
+        peer_name: "go-collector".to_string(),
+        peer_node: collector_node(),
+        // `http://`, which is what a plaintext gRPC endpoint is.
+        endpoint: format!("http://127.0.0.1:{port}"),
+        // No client certificate: `psk` with an empty secret is the shape of an uplink
+        // pointed at a daemon that authenticates nobody, which is what a Go collector does.
+        auth_kind: "psk".to_string(),
+        tls_cert_path: None,
+        tls_key_path: None,
+        tls_ca_path: None,
+        psk: None,
+        // The transition default. `true` would make the fallback a hard failure, which is
+        // the other half of §9.3 and is asserted below.
+        require_ack: false,
+    };
+    let identity = Identity {
+        node: satellite_node(),
+        name: "satellite-a".to_string(),
+        software: "modernweather test".to_string(),
+        stations: Vec::new(),
+    };
+    let mut uplink = Uplink::build(
+        &row,
+        identity.clone(),
+        Arc::clone(&satellite.spool),
+        satellite.cursor.clone(),
+    )
+    .expect("a psk row needs no files");
+
+    let first = admit(&satellite, 2, 29.90).await;
+    uplink
+        .readings(first, &cx(&satellite.cursor))
+        .await
+        .expect("the fallback delivers to a collector that serves only the Go method");
+    // The Go method has no provenance, so the receiving node **re-originates** every
+    // reading to itself through `admit` -- which is §9.2's first limitation seen from this
+    // side, and is why the spool here carries the collector's own node and its own `seq`
+    // rather than the satellite's.
+    let received: Vec<(OriginId, Seq)> = go_spool
+        .read_after(Seq::new(0), 1024)
+        .expect("a readable spool")
+        .envelopes
+        .into_iter()
+        .map(|(_, e)| (e.provenance.origin(), e.provenance.seq()))
+        .collect();
+    assert_eq!(
+        received,
+        vec![
+            (collector_node(), Seq::new(1)),
+            (collector_node(), Seq::new(2))
+        ],
+        "a reading forwarded through the Go method is re-originated to the receiver, so it          is not deduplicable against the same reading arriving later through the collector          -- §9.2's first limitation, which is why the shim is a transition and not a tier"
+    );
+
+    // `require_ack = true` turns the same fallback into a hard failure, which is what an
+    // operator sets once the fleet is upgraded (§9.3).
+    let mut strict = Uplink::build(
+        &UplinkRow {
+            require_ack: true,
+            ..row
+        },
+        identity,
+        Arc::clone(&satellite.spool),
+        satellite.cursor.clone(),
+    )
+    .expect("a psk row needs no files");
+    let batch = admit(&satellite, 1, 30.10).await;
+    let refused = strict
+        .readings(batch, &cx(&satellite.cursor))
+        .await
+        .expect_err("`require_ack` makes a collector with no acknowledgement a failure");
+    let chain = mw_types::DisplayChain(&refused).to_string();
+    assert!(
+        chain.contains("Hello"),
+        "the failure names the RPC that was not implemented: {chain}"
+    );
+
+    tokio::task::block_in_place(|| drop(runtime));
+}
+
 /// The other half of layer 1: a certificate the peer CA signed that names **no node** must
 /// not resolve to the only peer there is.
 ///

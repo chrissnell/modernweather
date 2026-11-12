@@ -122,8 +122,17 @@ message IngestBatch {
 // the database would make a stalled database back-pressure every satellite in the fleet.
 message IngestAck {
     // Cumulative in the SENDER's coordinate space: every sender position at or below this
-    // is durable here. Echoes `IngestBatch.through` on success, and is left UNCHANGED on
-    // `ACK_RESOURCE_EXHAUSTED`.
+    // is durable here.
+    //
+    // **MEANINGLESS UNLESS `status == ACK_OK` OR `ACK_REJECTED`. A sender must not move a
+    // cursor on any other status.** On `ACK_RESOURCE_EXHAUSTED` this carries the last
+    // position that *was* acknowledged on this stream, which is `0` when none has been --
+    // so a sender that advanced to it unconditionally would rewind to the start of its
+    // spool and replay everything it still holds. The dedup gate absorbs that, so it is a
+    // storm rather than a loss, but it is not what the field means.
+    //
+    // `ACK_REJECTED` carries the batch's own `through`, because every envelope in it was
+    // refused for a reason no later configuration changes (see `AckStatus`).
     uint64 through = 1;
 
     // The collector's per-origin high water, sent on the FIRST ack of a stream (W7 D-23).
@@ -147,12 +156,43 @@ message OriginHigh {
 }
 
 enum AckStatus {
-    ACK_OK = 0;
-    // The collector's spool is at its ceiling: `through` is unchanged, back off. This is
-    // the collector's `Failed`, not the satellite's (§4.3).
-    ACK_RESOURCE_EXHAUSTED = 1;
-    // The whole batch was refused; see `rejected`. Do NOT retry blindly.
-    ACK_REJECTED = 2;
+    // **Never sent.** proto3 makes field 0 the value a message that sets nothing decodes
+    // to, so whatever sits here is what an `IngestAck` from a buggy implementation -- or
+    // one whose `status` a proxy dropped -- claims. `ACK_OK` in this slot would make that
+    // message a successful durable acknowledgement and a receiver would advance its cursor
+    // on it; an unusable value makes it a protocol error instead.
+    ACK_UNSPECIFIED = 0;
+
+    // Everything in this batch that was not a duplicate is durably appended, and `through`
+    // may be taken as the sender's new cursor position.
+    ACK_OK = 1;
+
+    // **Back off and send this batch again.** `through` carries no new position.
+    //
+    // Two conditions produce it and both are properties of THIS node rather than of the
+    // batch, which is why they share an answer:
+    //
+    //   * the collector's spool is at its ceiling -- the collector's `Failed`, not the
+    //     satellite's (§4.3);
+    //   * one or more envelopes were refused for a reason this node can stop refusing --
+    //     a clock outside the skew window, a station it has no row for yet, an origin grant
+    //     an operator has not written, a full origin table.
+    //
+    // The second is the important one and it is not in §4.5's table. Acknowledging past
+    // such an envelope destroys an observation a later configuration would have accepted,
+    // and reports success while doing it: a collector ten minutes ahead of true time would
+    // refuse every envelope from every satellite in the fleet, and if that advanced their
+    // cursors the readings would be gone from every spool before NTP corrected the clock.
+    // Stalling instead costs a bounded delay -- `[spool].max_lag` is the backstop -- and is
+    // the only direction that cannot lose data silently.
+    ACK_RESOURCE_EXHAUSTED = 2;
+
+    // **Every envelope in this batch was refused permanently; do NOT retry.** `rejected`
+    // says how many, and `through` advances, because nothing here will ever be acceptable:
+    // a forged path, a hop that repeats, a reading with no metric. Stop and look at the
+    // sender's configuration -- the collector's `ingest_rejected_total{peer, reason}` says
+    // which clause.
+    ACK_REJECTED = 3;
 }
 
 // Registration carries identity ONLY (§5.2, W7 D-32).

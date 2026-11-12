@@ -49,6 +49,17 @@ use tracing::{info, warn};
 use crate::config_db::{self, ConfigDbError, PeerRow};
 use crate::ident;
 
+/// How many `config.stations` rows one **peer** node may own.
+///
+/// The bound exists because `NodeIdentity.stations` is a repeated field and a `Hello` can
+/// be re-sent: `mw_collector::service::MAX_PEER_STATIONS` bounds one call, and this bounds
+/// what a peer accumulates across all of them. The owner's fleet is four nodes with a
+/// handful of stations each, so 256 is two orders of magnitude above anything real.
+///
+/// **Peers only.** A local station is an operator's own row and is not counted here;
+/// `with_peer_stations`' predicate is the same distinction.
+pub const MAX_OWNED_STATIONS: i64 = 256;
+
 /// One immutable view of `peers`, `peer_origins` and the stations they registered.
 #[derive(Debug, Default)]
 pub struct PeerSnapshot {
@@ -129,49 +140,88 @@ impl PeerSnapshot {
         }
     }
 
-    /// The same snapshot, carrying the stations a `Hello` registered.
-    pub fn with_stations(mut self, owner: OriginId, stations: &[PeerStation]) -> Self {
-        for station in stations {
+    /// The same snapshot, carrying every station a **peer** owns, read from the database.
+    ///
+    /// # Why this is a read and not an accumulation
+    ///
+    /// The first version took the stations straight off the `Hello` that had just been
+    /// recorded and inserted them unconditionally, carrying the previous snapshot's entries
+    /// forward underneath. That was an **ownership hijack**: `upsert_station` guards the
+    /// database with `WHERE stations.owning_node_id = excluded.owning_node_id`, so a peer
+    /// naming another node's station key writes nothing and is told nothing — but the
+    /// snapshot was written from the *claim* rather than from the row, so the second peer to
+    /// declare a key became its owner in the only copy `StationRegistry::station_owner`
+    /// consults. One `Hello` from any enrolled peer was enough to take over another node's
+    /// station and write into its history, and `HelloAck.accepted_stations` — which filters
+    /// on that same snapshot — reported the stolen key as accepted.
+    ///
+    /// Deriving the map from `stations` instead makes ownership in the snapshot *be* the
+    /// guarded fact rather than a copy of it, and it removes the accumulator with no
+    /// eviction path that a peer could grow by inventing keys.
+    ///
+    /// `owning_node_id <> this node's id` is the predicate: a **local** station belongs to
+    /// the configured station snapshot, which `plan()` was derived from and which this must
+    /// never shadow (`crate::registry::ConfigRegistry::peers`).
+    pub async fn with_peer_stations(
+        mut self,
+        pool: &SqlitePool,
+        me: OriginId,
+    ) -> Result<Self, ConfigDbError> {
+        let rows = sqlx::query(
+            "SELECT station_key, owning_node_id, name, type, latitude, longitude, \
+                    altitude_m, timezone \
+             FROM stations WHERE owning_node_id <> ? ORDER BY station_key",
+        )
+        .bind(me.as_bytes().as_slice())
+        .fetch_all(pool)
+        .await
+        .map_err(|source| ConfigDbError::Query {
+            what: "the stations a peer owns",
+            source,
+        })?;
+        for row in rows {
+            let key: String = row.get("station_key");
+            let Some(owner) = node_id(&row.get::<Vec<u8>, _>("owning_node_id")) else {
+                // A column its own `CHECK` would have refused. Dropped rather than
+                // defaulted: an unowned station reads as unknown, which fails closed at
+                // W7 §4.4's step 5.
+                warn!(
+                    station = %key,
+                    "a `config.stations` row's owning_node_id is not 16 bytes, so that \
+                     station cannot be resolved for a peer and is ignored"
+                );
+                continue;
+            };
+            let latitude: Option<f64> = row.get("latitude");
+            let longitude: Option<f64> = row.get("longitude");
+            let altitude_m: Option<f64> = row.get("altitude_m");
+            let timezone: Option<String> = row.get("timezone");
             self.stations.insert(
-                station.station.as_str().to_string(),
+                key.clone(),
                 RegisteredStation {
                     owner,
                     meta: StationMeta {
-                        latitude: station.latitude,
-                        longitude: station.longitude,
-                        altitude_m: station.altitude_m,
+                        latitude,
+                        longitude,
+                        altitude_m,
                         // A peer does not report a snow base distance: it is a *calibration*
                         // of the collector's own gauge, and §5.2's `StationMeta` has no
                         // field for it.
                         snow_base_distance_mm: None,
                     },
                     projection: StationProjection {
-                        name: station.name.clone(),
-                        kind: station.kind.clone(),
-                        timezone: station.timezone.clone().filter(|z| !z.trim().is_empty()),
-                        latitude: station.latitude,
-                        longitude: station.longitude,
-                        altitude_m: station.altitude_m,
+                        name: row.get("name"),
+                        kind: row.get("type"),
+                        timezone: timezone.filter(|z| !z.trim().is_empty()),
+                        latitude,
+                        longitude,
+                        altitude_m,
                         snow_base_distance_mm: None,
                     },
                 },
             );
         }
-        self
-    }
-
-    /// Carry forward the stations another snapshot had registered.
-    ///
-    /// Called when a write republishes: the rows a *different* peer registered earlier in
-    /// this process's life are still only in memory, and dropping them would make one
-    /// satellite's reconnection un-resolve another's stations until the next restart.
-    pub fn inheriting(mut self, previous: &PeerSnapshot) -> Self {
-        for (key, station) in &previous.stations {
-            self.stations
-                .entry(key.clone())
-                .or_insert_with(|| station.clone());
-        }
-        self
+        Ok(self)
     }
 
     /// The peer this node id names, revoked or not.
@@ -254,20 +304,33 @@ fn auth(row: &PeerRow) -> Option<PeerAuth> {
 pub struct PeerStore {
     pool: SqlitePool,
     registry: Arc<crate::registry::ConfigRegistry>,
+    /// This node's own `NodeId`, which is what separates a **local** station from one a
+    /// peer owns (`PeerSnapshot::with_peer_stations`).
+    me: OriginId,
 }
 
 impl PeerStore {
     /// A store over one configuration database and the registry it publishes into.
-    pub fn new(pool: SqlitePool, registry: Arc<crate::registry::ConfigRegistry>) -> Self {
-        Self { pool, registry }
+    pub fn new(
+        pool: SqlitePool,
+        registry: Arc<crate::registry::ConfigRegistry>,
+        me: OriginId,
+    ) -> Self {
+        Self { pool, registry, me }
     }
 
-    /// Read `peers` and publish the peer half. Called once at boot and after every write.
+    /// Read `peers` and the stations they own, and publish the peer half.
+    ///
+    /// Called once at boot and after every write. Both halves come from the database every
+    /// time: a snapshot assembled from anything else is a second answer to "who owns this
+    /// station", and that question is an authorisation one
+    /// (`PeerSnapshot::with_peer_stations`).
     pub async fn republish(&self) -> Result<Arc<PeerSnapshot>, ConfigDbError> {
         let rows = config_db::peers(&self.pool).await?;
-        let previous = self.registry.peer_snapshot();
-        self.registry
-            .publish_peers(PeerSnapshot::new(&rows).inheriting(&previous));
+        let snapshot = PeerSnapshot::new(&rows)
+            .with_peer_stations(&self.pool, self.me)
+            .await?;
+        self.registry.publish_peers(snapshot);
         Ok(self.registry.peer_snapshot())
     }
 
@@ -325,24 +388,51 @@ impl PeerStore {
         for station in stations {
             upsert_station(&mut tx, node, station).await?;
         }
+        // **The total a node may own, counted after the writes and inside the
+        // transaction.**
+        //
+        // The caller bounds one `Hello`; this bounds the **accumulation** across
+        // reconnections, which is the growth a peer inventing a fresh station key per
+        // `Hello` would otherwise have no limit on at all — one `config.stations` row and
+        // one resident snapshot entry per call, for ever.
+        //
+        // Counted after the upserts rather than before, and the transaction is what makes
+        // that the simple version: if the answer is over the limit the error returns, `tx`
+        // drops un-committed, and every row it wrote goes with it. Counting first would
+        // mean deciding how many of the declared keys were new, which is the same question
+        // asked less directly.
+        let owned: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM stations WHERE owning_node_id = ?")
+                .bind(node.as_bytes().as_slice())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| query("counting the stations a peer owns", e))?;
+        if owned > MAX_OWNED_STATIONS {
+            warn!(
+                node = %node,
+                owned,
+                limit = MAX_OWNED_STATIONS,
+                "this registration would take a node past the number of stations one may \
+                 own, so none of it was written"
+            );
+            return Err(PeerWriteError::TooManyStations {
+                owned,
+                limit: MAX_OWNED_STATIONS,
+            });
+        }
         tx.commit()
             .await
             .map_err(|e| query("committing the registration transaction", e))?;
         // Published after the commit, never before: a gate that could resolve a station
         // whose row had not committed would admit an envelope the next restart cannot
-        // explain.
-        let previous = self.registry.peer_snapshot();
-        let rows = config_db::peers(&self.pool)
+        // explain. And read back from the database rather than assembled from the claim --
+        // `with_peer_stations` has why that distinction is an authorisation one.
+        self.republish()
             .await
             .map_err(|e| PeerWriteError::Backend {
                 reason: DisplayChain(&e).to_string(),
                 class: Class::RETRYABLE,
             })?;
-        self.registry.publish_peers(
-            PeerSnapshot::new(&rows)
-                .inheriting(&previous)
-                .with_stations(node, stations),
-        );
         Ok(())
     }
 
@@ -354,9 +444,25 @@ impl PeerStore {
         if open.is_empty() {
             return Err(PeerWriteError::EnrolmentClosed);
         }
-        let Some(token_id) = verify_token(request.token.expose_secret(), &open) else {
+        let Some((token_id, token_name)) = verify_token(request.token.expose_secret(), &open)
+        else {
             return Err(PeerWriteError::BadToken);
         };
+        // **The token is scoped to the name the operator minted it for**, and it is checked
+        // here because `peer_enrolment_token.peer_name` exists for exactly this and was
+        // read by nobody. Without it a token for a new `satellite-d` could be presented
+        // with any `node_id`, and a `node_id` that already has a row is a takeover: the
+        // `DO UPDATE` below replaces the credential, and `relay` and `peer_origins` are not
+        // the credential -- so an attacker inherited whatever the displaced peer had been
+        // granted. §5.3 says enrolment "inserts `peers` + `peer_origins` + `stations`
+        // rows"; insert, not adopt.
+        if request.name != token_name {
+            warn!(
+                presented = %request.name,
+                "an enrolment token was presented with a node name it was not minted for"
+            );
+            return Err(PeerWriteError::BadToken);
+        }
         let digest = request.spki_sha256;
         if digest == [0u8; 32] {
             // An all-zero digest is not a SHA-256 of anything a caller could have hashed;
@@ -385,14 +491,33 @@ impl PeerStore {
         if burned.rows_affected() == 0 {
             return Err(PeerWriteError::BadToken);
         }
-        sqlx::query(
+        // **Three clauses on the `DO UPDATE`, and each one closes a takeover.**
+        //
+        // A re-enrolment of the same `(node_id, name)` is legitimate: a satellite whose
+        // keypair was rotated or whose disk was replaced presents a new SPKI under the same
+        // identity. Anything else is not, and the predicate says which is which:
+        //
+        //   * `peers.name = excluded.name` -- the row this `node_id` already has must be
+        //     the peer the token names. Without it, a token for `satellite-d` presented
+        //     with `relay-west`'s `node_id` would replace `relay-west`'s credential while
+        //     leaving its name on the row, so nothing an operator reads would change.
+        //   * `peers.revoked_at IS NULL` -- re-trusting a revoked peer is an operator's
+        //     decision, not a decision a peer makes by enrolling again. The previous
+        //     version set `revoked_at = NULL` unconditionally, which made a revocation
+        //     undoable by whoever held a token.
+        //   * `relay = 0` -- a changed credential drops the relay grant. Fail-safe and
+        //     deliberate: if the key holder has changed, the authority to speak for other
+        //     nodes has to be re-granted by the operator rather than inherited. The grants
+        //     themselves are deleted below.
+        let upserted = sqlx::query(
             "INSERT INTO peers (node_id, name, auth_kind, auth_material, software) \
              VALUES (?, ?, 'mtls-pinned', ?, ?) \
              ON CONFLICT (node_id) DO UPDATE SET \
                  auth_kind = excluded.auth_kind, \
                  auth_material = excluded.auth_material, \
                  software = excluded.software, \
-                 revoked_at = NULL",
+                 relay = 0 \
+             WHERE peers.name = excluded.name AND peers.revoked_at IS NULL",
         )
         .bind(request.node.as_bytes().as_slice())
         .bind(&request.name)
@@ -401,6 +526,28 @@ impl PeerStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| query("inserting the peer row", e))?;
+        if upserted.rows_affected() == 0 {
+            // The `node_id` has a row belonging to a different name, or to a peer an
+            // operator revoked. The token is burned either way -- the transaction below
+            // would roll that back, so the burn is what this returns on -- because a token
+            // that can be probed against node ids until one is accepted is a token that
+            // enumerates the fleet.
+            warn!(
+                peer = %request.name,
+                node = %request.node,
+                "an enrolment named a node id that belongs to a different peer, or to one \
+                 whose enrolment was revoked, so nothing was changed"
+            );
+            return Err(PeerWriteError::BadToken);
+        }
+        // **Every grant but the peer's own is removed**, for the `relay = 0` reason: a
+        // changed credential must not inherit the authority the previous key holder had.
+        sqlx::query("DELETE FROM peer_origins WHERE node_id = ? AND origin_node_id <> ?")
+            .bind(request.node.as_bytes().as_slice())
+            .bind(request.node.as_bytes().as_slice())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| query("clearing the peer's inherited origin grants", e))?;
         // The peer itself, so that `peer_origins` is never empty and §8.5's
         // `PeerCannotSpeakForItself` cannot be reached by an enrolment this code performed.
         sqlx::query(
@@ -424,16 +571,13 @@ impl PeerStore {
             stations = request.stations.len(),
             "a peer enrolled and its SPKI was pinned"
         );
-        let previous = self.registry.peer_snapshot();
-        let rows = config_db::peers(&self.pool)
+        let snapshot = self
+            .republish()
             .await
             .map_err(|e| PeerWriteError::Backend {
                 reason: DisplayChain(&e).to_string(),
                 class: Class::RETRYABLE,
             })?;
-        let snapshot = PeerSnapshot::new(&rows)
-            .inheriting(&previous)
-            .with_stations(request.node, &request.stations);
         let peer = snapshot
             .peer(request.node)
             .ok_or_else(|| PeerWriteError::Backend {
@@ -441,17 +585,16 @@ impl PeerStore {
                     .to_string(),
                 class: Class::Fatal,
             })?;
-        self.registry.publish_peers(snapshot);
         Ok(Enrolled {
             peer,
             pinned_spki_sha256: Some(digest),
         })
     }
 
-    /// Every unexpired, unconsumed token, as `(id, phc)`.
-    async fn open_tokens(&self) -> Result<Vec<([u8; 16], String)>, PeerWriteError> {
+    /// Every unexpired, unconsumed token.
+    async fn open_tokens(&self) -> Result<Vec<OpenToken>, PeerWriteError> {
         let rows = sqlx::query(
-            "SELECT id, token_hash FROM peer_enrolment_token \
+            "SELECT id, peer_name, token_hash FROM peer_enrolment_token \
              WHERE consumed_at IS NULL AND expires_at > unixepoch() \
              ORDER BY expires_at",
         )
@@ -462,14 +605,38 @@ impl PeerStore {
             .into_iter()
             .filter_map(|r| {
                 let id: Vec<u8> = r.get("id");
-                let id = <[u8; 16]>::try_from(id.as_slice()).ok()?;
-                Some((id, r.get::<String, _>("token_hash")))
+                Some(OpenToken {
+                    id: <[u8; 16]>::try_from(id.as_slice()).ok()?,
+                    peer_name: r.get("peer_name"),
+                    phc: r.get("token_hash"),
+                })
             })
             .collect())
     }
 }
 
 /// Upsert one registered station, without letting a peer touch a row it does not own.
+///
+/// # `presented_key` is **not** written, and the schema is why
+///
+/// `config.stations` carries
+/// `CHECK (CASE identity_kind WHEN 'from_registration' THEN presented_key IS NULL ... END)`:
+/// a station that arrived by registration is identified by the key it was issued, not by a
+/// claim a frame presents. The first version of this function set the column to the station
+/// key, which meant **every** `Hello` failed on that constraint — a complete break of the
+/// registration path, found by `crates/mw-store/tests/peers.rs` and by nothing else, because
+/// every other test that touches a `from_registration` row builds a `StationRow` value
+/// rather than inserting one.
+///
+/// Nothing on the collector's path wants the column: `mw_collector::admit::Gate` authorises
+/// an envelope through `StationRegistry::station_owner`, which reads `owning_node_id`.
+/// What a NULL `presented_key` does cost is the **Go compat shim**: `station:grpcrx`
+/// resolves a frame through `StationRegistry::resolve`, which indexes on `presented_key` —
+/// so a station registered here is not reachable through `WeatherV1.SendWeatherReadings`
+/// until an operator sets that column by hand, which is what
+/// `mw_grpc::grpcrx::route_table`'s `Unimplemented` message already tells them to do. That
+/// is a property of the schema's own choice rather than of this item, and it is recorded in
+/// this item's PR.
 ///
 /// The `WHERE` on the `DO UPDATE` is the whole security property: SQLite applies it to the
 /// *existing* row, so a conflict on a key owned by this node or by another peer updates
@@ -483,9 +650,9 @@ async fn upsert_station(
 ) -> Result<(), PeerWriteError> {
     sqlx::query(
         "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind, \
-                               presented_key, latitude, longitude, altitude_m, timezone, \
+                               latitude, longitude, altitude_m, timezone, \
                                aprs_callsign, last_seen) \
-         VALUES (?, ?, ?, ?, 'from_registration', ?, ?, ?, ?, ?, ?, unixepoch()) \
+         VALUES (?, ?, ?, ?, 'from_registration', ?, ?, ?, ?, ?, unixepoch()) \
          ON CONFLICT (station_key) DO UPDATE SET \
              name = excluded.name, \
              type = excluded.type, \
@@ -502,11 +669,6 @@ async fn upsert_station(
     .bind(owner.as_bytes().as_slice())
     .bind(&station.name)
     .bind(&station.kind)
-    // `presented_key` is the station key itself: a `from_registration` station is
-    // identified by the key it was issued, and the envelope carries that key rather than a
-    // second claim. The Go compat shim's `station:grpcrx` resolves by this column, so a
-    // station registered here is also reachable from that method without a second row.
-    .bind(station.station.as_str())
     .bind(station.latitude)
     .bind(station.longitude)
     .bind(station.altitude_m)
@@ -581,10 +743,10 @@ fn hash_secret(secret: &str) -> Result<String, PeerWriteError> {
 /// handful of open tokens at any time, so the cost of being uniform is bounded by the
 /// operator's own behaviour. The comparison inside `verify_password` is `password-hash`'s
 /// own constant-time one (**D-33**).
-fn verify_token(secret: &str, open: &[([u8; 16], String)]) -> Option<[u8; 16]> {
+fn verify_token(secret: &str, open: &[OpenToken]) -> Option<([u8; 16], String)> {
     let mut found = None;
-    for (id, phc) in open {
-        let Ok(parsed) = PasswordHash::new(phc) else {
+    for token in open {
+        let Ok(parsed) = PasswordHash::new(&token.phc) else {
             warn!("an enrolment token row holds a hash this build cannot parse; ignoring it");
             continue;
         };
@@ -593,10 +755,22 @@ fn verify_token(secret: &str, open: &[([u8; 16], String)]) -> Option<[u8; 16]> {
             .is_ok()
             && found.is_none()
         {
-            found = Some(*id);
+            found = Some((token.id, token.peer_name.clone()));
         }
     }
     found
+}
+
+/// One unexpired, unconsumed enrolment token.
+///
+/// `peer_name` is on the row because the operator minted the token **for a peer**, and
+/// `enrol_inner` refuses a request that presents it for a different one — which is what
+/// stops a token being probed against node ids until one is accepted.
+#[derive(Debug)]
+struct OpenToken {
+    id: [u8; 16],
+    peer_name: String,
+    phc: String,
 }
 
 fn query(what: &'static str, source: sqlx::Error) -> PeerWriteError {
@@ -701,61 +875,43 @@ mod tests {
             .is_revoked());
     }
 
+    /// A snapshot with no station rows resolves nothing, which is what fails closed at
+    /// W7 §4.4's step 5.
+    ///
+    /// The populated case is asserted against a real database in
+    /// `crates/mw-store/tests/db.rs`, because the map is a **read** of `config.stations`
+    /// rather than an accumulation of what a `Hello` claimed — see
+    /// [`PeerSnapshot::with_peer_stations`] for why that distinction is an authorisation
+    /// one and what it cost before.
     #[test]
-    fn a_registered_station_answers_its_owner_and_its_metadata() {
-        let owner = OriginId::new([7; 16]);
-        let snapshot = PeerSnapshot::default().with_stations(
-            owner,
-            &[PeerStation {
-                station: StationKey::new("satellite-a:backyard"),
-                name: "Back Yard".into(),
-                kind: "davis".into(),
-                latitude: Some(39.64),
-                longitude: Some(-105.2),
-                altitude_m: Some(1800.0),
-                timezone: Some("America/Denver".into()),
-                aprs_callsign: None,
-            }],
-        );
+    fn a_snapshot_with_no_station_rows_owns_nothing() {
+        let snapshot = PeerSnapshot::new(&[row("satellite-a", "mtls-ca", None)]);
         let key = StationKey::new("satellite-a:backyard");
-        assert_eq!(snapshot.owner(&key), Some(owner));
-        assert_eq!(
-            snapshot.metadata(&key).expect("registered").latitude,
-            Some(39.64)
-        );
-        assert_eq!(snapshot.projection(&key).expect("registered").kind, "davis");
-        assert_eq!(snapshot.owner(&StationKey::new("other")), None);
-    }
-
-    /// A second peer's reconnection must not un-resolve the first peer's stations.
-    #[test]
-    fn republishing_inherits_the_stations_other_peers_registered() {
-        let a = OriginId::new([1; 16]);
-        let first = PeerSnapshot::default().with_stations(
-            a,
-            &[PeerStation {
-                station: StationKey::new("a:one"),
-                name: "One".into(),
-                kind: "davis".into(),
-                latitude: None,
-                longitude: None,
-                altitude_m: None,
-                timezone: None,
-                aprs_callsign: None,
-            }],
-        );
-        let second = PeerSnapshot::default()
-            .inheriting(&first)
-            .with_stations(OriginId::new([2; 16]), &[]);
-        assert_eq!(second.owner(&StationKey::new("a:one")), Some(a));
+        assert_eq!(snapshot.owner(&key), None);
+        assert_eq!(snapshot.metadata(&key), None);
+        assert!(snapshot.projection(&key).is_none());
     }
 
     #[test]
     fn a_token_verifies_against_its_own_hash_and_not_another() {
-        let phc = hash_secret("c0ffee").expect("hashable");
-        let other = hash_secret("decaf").expect("hashable");
-        let open = vec![([1; 16], other), ([2; 16], phc)];
-        assert_eq!(verify_token("c0ffee", &open), Some([2; 16]));
+        let open = vec![
+            OpenToken {
+                id: [1; 16],
+                peer_name: "satellite-b".to_string(),
+                phc: hash_secret("decaf").expect("hashable"),
+            },
+            OpenToken {
+                id: [2; 16],
+                peer_name: "satellite-a".to_string(),
+                phc: hash_secret("c0ffee").expect("hashable"),
+            },
+        ];
+        assert_eq!(
+            verify_token("c0ffee", &open),
+            Some(([2; 16], "satellite-a".to_string())),
+            "the token resolves to its own row, and carries the name it was minted for -- \
+             which is what `enrol_inner` refuses a mismatch against"
+        );
         assert_eq!(verify_token("tea", &open), None);
         assert_eq!(verify_token("c0ffee", &[]), None);
     }

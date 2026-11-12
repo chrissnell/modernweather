@@ -49,6 +49,94 @@ pub type HelloClientCodec = tonic_prost::ProstCodec<pb::NodeIdentity, pb::HelloA
 /// The codec for `Ingest`, client side.
 pub type IngestClientCodec = tonic_prost::ProstCodec<pb::IngestBatch, pb::IngestAck>;
 
+/// `WeatherV1.SendWeatherReadings` — the method a **Go-era collector** serves (§9.3).
+///
+/// Declared here rather than imported from `mw_grpc::grpcrx`, which declares the same
+/// string for the receiving side: the two crates are in the same layer and
+/// `ci/layers.toml` forbids either naming the other. A path is a wire contract, so each
+/// copy has a test asserting the exact string — `mw_grpc::grpcrx`'s own, and
+/// [`tests::the_compat_path_is_the_go_method`] here. A divergence between them is a
+/// satellite that gets `Unimplemented` from its own collector.
+pub const SEND_WEATHER_READINGS: &str = "/remoteweather.v1.WeatherV1/SendWeatherReadings";
+
+/// The codec for the compat fallback: a `Reading` out, nothing back.
+///
+/// `remoteweather.v1.Empty` has no fields, and a protobuf message with no fields set is
+/// **zero bytes** — so there is nothing to decode and no type to decode it into.
+/// `mw_grpc::codec::ReadingCodec` is this codec's mirror image for the same reason, on the
+/// receiving side.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompatCodec;
+
+impl tonic::codec::Codec for CompatCodec {
+    type Encode = pb_reading::Reading;
+    type Decode = ();
+    type Encoder = CompatCodec;
+    type Decoder = CompatCodec;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        *self
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        *self
+    }
+}
+
+impl tonic::codec::Encoder for CompatCodec {
+    type Item = pb_reading::Reading;
+    type Error = tonic::Status;
+
+    fn encode(
+        &mut self,
+        item: Self::Item,
+        dst: &mut tonic::codec::EncodeBuf<'_>,
+    ) -> Result<(), Self::Error> {
+        prost::Message::encode(&item, dst)
+            .map_err(|e| tonic::Status::internal(format!("a reading did not encode: {e}")))
+    }
+}
+
+impl tonic::codec::Decoder for CompatCodec {
+    type Item = ();
+    type Error = tonic::Status;
+
+    fn decode(
+        &mut self,
+        src: &mut tonic::codec::DecodeBuf<'_>,
+    ) -> Result<Option<Self::Item>, Self::Error> {
+        // Whatever arrived is `Empty`, whose encoding is no bytes at all. Advancing the
+        // buffer rather than ignoring it, because `tonic` hands over exactly one message
+        // and a decoder that consumed none of it would be asked again.
+        let len = prost::bytes::Buf::remaining(src);
+        prost::bytes::Buf::advance(src, len);
+        Ok(Some(()))
+    }
+}
+
+/// The generated reading, under a name that does not collide with the collector package.
+pub use mw_proto::wire::modernweather::v1 as pb_reading;
+
+/// One envelope's reading, as a Go-era collector's `SendWeatherReadings` expects it (§9.3).
+///
+/// **The station key goes in `station_id` and in `stationName`.** `mw_grpc::grpcrx` reads
+/// `station_id` first and falls back to `stationName`, and a Go-era receiver reads
+/// `stationName`; setting both is what makes one message work against either. Neither is a
+/// credential — the Go method has no authorisation at all, which is §9.2's second
+/// limitation seen from the sending side.
+///
+/// **Field presence does not survive this hop**, and that is §9.3's stated cost rather than
+/// a defect here: the committed Go proto's bare scalars make absent and `0.0` the same
+/// bytes (W3 §6.5), so a metric this satellite did not measure arrives at a Go collector as
+/// a zero. Nothing on either side can recover it. The `optional` fields on
+/// `modernweather.v1.Reading` are what a *Rust* collector gets instead.
+pub fn compat_reading(envelope: &mw_types::Envelope) -> pb_reading::Reading {
+    let mut reading = pb_reading::Reading::from(envelope.reading.as_ref());
+    reading.station_id = envelope.station.as_str().to_string();
+    reading.station_name = envelope.station.as_str().to_string();
+    reading
+}
+
 /// Unix milliseconds, as every instant on this wire is.
 pub fn millis(at: DateTime<Utc>) -> i64 {
     at.timestamp_millis()
@@ -69,6 +157,12 @@ pub fn station(meta: &pb::StationMeta) -> Option<PeerStation> {
     if key.is_empty() {
         // A station with no key is not a station: there is no envelope without one
         // (W2a §4a.6), so registering it would create a row nothing can ever name.
+        return None;
+    }
+    if key.len() > mw_proto::MAX_STATION_KEY {
+        // The **same bound the envelope decode applies**, read from the same constant: a
+        // key this node would register and then refuse every envelope for is worse than one
+        // it never registered. The two cannot drift because there is one constant.
         return None;
     }
     Some(PeerStation {
@@ -118,6 +212,43 @@ mod tests {
         assert_eq!(HELLO, format!("/{SERVICE}/Hello"));
         assert_eq!(INGEST, format!("/{SERVICE}/Ingest"));
         assert_eq!(ENROL, format!("/{SERVICE}/Enroll"));
+    }
+
+    /// The compat fallback's path is the **Go** one, verbatim, because a Go-era collector
+    /// is what serves it. A typo here is a satellite that gets `Unimplemented` from the
+    /// collector it was pointed at and reports a degraded link it could have used.
+    #[test]
+    fn the_compat_path_is_the_go_method() {
+        assert_eq!(
+            SEND_WEATHER_READINGS,
+            "/remoteweather.v1.WeatherV1/SendWeatherReadings"
+        );
+        assert!(
+            SEND_WEATHER_READINGS.starts_with("/remoteweather.v1.WeatherV1/"),
+            "the compat method is on the FROZEN service, which W7 D-19 leaves untouched"
+        );
+    }
+
+    #[test]
+    fn a_compat_reading_carries_the_station_key_in_both_fields() {
+        let envelope = crate::testing::envelope(
+            "satellite-a:backyard",
+            mw_types::OriginId::new([1; 16]),
+            1,
+            &[1, 9],
+            chrono::Utc::now(),
+        );
+        let reading = compat_reading(&envelope);
+        assert_eq!(reading.station_id, "satellite-a:backyard");
+        assert_eq!(
+            reading.station_name, "satellite-a:backyard",
+            "a Go-era receiver reads `stationName`, a current one reads `station_id`"
+        );
+        assert_eq!(
+            reading.barometer,
+            Some(29.92),
+            "the metrics survive the hop"
+        );
     }
 
     /// `WeatherV1` is not touched (W7 **D-19**), so no path here may collide with the two

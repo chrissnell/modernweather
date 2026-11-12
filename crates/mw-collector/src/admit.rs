@@ -43,25 +43,33 @@
 //! itself can name the collector's own roof sensor; every other check passes, and the
 //! envelope lands in that station's history.
 //!
-//! So the check is: **the station's owner must be a node on the envelope's inbound path,
-//! excluding this node.** That is exactly as permissive as the topologies §8 documents and
-//! no more:
+//! So the check is: **the station's owner must be the envelope's origin or the sending
+//! peer.** That is exactly as permissive as the topologies §8 documents and no more:
 //!
 //! ```text
-//! leaf    path [A, me]        station owned by A          ✓ A is on the inbound path
-//! relay   path [B, R, me]     station owned by R or B     ✓ both are
-//! attack  path [A, me]        station owned by me         ✗ `me` is never an inbound hop
+//! leaf    path [A, me]         owned by A                   ✓ owner == origin == peer
+//! relay   path [B, R, me]      owned by B, the measurer      ✓ owner == origin
+//!                              owned by R, its inventory     ✓ owner == peer
+//! attack  path [A, me]         owned by me                   ✗ neither
+//! attack  path [B, X, R, me]   owned by X                    ✗ neither
 //! ```
 //!
-//! The third line is closed by the receive check's own clause 4 — `me ∉ path[..len-1]` — so
-//! the two checks compose into the property **D-36** claims. Filed as a proposed amendment
-//! to §4.4 in this item's PR rather than taken silently.
+//! **Two nodes and not "anywhere on the path", which is where the first version was
+//! wrong.** A path's interior hops are chosen by whoever built it — nothing constrains them
+//! beyond distinctness, the length bound, `me` not being among them, `path[0] == origin`
+//! and `path[len - 2] == peer` — so "the owner is on the inbound path" was satisfiable by
+//! inventing a hop, and a relay-granted peer could reach any station it liked. The two
+//! nodes this clause does accept are the two the other checks have already proved:
+//! `origin` is `path[0]`, which `Provenance::sealed` enforces and `may_speak_for` has
+//! authorised, and `peer` is `path[len - 2]`, which the receive check enforced.
+//!
+//! Filed as a proposed amendment to §4.4 in this item's PR rather than taken silently.
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use mw_component::{PeerEntry, Reject, StationRegistry};
-use mw_types::{Envelope, OriginId};
+use mw_types::{Envelope, OriginId, Seq};
 
 /// How far ahead of this node's clock an `observed_at` may be (§4.6).
 ///
@@ -237,13 +245,33 @@ impl Gate {
         self.registry.station_owner(station)
     }
 
-    /// Steps 3, 4 and 5 for one envelope. `Ok(())` means it may be handed to `accept`.
+    /// Steps 3, 4 and 5 for one envelope, plus §4.6's other two. `Ok(())` means it may be
+    /// handed to `accept`.
     ///
     /// Ordered cheapest-first among the ones that cost anything, and with the two that
     /// cannot fail together adjacent: the origin grant is a set membership, the skew window
     /// is two comparisons, and the station lookup is a map read over a published snapshot.
     /// None of them does I/O, which is what lets this run inside the same `await`-free
     /// stretch `accept` does.
+    ///
+    /// # The two §4.6 clauses that are **not** step 3, 4 or 5
+    ///
+    /// §4.6's table has four rows; two of them are the skew window and the station lookup
+    /// below, and the other two are here because nothing else on the `accept` path performs
+    /// them. `admit` has both already (`mw_pipeline::ingress`), and `accept` deliberately
+    /// has neither, because `admit`'s versions are about a reading this node measured:
+    ///
+    /// - **`seq != 0`.** `mw_types::Seq::FIRST` is 1, so a zero is an encoder that omitted
+    ///   the field. It is refused here because the dedup gate answers `Duplicate` for it
+    ///   (`mw_pipeline::spool::dedup`'s `accept`) — which would be reported to the sender as
+    ///   `ACK_OK` with a duplicate count, and a peer whose encoder has that bug would
+    ///   advance its cursor over everything it ever sent while both ends logged success.
+    /// - **at least one populated metric.** §4.6 calls an all-`None` reading "a row the
+    ///   aggregates must still process", which understates it: W3's writer upserts
+    ///   `col = EXCLUDED.col` (`mw_store::writer`, asserted there), **not** `coalesce`, so
+    ///   an empty reading at a `(station_id, time)` that already holds a real observation
+    ///   **erases its values**. That makes this clause a destructive-write guard rather
+    ///   than a tidiness one, which is why it is a refusal here and not a filter later.
     pub fn check(
         &self,
         envelope: &Envelope,
@@ -256,29 +284,72 @@ impl Gate {
         if !peer.may_speak_for(origin) {
             return Err(Reject::UnauthorizedOrigin);
         }
+        if envelope.provenance.seq() == Seq::new(0) {
+            return Err(Reject::BadSequence);
+        }
+        if !carries_a_metric(&envelope.reading) {
+            return Err(Reject::EmptyReading);
+        }
         // 4. The skew window (§4.6). `observed_at`, not `received_at`: the second is the
         //    origin's own admission instant and is bounded by the first in every honest
         //    encoder, while the first is what every window computation and `/latest` reads.
-        if envelope.observed_at > now + max_future_skew()
-            || envelope.observed_at < now - max_past_skew()
-        {
+        // **Two edges, two verdicts**, because their permanence is opposite: a collector
+        // whose own clock is fast clears by being corrected, and an envelope that is
+        // already thirty days old only ever gets older (`Reject::is_transient`).
+        if envelope.observed_at > now + max_future_skew() {
             return Err(Reject::ClockSkew);
+        }
+        if envelope.observed_at < now - max_past_skew() {
+            return Err(Reject::TooOld);
         }
         // 5. The station resolves, **and its owner is on the inbound path** (see this
         //    module's documentation for why the second clause is here).
         let Some(owner) = self.registry.station_owner(&envelope.station) else {
             return Err(Reject::UnknownStation);
         };
-        let hops = envelope.provenance.path().hops();
-        // `len - 1` because the last hop is this node: the receive check has already
-        // established `path.last() == me`, and a station this node owns is not one a peer
-        // may write into.
-        let inbound = &hops[..hops.len().saturating_sub(1)];
-        if !inbound.contains(&owner) {
+        // **The owner must be the origin or the sending peer, and nothing else.**
+        //
+        // The first version accepted any node on the inbound path, and that was a bypass: a
+        // path's *interior* hops are chosen by whoever built it. Nothing constrains them
+        // beyond distinctness, the length bound, `me` not being among them,
+        // `path[0] == origin` and `path[len - 2] == peer` -- so a relay-granted peer could
+        // pad the path with the owner of any station it wanted and walk straight through.
+        // `[2, 3, 7, 9]` from relay 7, granted origins `{7, 2}`, writes into node 3's
+        // station.
+        //
+        // Two nodes, because §8's topologies need exactly two -- and both are already
+        // proved rather than claimed: `origin` is `path[0]`, which `Provenance::sealed`
+        // enforces at the decode and `may_speak_for` has just authorised, and `peer` is
+        // `path[len - 2]`, which the receive check enforced. An interior hop is neither.
+        if owner != origin && owner != peer.node {
             return Err(Reject::UnauthorizedOrigin);
         }
         Ok(())
     }
+}
+
+/// Whether a reading carries anything at all (§4.6's last row).
+///
+/// The same function `mw_pipeline::ingress` uses on the `admit` path, and written the same
+/// way for the same reason: comparing against a `Reading` with the same two dimensions and
+/// no metrics makes it **registry-proof**. A metric added to `metrics/registry.toml` is
+/// covered without an edit here, and there is no list to fall out of date.
+///
+/// The obvious implementation — walk `METRICS` asking `Reading::get` — is wrong and subtly
+/// so: `get` answers `None` for the fifteen non-numeric metrics, so an envelope whose only
+/// content is one of them would read as empty and be refused.
+///
+/// Not shared with `mw-pipeline` by calling it: that crate's copy is private to its own
+/// module, and exporting it to be called from one place here would make a hot-path function
+/// part of its public surface. The generated type derives `PartialEq`, so each copy is
+/// three lines and neither can drift from the registry.
+fn carries_a_metric(reading: &mw_types::Reading) -> bool {
+    let empty = mw_types::Reading {
+        time: reading.time,
+        station_id: reading.station_id.clone(),
+        ..mw_types::Reading::default()
+    };
+    *reading != empty
 }
 
 #[cfg(test)]
@@ -340,6 +411,39 @@ mod tests {
         let env = envelope("satellite-b:barn", node(1), 1, &[1, 9], now());
         assert_eq!(
             gate.check(&env, &leaf_peer(), now()),
+            Err(Reject::UnauthorizedOrigin)
+        );
+    }
+
+    /// **The padding attack the first version of the ownership clause admitted.**
+    ///
+    /// A relay chooses its own path's interior hops, so "the owner is somewhere on the
+    /// inbound path" was satisfiable by inventing a hop. Here relay 7 is granted origins
+    /// `{7, 2}` and tries to forward a station owned by node 3 -- which it has no grant for
+    /// -- by putting 3 on the path.
+    #[tokio::test]
+    async fn a_relay_cannot_reach_a_third_partys_station_by_padding_the_path() {
+        let gate = gate(&[("satellite-c:shed", 3)]);
+        let relay = PeerEntry {
+            node: node(7),
+            name: PeerName::new("relay-west"),
+            auth: PeerAuth::MtlsCa,
+            relay: true,
+            origins: [node(7), node(2)].into_iter().collect(),
+            revoked_at: None,
+            software: None,
+        };
+        // `path[0] == origin == 2` (granted), `path[len - 2] == 7` (the sending peer), and
+        // node 3 sits between them -- so every other clause passes.
+        let env = envelope("satellite-c:shed", node(2), 4711, &[2, 3, 7, 9], now());
+        assert_eq!(
+            mw_pipeline::receive_check(env.provenance.path(), node(9), node(7)),
+            Ok(()),
+            "the receive check has nothing to say about an interior hop, which is why the \
+             owner clause cannot lean on one"
+        );
+        assert_eq!(
+            gate.check(&env, &relay, now()),
             Err(Reject::UnauthorizedOrigin)
         );
     }
@@ -410,7 +514,17 @@ mod tests {
         );
         assert_eq!(
             gate.check(&at(-Duration::days(31)), &leaf_peer(), now()),
-            Err(Reject::ClockSkew)
+            Err(Reject::TooOld),
+            "the past edge is its own verdict, because time never moves back towards it"
+        );
+        assert!(
+            Reject::ClockSkew.is_transient(),
+            "a fast clock can be corrected"
+        );
+        assert!(
+            !Reject::TooOld.is_transient(),
+            "an envelope already too old will never be young enough, so stalling on it \
+             would stall for ever"
         );
     }
 
@@ -431,6 +545,52 @@ mod tests {
         #[allow(clippy::cast_possible_truncation)]
         let worst_case = Duration::seconds(worst_case_seconds as i64);
         assert!(max_past_skew() > worst_case, "{worst_case}");
+    }
+
+    /// §4.6, and a **destructive-write** guard rather than a tidiness one: W3's writer
+    /// assigns `col = EXCLUDED.col`, so an all-`None` reading at an instant that already
+    /// holds a real observation would erase its values.
+    #[tokio::test]
+    async fn an_empty_reading_is_refused_rather_than_erasing_a_row() {
+        let gate = gate(&[("satellite-a:backyard", 1)]);
+        let mut env = envelope("satellite-a:backyard", node(1), 1, &[1, 9], now());
+        env.reading = std::sync::Arc::new(mw_types::Reading {
+            time: env.observed_at,
+            station_id: "satellite-a:backyard".to_string(),
+            ..mw_types::Reading::default()
+        });
+        assert_eq!(
+            gate.check(&env, &leaf_peer(), now()),
+            Err(Reject::EmptyReading)
+        );
+        // One metric is enough, and it may be a non-numeric one -- which is the case a
+        // `METRICS`-walking implementation gets wrong.
+        let mut text_only = env.clone();
+        text_only.reading = std::sync::Arc::new(mw_types::Reading {
+            time: env.observed_at,
+            station_id: "satellite-a:backyard".to_string(),
+            extra_text1: Some("hail".to_string()),
+            ..mw_types::Reading::default()
+        });
+        assert_eq!(gate.check(&text_only, &leaf_peer(), now()), Ok(()));
+    }
+
+    /// A `seq` of zero is an encoder that omitted the field. Refused here, because the
+    /// dedup gate answers `Duplicate` for it -- which the sender would read as `ACK_OK`
+    /// and advance over everything it had ever sent.
+    #[tokio::test]
+    async fn a_zero_sequence_number_is_refused_rather_than_deduplicated() {
+        let gate = gate(&[("satellite-a:backyard", 1)]);
+        let env = envelope("satellite-a:backyard", node(1), 0, &[1, 9], now());
+        assert_eq!(
+            gate.check(&env, &leaf_peer(), now()),
+            Err(Reject::BadSequence)
+        );
+        assert!(
+            !Reject::BadSequence.is_transient(),
+            "a sender whose encoder omits `seq` must be allowed to drain rather than \
+             stall for ever"
+        );
     }
 
     #[test]

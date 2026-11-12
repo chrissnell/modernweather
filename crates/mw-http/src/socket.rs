@@ -372,8 +372,11 @@ impl Bound {
             let rx = signal.clone();
             async move {
                 match self.grpc {
+                    // **With connect info here too**, even though there is no chain to
+                    // report: what a handler needs is "this arrived on the ingest socket",
+                    // and the struct's presence is that fact. See [`PeerCerts::tls`].
                     Either::Plain(listener, addr) => {
-                        serve_one(listener, router, addr, wait(rx)).await
+                        serve_with_peer_certs(listener, router, addr, wait(rx)).await
                     }
                     // **With connect info, and only here.** The handler that reads
                     // [`PeerCerts`] is `ingest:grpc`'s, the chain only exists on a socket
@@ -448,13 +451,18 @@ impl Bound {
 /// socket has a certificate chain to report. The main socket deliberately does **not** get
 /// this: it is `with_no_client_auth`, so the slot would always be empty and an empty slot
 /// that exists is harder to reason about than one that does not.
-async fn serve_with_peer_certs<F>(
-    listener: TlsListener,
+async fn serve_with_peer_certs<L, F>(
+    listener: L,
     router: Router,
     addr: SocketAddr,
     shutdown: F,
 ) -> Result<(), HttpError>
 where
+    L: axum::serve::Listener,
+    L::Addr: std::fmt::Debug,
+    // Higher-ranked: `axum` constructs an `IncomingStream` per connection, borrowed for
+    // that connection, so the bound has to hold for **any** lifetime rather than for one.
+    PeerCerts: for<'a> axum::extract::connect_info::Connected<axum::serve::IncomingStream<'a, L>>,
     F: Future<Output = ()> + Send + 'static,
 {
     axum::serve(
@@ -643,6 +651,7 @@ pub struct LazyTls {
 pub struct PeerCerts {
     chain: Arc<OnceLock<Arc<Vec<CertificateDer<'static>>>>>,
     remote: SocketAddr,
+    tls: bool,
 }
 
 impl Default for PeerCerts {
@@ -652,6 +661,7 @@ impl Default for PeerCerts {
         Self {
             chain: Arc::new(OnceLock::new()),
             remote: SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+            tls: false,
         }
     }
 }
@@ -680,6 +690,25 @@ impl PeerCerts {
     pub fn remote(&self) -> SocketAddr {
         self.remote
     }
+
+    /// Whether this connection completed a TLS handshake.
+    ///
+    /// **The reason this is a field and not "`leaf()` is `Some`".** A `psk` ingest socket
+    /// asks for no client certificate, and an ingest socket an operator has explicitly
+    /// opted into running in plaintext (W7 **D-35**) has no handshake at all — so on both
+    /// of those `leaf()` is `None` and the connection is still one a peer is allowed to
+    /// make. What a handler actually needs to know is **which socket this arrived on**, and
+    /// the presence of this whole struct in `ConnectInfo` is that fact: it is installed on
+    /// the gRPC socket and on no other, TLS or not. This flag is the second half — "and it
+    /// was encrypted" — which is what lets `mw_collector` refuse the two `mtls-*` kinds on
+    /// a plaintext socket while letting `psk` through.
+    ///
+    /// Inferring the socket from `leaf().is_some()` was the first version and it made
+    /// D-35's documented escape hatch non-functional: every peer, `psk` included, was
+    /// refused on a plaintext ingest socket while the startup warning said the opposite.
+    pub fn tls(&self) -> bool {
+        self.tls
+    }
 }
 
 impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsListener>>
@@ -688,7 +717,26 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsL
     fn connect_info(stream: axum::serve::IncomingStream<'_, TlsListener>) -> Self {
         let mut info = stream.io().certs.clone();
         info.remote = *stream.remote_addr();
+        info.tls = true;
         info
+    }
+}
+
+/// The same report for a **plaintext** connection: no chain, and `tls()` is `false`.
+///
+/// Installed on the gRPC socket when it has no TLS, which is W7 **D-35**'s explicit
+/// opt-out. Without it that socket reported nothing at all and `mw_collector` could not
+/// tell "arrived over the ingest port with no encryption" from "arrived over the website's
+/// port", so it refused both — see [`PeerCerts::tls`].
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TcpListener>>
+    for PeerCerts
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, TcpListener>) -> Self {
+        Self {
+            chain: Arc::new(OnceLock::new()),
+            remote: *stream.remote_addr(),
+            tls: false,
+        }
     }
 }
 

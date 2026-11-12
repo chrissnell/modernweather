@@ -32,5 +32,5 @@ mod envelope;
 mod reading;
 pub mod wire;
 
-pub use envelope::EnvelopeError;
+pub use envelope::{EnvelopeError, MAX_STATION_KEY};
 pub use reading::WireError;

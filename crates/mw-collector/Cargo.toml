@@ -50,10 +50,11 @@ rustls-pemfile.workspace = true
 # `only-mw-http-binds-a-socket` rule names `tonic::transport::Server`, and this is
 # `Channel`.
 tower.workspace = true
-# `peers.auth_material`'s PSK hash is Argon2id and the comparison is constant-time
-# (**D-33**).
+# `peers.auth_material`'s PSK hash is Argon2id, and the comparison inside
+# `Argon2::verify_password` is `password-hash`'s own constant-time one (**D-33**) -- which
+# is why `subtle` is NOT declared here: it would be a row in a D-32-governed manifest for a
+# comparison this crate does not write itself.
 argon2.workspace = true
-subtle.workspace = true
 secrecy.workspace = true
 
 [dev-dependencies]

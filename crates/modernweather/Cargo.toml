@@ -64,6 +64,11 @@ rustls.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]
+# `Status::unimplemented` for the Go-era collector `tests/collector_two_node.rs` stands up:
+# a gRPC server answers `Unimplemented` for a method it does not register, and `axum`'s own
+# fallback answers an HTTP 404 that `tonic` cannot read as a status at all -- so a test that
+# used the router's default fallback would exercise a shape no Go daemon produces.
+tonic.workspace = true
 # `Router::new()` for the probe in `tests/boot.rs` that asks `mw_http::bind` for two free
 # ports -- `ci/layers.toml` reserves binding for `mw-http` and scans `tests/`, so the probe
 # has to go through the real `bind` and therefore needs a router to hand it.

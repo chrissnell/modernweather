@@ -137,6 +137,18 @@ pub fn register() {
         "Envelopes `Envelope::forward` refused. NON-ZERO IS A BUG IN THIS CODE (W7 D-41)"
     );
     metrics::describe_counter!(
+        "mw_uplink_resume_skipped_total",
+        "Envelopes not re-sent because HelloAck.known_through already covered them"
+    );
+    metrics::describe_counter!(
+        "mw_uplink_path_full_total",
+        "Envelopes `forward` refused at the hop bound. W7 D-8's bound, NOT D-41's bug"
+    );
+    metrics::describe_counter!(
+        "mw_uplink_rejected_total",
+        "Envelopes a collector acknowledged as refused, per uplink"
+    );
+    metrics::describe_counter!(
         "mw_uplink_reconnects_total",
         "Connections established, per uplink"
     );
@@ -200,6 +212,9 @@ pub fn arm_uplink(peer: &PeerName) {
         "mw_uplink_batches_sent_total",
         "mw_uplink_envelopes_sent_total",
         "mw_uplink_filtered_total",
+        "mw_uplink_resume_skipped_total",
+        "mw_uplink_path_full_total",
+        "mw_uplink_rejected_total",
         "mw_uplink_loop_refused_total",
         "mw_uplink_reconnects_total",
         "mw_uplink_duplicates_acked_total",
@@ -266,6 +281,36 @@ pub fn filtered(peer: &PeerName, envelopes: u64) {
 /// has a meaning when it moves.
 pub fn loop_refused(peer: &PeerName, envelopes: u64) {
     metrics::counter!("mw_uplink_loop_refused_total", "peer" => peer.as_str().to_string())
+        .increment(envelopes);
+}
+
+/// Envelopes the fast-resume skip did not re-send, because `known_through` covered them
+/// (§4.2).
+///
+/// Separate from [`filtered`]: a filtered envelope was never for this peer, and a skipped
+/// one was for it and had already arrived. The two together are "not sent"; one is a
+/// topology fact and the other is a lost ack.
+pub fn resume_skipped(peer: &PeerName, envelopes: u64) {
+    metrics::counter!("mw_uplink_resume_skipped_total", "peer" => peer.as_str().to_string())
+        .increment(envelopes);
+}
+
+/// `Envelope::forward` refused because the path is at `MAX_PATH` (W7 **D-8**).
+///
+/// **Not** [`loop_refused`], and the separation is the point: this is the hop bound
+/// working, where that one is documented as "a bug in this code".
+pub fn path_full(peer: &PeerName, envelopes: u64) {
+    metrics::counter!("mw_uplink_path_full_total", "peer" => peer.as_str().to_string())
+        .increment(envelopes);
+}
+
+/// Envelopes a collector acknowledged as refused (`IngestAck.rejected`).
+///
+/// **Counted on every status, not only on `ACK_REJECTED`.** A batch of 256 where 255 were
+/// spooled and one was refused answers `ACK_OK`, so without this series that one envelope
+/// is lost at the collector with nothing on the sending side saying so.
+pub fn rejected_by_collector(peer: &PeerName, envelopes: u64) {
+    metrics::counter!("mw_uplink_rejected_total", "peer" => peer.as_str().to_string())
         .increment(envelopes);
 }
 

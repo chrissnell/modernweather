@@ -163,9 +163,29 @@ pub enum Reject {
     /// `relay = false` is the default, so this is what a leaf trying to inject history for
     /// another station reaches.
     UnauthorizedOrigin,
-    /// `observed_at` is outside the skew window: more than `max_future_skew` ahead of this
-    /// node's clock, or more than `max_past_skew` behind it (W7 §4.6).
+    /// `observed_at` is more than `max_future_skew` **ahead** of this node's clock
+    /// (W7 §4.6).
+    ///
+    /// Transient, and that is the direction that matters: a collector whose own clock is
+    /// fast refuses every envelope in the fleet, and the condition clears the moment NTP
+    /// corrects it.
     ClockSkew,
+    /// `observed_at` is more than `max_past_skew` **behind** this node's clock (W7 §4.6).
+    ///
+    /// **Separate from [`Reject::ClockSkew`] because the two edges have opposite
+    /// permanence.** Time moves away from the past edge and never back towards it, so an
+    /// envelope that is already too old will never be young enough — treating it as
+    /// transient would guarantee a stall until `[spool].max_lag` abandoned the sender's
+    /// cursor, which is the one outcome worse than a counted rejection. The window is
+    /// thirty days, chosen above both `max_lag` and the worst-case ceiling, so reaching
+    /// this means a spool that outlived its own retention.
+    TooOld,
+    /// `seq` is zero, which `mw_types::Seq::FIRST` makes impossible for an honest encoder.
+    ///
+    /// Its own variant rather than `MalformedPath`, because the metric label and the log
+    /// field are what an operator chases: `malformed_path` on an envelope whose path is
+    /// perfectly well formed sends them to the wrong place.
+    BadSequence,
     /// The provenance path is longer than `PathSet::MAX_HOPS` (W7 **D-8**).
     PathTooLong,
     /// The provenance path is not something an honest encoder produces — the origin is not
@@ -188,6 +208,62 @@ pub enum Reject {
 }
 
 impl Reject {
+    /// Whether re-sending the same bytes could ever get a different answer.
+    ///
+    /// **The question is whose state the verdict depends on.** A verdict that is a function
+    /// of the envelope's own bytes — a forged path, a hop that repeats, a reading with no
+    /// metric — is the same verdict for ever, on this node and on every other. A verdict
+    /// that is also a function of **this node's** state — a station it has no row for yet,
+    /// an origin grant an operator has not written, a clock that is wrong, an intern table
+    /// that is full — changes the moment that state does.
+    ///
+    /// # Why this distinction is load-bearing and not taxonomy
+    ///
+    /// A collector's ack is cumulative in the sender's log, so acknowledging a batch tells
+    /// the sender it may advance **past** every envelope in it. Doing that for a transient
+    /// refusal destroys real observations and reports success while doing it:
+    ///
+    /// - a collector whose clock is ten minutes fast refuses *every* envelope from *every*
+    ///   satellite as [`Reject::ClockSkew`]. If that advances the senders' cursors, then by
+    ///   the time NTP corrects the clock the fleet's readings for that window are gone from
+    ///   every spool in it. One wrong clock on one machine, permanent fleet-wide loss.
+    /// - a station added to a running satellite is not in the collector's
+    ///   `config.stations` until the next `Hello`, so its readings are
+    ///   [`Reject::UnknownStation`] until then.
+    /// - [`Reject::OriginTableFull`] is a capacity condition by construction.
+    ///
+    /// Treating a reason as transient costs a **stall**, and a stall is bounded: the
+    /// sender's cursor stays put, its spool fills, and `[spool].max_lag` abandons the cursor
+    /// with a counted, named gap (W7 **D-16**). Treating one as permanent costs silent loss
+    /// with no counter anywhere. So the safe default is transient, and only a reason that is
+    /// provably a property of the bytes answers `false`.
+    pub const fn is_transient(self) -> bool {
+        match self {
+            // Properties of this node's configuration or state.
+            Reject::UnknownStation
+            | Reject::Disabled
+            | Reject::UnauthorizedPeer
+            | Reject::Revoked
+            | Reject::UnauthorizedOrigin
+            | Reject::BadSecret
+            | Reject::ClockSkew
+            | Reject::OriginTableFull => true,
+            // Properties of the envelope's own bytes. No configuration change makes these
+            // acceptable, and re-reading them cannot produce a different answer.
+            Reject::PathTooLong
+            | Reject::MalformedPath
+            | Reject::NotAddressedHere
+            | Reject::Loop
+            | Reject::PathForged
+            | Reject::BatchTooLarge
+            | Reject::EmptyReading
+            | Reject::BadSequence
+            // Time only moves away from the past edge, so an envelope already too old will
+            // never be young enough. Transient here would mean a guaranteed stall.
+            | Reject::TooOld => false,
+        }
+    }
+
     /// The metric label and log field for this reason.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -198,6 +274,8 @@ impl Reject {
             Reject::Revoked => "revoked",
             Reject::UnauthorizedOrigin => "unauthorized_origin",
             Reject::ClockSkew => "clock_skew",
+            Reject::TooOld => "too_old",
+            Reject::BadSequence => "bad_sequence",
             Reject::PathTooLong => "path_too_long",
             Reject::MalformedPath => "malformed_path",
             Reject::NotAddressedHere => "not_addressed_here",
@@ -219,6 +297,8 @@ impl Reject {
         Reject::Revoked,
         Reject::UnauthorizedOrigin,
         Reject::ClockSkew,
+        Reject::TooOld,
+        Reject::BadSequence,
         Reject::PathTooLong,
         Reject::MalformedPath,
         Reject::NotAddressedHere,
@@ -611,9 +691,48 @@ mod tests {
         }
         assert_eq!(
             Reject::ALL.len(),
-            15,
+            17,
             "a new Reject variant needs a line in ALL"
         );
+    }
+
+    /// The split is exhaustive by construction — `is_transient` is a total `match` — but
+    /// the *direction* of each answer is a decision, so each one is pinned.
+    #[test]
+    fn only_a_property_of_the_bytes_is_permanent() {
+        for reason in [
+            Reject::UnknownStation,
+            Reject::Disabled,
+            Reject::UnauthorizedPeer,
+            Reject::Revoked,
+            Reject::UnauthorizedOrigin,
+            Reject::BadSecret,
+            Reject::ClockSkew,
+            Reject::OriginTableFull,
+        ] {
+            assert!(
+                reason.is_transient(),
+                "{reason} is a function of this node's state, so acknowledging past it \
+                 would destroy observations a later configuration would have accepted"
+            );
+        }
+        for reason in [
+            Reject::PathTooLong,
+            Reject::MalformedPath,
+            Reject::NotAddressedHere,
+            Reject::Loop,
+            Reject::PathForged,
+            Reject::BatchTooLarge,
+            Reject::EmptyReading,
+            Reject::BadSequence,
+            Reject::TooOld,
+        ] {
+            assert!(
+                !reason.is_transient(),
+                "{reason} is a property of the envelope's bytes, so a sender that kept \
+                 re-sending it would never drain"
+            );
+        }
     }
 
     #[test]

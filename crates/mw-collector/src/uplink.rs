@@ -69,7 +69,7 @@ use mw_component::{
     ConfigDigest, Cx, OnReading, PeerName, ReadingBatch, ReadingFilter, ReadingPolicy, Trigger,
 };
 use mw_proto::wire::collector::v1 as pb;
-use mw_types::{Class, Classify, DisplayChain, Envelope, OriginId, Seq};
+use mw_types::{Class, Classify, DisplayChain, Envelope, ForwardRefused, OriginId, Seq};
 use secrecy::{ExposeSecret, SecretString};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tracing::{debug, error, info, warn};
@@ -199,10 +199,23 @@ pub enum UplinkError {
 }
 
 impl Classify for UplinkError {
+    /// **What this classification reaches, and what it does not.**
+    ///
+    /// `Fatal` here does not make the supervisor stop retrying, and saying so matters
+    /// because the first version of this comment claimed it did.
+    /// `ComponentError::Tick` is `Class::RETRYABLE` unconditionally and its own
+    /// documentation explains why — the boxed source's `Classify` is not reachable through
+    /// `dyn Error`, and the supervisor's answer to a failed occurrence is the same either
+    /// way: record it, count it, and the next occurrence *is* the retry (W2a Decision 29).
+    ///
+    /// So this impl earns its keep where the concrete type is still known: the log line, a
+    /// test, and the two errors below that are produced at **build** time, where
+    /// `BuildError` does carry a classification. A malformed endpoint is one of those —
+    /// which is why it is parsed in [`Uplink::build`] and not on the connect path.
     fn class(&self) -> Class {
         match self {
-            // A configuration mistake. `Fatal` so the component stays `Failed` and an
-            // operator sees it, rather than retrying a URL that will never parse.
+            // A configuration mistake no retry fixes. Reachable only from `build`, where
+            // the classification is read.
             UplinkError::Address { .. } | UplinkError::NoPosition => Class::Fatal,
             // A credential that cannot be read is a `Backoff`, not a `Fatal`: the usual
             // cause is a certificate being rotated under the process.
@@ -277,7 +290,17 @@ pub struct Identity {
 pub struct Uplink {
     peer: PeerName,
     peer_node: OriginId,
+    /// The endpoint as configured, for every message that names it.
     endpoint: String,
+    /// The same endpoint, **parsed once at build** rather than per connect.
+    ///
+    /// A URL `tonic` will not dial is a configuration mistake no retry fixes, and `build`
+    /// is the one place a classification is read (`Classify for UplinkError`) — so parsing
+    /// here turns it into a `BuildError::Resource` with the reason in
+    /// `ComponentStatus::last_error`, which is where an unreadable certificate already
+    /// lands. On the connect path it would have been a `Tick` failure indistinguishable
+    /// from a collector that was merely down.
+    dial: Endpoint,
     credentials: Credentials,
     identity: Identity,
     require_ack: bool,
@@ -289,7 +312,7 @@ pub struct Uplink {
     /// Built lazily rather than in `build`, so that a collector that is down does not stop
     /// the component from starting: a satellite whose link is down must still admit and
     /// spool its own readings, which is the entire point of the spool.
-    session: Option<Session>,
+    session: Option<Link>,
     /// `known_through` from the most recent `HelloAck`, for the fast-resume skip (§4.2).
     known_through: Vec<(OriginId, Seq)>,
 }
@@ -325,14 +348,42 @@ impl fmt::Debug for Credentials {
     }
 }
 
-/// One open connection: the ingest stream, and what the collector said at `Hello`.
-struct Session {
-    /// The sender half of the request stream.
-    batches: tokio::sync::mpsc::Sender<pb::IngestBatch>,
-    /// The ack stream.
-    acks: tonic::Streaming<pb::IngestAck>,
-    /// Whether the collector supports `Hello` at all (§9.3).
-    acked: bool,
+/// One open connection, in one of the two shapes a collector can be.
+///
+/// An enum rather than a flag, because the two shapes have **nothing in common**: one holds
+/// a bidirectional stream and waits for acks, and the other opens a fresh client-streaming
+/// call per batch and has no ack to wait for. A `bool` beside one set of fields is how a
+/// fallback comes to share a send path it cannot use -- which is exactly the defect this
+/// enum replaced: the first version set `acked = false` and then opened `Ingest` anyway, a
+/// method the collector that had just answered `UNIMPLEMENTED` for `Hello` does not
+/// implement either.
+enum Link {
+    /// A collector that speaks `collector.v1.Collector`: one `Ingest` stream for the life
+    /// of the connection, and `through` acknowledged per batch.
+    Acked {
+        /// The sender half of the request stream.
+        batches: tokio::sync::mpsc::Sender<pb::IngestBatch>,
+        /// The ack stream.
+        acks: tonic::Streaming<pb::IngestAck>,
+    },
+    /// A **Go-era** collector (§9.3): `WeatherV1.SendWeatherReadings`, one call per batch.
+    ///
+    /// At-most-once, and the cursor advances when the call returns rather than when
+    /// anything is durable -- because there is nothing on that wire that says it is. The
+    /// `Empty` the method answers with is confirmation that the stream was accepted and
+    /// nothing more, which is still better than the fire-and-forget the Go satellite does
+    /// today and is the most the frozen method can offer.
+    Compat {
+        /// The channel, re-used across batches. Each batch is its own RPC on it.
+        channel: Channel,
+    },
+}
+
+impl Link {
+    /// Whether this link acknowledges durability.
+    const fn is_acked(&self) -> bool {
+        matches!(self, Link::Acked { .. })
+    }
 }
 
 impl Uplink {
@@ -364,6 +415,28 @@ impl Uplink {
                 ca: read("tls_ca_path", row.tls_ca_path.as_deref())?,
             },
         };
+        let mut dial = Endpoint::from_shared(row.endpoint.clone())
+            .map_err(|e| UplinkError::Address {
+                endpoint: row.endpoint.clone(),
+                why: e.to_string(),
+            })?
+            .connect_timeout(CONNECT_TIMEOUT)
+            .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+            // Without this a keepalive is only sent while a stream is open, and the gap it
+            // exists to close is precisely a satellite with nothing to send.
+            .keep_alive_while_idle(true);
+        if let Credentials::Mtls { cert, key, ca } = &credentials {
+            let tls = ClientTlsConfig::new()
+                .ca_certificate(tonic::transport::Certificate::from_pem(ca.clone()))
+                .identity(tonic::transport::Identity::from_pem(
+                    cert.clone(),
+                    key.clone(),
+                ));
+            dial = dial
+                .tls_config(tls)
+                .map_err(|source| UplinkError::Tls { source })?;
+        }
         let peer = PeerName::new(row.peer_name.as_str());
         m::arm_uplink(&peer);
         m::uplink_state(&peer, UplinkState::Disconnected);
@@ -371,6 +444,7 @@ impl Uplink {
             peer,
             peer_node: row.peer_node,
             endpoint: row.endpoint.clone(),
+            dial,
             credentials,
             identity,
             require_ack: row.require_ack,
@@ -384,29 +458,7 @@ impl Uplink {
     /// Dial, handshake and `Hello`. The three states before `Streaming`.
     async fn connect(&mut self) -> Result<(), UplinkError> {
         m::uplink_state(&self.peer, UplinkState::Connecting);
-        let mut endpoint = Endpoint::from_shared(self.endpoint.clone())
-            .map_err(|e| UplinkError::Address {
-                endpoint: self.endpoint.clone(),
-                why: e.to_string(),
-            })?
-            .connect_timeout(CONNECT_TIMEOUT)
-            .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
-            .keep_alive_timeout(KEEPALIVE_TIMEOUT)
-            // Without this a keepalive is only sent while a stream is open, and the gap
-            // this exists to close is precisely a satellite with nothing to send.
-            .keep_alive_while_idle(true);
-        if let Credentials::Mtls { cert, key, ca } = &self.credentials {
-            let tls = ClientTlsConfig::new()
-                .ca_certificate(tonic::transport::Certificate::from_pem(ca.clone()))
-                .identity(tonic::transport::Identity::from_pem(
-                    cert.clone(),
-                    key.clone(),
-                ));
-            endpoint = endpoint
-                .tls_config(tls)
-                .map_err(|source| UplinkError::Tls { source })?;
-        }
-        let channel = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect())
+        let channel = tokio::time::timeout(CONNECT_TIMEOUT, self.dial.connect())
             .await
             .map_err(|_| UplinkError::Timeout {
                 endpoint: self.endpoint.clone(),
@@ -418,9 +470,14 @@ impl Uplink {
             })?;
 
         m::uplink_state(&self.peer, UplinkState::Hello);
-        let acked = self.hello(channel.clone()).await?;
-        let session = self.open_stream(channel, acked).await?;
-        self.session = Some(session);
+        let link = if self.hello(channel.clone()).await? {
+            self.open_stream(channel).await?
+        } else {
+            // §9.3: a collector with no `Hello` has no `Ingest` either, so there is no
+            // stream to open. The channel is kept and each batch is its own RPC on it.
+            Link::Compat { channel }
+        };
+        self.session = Some(link);
         m::reconnected(&self.peer);
         m::uplink_state(&self.peer, UplinkState::Streaming);
         Ok(())
@@ -473,6 +530,14 @@ impl Uplink {
             // §9.3: a Go-era collector has no `Hello`. The uplink falls back to the compat
             // method and is at-most-once, which is **logged on every connection and
             // exported** rather than being a silent downgrade.
+            //
+            // **`UNIMPLEMENTED` and nothing else.** That is what a gRPC server answers for
+            // a method it does not register -- `grpc-go`'s does, and so does `tonic`'s --
+            // and it is the only signal that means "this is a collector, and it is older
+            // than me". A bare HTTP `404` is deliberately **not** treated the same way:
+            // it is what an endpoint pointed at the wrong server answers, and reporting a
+            // wrong address as a degraded link would hide a configuration mistake behind a
+            // gauge that says "working, slowly".
             Err(status) if status.code() == tonic::Code::Unimplemented => {
                 if self.require_ack {
                     return Err(UplinkError::Hello {
@@ -515,11 +580,11 @@ impl Uplink {
     }
 
     /// Open the `Ingest` stream over a connection that has said hello.
-    async fn open_stream(&self, channel: Channel, acked: bool) -> Result<Session, UplinkError> {
+    async fn open_stream(&self, channel: Channel) -> Result<Link, UplinkError> {
         // **At most 8 batches in flight unacked** (W7 **D-24**), which is what bounds the
         // memory a slow collector can cost a satellite -- the backpressure the current
         // unbounded `stream.Send` lacks. The channel's own capacity is that bound.
-        let (tx, rx) = tokio::sync::mpsc::channel::<pb::IngestBatch>(MAX_IN_FLIGHT_BATCHES);
+        let (tx, rx) = tokio::sync::mpsc::channel::<pb::IngestBatch>(REQUEST_CHANNEL);
         let mut grpc = tonic::client::Grpc::new(channel);
         grpc.ready().await.map_err(|source| UplinkError::Connect {
             endpoint: self.endpoint.clone(),
@@ -537,11 +602,7 @@ impl Uplink {
                 status: Box::new(status),
             })?
             .into_inner();
-        Ok(Session {
-            batches: tx,
-            acks,
-            acked,
-        })
+        Ok(Link::Acked { batches: tx, acks })
     }
 
     /// One request, carrying the metadata layer 2 resolves a `psk` peer from.
@@ -572,105 +633,246 @@ impl Uplink {
     /// One batch: filter, forward, send, wait for the ack.
     async fn deliver(&mut self, batch: &ReadingBatch) -> Result<(), UplinkError> {
         let through = batch.through().ok_or(UplinkError::NoPosition)?;
-        if self.session.is_none() {
-            self.connect().await?;
+        // **Staged before the connection is dialled**, and the order is W7 **D-9**: a batch
+        // in which every envelope is for this peer already has nothing to send, so it must
+        // advance the cursor *whether or not the peer is reachable*. Dialling first made
+        // that advance depend on a collector that is down -- which is precisely the stall
+        // D-9 exists to forbid, reached from the one direction nobody looks at.
+        let staged = self.stage(batch.envelopes());
+        if staged.filtered > 0 {
+            m::filtered(&self.peer, staged.filtered);
         }
-        let (staged, filtered, refused) = self.stage(batch.envelopes());
-        if filtered > 0 {
-            m::filtered(&self.peer, filtered);
+        if staged.skipped > 0 {
+            // §4.2's advisory fast resume: the collector's `known_through` said it already
+            // had these. Counted as duplicates-avoided rather than as filtered, because
+            // they were for this peer and would have been deduplicated at the far end.
+            m::resume_skipped(&self.peer, staged.skipped);
         }
-        if refused > 0 {
+        if staged.path_full > 0 {
+            // W7 **D-8**'s counted rejection, and **not** D-41's bug signal: a path at
+            // `MAX_PATH` is a legitimate eight-hop topology refusing a ninth, which is the
+            // bound working. Counted separately so that `uplink_loop_refused_total` keeps
+            // the one meaning it is documented to have.
+            m::path_full(&self.peer, staged.path_full);
+            warn!(
+                peer = %self.peer,
+                refused = staged.path_full,
+                max_hops = mw_types::PathSet::MAX_HOPS,
+                "`forward` refused envelopes already at the hop bound, so they are not \
+                 forwarded to this peer. The cursor advances over them; a topology this \
+                 deep needs a shorter route rather than a larger bound."
+            );
+        }
+        if staged.loop_refused > 0 {
             // **Non-zero is a bug in this code** (W7 **D-41**): the filter should have
             // caught it and the invariant did. Said at `ERROR` as well as counted, because
             // the counter's whole meaning is that it does not move.
-            m::loop_refused(&self.peer, refused);
+            m::loop_refused(&self.peer, staged.loop_refused);
             error!(
                 peer = %self.peer,
-                refused,
+                refused = staged.loop_refused,
                 "`Envelope::forward` refused envelopes the `NotFrom(peer)` filter should \
                  have skipped. This is a bug in the uplink, not a configuration problem \
                  (W7 D-41): the cursor advances over them so nothing stalls, but the two \
                  guards disagree and one of them is wrong."
             );
         }
-        if staged.is_empty() {
-            // Every envelope was filtered or refused. **The cursor still advances**, which
-            // is W7 **D-9** and is the part that is easy to get wrong: a cursor that stalls
-            // on an envelope it will never send stalls for ever, the spool never reclaims,
-            // and `max_lag` eventually abandons the cursor -- so a mutual uplink would
-            // present as a disk filling up. Returning `Ok` is what advances it.
+        if staged.envelopes.is_empty() {
+            // Nothing to send. **The cursor still advances**, which is W7 **D-9** and is the
+            // part that is easy to get wrong: a cursor that stalls on an envelope it will
+            // never send stalls for ever, the spool never reclaims, and `max_lag` eventually
+            // abandons the cursor -- so a mutual uplink would present as a disk filling up.
+            // Returning `Ok` is what advances it.
             debug!(
                 peer = %self.peer,
                 through = through.get(),
-                "every envelope in this batch was for this peer already; the cursor \
-                 advances over them without sending"
+                filtered = staged.filtered,
+                skipped = staged.skipped,
+                "this batch had nothing to send to this peer; the cursor advances over it"
             );
             return Ok(());
         }
 
-        let envelopes = staged.len();
+        if self.session.is_none() {
+            self.connect().await?;
+        }
+        let envelopes = staged.envelopes.len();
+        match self.session.as_ref().map(Link::is_acked) {
+            Some(true) => self.deliver_acked(staged.envelopes, through).await,
+            // §9.3, and the cost is stated where it is paid: at-most-once.
+            Some(false) => self.deliver_compat(staged.envelopes).await,
+            None => Err(UplinkError::Unacknowledged { envelopes }),
+        }
+    }
+
+    /// The ordinary path: one `IngestBatch` on the open stream, then its ack.
+    async fn deliver_acked(
+        &mut self,
+        envelopes: Vec<pb::Envelope>,
+        through: Seq,
+    ) -> Result<(), UplinkError> {
+        let count = envelopes.len();
         let message = pb::IngestBatch {
-            envelopes: staged,
+            envelopes,
             through: through.get(),
             sender_depth: self.depth(),
         };
-        let session = self
-            .session
-            .as_mut()
-            .expect("a session was established above");
-        if session.batches.send(message).await.is_err() {
+        let Some(Link::Acked { batches, .. }) = self.session.as_mut() else {
+            return Err(UplinkError::Unacknowledged { envelopes: count });
+        };
+        if batches.send(message).await.is_err() {
             // The request stream was closed under us, which means the connection is gone.
             self.drop_session();
-            return Err(UplinkError::Unacknowledged { envelopes });
+            return Err(UplinkError::Unacknowledged { envelopes: count });
         }
-        m::sent(&self.peer, envelopes as u64);
-        if !session.acked {
-            // §9.3: there is no ack to wait for, so the cursor advances **on send** and
-            // this uplink is at-most-once -- exactly as the Go satellite is today.
-            m::unacked(&self.peer, 0);
-            return Ok(());
+        m::sent(&self.peer, count as u64);
+        self.await_ack(count, through).await
+    }
+
+    /// §9.3: one `WeatherV1.SendWeatherReadings` call against a Go-era collector.
+    ///
+    /// **At-most-once, and the cursor advances when the call returns.** There is no ack on
+    /// that wire -- the method answers one `Empty` at end of stream and says nothing about
+    /// durability -- so what returning `Ok` here means is "the collector accepted the
+    /// stream", which is the most the frozen method can offer. `uplink_degraded` is already
+    /// set for the life of the connection, so the downgrade is a number and not only a log
+    /// line.
+    ///
+    /// One call per batch rather than one for the life of the connection, deliberately: a
+    /// single long-lived call would make the end-of-stream `Empty` arrive once, at
+    /// shutdown, and every batch before it would be fire-and-forget with no confirmation at
+    /// all. Per batch, a collector that has gone away is noticed on the next batch rather
+    /// than at the next restart.
+    async fn deliver_compat(&mut self, envelopes: Vec<pb::Envelope>) -> Result<(), UplinkError> {
+        let count = envelopes.len();
+        let Some(Link::Compat { channel }) = self.session.as_ref() else {
+            return Err(UplinkError::Unacknowledged { envelopes: count });
+        };
+        // Decoded back to the domain type and re-encoded as the Go message. The round trip
+        // is not free and is not avoidable: the two schemas are different messages, and the
+        // envelope on the spool is the collector one (W7 **D-11**).
+        let mut readings = Vec::with_capacity(count);
+        for wire in &envelopes {
+            match mw_types::Envelope::try_from(wire) {
+                Ok(envelope) => readings.push(crate::wire::compat_reading(&envelope)),
+                Err(e) => {
+                    // An envelope this node staged itself and cannot decode is a bug here,
+                    // not a peer's malformed input -- so it is loud, and it is dropped
+                    // rather than failing the batch, because the alternative is a cursor
+                    // that never moves past it.
+                    error!(
+                        peer = %self.peer,
+                        error = %DisplayChain(&e),
+                        "an envelope this uplink staged did not re-decode, so it is not \
+                         forwarded. This is a bug in this code."
+                    );
+                }
+            }
         }
-        self.await_ack(envelopes, through).await
+        let mut grpc = tonic::client::Grpc::new(channel.clone());
+        grpc.ready().await.map_err(|source| UplinkError::Connect {
+            endpoint: self.endpoint.clone(),
+            source,
+        })?;
+        let path = http::uri::PathAndQuery::from_static(crate::wire::SEND_WEATHER_READINGS);
+        let sent = readings.len();
+        grpc.client_streaming(
+            self.request(ReadingStream {
+                readings: readings.into_iter(),
+            }),
+            path,
+            crate::wire::CompatCodec,
+        )
+        .await
+        .map_err(|status| {
+            self.drop_session();
+            UplinkError::Stream {
+                status: Box::new(status),
+            }
+        })?;
+        m::sent(&self.peer, sent as u64);
+        // Nothing is outstanding, because nothing was ever promised.
+        m::unacked(&self.peer, 0);
+        m::ack_lag(&self.peer, 0.0);
+        Ok(())
     }
 
     /// Wait for the ack that covers `through`.
+    ///
+    /// **Only `ACK_OK` and `ACK_REJECTED` advance anything**, which is `IngestAck.through`'s
+    /// own contract: on any other status the field carries the last position that *was*
+    /// acknowledged on this stream, and taking it as a cursor position would rewind the
+    /// sender rather than advance it.
     async fn await_ack(&mut self, envelopes: usize, through: Seq) -> Result<(), UplinkError> {
-        let session = self
-            .session
-            .as_mut()
-            .expect("a session was established by the caller");
         loop {
-            match session.acks.message().await {
+            let Some(Link::Acked { acks, .. }) = self.session.as_mut() else {
+                return Err(UplinkError::Unacknowledged { envelopes });
+            };
+            match acks.message().await {
                 Ok(Some(ack)) => {
                     if ack.duplicates > 0 {
                         m::duplicates_acked(&self.peer, u64::from(ack.duplicates));
                     }
-                    if ack.status == pb::AckStatus::AckResourceExhausted as i32 {
-                        // The cursor does **not** advance: returning `Err` is what leaves
-                        // it where it is, and the batch replays on the next attempt.
+                    if ack.rejected > 0 {
+                        // **On every status, not only on `ACK_REJECTED`.** A batch of 256
+                        // where 255 were spooled and one was refused answers `ACK_OK`, and
+                        // without this the one that was refused is lost at the collector
+                        // with nothing here saying so.
+                        m::rejected_by_collector(&self.peer, u64::from(ack.rejected));
                         warn!(
                             peer = %self.peer,
-                            "the collector's spool is at its ceiling, so this batch was \
-                             not spooled and will be re-sent"
+                            rejected = ack.rejected,
+                            status = ack.status,
+                            "the collector refused {} envelope(s) in a batch. Its \
+                             `mw_ingest_rejected_total{{peer, reason}}` says which clause; \
+                             the usual causes are a station it has no row for and two \
+                             clocks that disagree.",
+                            ack.rejected
+                        );
+                    }
+                    let status = ack.status;
+                    if status == pb::AckStatus::AckResourceExhausted as i32 {
+                        // **The cursor does not advance.** Returning `Err` is what leaves
+                        // it where it is, and the batch replays on the next attempt. Two
+                        // conditions share this status and both are the collector's own
+                        // state: its spool at the ceiling, or one of these envelopes
+                        // refused for a reason it can stop refusing (a clock, a station it
+                        // has no row for, an origin grant nobody wrote).
+                        warn!(
+                            peer = %self.peer,
+                            rejected = ack.rejected,
+                            "the collector could not take this batch and asked for it \
+                             again, so the cursor stays where it is and nothing is lost"
                         );
                         self.drop_session();
                         return Err(UplinkError::CollectorFull);
                     }
-                    if ack.status == pb::AckStatus::AckRejected as i32 {
-                        // `through` has advanced on the collector's side and these
-                        // envelopes will never be accepted, so the cursor must advance too
-                        // (W7 D-9). Loud, because the cause is always configuration: an
-                        // unknown station, a path this node forged, a clock out of the
-                        // window.
+                    if status == pb::AckStatus::AckRejected as i32 {
+                        // Every envelope was refused **permanently** -- a forged path, a
+                        // repeated hop, a reading with no metric -- so the cursor must
+                        // advance or it stalls for ever (W7 D-9). Loud, because the cause
+                        // is always this node's own encoder or configuration.
                         error!(
                             peer = %self.peer,
                             rejected = ack.rejected,
                             through = ack.through,
-                            "the collector REFUSED every envelope in a batch. These \
-                             readings are lost at that collector and will not be re-sent: \
-                             check that it has a station row for each key this node sends \
-                             and that the two clocks agree."
+                            "the collector refused every envelope in a batch as \
+                             PERMANENTLY unacceptable. These readings are lost at that \
+                             collector and will NOT be re-sent."
                         );
+                    } else if status != pb::AckStatus::AckOk as i32 {
+                        // `ACK_UNSPECIFIED`, or a status from a newer collector. Advancing
+                        // on a status this build does not understand is the one thing that
+                        // cannot be undone, so it does not.
+                        error!(
+                            peer = %self.peer,
+                            status,
+                            "the collector answered with an acknowledgement status this \
+                             build does not understand, so the batch is treated as \
+                             undelivered. The cursor stays where it is."
+                        );
+                        self.drop_session();
+                        return Err(UplinkError::Unacknowledged { envelopes });
                     }
                     if ack.through >= through.get() {
                         m::unacked(&self.peer, 0);
@@ -679,7 +881,6 @@ impl Uplink {
                     }
                     // A cumulative ack below our position: the collector is acknowledging
                     // an earlier batch, which happens when more than one is in flight.
-                    #[allow(clippy::cast_precision_loss)]
                     m::unacked(&self.peer, through.get().saturating_sub(ack.through));
                 }
                 // The collector closed the stream without acking. Nothing is lost -- the
@@ -698,35 +899,57 @@ impl Uplink {
         }
     }
 
-    /// The filter, the invariant, and the encode. §1.4's three lines.
-    fn stage(&self, envelopes: &[Envelope]) -> (Vec<pb::Envelope>, u64, u64) {
-        let mut staged = Vec::with_capacity(envelopes.len());
-        let mut filtered = 0u64;
-        let mut refused = 0u64;
+    /// The filter, the fast-resume skip, the invariant, and the encode. §1.4's three lines
+    /// plus §4.2's one.
+    fn stage(&self, envelopes: &[Envelope]) -> Staged {
+        let mut staged = Staged {
+            envelopes: Vec::with_capacity(envelopes.len()),
+            filtered: 0,
+            skipped: 0,
+            loop_refused: 0,
+            path_full: 0,
+        };
         for envelope in envelopes {
             // The filter, as an optimisation. The subscription already applies
             // `NotFrom(peer)`, so this fires only for an envelope that reached here by
             // another route -- and it is cheaper than the `forward` that would refuse it.
             if envelope.provenance.has_visited(self.peer_node) {
-                filtered += 1;
+                staged.filtered += 1;
+                continue;
+            }
+            // **§4.2's advisory fast resume.** `HelloAck.known_through` is the collector's
+            // per-origin high water, so an envelope at or below it is one the collector
+            // demonstrably already has -- the common case being an ack that was lost when
+            // the link dropped. Skipping it is an optimisation and nothing more: ignoring
+            // the vector entirely is correct (**D-23**) and costs only deduplicated
+            // resends, which is why this is a `<=` against a number the collector offered
+            // rather than any kind of state this node keeps.
+            if self.already_delivered(envelope) {
+                staged.skipped += 1;
                 continue;
             }
             // The invariant. `forward` inserts the **destination**, so the path the
             // collector receives already contains it -- which is what makes the receive
             // check's "addressed to me" clause exact (§2.1).
             match envelope.clone().forward(self.peer_node) {
-                Ok(forwarded) => staged.push(pb::Envelope::from(&forwarded)),
-                Err(e) => {
-                    refused += 1;
-                    debug!(
-                        peer = %self.peer,
-                        error = %DisplayChain(&e),
-                        "`forward` refused an envelope"
-                    );
-                }
+                Ok(forwarded) => staged.envelopes.push(pb::Envelope::from(&forwarded)),
+                // The two refusals mean different things and must not share a counter: a
+                // cycle is D-41's "a bug in this code", and a full path is D-8's counted
+                // bound doing its job.
+                Err(ForwardRefused::Loop { .. }) => staged.loop_refused += 1,
+                Err(ForwardRefused::PathFull { .. }) => staged.path_full += 1,
             }
         }
-        (staged, filtered, refused)
+        staged
+    }
+
+    /// Whether the collector's own `known_through` already covers this envelope (§4.2).
+    fn already_delivered(&self, envelope: &Envelope) -> bool {
+        let origin = envelope.provenance.origin();
+        self.known_through
+            .iter()
+            .find(|(known, _)| *known == origin)
+            .is_some_and(|(_, high)| envelope.provenance.seq() <= *high)
     }
 
     /// `IngestBatch.sender_depth` — envelopes still unsent in this node's spool (§7).
@@ -752,8 +975,66 @@ impl Uplink {
     }
 }
 
-/// At most 8 batches / 2048 envelopes in flight unacked (W7 **D-24**).
+/// What one call to [`Uplink::stage`] produced.
+///
+/// Five numbers rather than a tuple, because four of them are *different kinds of
+/// not-sent* and each has its own counter and its own meaning to an operator — a tuple of
+/// `u64`s is how `path_full` came to be counted as a loop refusal, on the one counter whose
+/// documented meaning is "there is a bug here".
+struct Staged {
+    /// Ready to send, already addressed at the peer.
+    envelopes: Vec<pb::Envelope>,
+    /// Dropped by the loop filter: this peer is already on the path (§1.4).
+    filtered: u64,
+    /// Dropped by the fast-resume skip: the collector said it already has them (§4.2).
+    skipped: u64,
+    /// `forward` refused because the hop is already on the path. **A bug here** (D-41).
+    loop_refused: u64,
+    /// `forward` refused because the path is at `MAX_PATH`. D-8's bound, not a bug.
+    path_full: u64,
+}
+
+/// The request half of the compat call: the readings, once each.
+struct ReadingStream {
+    readings: std::vec::IntoIter<crate::wire::pb_reading::Reading>,
+}
+
+impl tonic::codegen::tokio_stream::Stream for ReadingStream {
+    type Item = crate::wire::pb_reading::Reading;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // Ready immediately and for ever: the whole batch is in memory before the call
+        // opens, so there is nothing for this stream to wait on. A `tokio_stream::iter`
+        // would be the same thing from a feature of `tokio-stream` that `tonic` does not
+        // enable (`crate::service`'s `AckStream` has the same note).
+        std::task::Poll::Ready(self.readings.next())
+    }
+}
+
+/// The protocol's bound on batches in flight unacked (W7 **D-24**).
+///
+/// **This implementation stays strictly inside it, at one.** `Trigger::OnReading` is driven
+/// by `mw_supervisor::task::run_on_reading`, which calls `readings` for one batch, waits
+/// for it to return, and only then advances the cursor and asks the subscription for the
+/// next — so a second batch cannot be in flight while the first is unacked, whatever this
+/// crate does. D-24's 8/2048 is therefore a ceiling this uplink is far below rather than a
+/// window it fills, and the pipelining it would buy a satellite draining a backlog does not
+/// exist here. Recorded rather than papered over: closing the gap needs
+/// `ReadingSubscription` to be able to acknowledge a *prefix*, which is `mw-component`'s
+/// trait and `mw-supervisor`'s driver — the same missing `ack_through(n)` that
+/// `mw_pipeline::sink`'s module documentation already records as a known gap.
 pub const MAX_IN_FLIGHT_BATCHES: usize = 8;
+
+/// The request stream's channel capacity.
+///
+/// **One**, which is what is actually in flight (see [`MAX_IN_FLIGHT_BATCHES`]). A capacity
+/// of 8 would have been a buffer nothing ever puts a second item in, and a buffer that is
+/// never exercised is a place for a bug to hide: a `send` that succeeded into it would have
+/// made `deliver` return before the batch reached the socket.
+const REQUEST_CHANNEL: usize = 1;
 
 /// Read one of the `uplink` row's credential files.
 fn read(what: &'static str, path: Option<&str>) -> Result<Vec<u8>, UplinkError> {

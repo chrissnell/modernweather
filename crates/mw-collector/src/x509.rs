@@ -49,6 +49,7 @@
 
 use mw_types::OriginId;
 use rustls::pki_types::CertificateDer;
+use tracing::warn;
 
 /// The URN scheme a peer's `NodeId` travels in, per W7 §5.4's `mtls-ca` row.
 pub const NODE_URN_PREFIX: &str = "urn:modernweather:node:";
@@ -232,25 +233,67 @@ fn extensions(cert: &[u8]) -> Option<&[u8]> {
 /// for something that is not a node. The connection is then refused by layer 2 for having
 /// no resolvable identity, which is the correct answer and not a fallback.
 pub fn node_from_san(cert: &CertificateDer<'_>) -> Option<OriginId> {
-    san_uris(cert)
+    let mut named: Vec<[u8; 16]> = san_uris(cert)
         .iter()
         .filter_map(|uri| uri.strip_prefix(NODE_URN_PREFIX))
-        .find_map(parse_uuid)
-        .map(OriginId::new)
+        .filter_map(parse_uuid)
+        .collect();
+    named.dedup();
+    // **Exactly one, or none.** A certificate carrying two node URNs is ambiguous about
+    // which node it is, and resolving it to whichever came first would make the identity a
+    // function of the issuer's field order. Duplicates of the *same* id are not ambiguous
+    // and are collapsed above.
+    match named.as_slice() {
+        [one] => Some(OriginId::new(*one)),
+        [] => None,
+        many => {
+            warn!(
+                urns = many.len(),
+                "a certificate's subjectAltName names more than one node, so it names \
+                 none: which node it is would otherwise depend on the issuer's field order"
+            );
+            None
+        }
+    }
 }
 
-/// A hyphenated or bare UUID as 16 bytes.
+/// A UUID in the canonical `8-4-4-4-12` form, or bare 32 hex characters, as 16 bytes.
+///
+/// **The shape is checked, not just the digits.** An earlier version stripped `-` from
+/// anywhere and accepted any 32 hex characters left over, so
+/// `-0-1-9-3F3C27A107B649C2E4F1B8A6D0E11-` and the canonical spelling were one identity —
+/// which contradicts the reason this function refuses a trailing tail in the first place.
+/// Two spellings of one identity is how a revocation comes to miss.
 fn parse_uuid(text: &str) -> Option<[u8; 16]> {
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let hex: String = if text.contains('-') {
+        let mut groups = text.split('-');
+        let mut joined = String::with_capacity(32);
+        for width in GROUPS {
+            let group = groups.next()?;
+            if group.len() != width {
+                return None;
+            }
+            joined.push_str(group);
+        }
+        if groups.next().is_some() {
+            return None;
+        }
+        joined
+    } else {
+        text.to_string()
+    };
+    if hex.len() != 32 {
+        return None;
+    }
+    let bytes = hex.as_bytes();
     let mut out = [0u8; 16];
-    let mut nibbles = text.chars().filter(|c| *c != '-');
-    for byte in &mut out {
-        let hi = nibbles.next()?.to_digit(16)?;
-        let lo = nibbles.next()?.to_digit(16)?;
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = char::from(bytes[i * 2]).to_digit(16)?;
+        let lo = char::from(bytes[i * 2 + 1]).to_digit(16)?;
         *byte = u8::try_from(hi * 16 + lo).ok()?;
     }
-    // Anything after the sixteenth byte means this is not a UUID, and silently ignoring a
-    // tail would make two different strings one identity.
-    nibbles.next().is_none().then_some(out)
+    Some(out)
 }
 
 #[cfg(test)]
@@ -381,6 +424,19 @@ mod tests {
             "a tail must not be ignored: two strings would be one identity"
         );
         assert_eq!(parse_uuid("zzzzzzzz-7a10-7b64-9c2e-4f1b8a6d0e11"), None);
+        // **The group widths are checked, not just the digits.** Stripping `-` from
+        // anywhere made every one of these the canonical id.
+        assert_eq!(
+            parse_uuid("-0-1-9-3f3c27a107b649c2e4f1b8a6d0e11-"),
+            None,
+            "hyphens are not whitespace: a UUID has five groups of fixed width"
+        );
+        assert_eq!(parse_uuid("0193f3c27a10-7b64-9c2e-4f1b-8a6d0e11"), None);
+        assert_eq!(
+            parse_uuid("0193f3c2-7a10-7b64-9c2e-4f1b8a6d0e11-"),
+            None,
+            "a sixth group is not a UUID"
+        );
     }
 
     /// The scheme is matched exactly, so an operator's `-addext` has to say what the

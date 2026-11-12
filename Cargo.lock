@@ -1477,6 +1477,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tonic",
  "tracing",
 ]
 
@@ -1567,7 +1568,6 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "secrecy",
- "subtle",
  "thiserror",
  "tokio",
  "tokio-util",

@@ -697,7 +697,17 @@ async fn attach_peers(
     pool: &sqlx::SqlitePool,
     registry: Arc<mw_store::ConfigRegistry>,
 ) -> anyhow::Result<()> {
-    let store = Arc::new(mw_store::PeerStore::new(pool.clone(), registry));
+    let identity = node_identity(cfg);
+    // This node's own id separates a **local** station from one a peer owns, which is the
+    // predicate the peer snapshot's station map is read with
+    // (`mw_store::PeerSnapshot::with_peer_stations`). `node_identity`'s own fallback is
+    // unreachable here -- `attach_peers` runs only for a node that opened a spool, which
+    // needs a 16-byte `node_id` -- and is an all-zero id, which owns nothing.
+    let store = Arc::new(mw_store::PeerStore::new(
+        pool.clone(),
+        registry,
+        identity.node,
+    ));
     let snapshot = store.republish().await.context("reading the peer rows")?;
     info!(peers = snapshot.len(), "peer registry published");
     for peer in snapshot.peers() {
@@ -710,7 +720,6 @@ async fn attach_peers(
             );
         }
     }
-    let identity = node_identity(cfg);
     cfg.set_collector(
         store as Arc<dyn mw_component::PeerRegistry>,
         Arc::clone(&fanout.spool),

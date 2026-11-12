@@ -12,7 +12,7 @@
 //! | [`nothing_in_this_file_has_a_database`] | the ack is **weaker** than "stored": there is no PostgreSQL in any of this, and the acks still happen |
 //! | [`a_replayed_batch_is_acked_again_and_spooled_once`] | the resume path: an ack lost on the wire costs a deduplicated resend and never a duplicate row |
 //!
-//! # Why this kills a real process
+//! # Why this kills a real process, and exactly how far that gets
 //!
 //! The cheap version of the first test drops the `Spool` and reopens it, and it would pass
 //! for the wrong reason: `Drop` runs, buffers flush, and what is asserted is that a clean
@@ -24,6 +24,24 @@
 //! child's own test selected by name. That is the standard arrangement for a test that
 //! needs a process to die, and it is why [`child_acks_then_waits`] is a no-op without the
 //! variable: in an ordinary run it is one of the tests and does nothing.
+//!
+//! **What `SIGKILL` establishes, and what it cannot.** This was checked rather than
+//! assumed: with the spool's `sync_data` deleted, `an_ack_survives_sigkill` still passes.
+//! That is not a hole in the test, it is the boundary of what killing a *process* can show
+//! — a `SIGKILL` loses the dying process's own memory and nothing else, because the kernel's
+//! page cache outlives it. So the three claims separate like this:
+//!
+//! | Claim | Shown by |
+//! |---|---|
+//! | the bytes left the process before the ack | `SIGKILL` + reopen, here |
+//! | the records were `fsync`ed before the ack | the `commits` counter, asserted here |
+//! | the platter has them after a power loss | **nothing here**, and nothing a test on one machine can show |
+//!
+//! The second line is why this file asserts `SpoolStats::commits`: without it, "the bytes
+//! are in the page cache" and "the bytes are durable" would both pass, and the ack promises
+//! the second. The third is the honest limit — `mw_pipeline`'s own spool tests cover the
+//! consequence of losing a commit mid-write (a torn tail is truncated and counted), which is
+//! the other half of the same property approached from the recovery side.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -286,6 +304,20 @@ async fn nothing_in_this_file_has_a_database() {
     // That is the collector of W7 §8.4 -- a relay with no database of its own -- and it is
     // a legitimate node rather than a degraded one.
     assert_eq!(spool.tail_seq(), Seq::FIRST);
+    // **The other half of what the ack promises, and the half `SIGKILL` cannot show.** A
+    // group commit is `sync_data` on the open segment plus, when the manifest changed, its
+    // own write-fsync-rename-fsyncdir (`mw_pipeline::SpoolStats::commits`). So a non-zero
+    // count here is "the records were fsynced before this function returned", which is what
+    // separates the ack's promise from "the bytes are in the page cache" -- and page cache
+    // is exactly what a killed process leaves behind, so without this assertion the two
+    // would be indistinguishable. See this file's module documentation.
+    let stats = spool.stats();
+    assert_eq!(stats.appends, 1, "one batch is one append call (W7 D-14)");
+    assert!(
+        stats.commits >= 1,
+        "the ack returned without a group commit, so it promised durability it had not \
+         obtained"
+    );
 }
 
 /// **Resume without duplicates** (W7 **D-27**, **D-29**), which is the other half of the
@@ -349,6 +381,138 @@ async fn a_replayed_batch_is_acked_again_and_spooled_once() {
     assert_eq!(third.duplicates, 0);
     assert_eq!(spooled(&spool).len(), 3);
     assert_eq!(spool.high_water(node(1)), Seq::new(3));
+}
+
+/// **A refusal this node's own state produced must not advance the sender's cursor.**
+///
+/// The one that matters most is the clock: a collector ten minutes ahead of true time
+/// refuses *every* envelope from *every* satellite as `ClockSkew`, and if that advanced
+/// their cursors the fleet's readings for that window would be gone from every spool in it
+/// before NTP corrected the clock. One wrong clock, permanent fleet-wide loss.
+///
+/// So the ack is `ACK_RESOURCE_EXHAUSTED` — "back off and send it again" — and `through`
+/// does not move. The cost is a bounded stall; `[spool].max_lag` is the backstop.
+#[tokio::test]
+async fn a_transient_refusal_does_not_advance_the_senders_cursor() {
+    let dir = mw_collector::testing::scratch("ack-transient");
+    let (handlers, spool) = collector(&dir);
+    let mut acked_through = 0u64;
+
+    // Ten minutes **ahead**, which is outside §4.6's five-minute future window — and is
+    // exactly the shape a collector whose own clock is ten minutes *slow* sees for every
+    // current reading in the fleet.
+    //
+    // The **future** edge, deliberately: the past edge is `Reject::TooOld` and is
+    // permanent, because time only moves away from it (`Reject::is_transient`). Asserted
+    // below.
+    let mut ahead = batch(&[1], 1);
+    let later = chrono::Utc::now() + chrono::Duration::minutes(10);
+    ahead.envelopes[0].observed_at = later.timestamp_millis();
+    ahead.envelopes[0].received_at = later.timestamp_millis();
+
+    let ack = handlers
+        .ingest_batch(&peer(), &ahead, true, &mut acked_through)
+        .await
+        .expect("the batch is answered rather than closing the stream");
+    assert_eq!(
+        ack.status,
+        pb::AckStatus::AckResourceExhausted as i32,
+        "a clock-skew refusal is this node's state, not the envelope's bytes, so the \
+         sender must be told to retry rather than to advance"
+    );
+    assert_eq!(
+        ack.through, 0,
+        "`through` carries no new position: the sender's cursor stays where it was"
+    );
+    assert_eq!(
+        acked_through, 0,
+        "…and so does the stream's own record of it"
+    );
+    assert_eq!(ack.rejected, 1);
+    assert!(spooled(&spool).is_empty(), "nothing was stored");
+
+    // The same envelope with a current instant — i.e. the clock corrected — is accepted.
+    // That is the whole point of not having advanced past it.
+    let ack = handlers
+        .ingest_batch(&peer(), &batch(&[1], 1), false, &mut acked_through)
+        .await
+        .expect("acknowledged");
+    assert_eq!(ack.status, pb::AckStatus::AckOk as i32);
+    assert_eq!(ack.through, 1);
+    assert_eq!(
+        spooled(&spool).len(),
+        1,
+        "the reading the wrong clock refused is now stored, which it could not have been \
+         if the sender had advanced past it"
+    );
+
+    // **The other edge is permanent**, and the asymmetry is the point: an envelope already
+    // older than the window only ever gets older, so stalling the sender on it would stall
+    // for ever rather than until something is fixed.
+    let mut stale = batch(&[2], 2);
+    let long_ago = chrono::Utc::now() - chrono::Duration::days(40);
+    stale.envelopes[0].observed_at = long_ago.timestamp_millis();
+    stale.envelopes[0].received_at = long_ago.timestamp_millis();
+    let ack = handlers
+        .ingest_batch(&peer(), &stale, false, &mut acked_through)
+        .await
+        .expect("answered");
+    assert_eq!(
+        ack.status,
+        pb::AckStatus::AckRejected as i32,
+        "an envelope past `max_past_skew` will never be young enough, so the sender has \
+         to be allowed to drain"
+    );
+    assert_eq!(ack.through, 2, "…which means `through` advances");
+}
+
+/// …and a refusal the envelope's **own bytes** earned does advance it, because a sender
+/// that kept re-sending it would never drain (W7 **D-9**).
+#[tokio::test]
+async fn a_permanent_refusal_does_advance_the_senders_cursor() {
+    let dir = mw_collector::testing::scratch("ack-permanent");
+    let (handlers, spool) = collector(&dir);
+    let mut acked_through = 0u64;
+
+    // An all-`None` reading: §4.6's `EmptyReading`, and a destructive write if it were
+    // stored -- W3's writer assigns `col = EXCLUDED.col`, so it would erase whatever that
+    // `(station_id, time)` already held.
+    let mut empty = batch(&[1], 1);
+    empty.envelopes[0].reading = Some(mw_proto::wire::Reading {
+        station_id: STATION.to_string(),
+        reading_timestamp: Some(mw_proto::wire::Timestamp {
+            seconds: chrono::Utc::now().timestamp(),
+            nanos: 0,
+        }),
+        ..Default::default()
+    });
+
+    let ack = handlers
+        .ingest_batch(&peer(), &empty, true, &mut acked_through)
+        .await
+        .expect("the batch is answered rather than closing the stream");
+    assert_eq!(
+        ack.status,
+        pb::AckStatus::AckRejected as i32,
+        "nothing a later configuration does makes an empty reading storable"
+    );
+    assert_eq!(
+        ack.through, 1,
+        "`through` advances, or the sender stalls on it for ever"
+    );
+    assert_eq!(ack.rejected, 1);
+    assert!(
+        spooled(&spool).is_empty(),
+        "and it did not reach the spool, where it would have erased a real observation"
+    );
+}
+
+/// `ACK_UNSPECIFIED` is field 0, so it is what a message that sets nothing decodes to — and
+/// it must never be a status this node sends.
+#[test]
+fn the_zero_status_is_not_a_successful_acknowledgement() {
+    assert_eq!(pb::AckStatus::AckUnspecified as i32, 0);
+    assert_ne!(pb::AckStatus::AckOk as i32, 0);
 }
 
 /// `HelloAck.known_through` is the collector's per-origin high water **for this peer's

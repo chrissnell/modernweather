@@ -60,6 +60,20 @@ pub enum EnvelopeError {
     #[error("the envelope names no station")]
     NoStation,
 
+    /// `station_key` is longer than [`MAX_STATION_KEY`].
+    ///
+    /// A bound rather than a truncation, and it is here rather than at the gate because
+    /// every consumer of a decoded envelope is downstream of this point: a peer-controlled
+    /// string of unbounded length reaches a `config.stations` row, a metric label's
+    /// rejection path, and a `WARN` field that `tracing` does not escape — so one peer
+    /// could forge log lines and grow a table at will. Nothing legitimate is near the
+    /// bound: the longest key in the frozen fixtures is under thirty characters.
+    #[error("`station_key` is {len} bytes, and the bound is {MAX_STATION_KEY}")]
+    StationKeyTooLong {
+        /// How long the key was.
+        len: usize,
+    },
+
     /// `reading` was absent. An envelope with no reading is an acknowledgement-shaped
     /// nothing; it would store as an all-`NULL` row the aggregates still have to process.
     #[error("the envelope carries no reading")]
@@ -87,6 +101,13 @@ impl mw_types::Classify for EnvelopeError {
         mw_types::Class::Ignorable
     }
 }
+
+/// How long a `station_key` may be on the wire.
+///
+/// 128 bytes: generous against every key the frozen contract's fixtures carry and small
+/// enough that a rejected envelope's log field and a `config.stations` row are both
+/// bounded by something other than a peer's imagination.
+pub const MAX_STATION_KEY: usize = 128;
 
 fn origin_id(bytes: &[u8]) -> Option<OriginId> {
     <[u8; 16]>::try_from(bytes).ok().map(OriginId::new)
@@ -135,8 +156,26 @@ impl TryFrom<&wire::Envelope> for Envelope {
         if w.station_key.is_empty() {
             return Err(EnvelopeError::NoStation);
         }
+        if w.station_key.len() > MAX_STATION_KEY {
+            return Err(EnvelopeError::StationKeyTooLong {
+                len: w.station_key.len(),
+            });
+        }
         let reading = w.reading.as_ref().ok_or(EnvelopeError::NoReading)?;
-        let reading = Reading::try_from(reading).map_err(EnvelopeError::Reading)?;
+        let mut reading = Reading::try_from(reading).map_err(EnvelopeError::Reading)?;
+        // **`reading.station_id` is normalised to the envelope's own key.**
+        //
+        // The wire carries the station twice -- `Envelope.station_key`, which is the
+        // identity every check and every consumer reads, and `Reading.station_id`, which is
+        // a field inside the payload. A peer can make them disagree, and the local
+        // admission path already normalises exactly this
+        // (`mw_pipeline::ingress`'s `admit` assigns `reading.station_id = station`), so a
+        // decoded envelope from a peer must not be the one shape where they differ.
+        //
+        // Inert today: the writer groups on `envelope.station` and the snapshot indexes on
+        // it, so nothing serving reads the inner copy. It is one accessor away from being
+        // an authorisation bypass, which is a worse thing to leave than a field assignment.
+        reading.station_id = w.station_key.clone();
         Ok(Envelope {
             station: StationKey::new(w.station_key.as_str()),
             observed_at: millis("observed_at", w.observed_at)?,
@@ -249,6 +288,40 @@ mod tests {
         let mut w = wire::Envelope::from(&envelope());
         w.station_key = String::new();
         assert_eq!(Envelope::try_from(&w), Err(EnvelopeError::NoStation));
+    }
+
+    #[test]
+    fn an_over_long_station_key_is_refused() {
+        let mut w = wire::Envelope::from(&envelope());
+        w.station_key = "k".repeat(MAX_STATION_KEY + 1);
+        assert_eq!(
+            Envelope::try_from(&w),
+            Err(EnvelopeError::StationKeyTooLong {
+                len: MAX_STATION_KEY + 1
+            })
+        );
+        // The bound itself is inclusive, so nothing at it is refused.
+        w.station_key = "k".repeat(MAX_STATION_KEY);
+        assert!(Envelope::try_from(&w).is_ok());
+    }
+
+    /// A peer can make the envelope's `station_key` and the reading's own `station_id`
+    /// disagree. The decode does not let that survive: `admit` normalises the same field on
+    /// the local path, and a peer's envelope must not be the one shape where the two differ.
+    #[test]
+    fn the_readings_station_id_is_normalised_to_the_envelopes_key() {
+        let mut w = wire::Envelope::from(&envelope());
+        w.station_key = "satellite-a:backyard".to_string();
+        if let Some(reading) = w.reading.as_mut() {
+            reading.station_id = "suncrest:roof".to_string();
+        }
+        let decoded = Envelope::try_from(&w).expect("a well-formed envelope");
+        assert_eq!(decoded.station.as_str(), "satellite-a:backyard");
+        assert_eq!(
+            decoded.reading.station_id, "satellite-a:backyard",
+            "the inner copy follows the key the gate authorises, not the one the peer put \
+             in the payload"
+        );
     }
 
     #[test]

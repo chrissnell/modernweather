@@ -230,6 +230,21 @@ pub enum PeerWriteError {
     #[error("the enrolment request carries no key material to record")]
     NoMaterial,
 
+    /// Registering these stations would take one node past the number it may own.
+    ///
+    /// A bound rather than a truncation: `NodeIdentity.stations` is a repeated field and a
+    /// `Hello` can be re-sent, so without a limit a peer inventing a fresh key per
+    /// connection grows a table and a resident snapshot for ever. Refused whole, because
+    /// registering some of a satellite's stations and silently refusing envelopes for the
+    /// rest is the worse failure.
+    #[error("this node already owns {owned} stations, and the limit is {limit}")]
+    TooManyStations {
+        /// How many it owns now.
+        owned: i64,
+        /// The limit.
+        limit: i64,
+    },
+
     /// `auth_kind = 'mtls-ca'` asks this node to **sign** a certificate.
     ///
     /// Refused by name rather than half-implemented. §5.3 offers two outcomes — sign the
