@@ -145,8 +145,27 @@ pub enum Reject {
     BadSecret,
     /// The station exists and is switched off.
     Disabled,
-    /// The sending node is not a peer, or has no grant for this origin (W7 §5.4).
+    /// The sending node is not a peer at all — §5.4's `UnknownPeer`.
+    ///
+    /// The one name in §5.4's list that is spelled differently here, and deliberately: the
+    /// variant and its metric label predate M6-4 and are already emitted, so renaming it
+    /// would retire a series an operator may be alerting on to say exactly the same thing.
+    /// [`Reject::UnauthorizedOrigin`] carries the other half the original wording covered.
     UnauthorizedPeer,
+    /// The peer is known and `peers.revoked_at` is set (W7 §5.4 layer 2).
+    ///
+    /// Separate from [`Reject::UnauthorizedPeer`] because the two need different people: a
+    /// revoked peer is an operator's own past decision still being honoured, where an
+    /// unknown one means somebody is pointing a node at this port.
+    Revoked,
+    /// The peer may not speak for the origin this envelope claims (W7 §5.4 layer 3).
+    ///
+    /// `relay = false` is the default, so this is what a leaf trying to inject history for
+    /// another station reaches.
+    UnauthorizedOrigin,
+    /// `observed_at` is outside the skew window: more than `max_future_skew` ahead of this
+    /// node's clock, or more than `max_past_skew` behind it (W7 §4.6).
+    ClockSkew,
     /// The provenance path is longer than `PathSet::MAX_HOPS` (W7 **D-8**).
     PathTooLong,
     /// The provenance path is not something an honest encoder produces — the origin is not
@@ -176,6 +195,9 @@ impl Reject {
             Reject::BadSecret => "bad_secret",
             Reject::Disabled => "disabled",
             Reject::UnauthorizedPeer => "unauthorized_peer",
+            Reject::Revoked => "revoked",
+            Reject::UnauthorizedOrigin => "unauthorized_origin",
+            Reject::ClockSkew => "clock_skew",
             Reject::PathTooLong => "path_too_long",
             Reject::MalformedPath => "malformed_path",
             Reject::NotAddressedHere => "not_addressed_here",
@@ -194,6 +216,9 @@ impl Reject {
         Reject::BadSecret,
         Reject::Disabled,
         Reject::UnauthorizedPeer,
+        Reject::Revoked,
+        Reject::UnauthorizedOrigin,
+        Reject::ClockSkew,
         Reject::PathTooLong,
         Reject::MalformedPath,
         Reject::NotAddressedHere,
@@ -443,6 +468,38 @@ pub trait StationRegistry: Send + Sync + 'static {
     /// `writer:timescale`, off that path entirely. Merging them would put two allocations
     /// on the path W3 **D-87** exists to keep free of everything but an `fsync`.
     fn projection(&self, station: &StationKey) -> Option<StationProjection>;
+
+    /// Which node owns this station — `config.stations.owning_node_id` — or `None` if
+    /// this node has no row for the key at all.
+    ///
+    /// **W7 §4.4's step 5, and one clause more than §4.4 writes.** The existence half is
+    /// §4.6's: "an envelope naming a station the collector has never heard of would create
+    /// history under a key nothing else references". The owner half is what makes
+    /// **D-36**'s stated property true — *a compromised leaf cannot inject history for
+    /// another station* — because origin authorisation alone does not give it:
+    /// `peers.relay = false` constrains which **origin** a peer may claim and says nothing
+    /// about which **station key** that origin may write into, so a leaf speaking honestly
+    /// for itself could name the collector's own roof sensor and have every other check
+    /// pass. `mw_collector::admit` reads the owner and requires it to be a node on the
+    /// envelope's inbound path; the reasoning and the proposed amendment are recorded
+    /// there.
+    ///
+    /// **The check [`StationRegistry::metadata`] deliberately is not.** That method is
+    /// total by design: every field of [`StationMeta`] is already an `Option`, so an
+    /// unplaced station answers [`StationMeta::EMPTY`] rather than refusing, and turning
+    /// it into a refusal would make an unplaced station's envelopes unstorable.
+    ///
+    /// It is **existence and ownership, not admission**: a disabled station still exists,
+    /// and an envelope a peer has already sealed for a station whose collection the
+    /// operator switched off is history that arrived, not a frame to refuse. `resolve` is
+    /// the gate for the `admit` path and this is not a second one.
+    ///
+    /// `None` is also the honest answer for a row whose `owning_node_id` is not 16 bytes,
+    /// which is a schema the `CHECK` should have refused: unowned reads as unknown, which
+    /// fails closed.
+    ///
+    /// Synchronous for `resolve`'s reason, and over the same snapshot.
+    fn station_owner(&self, station: &StationKey) -> Option<mw_types::OriginId>;
 }
 
 /// The weather schema's `stations` row, as configuration knows it (W4 §2.1).
@@ -554,7 +611,7 @@ mod tests {
         }
         assert_eq!(
             Reject::ALL.len(),
-            12,
+            15,
             "a new Reject variant needs a line in ALL"
         );
     }

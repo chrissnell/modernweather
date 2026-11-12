@@ -72,7 +72,12 @@ axum = "0.8"
 http = "1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
-tonic = "0.14"
+# `tls-ring`: the uplink dials its collector over mTLS (W7 §8.2's `[[uplink]]`), and
+# `tonic`'s client TLS lives behind that feature. **A feature, not a substitution**: it
+# resolves to `tokio-rustls` over `rustls`'s `ring` provider, which is exactly what A-W8-3
+# chose and what `mw-http` already serves with -- so there is still one TLS stack in the
+# binary. DESIGN.md D-32's table is unchanged.
+tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 
 # TLS and the SNI resolver: `rustls` + `ring` (A-W8-3). `ring` rather than `aws-lc-rs`

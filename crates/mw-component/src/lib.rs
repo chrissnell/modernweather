@@ -66,6 +66,7 @@ mod error;
 mod id;
 mod identity;
 mod ingress;
+mod peer;
 mod routes;
 mod schedule;
 mod snapshot;
@@ -93,6 +94,9 @@ pub use identity::{
 pub use ingress::{
     AcceptError, Accepted, AdmitError, Admitted, FrameMeta, Ingress, Reject, StationMeta,
     StationProjection, StationRegistry,
+};
+pub use peer::{
+    Enrolled, Enrolment, PeerAuth, PeerEntry, PeerName, PeerRegistry, PeerStation, PeerWriteError,
 };
 pub use routes::{
     Match, Methods, RouteEntry, RouteManifest, RouteProvider, Scope, Upload, UploadEndpoint,

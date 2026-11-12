@@ -53,6 +53,11 @@ metrics.workspace = true
 # The weather database's URL is a `SecretString` from the moment it is read (**D-33**), so
 # the one place that hands it to a connection has to be able to expose it.
 secrecy.workspace = true
+# The ingest socket's `ServerConfig` is assembled here, because the verifier's choice is
+# per `auth_kind` and the pinned case reads the `peers` snapshot: `mw-http` binds the
+# socket and may not name a peer, `mw-collector` decides who may be on it and may not bind
+# (ci/layers.toml, §1.4), and the binary is where the two meet (§1.3 rule 1).
+rustls.workspace = true
 # `Utc::now()` for the snapshot-age sweep the `/metrics` route runs on every scrape
 # (M4-1's constraint 2). One clock reading, at the one place §3.3 allows the binary to
 # take one: the scrape path is not a component tick.

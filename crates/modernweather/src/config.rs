@@ -28,6 +28,7 @@ use std::sync::Arc;
 use mw_component::{Generation, Ingress, Zone};
 use mw_store::config_db::{self, ConfigDbError, Listener, Node, WeatherDatabase, WebsiteRow};
 use mw_types::{StationKey, WebsiteId};
+use secrecy::ExposeSecret as _;
 use sqlx::SqlitePool;
 
 /// Everything `plan()` and the boot sequence read from the configuration database.
@@ -223,6 +224,54 @@ pub struct Config {
     /// shape would be a field whose only purpose is to be converted.
     pub(crate) declared_uploaders: Vec<mw_output::UploaderRow>,
 
+    /// The same `config.ingest` rows in the shape `mw-collector` plans from.
+    ///
+    /// A third copy of one table, for [`Config::declared_ingest`]'s reason exactly: three
+    /// crates in two layers read it, none of them may name the others, and the binary is
+    /// where they meet. The copy is four lines and it is what stops `mw-grpc` and
+    /// `mw-collector` from growing each other's job.
+    pub(crate) declared_collector_ingest: Vec<mw_collector::IngestRow>,
+
+    /// Every `uplink` row in the shape `mw-collector` plans from.
+    ///
+    /// **Its emptiness is meaningful** and is the common case for a collector: a node with
+    /// no row sends to nobody, which is the other half of W7 **D-44**. Joined to the
+    /// `peers` rows here, because an uplink needs its peer's `NodeId` and `mw-collector`
+    /// may not read a database.
+    pub(crate) declared_uplinks: Vec<mw_collector::UplinkRow>,
+
+    /// The peer registry and the registration path (W7 §5.1), once `main` has built it.
+    ///
+    /// A root resource for [`Config::registry`]'s reason and the same object's other half:
+    /// `PeerRegistry` is `Capability::StationRegistry` seen from the collector's side, so
+    /// there is one published snapshot and two accessor sets.
+    pub(crate) peer_registry: Option<Arc<dyn mw_component::PeerRegistry>>,
+
+    /// The collector's state slot, once `main` has built it.
+    ///
+    /// A root resource for [`Config::grpcrx_service`]'s reason exactly.
+    pub(crate) ingest_service: Option<Arc<mw_collector::ServiceState>>,
+
+    /// What an uplink's `Hello` announces about this node (§5.2), once the registry is
+    /// published.
+    pub(crate) node_identity: Option<mw_collector::Identity>,
+
+    /// The ingest socket's own TLS, with a client-certificate verifier (W7 §5.4 layer 1).
+    ///
+    /// `None` leaves the gRPC port plaintext, which is every node with no `config.ingest`
+    /// row and every node that has one but no certificate to present. Assembled in the
+    /// binary because the verifier's choice is per `auth_kind` and the pinned case reads
+    /// the `peers` snapshot: `mw-http` binds the socket and may not name a peer,
+    /// `mw-collector` decides who may be on it and may not bind.
+    pub(crate) ingest_tls: Option<Arc<rustls::ServerConfig>>,
+
+    /// The open spool, once step 4b has opened it.
+    ///
+    /// Held as well as handed to the ingress because the collector reads two numbers off it
+    /// that no capability carries: the per-origin high water for `HelloAck.known_through`,
+    /// and the cursor lag for `IngestBatch.sender_depth`.
+    pub(crate) spool: Option<Arc<mw_pipeline::Spool>>,
+
     /// The generation these rows were read at (**D-53**).
     ///
     /// `ZERO` until something can bump it: a generation is assigned by `ConfigAdmin` on
@@ -237,6 +286,13 @@ impl Config {
     pub async fn load(pool: &SqlitePool) -> Result<Self, ConfigDbError> {
         let stations = config_db::stations(pool).await?;
         let ingest = config_db::ingest(pool).await?;
+        // The `uplink` rows joined to the `peers` rows, which is the one join this type
+        // does: `mw_collector::UplinkRow` needs the peer's `NodeId` for the loop filter and
+        // the `uplink` table keys on the peer's *name*. A row whose peer has no `peers` row
+        // is dropped here and the warning is `mw_collector::register`'s, which is where
+        // the plan error that names it lives.
+        let peers = config_db::peers(pool).await?;
+        let uplinks = config_db::uplinks(pool).await?;
         let websites = config_db::websites(pool).await?;
         // `aerisWeatherEnabled` is a `station_service` row with `service = 'aeris'` rather
         // than a column -- the `website` table's own comment says so -- and it is folded
@@ -244,6 +300,16 @@ impl Config {
         let aeris_stations = config_db::aeris_stations(pool).await?;
         let uploaders = config_db::uploaders(pool).await?;
         Ok(Config {
+            declared_collector_ingest: ingest.iter().map(declare_collector_ingest).collect(),
+            declared_uplinks: uplinks
+                .iter()
+                .filter_map(|row| declare_uplink(row, &peers))
+                .collect(),
+            peer_registry: None,
+            ingest_service: None,
+            node_identity: None,
+            ingest_tls: None,
+            spool: None,
             declared_uploaders: uploaders.iter().map(declare_uploader).collect(),
             web_sites: websites
                 .iter()
@@ -332,6 +398,37 @@ impl Config {
         self.legacy_routes = Some(routes);
         self.snapshot_render = Some(Arc::clone(&render) as Arc<dyn mw_component::SnapshotRender>);
         self.legacy_render = Some(render);
+    }
+
+    /// Hand the configuration the peer registry, the spool and what a `Hello` announces.
+    ///
+    /// One call rather than three, because all three come out of step 4b/4c together and a
+    /// configuration with one and not the others is a boot sequence that stopped halfway
+    /// rather than a shape worth planning: the collector needs the registry **and** the
+    /// spool, and the uplink needs the spool **and** the identity.
+    pub fn set_collector(
+        &mut self,
+        peers: Arc<dyn mw_component::PeerRegistry>,
+        spool: Arc<mw_pipeline::Spool>,
+        identity: mw_collector::Identity,
+    ) {
+        self.peer_registry = Some(peers);
+        self.spool = Some(spool);
+        self.node_identity = Some(identity);
+    }
+
+    /// Hand the configuration the collector's state slot and the ingest socket's TLS.
+    ///
+    /// One call, because `ingest:grpc`'s plan check reads the second to decide whether
+    /// **D-35**'s opt-out is required, and a slot with no answer about TLS would make that
+    /// check depend on the order two setters were called in.
+    pub fn set_ingest(
+        &mut self,
+        state: Arc<mw_collector::ServiceState>,
+        tls: Option<Arc<rustls::ServerConfig>>,
+    ) {
+        self.ingest_service = Some(state);
+        self.ingest_tls = tls;
     }
 
     /// Hand the configuration the reading receiver's state slot.
@@ -491,6 +588,14 @@ impl mw_grpc::GrpcIngestConfig for Config {
 
     fn ingress(&self) -> Option<&Arc<dyn Ingress>> {
         self.ingress.as_ref()
+    }
+
+    /// The **same** answer `mw_collector::CollectorConfig::ingest_tls_available` gives,
+    /// read from the same field: the two components are mounted on one socket, so a
+    /// configuration one of them refuses and the other accepts is a daemon that will not
+    /// start for no reason an operator can act on.
+    fn ingest_tls_available(&self) -> bool {
+        self.ingest_tls.is_some()
     }
 }
 
@@ -726,6 +831,105 @@ impl mw_http::ListenerConfig for Config {
     fn sni_resolver(&self) -> Option<&Arc<mw_http::SniResolver>> {
         self.sni.as_ref()
     }
+
+    fn ingest_tls(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.ingest_tls.clone()
+    }
+}
+
+impl mw_collector::CollectorConfig for Config {
+    fn ingest(&self) -> &[mw_collector::IngestRow] {
+        &self.declared_collector_ingest
+    }
+
+    fn ingress(&self) -> Option<&Arc<dyn Ingress>> {
+        self.ingress.as_ref()
+    }
+
+    fn spool(&self) -> Option<&Arc<mw_pipeline::Spool>> {
+        self.spool.as_ref()
+    }
+
+    fn station_registry(&self) -> Option<&Arc<dyn mw_component::StationRegistry>> {
+        self.registry.as_ref()
+    }
+
+    fn peer_registry(&self) -> Option<&Arc<dyn mw_component::PeerRegistry>> {
+        self.peer_registry.as_ref()
+    }
+
+    fn node_id(&self) -> Option<mw_types::OriginId> {
+        self.node
+            .as_ref()
+            .and_then(|node| <[u8; 16]>::try_from(node.node_id.as_slice()).ok())
+            .map(mw_types::OriginId::new)
+    }
+
+    fn ingest_service(&self) -> Option<&Arc<mw_collector::ServiceState>> {
+        self.ingest_service.as_ref()
+    }
+
+    fn ingest_tls_available(&self) -> bool {
+        self.ingest_tls.is_some()
+    }
+}
+
+impl mw_collector::UplinkConfig for Config {
+    fn uplinks(&self) -> &[mw_collector::UplinkRow] {
+        &self.declared_uplinks
+    }
+
+    fn identity(&self) -> Option<&mw_collector::Identity> {
+        self.node_identity.as_ref()
+    }
+
+    fn spool(&self) -> Option<&Arc<mw_pipeline::Spool>> {
+        self.spool.as_ref()
+    }
+}
+
+/// One `config.ingest` row in the shape `mw-collector` plans from.
+fn declare_collector_ingest(row: &config_db::IngestRow) -> mw_collector::IngestRow {
+    mw_collector::IngestRow {
+        listen: row.listen.clone(),
+        peer_auth: row.peer_auth.clone(),
+        ca_path: row.ca_path.clone(),
+        allow_insecure: row.allow_insecure,
+    }
+}
+
+/// One `uplink` row joined to the peer it names, or `None` when there is no such peer.
+///
+/// `None` rather than a plan error, and the plan error is `mw_collector::register`'s: the
+/// uplink needs the peer's `NodeId` for the loop filter and for `forward`, and there is
+/// nowhere else to get one — so a row whose peer is unknown cannot be planned, and the
+/// message that says so belongs with the component rather than with the query.
+fn declare_uplink(
+    row: &config_db::UplinkRow,
+    peers: &[config_db::PeerRow],
+) -> Option<mw_collector::UplinkRow> {
+    let peer = peers.iter().find(|p| p.name == row.peer_name)?;
+    let node = <[u8; 16]>::try_from(peer.node_id.as_slice()).ok()?;
+    Some(mw_collector::UplinkRow {
+        peer_name: row.peer_name.clone(),
+        peer_node: mw_types::OriginId::new(node),
+        endpoint: row.endpoint.clone(),
+        auth_kind: row.auth_kind.clone(),
+        tls_cert_path: row.tls_cert_path.clone(),
+        tls_key_path: row.tls_key_path.clone(),
+        tls_ca_path: row.tls_ca_path.clone(),
+        // Re-read from the row rather than cloned: `SecretString` is deliberately not
+        // `Clone`, and `Arc` is how the one copy is shared with a builder that runs per
+        // start attempt (`mw_collector::UplinkRow`).
+        psk: row
+            .psk
+            .as_ref()
+            .map(|psk| Arc::new(secrecy::SecretString::from(psk.expose_secret().to_string()))),
+        // §9.3's `[[uplink]].require_ack` has no column yet -- the `uplink` table predates
+        // that section -- so the transition default is what travels, and adding the column
+        // is a migration rather than a redesign.
+        require_ack: false,
+    })
 }
 
 /// One `config.website` row joined to its primary station, as the website renders it.
@@ -925,6 +1129,13 @@ mod tests {
             legacy_stations: Vec::new(),
             ingest: Vec::new(),
             declared_ingest: Vec::new(),
+            declared_collector_ingest: Vec::new(),
+            declared_uplinks: Vec::new(),
+            peer_registry: None,
+            ingest_service: None,
+            node_identity: None,
+            ingest_tls: None,
+            spool: None,
             legacy_routes: None,
             ambient_upload: None,
             grpcrx_service: None,

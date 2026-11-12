@@ -9,7 +9,8 @@
 //! a station key that identity resolution has already bounded, or a closed enum — and the
 //! review rule is that a new one must be justifiable as "there are N of these and N is in
 //! the configuration". The one place that was false is recorded on [`accepted`]: on the
-//! `accept` path the station key is a peer's claim until M6-4's registry check lands, so
+//! `accept` path the station key is resolved by `mw_collector::admit::Gate` rather than
+//! here, and this crate's `Ingress` is implementable without one, so
 //! that path does not label with it.
 //!
 //! # Which named metrics are deliberately not here
@@ -21,7 +22,8 @@
 //!   §7). Omitted for now: `origin` is bounded by `MAX_ORIGINS`, a *constant*, not by the
 //!   configuration — so it passes the letter of the cardinality rule and fails its test
 //!   ("there are N of these and N is in the configuration"). The per-origin breakdown
-//!   belongs with the peer registry that makes N configured, which is M6-4's.
+//!   belongs with the peer registry that makes N configured, and is
+//!   `mw_collector::metrics::ingested`'s.
 //! - **W7 §7's spellings `admit_rejected_total` and `ingest_rejected_total`** are both
 //!   [`rejected`], i.e. `mw_readings_rejected_total{reason}` — §5.10's name, with §5.10's
 //!   `mw_` prefix. One series for one event; an alert written against either §7 spelling
@@ -31,7 +33,7 @@
 //!   coarser label is how two dashboards come to disagree.
 //! - **Everything per-peer in W7 §7's uplink and collector tables** — `uplink_*`,
 //!   `ingest_envelopes_total`, `peer_last_seen_seconds` and the rest. Those belong to the
-//!   uplink and the gRPC receiver, which are M6-4's.
+//!   uplink and the collector, which are `mw_collector::metrics`'s.
 
 use mw_component::{ComponentId, Reject};
 
@@ -221,10 +223,13 @@ pub fn ingested(station: &str, n: u64) {
 /// Readings accepted from a peer — **unlabelled**.
 ///
 /// §5.10: "A label whose values come from a request … is forbidden". On the `accept` path
-/// the `station_key` is whatever the peer put in the envelope: the check that would bound
-/// it is `station_key` resolving in `StationRegistry`, which is W7 §4.4 step 5 and M6-4's
-/// seam. Labelling with it would let one peer mint unbounded series. When M6-4 lands that
-/// check, this can become [`ingested`] and the two paths merge again.
+/// the `station_key` is whatever the peer put in the envelope, and this crate's
+/// [`crate::SpoolIngress`] is implementable by a caller that has not checked it — so the
+/// bound cannot be established here. The caller that does establish it is
+/// `mw_collector::admit::Gate` (W7 §4.4 step 5), and the series that carries the per-peer
+/// breakdown is `mw_collector::metrics::ingested`, keyed by **peer and origin**, both of
+/// which are configuration. Labelling this one with the station key would let one peer
+/// mint unbounded series.
 pub fn accepted(station: &str) {
     let _ = station;
     metrics::counter!("mw_readings_ingested_total", "station" => "peer").increment(1);

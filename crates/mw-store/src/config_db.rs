@@ -1464,6 +1464,15 @@ pub struct StationRow {
     pub id: i64,
     /// `station_key` -- the domain identity.
     pub station_key: String,
+    /// `owning_node_id` -- the node that **measures** this station, 16 bytes.
+    ///
+    /// Equal to `node.node_id` for a local station and a peer's `node_id` for one that
+    /// arrived by registration. Read because W7 §4.4's step 5 is checked against it: an
+    /// envelope may only name a station some node on its inbound path owns, which is what
+    /// makes **D-36**'s "a compromised leaf cannot inject history for another station"
+    /// true of station keys and not only of origins (`mw_component::StationRegistry::
+    /// station_owner`).
+    pub owning_node_id: Vec<u8>,
     /// `name`.
     pub name: String,
     /// `type` -- the configured device type, in the frozen contract's spelling.
@@ -1547,7 +1556,8 @@ pub struct StationRow {
 /// has no uniqueness constraint and the digest has to be stable.
 pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbError> {
     let rows = sqlx::query(
-        "SELECT id, station_key, name, type, enabled, identity_kind, presented_key, \
+        "SELECT id, station_key, owning_node_id, name, type, enabled, identity_kind, \
+                presented_key, \
                 ingest_secret_hash, latitude, longitude, altitude_m, timezone, \
                 snow_base_distance_mm, wind_dir_correction_degrees, \
                 transport_kind, transport_dev, transport_baud, \
@@ -1568,6 +1578,7 @@ pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbErro
             Ok(StationRow {
                 id: r.get("id"),
                 station_key: r.get("station_key"),
+                owning_node_id: r.get("owning_node_id"),
                 name: r.get("name"),
                 kind: r.get("type"),
                 enabled: flag(&r, "enabled")?,
@@ -2063,4 +2074,179 @@ pub async fn uploaders(pool: &SqlitePool) -> Result<Vec<UploaderRow>, ConfigDbEr
             })
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------------------
+// The peer registry, the uplinks, and the node row this node allocates for itself
+//
+// W7 §5.1 and §8.2. These are implementation-plan.md M6-4's reads and the one write in this
+// module: `allocate_node` is "allocated once, by the node itself, at first start"
+// (W7 **D-5**), which the `node` loader above has always deferred to this item by name.
+
+/// One `peers` row.
+///
+/// W7 §5.1. `auth_material` is an SPKI fingerprint or a PSK hash by `auth_kind`, and `NULL`
+/// under a shared CA -- which is the common case rather than an exception, because the
+/// certificate chain does the authenticating and the row only says who is allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerRow {
+    /// `node_id`, 16 bytes.
+    pub node_id: Vec<u8>,
+    /// `name` -- operator-facing, unique, and the `peer` metric label.
+    pub name: String,
+    /// `auth_kind` -- `mtls-ca`, `mtls-pinned` or `psk`.
+    pub auth_kind: String,
+    /// `auth_material` -- an SPKI digest or an Argon2id PHC string.
+    pub auth_material: Option<String>,
+    /// `relay`. **False by default** (W7 **D-36**).
+    pub relay: bool,
+    /// `software` -- `NodeIdentity.software` as last seen, which is what W7 OQ-W7-6 gates
+    /// removal of the Go compat shim on.
+    pub software: Option<String>,
+    /// `last_seen`, unix seconds.
+    pub last_seen: Option<i64>,
+    /// `revoked_at`, unix seconds. Revocation is a timestamp rather than a deletion.
+    pub revoked_at: Option<i64>,
+    /// `peer_origins.origin_node_id` for this peer, each 16 bytes.
+    pub origins: Vec<Vec<u8>>,
+}
+
+/// Every `peers` row with its `peer_origins`, in name order.
+///
+/// Two queries rather than a join: a join over a one-to-many produces one row per origin
+/// and the peer's own columns repeated, which then has to be folded back -- and the fold is
+/// the part that gets a peer with no origins wrong. Ordered by name so that a digest over
+/// the result is a function of the table's contents.
+pub async fn peers(pool: &SqlitePool) -> Result<Vec<PeerRow>, ConfigDbError> {
+    let rows = sqlx::query(
+        "SELECT node_id, name, auth_kind, auth_material, relay, software, last_seen, \
+                revoked_at \
+         FROM peers ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|source| ConfigDbError::Query {
+        what: "the peer rows",
+        source,
+    })?;
+    let origins = sqlx::query(
+        "SELECT node_id, origin_node_id FROM peer_origins ORDER BY node_id, origin_node_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|source| ConfigDbError::Query {
+        what: "the peer origin grants",
+        source,
+    })?;
+    let mut by_node: std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>> =
+        std::collections::BTreeMap::new();
+    for row in origins {
+        by_node
+            .entry(row.get("node_id"))
+            .or_default()
+            .push(row.get("origin_node_id"));
+    }
+    rows.into_iter()
+        .map(|r| {
+            let node_id: Vec<u8> = r.get("node_id");
+            Ok(PeerRow {
+                origins: by_node.get(&node_id).cloned().unwrap_or_else(Vec::new),
+                node_id,
+                name: r.get("name"),
+                auth_kind: r.get("auth_kind"),
+                auth_material: r.get("auth_material"),
+                relay: flag(&r, "relay")?,
+                software: r.get("software"),
+                last_seen: r.get("last_seen"),
+                revoked_at: r.get("revoked_at"),
+            })
+        })
+        .collect()
+}
+
+/// One `uplink` row -- W7 §8.2's `[[uplink]]`, the other half of **D-44**.
+///
+/// A node with no row sends to nobody. `psk` is a [`SecretString`] from the moment it is
+/// read (**D-33**), like `weather_database.url`.
+#[derive(Debug)]
+pub struct UplinkRow {
+    /// `peer_name` -- which peer this uplink sends to, and the `peer` metric label.
+    pub peer_name: String,
+    /// `endpoint` -- e.g. `https://suncrest.example.net:50051`.
+    pub endpoint: String,
+    /// `auth_kind` -- `mtls` or `psk`.
+    pub auth_kind: String,
+    /// The client certificate, for `mtls`.
+    pub tls_cert_path: Option<String>,
+    /// Its key.
+    pub tls_key_path: Option<String>,
+    /// The CA the collector's certificate is verified against.
+    pub tls_ca_path: Option<String>,
+    /// The pre-shared secret, for `psk`.
+    pub psk: Option<SecretString>,
+}
+
+/// Every `uplink` row, in peer-name order.
+pub async fn uplinks(pool: &SqlitePool) -> Result<Vec<UplinkRow>, ConfigDbError> {
+    let rows = sqlx::query(
+        "SELECT peer_name, endpoint, auth_kind, tls_cert_path, tls_key_path, tls_ca_path, \
+                psk \
+         FROM uplink ORDER BY peer_name",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|source| ConfigDbError::Query {
+        what: "the uplink rows",
+        source,
+    })?;
+    Ok(rows
+        .into_iter()
+        .map(|r| UplinkRow {
+            peer_name: r.get("peer_name"),
+            endpoint: r.get("endpoint"),
+            auth_kind: r.get("auth_kind"),
+            tls_cert_path: r.get("tls_cert_path"),
+            tls_key_path: r.get("tls_key_path"),
+            tls_ca_path: r.get("tls_ca_path"),
+            psk: r.get::<Option<String>, _>("psk").map(SecretString::from),
+        })
+        .collect())
+}
+
+/// Allocate this node's identity, once, at first start (W7 **D-5**).
+///
+/// Returns the existing row unchanged when there is one, so this is safe to call on every
+/// start and the "allocated once" property is the `CHECK (id = 1)` primary key rather than
+/// a decision made here. `INSERT ... ON CONFLICT DO NOTHING` followed by a read, because
+/// two processes racing on one configuration database must agree about the identity and the
+/// loser must adopt the winner's rather than overwrite it -- a `node_id` that changed under
+/// a spool whose `MANIFEST` already holds the old one is a spool this build refuses to
+/// open.
+///
+/// `spool_path` is the caller's: W7 **D-10** puts the spool at a **sibling of `config.db`**,
+/// and the binary is what knows where `config.db` is. The column has no `DEFAULT` for the
+/// same reason.
+pub async fn allocate_node(
+    pool: &SqlitePool,
+    node_id: &[u8; 16],
+    node_name: &str,
+    spool_path: &str,
+) -> Result<Node, ConfigDbError> {
+    sqlx::query(
+        "INSERT INTO node (id, node_id, node_name, spool_path) VALUES (1, ?, ?, ?) \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(node_id.as_slice())
+    .bind(node_name)
+    .bind(spool_path)
+    .execute(pool)
+    .await
+    .map_err(|source| ConfigDbError::Query {
+        what: "allocating this node's identity",
+        source,
+    })?;
+    node(pool).await?.ok_or(ConfigDbError::Query {
+        what: "re-reading the node row this start allocated",
+        source: sqlx::Error::RowNotFound,
+    })
 }

@@ -1470,6 +1470,7 @@ dependencies = [
  "mw-supervisor",
  "mw-types",
  "mw-web",
+ "rustls",
  "sd-notify",
  "secrecy",
  "sqlx",
@@ -1551,13 +1552,28 @@ dependencies = [
 name = "mw-collector"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
+ "argon2",
+ "axum",
  "chrono",
+ "http",
+ "metrics",
  "mw-component",
+ "mw-http",
+ "mw-pipeline",
  "mw-proto",
  "mw-types",
+ "prost",
+ "rustls",
+ "rustls-pemfile",
+ "secrecy",
+ "subtle",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tonic",
+ "tonic-prost",
+ "tower",
  "tracing",
 ]
 
@@ -2391,6 +2407,7 @@ version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -3121,6 +3138,7 @@ dependencies = [
  "socket2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tower",

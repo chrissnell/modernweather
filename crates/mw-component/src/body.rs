@@ -19,7 +19,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use mw_types::Envelope;
+use mw_types::{Envelope, Seq};
 
 use crate::cx::{BuildCx, Cx};
 use crate::error::{BuildError, ComponentError};
@@ -69,6 +69,7 @@ pub trait Serve: Send + 'static {
 #[derive(Debug, Clone)]
 pub struct ReadingBatch {
     envelopes: Arc<[Envelope]>,
+    through: Option<Seq>,
 }
 
 impl ReadingBatch {
@@ -76,7 +77,40 @@ impl ReadingBatch {
     pub fn new(envelopes: impl Into<Arc<[Envelope]>>) -> Self {
         Self {
             envelopes: envelopes.into(),
+            through: None,
         }
+    }
+
+    /// [`ReadingBatch::new`] carrying the **local** spool position the read covered.
+    ///
+    /// Only a `Durable` subscription has one, which is why the accessor is an `Option`
+    /// rather than this being a field on every batch.
+    pub fn at(envelopes: impl Into<Arc<[Envelope]>>, through: Seq) -> Self {
+        Self {
+            envelopes: envelopes.into(),
+            through: Some(through),
+        }
+    }
+
+    /// The highest **local** spool position this batch covered, for a `Durable`
+    /// subscription.
+    ///
+    /// **This is the sender's coordinate space, which is the only one an ack can be
+    /// cumulative in** (W7 **D-22**): `IngestBatch.through` is the sender's spool `seq` of
+    /// the last envelope in the batch, and for a relay that is a different number from any
+    /// envelope's own `(origin, seq)`, because a relay's log interleaves origins. An uplink
+    /// cannot derive it from the envelopes it was handed.
+    ///
+    /// **Not `envelopes.last()`'s position.** A filter applied by the subscription drops
+    /// envelopes that still have to advance the cursor (W7 **D-9**), so the covered
+    /// position can be past the last surviving envelope — and a batch that was filtered
+    /// empty still has one.
+    ///
+    /// `None` for `Latest` and `Lossy`, which have no cursor and therefore no position: an
+    /// uplink declares `Durable`, so a `None` there is a wiring mistake rather than a state
+    /// to handle.
+    pub fn through(&self) -> Option<Seq> {
+        self.through
     }
 
     /// The envelopes, oldest first.

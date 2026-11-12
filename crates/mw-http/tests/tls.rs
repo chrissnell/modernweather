@@ -328,6 +328,9 @@ async fn the_plaintext_port_redirects_to_the_tls_one() {
             "exact.test".to_string(),
             mw_types::WebsiteId::new(1),
         )])),
+        // No ingest TLS: this test is about the main port's SNI chain, and the gRPC socket
+        // stays plaintext exactly as it does on a node with no `config.ingest` row.
+        None,
     )
     .await
     .expect("both ports bind");

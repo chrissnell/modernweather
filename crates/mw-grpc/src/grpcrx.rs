@@ -28,23 +28,41 @@
 //! answered. What this file does is hand the gate what the frame claimed; the refusal is
 //! `mw_readings_rejected_total{reason}` and a `Status`, not a log line.
 //!
-//! # What is M6-4's, and is therefore not here
+//! # What landed with M6-4, and what this service still cannot do
 //!
-//! **Registration.** `RegisterRemoteStation` mints a station key, which needs `Write` on
-//! `StationRegistry` — W2a §4.1b gives that to `station:grpcrx` alone, and
-//! `mw_station::config`'s module documentation records that the first non-root write
-//! capability is what should force `Access` into handle resolution. That bill comes due in
-//! **M6-4**, with the collector. Until then the method answers `Unimplemented` **naming the
-//! work item**, rather than being absent — a satellite that tries to enrol gets a sentence
-//! instead of a 404.
+//! **The three admission layers of D-46 are the collector's** — `mw_collector::handshake`,
+//! `mw_collector::service` and `mw_collector::admit`, over `collector.v1.Collector`. Layer
+//! 1 is on the **socket**, so it covers this method too: a connection that reaches
+//! `SendWeatherReadings` has completed the handshake `config.ingest.peer_auth` configures.
+//! That is why [`crate::GrpcIngestConfig::ingest_tls_available`] exists and why
+//! [`GrpcRxPlanError::InsecureIngest`] no longer fires on every row.
 //!
-//! **The three admission layers of D-46** — mTLS or a PSK at the handshake, a per-RPC
-//! interceptor resolving the peer before any method body runs, and per-envelope origin
-//! authorisation — are the collector's, over `collector.v1.Collector`. This service is the
-//! **Go compat shim**: it carries bare readings rather than sealed envelopes, so it has no
-//! provenance to authorise and no `(origin, seq)` to dedup against, which is M6-4's own
-//! list of that shim's three limitations. [`PEER_AUTH_NOTE`] is what this build says about
-//! the `peer_auth` column it cannot yet honour, once, at startup.
+//! Layers 2 and 3 are not reachable from here and cannot be: this service carries **bare
+//! readings** rather than sealed envelopes, so there is no provenance to authorise and no
+//! `(origin, seq)` to deduplicate against. Those are two of §9.2's three stated limitations,
+//! and they are properties of the schema rather than of this file:
+//!
+//! | §9.2's limitation | Why it holds here |
+//! |---|---|
+//! | no resume, no cross-reconnect dedup | a `WeatherReading` has no `seq`, so `admit` mints one and a reconnect re-mints |
+//! | no relay | a `WeatherReading` has no `path`, so there is nowhere to record a hop — relaying is **inexpressible**, not refused |
+//! | field presence is lost | the committed Go proto's bare scalars make absent and `0.0` the same bytes (W3 §6.5) |
+//!
+//! The second one is worth being exact about, because §9.2 writes it as "`relay = true` on
+//! a compat peer is a plan error" and this build does not have that check. It does not need
+//! one and could not write one honestly: `plan()` cannot know which protocol a peer will
+//! speak — `peers.software` is written by a `Hello` that has not happened yet — and the shim
+//! re-originates every reading to **this** node through `admit`, so a forwarded path is not
+//! something a compat peer can present at all. [`PEER_AUTH_NOTE`] states all three
+//! limitations to the operator, once, at startup, and the removal condition is
+//! `mw_peer_software_info` (W7 OQ-W7-6).
+//!
+//! **Registration.** `RegisterRemoteStation` still answers `Unimplemented`, and that is now
+//! a decision rather than a deferral: its message carries the four plaintext secrets §5.2
+//! and **D-67** delete, so decoding it would put them back into this tree. The supported
+//! path is `collector.v1.Collector`'s `Hello`, which registers a peer's stations carrying
+//! identity only — or an operator's own `config.stations` row, which the `Unimplemented`
+//! message names.
 //!
 //! # Why `admit` and not `accept`
 //!
@@ -53,7 +71,7 @@
 //! — so there is no provenance to preserve, and `admit` is the only one of the two that can
 //! take it. The consequence is the shim's third limitation stated in another coat: a
 //! reading forwarded through this method is re-originated to **this** node, so it is not
-//! deduplicable against the same reading arriving later through the collector. M6-4's
+//! deduplicable against the same reading arriving later through the collector.
 //! `collector.v1.Collector` is where a satellite's own `(origin, seq)` survives the hop.
 
 use std::fmt;
@@ -88,25 +106,37 @@ pub const ID: &str = "station:grpcrx";
 /// (the registry's protobuf schema, and **D-21** on why a field number is never reused).
 pub const SEND_WEATHER_READINGS: &str = "/remoteweather.v1.WeatherV1/SendWeatherReadings";
 
-/// The enrolment method, which answers `Unimplemented` until M6-4.
+/// The Go-era registration method, which answers `Unimplemented` by decision -- see this
+/// module's documentation and `route_table`'s message for why, and for the path that works.
 pub const REGISTER_REMOTE_STATION: &str = "/remoteweather.v1.WeatherV1/RegisterRemoteStation";
 
-/// What this build says, once, about a `peer_auth` it cannot yet honour.
+/// What this build says, once, about what authenticates a reading on **this** method.
+///
+/// **Not "`peer_auth` is unenforced" any more**, which is what this note used to say.
+/// Implementation-plan.md M6-4 landed D-46's three layers on the same socket, so a
+/// connection that reaches this method has completed the handshake
+/// `config.ingest.peer_auth` configures. What it has *not* done is prove which station it
+/// may write for, and that is the shim's stated limitation rather than a gap: a
+/// `WeatherReading` carries no origin, no sequence number and no path, so there is no
+/// provenance for per-envelope authorisation to be checked against.
 pub const PEER_AUTH_NOTE: &str =
-    "the `ingest.peer_auth` column is read and NOT enforced by this build: \
-     docs/collector.md D-46's three admission layers are implementation-plan.md M6-4's, \
-     over `collector.v1.Collector`. What authenticates a reading on this method is the \
-     station identity the registry resolves, which is `from_registration` -- so a sender \
-     that can reach this port can write readings for any station it knows the registered \
-     key of, and not for one it does not.";
+    "`WeatherV1.SendWeatherReadings` is the GO COMPAT SHIM (docs/collector.md §9.2). The \
+     connection is authenticated by `config.ingest.peer_auth` at the handshake, as every \
+     connection to this socket is -- but a `WeatherReading` carries no provenance, so this \
+     method cannot check WHICH station an authenticated peer may write for: any enrolled \
+     peer can write readings for any station whose registered key it knows. It is also \
+     at-most-once and cannot relay. A satellite that speaks `collector.v1.Collector` gets \
+     all three back; the shim is removed when `mw_peer_software_info` shows no peer at \
+     version \"unknown\" (W7 OQ-W7-6).";
 
 /// What this build says, once, about the opt-out that let it start.
 pub const INSECURE_NOTE: &str =
-    "`config.ingest.allow_insecure = 1` is set, so this node serves its reading receiver \
-     over plaintext with no peer authentication: anyone who can reach the gRPC port can \
-     write readings for any station whose registered key they know. Decision 35 requires \
-     this to be said on every start. Reach it only over a private network or a tunnel \
-     until M6-4 lands mTLS.";
+    "`config.ingest.allow_insecure = 1` is set and this node has no TLS certificate for \
+     the gRPC socket, so it serves its reading receiver over plaintext with NO peer \
+     authentication at all: anyone who can reach the gRPC port can write readings for any \
+     station whose registered key they know. Decision 35 requires this to be said on every \
+     start. Configure `listener.https_port` and a website certificate and clear \
+     `allow_insecure`, or reach this port only over a private network or a tunnel.";
 
 /// The component id, which is a constant and is still validated.
 pub fn component_id() -> Result<ComponentId, ComponentIdError> {
@@ -344,11 +374,13 @@ pub fn route_table(state: Arc<ServiceState>) -> Result<mw_http::RouteTable, Comp
         // Named rather than absent: a satellite that tries to enrol gets a sentence and the
         // work item, where a 404 would look like the wrong address.
         unimplemented_status(
-            "`RegisterRemoteStation` mints a station key, which needs Write on \
-             StationRegistry -- implementation-plan.md M6-4 adds it with the collector. \
-             Until then a received station is configured by an operator: insert the \
-             `config.stations` row with `identity_kind = 'from_registration'` and the key \
-             the satellite will present in `presented_key`.",
+            "`RegisterRemoteStation` is not implemented and will not be: its message \
+             carries four plaintext secrets that docs/collector.md §5.2 and D-67 delete, \
+             so decoding it would carry that exposure forward. Register through \
+             `collector.v1.Collector/Hello`, which carries identity only -- or have an \
+             operator insert the `config.stations` row with \
+             `identity_kind = 'from_registration'` and the key this satellite presents in \
+             `presented_key`.",
         )
     });
     Ok(mw_http::RouteTable::new(
@@ -487,19 +519,25 @@ pub enum GrpcRxPlanError {
 
     /// Plaintext ingest with no explicit opt-out, which **decision 35** makes a plan error.
     ///
-    /// The gRPC socket this build serves has no TLS branch at all
-    /// (`mw_http::socket::serve`), and `peer_auth` is read and not enforced, so the method
-    /// is reachable by anyone who can reach the port. `docs/collector.md` §5.4 and decision
-    /// 35 answer that shape with "a plan-time error unless `allow_insecure_ingest = true`
-    /// is set explicitly, in which case it is logged at `WARN` on every start", and the
-    /// column exists for it. Refusing here rather than deferring with the rest of D-46:
-    /// the alternative is a daemon that serves an unauthenticated write method while the
-    /// operator's own opt-out sits unread, which is worse than one that will not start.
+    /// **The condition changed with implementation-plan.md M6-4 and the error did not.** It
+    /// used to fire on every `config.ingest` row, because the gRPC socket had no TLS branch
+    /// at all; it now fires when that socket *cannot* complete a handshake, which is when
+    /// no `listener.https_port` and certificate are configured for the SNI resolver to
+    /// answer from (`mw_collector::handshake`). A node with TLS no longer needs the opt-out,
+    /// and that is what makes the two components mounted on this socket agree: refusing
+    /// here while `ingest:grpc` planned happily would be a daemon that will not start for a
+    /// configuration the design calls correct.
+    ///
+    /// Refusing at all rather than deferring: the alternative is a daemon that serves an
+    /// unauthenticated write method while the operator's own opt-out sits unread, which is
+    /// worse than one that will not start.
     #[error(
-        "`config.ingest.listen = 'grpc'` serves `{SEND_WEATHER_READINGS}` over plaintext \
-         in this build -- there is no TLS on the gRPC socket and `peer_auth = '{peer_auth}'` \
-         is not enforced until M6-4 -- so decision 35 requires the opt-out: set \
-         `config.ingest.allow_insecure = 1` to accept that, or remove the row"
+        "`config.ingest.listen = 'grpc'` serves `{SEND_WEATHER_READINGS}` over plaintext, \
+         because this node has no TLS certificate for the gRPC socket to present -- so \
+         `peer_auth = '{peer_auth}'` authenticates nobody. Configure \
+         `listener.https_port` and a website certificate, or set \
+         `config.ingest.allow_insecure = 1` to accept that (decision 35 requires it to be \
+         explicit), or remove the row"
     )]
     InsecureIngest {
         /// What the row asked for, so the message names the setting being ignored.
@@ -549,9 +587,10 @@ where
     };
     // **Before anything is built**, because the point of a plan error is that the daemon
     // does not start: decision 35's "plaintext ingest is a plan-time error unless
-    // `allow_insecure_ingest = true`". The column was plumbed through `IngestRow` and read
-    // by nobody, so the one switch an operator has for this did nothing.
-    if !row.allow_insecure {
+    // `allow_insecure_ingest = true`". The TLS half of the condition is M6-4's and is the
+    // same question `mw_collector::service::register` asks, so the two components mounted
+    // on this socket cannot disagree about whether the configuration is acceptable.
+    if !cfg.ingest_tls_available() && !row.allow_insecure {
         return Err(GrpcRxPlanError::InsecureIngest {
             peer_auth: row.peer_auth.clone(),
         });
@@ -788,6 +827,10 @@ mod tests {
             }
             fn ingress(&self) -> Option<&Arc<dyn Ingress>> {
                 self.ingress.as_ref()
+            }
+            /// No TLS, so decision 35's opt-out is what this test is about.
+            fn ingest_tls_available(&self) -> bool {
+                false
             }
         }
 

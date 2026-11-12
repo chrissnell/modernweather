@@ -54,6 +54,7 @@ fn row(key: &str, claim: &str, hash: &str) -> StationRow {
     StationRow {
         id: 0,
         station_key: key.to_string(),
+        owning_node_id: vec![1; 16],
         name: key.to_string(),
         kind: "ambient-customized".to_string(),
         enabled: true,
