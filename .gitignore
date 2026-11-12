@@ -6,3 +6,8 @@ Cargo.lock.orig
 # Client binaries lifted out of the TimescaleDB pod so that the database gates can run
 # where `apt` is not available. Not part of the build and not portable between hosts.
 /.tools
+
+# Kubernetes manifests for the cluster this runs on. They name nodes, host paths and
+# addresses, and this repository is public. They live in the private
+# kube-cluster-helm-values repo instead, under apps/modernweather-db/.
+/deploy/
