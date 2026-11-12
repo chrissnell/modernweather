@@ -1,0 +1,71 @@
+# /etc/ser2net/campbell.yaml -- the Campbell station's serial fan-out on pitcairn.
+#
+# One serial line has one reader. This gives it several, so that `remoteweather` and
+# `modernweather` can read the same datalogger at the same time -- which is what
+# implementation-plan.md M5-2's mechanism (b) needs on this station and cannot get any other
+# way. docs/reconciliation.md N-20 is the same arrangement arriving a milestone early.
+#
+# `campbell-serial-bridge.service` is the unit that runs this; its README has the cutover,
+# the rollback, and the measurements behind every claim below.
+#
+# ---------------------------------------------------------------------------------------
+# TWO VALUES IN THIS FILE ARE THE OWNER'S TO CONFIRM AND BOTH FAIL QUIETLY IF WRONG.
+#
+#   1. the device. The issue says /dev/ttyS0, which is a built-in port;
+#      crates/mw-station/src/stream.rs records the same station as USB serial, which would
+#      make it /dev/ttyUSB0 -- and for USB the path to use is the by-id symlink, because
+#      /dev/ttyUSB* numbering is not stable across a replug. gensio accepts a symlink: that
+#      was checked. One of those two documents is wrong and the box is the only thing that
+#      can say which.
+#
+#   2. the line rate. It is the `baud` column of this station's row in `remoteweather`'s
+#      configuration database. Getting it wrong does NOT produce silence: the bytes arrive
+#      framed wrong and every line fails to parse, so the symptom is a station that is
+#      connected and reports nothing.
+# ---------------------------------------------------------------------------------------
+
+%YAML 1.1
+---
+
+connection: &campbell
+  # Reachable by `remoteweather` on this box and by `modernweather` from the Kubernetes
+  # cluster, which is on the same /24 (10.50.0.51-56). A loopback-only accepter would serve
+  # the first and not the second, and serving both is the entire point of the exercise.
+  #
+  # THIS PORT IS WRITABLE. ser2net is bidirectional: bytes a client sends are forwarded to
+  # the datalogger. Neither daemon writes to this line -- remoteweather's Campbell driver
+  # has no `.Write(` in it (checked) and mw-station's session has
+  # `mw_station::lines::tests::the_session_writes_nothing` as its assertion
+  # -- but after this change anything that can reach the port can write to the station,
+  # which was not true when the port was a file only `remoteweather` had open. That is the
+  # one new hazard this item introduces. The accepter is `tcp`, not `telnet`, so there is no
+  # RFC 2217 negotiation and a client cannot change the line rate; the remaining exposure is
+  # the LAN, and it belongs to pitcairn's firewall rather than to this file. ser2net's own
+  # `remaddr` option takes an `<address>,<port>` pair and no CIDR, so it cannot express
+  # "the cluster" -- that was tried.
+  accepter: tcp,10.50.0.35,7001
+
+  # `local` because there are no modem control lines to wait for on this cable.
+  #
+  # The uucp lock is left ON (no `nouucplock`), which is deliberate and has a consequence:
+  # a ser2net killed with SIGKILL leaves `/run/lock/LCK..*` behind -- one keyed by the
+  # device path and one by its major.minor -- and the next start then answers its clients
+  # `Device open failure: Object was already in use` while otherwise looking healthy. The
+  # unit therefore stops with SIGTERM and the README says where to look if it ever happens.
+  connector: serialdev,/dev/ttyS0,19200n81,local
+
+  options:
+    # Two daemons, plus room for a person with `nc` to watch the line without displacing
+    # either of them.
+    #
+    # Measured, against 4.6.4 and against the 4.6.8 Arch ships
+    # (`crates/mw-station/tests/serial_bridge.rs`): every connected client receives every
+    # byte, identical byte for byte; a client beyond this limit is answered
+    # `Port already in use` and the clients already reading do not notice; and a client that
+    # stops reading entirely does not cost the others a byte over three hours' worth of
+    # records.
+    max-connections: 4
+
+    # Not set, and named here so that a later reader does not add it: `kickolduser` would
+    # make a careless third connection displace a daemon that is reading. Refusing the
+    # newcomer is the behaviour this station wants.

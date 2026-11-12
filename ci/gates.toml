@@ -236,6 +236,35 @@ tests passed, because a filter that matches no tests exits zero and a gate that 
 green while running nothing is docs/reconciliation.md G-1."""
 
 [[gate]]
+id = "serial-bridge"
+description = "A `ser2net` fan-out broadcasts every byte to every client, with its controls"
+owner = "GRA-787 (the Campbell multiplexer on pitcairn); consumed by M5-2 mechanism (b)"
+arms_when = "packaging/serial-bridge/ser2net.yaml"
+cmd = ["ci/serial-bridge/prove.sh"]
+note = """
+M5-2's mechanism (b) diffs the two implementations by value on real data, which needs both
+daemons fed the same readings. The WeatherLink Live broadcasts over UDP and gives that away;
+the Campbell station is on a serial line, which has exactly one reader, so for that station
+(b) does not exist without the multiplexer this gate guards.
+
+The property is not that the multiplexer works -- it is that it BROADCASTS. A multiplexer
+that handed bytes to whichever client read first would leave both daemons with gap-ridden
+data that still parses, which is the worst available outcome because nothing downstream
+could tell it from weather. `ser2net`'s documentation says `max-connections` does the right
+thing; this gate is the measurement, byte for byte, with two negative controls (one
+misconfigured bridge, one unbridged character device read twice).
+
+`ser2net` and `socat` are hard requirements and the runner says so rather than skipping: the
+binary under test is the one that runs on pitcairn, and a faked fan-out would prove only that
+its author can write one. The runner asserts the declared number of tests passed, because a
+`--ignored` filter that matches no tests exits zero and a gate that reports green while
+running nothing is docs/reconciliation.md G-1 -- the same rule `cargo xtask emulator-tests`
+applies.
+
+packaging/serial-bridge/README.md has what each test establishes, the cutover order the
+measurements require, and the two values on the box that no test here can confirm."""
+
+[[gate]]
 id = "coverage-ratchet"
 description = "Line coverage has not decreased against the committed floor"
 owner = "W8 (this item); becomes meaningful once there are tests"
