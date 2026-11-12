@@ -29,19 +29,11 @@
 #     REMOTEWEATHER=../remoteweather lab/run-in-pod.sh up
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-POD="${POD:-w9-migration-lab}"
-NS="${NS:-default}"
-IMAGE="${IMAGE:-timescale/timescaledb-ha:pg17}"
-# The source half only. Defaults to IMAGE, in which case the source shares the target's
-# pod and nothing about the earlier behaviour changes. Set it to production's version to
-# run the whole procedure across the pair it will actually cross.
-SRC_IMAGE="${SRC_IMAGE:-$IMAGE}"
-# `10-seed.sh` reads SRC_POD too, so a split lab seeds the right database.
-if [ "$SRC_IMAGE" = "$IMAGE" ]; then
-  SRC_POD="${SRC_POD:-$POD}"
-else
-  SRC_POD="${SRC_POD:-$POD-src}"
-fi
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# POD, NS, IMAGE, SRC_IMAGE, SRC_POD and lab_adopt_existing_source_pod. Shared with
+# 10-seed.sh so that one environment cannot select two different source pods.
+# shellcheck source=ci/db/migrate-from-go/lab/lab-env.sh
+. "$HERE/lab-env.sh"
 OLD_DB=weather_v2_0_0
 NEW_DB=modernweather
 
@@ -69,15 +61,16 @@ up)
   kex_src psql -U postgres -c "CREATE DATABASE $OLD_DB"
   kex psql -U postgres -c "CREATE DATABASE $NEW_DB"
   # The OLD schema, built from the Go source's own constants rather than retyped.
-  "$(dirname "${BASH_SOURCE[0]}")/emit-old-schema.sh" "${REMOTEWEATHER:?set REMOTEWEATHER to a remoteweather checkout}" \
+  "$HERE/emit-old-schema.sh" "${REMOTEWEATHER:?set REMOTEWEATHER to a remoteweather checkout}" \
     | psql_old -f -
-  psql_old -f - < "$(dirname "${BASH_SOURCE[0]}")/00-old-harness.sql"
+  psql_old -f - < "$HERE/00-old-harness.sql"
   # The NEW schema, from the migrations, so this is the schema that ships.
   for f in "$ROOT"/migrations/*.sql; do psql_new -1 -f - < "$f"; done
   echo "lab up: $OLD_DB on $SRC_POD (old schema) and $NEW_DB on $POD (migrations applied)"
   echo "now seed: see lab/10-seed.sh"
   ;;
 migrate)
+  lab_adopt_existing_source_pod
   export PSQL_SOURCE="kubectl exec -i $SRC_POD -n $NS -- psql -U postgres -d $OLD_DB -X -q -v ON_ERROR_STOP=1"
   export PSQL_TARGET="kubectl exec -i $POD -n $NS -- psql -U postgres -d $NEW_DB -X -q -v ON_ERROR_STOP=1"
   export TARGET="postgresql://postgres:w9lab@localhost/$NEW_DB"
@@ -85,6 +78,7 @@ migrate)
   "$ROOT/ci/db/migrate-from-go/migrate-from-go.sh" "${@:-all}"
   ;;
 down)
+  lab_adopt_existing_source_pod
   # --ignore-not-found, because with two pods a missing first one must not stop `set -e`
   # from reaching the second.
   kubectl delete pod "$POD" -n "$NS" --wait=false --ignore-not-found

@@ -263,12 +263,26 @@ separate, explicitly named step rather than part of `all`.
 > | the §6.3 control | a scalar mean of the wind direction disagrees with the vector mean in **184 of 184** buckets, so the circular-mean check is not passing for the wrong reason |
 > | legacy re-read | 336 of 336 rows exact on mean, angle, extrema and total |
 >
+> **Reproducing it.** `SRC_IMAGE=timescale/timescaledb-ha:pg16.6-ts2.17.2 … run-in-pod.sh up`,
+> then `FROM=2025-01-01 TO=2025-06-25 CADENCE=40 RETAIN='60 days' 10-seed.sh`, then `run-in-pod.sh
+> migrate <step>`. That reproduces the shape — about 61 days of raw under 174 days of rollup; the
+> exact raw row count depends on which 7-day chunk boundary the retention cut lands on.
+>
 > **Two harness constraints the lab's clock imposes, worth knowing before reading any lab output.**
-> The lab's data sits in the past while `now()` does not, and two things follow. First, a *real*
-> retention policy on the lab source deletes everything: `add_retention_policy('weather', '60 days')`
-> fires within minutes and the whole seeded range is older than that — which is why `10-seed.sh`
-> reproduces the retention window with an explicit `drop_chunks` and no policy, and why a policy
-> added to exercise `pause-source-retention` needs a `drop_after` wide enough to drop nothing.
+> The lab's data sits in the past while `now()` does not, and two things follow.
+>
+> First, a *real* retention policy on the lab source deletes everything:
+> `add_retention_policy('weather', '60 days')` is due the moment it is created, because the whole
+> seeded range is older than 60 days *ago*. That is why `10-seed.sh` produces the retention window
+> with an explicit `drop_chunks` and no policy, and why the five policies it does create — so that
+> `pause-source-retention` has the one it pauses and the four it must not touch — take a `drop_after`
+> derived to reach past the oldest row in **any** of the five relations. Deriving it from raw alone
+> is not sufficient and was measured: a `drop_after` of raw's age + 30 days leaves the `weather_1d`
+> policy free to delete the rollup-only buckets, since the whole point of the seed is that
+> `weather_1d` reaches further back than `weather` does. In a lab seeded to a 98-day window it
+> removed 56 of those days within minutes of the policy being created — the A-W9-1 mechanism again,
+> this time with the lab's own clock supplying the invalidation.
+>
 > Second, `rebuild-aggregates.sh` phase 1 — "the widest `/span` band above each level", bounded by
 > `now() - 366 days` — matches no rows in the lab and the whole hierarchy is built by phase 2. On
 > production, where `max(time)` is minutes old, phase 1 is the part that matters.
@@ -965,7 +979,12 @@ job uses, so a result here is a result there.
   retyped — a "faithful copy" that was retyped is a measurement of the retyping;
 - the new schema is built from `migrations/`, so it is the schema that ships;
 - the rollup-only window is produced by the mechanism production used: materialise all four levels
-  over the full range, then let retention drop the raw chunks underneath;
+  over the full range, then let retention drop the raw chunks underneath. Its width is
+  `(TO - FROM) - RETAIN`, and `RETAIN` defaults to production's 365 days — so a shortened span needs
+  it lowered too. **`10-seed.sh` measures the window it produced and fails when it is zero**, because
+  a seed with no such window reports success and then `rollup` imports nothing,
+  `assert_legacy_disjoint()` passes over an empty table, and the reconciliation downstream is green
+  on a lab that never exercised the legacy path at all;
 - the cadence is **40 seconds, not 60**, which puts 1 or 2 readings in each 1-minute bucket rather
   than exactly one. That is D-12's uneven-bucket condition — the condition under which a mean of
   means is wrong and a sum-and-count hierarchy is not. A 60-second cadence would make §6.3 pass for
