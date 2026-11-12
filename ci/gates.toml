@@ -329,6 +329,68 @@ closing two of them is not enough:
      gate exited 2 naming the gutted test."""
 
 [[gate]]
+id = "db-restore-rehearsal"
+description = "The off-site archive is restored into a fresh database and reconciled byte for byte"
+owner = "implementation-plan.md M0-2 (work item N-19)"
+arms_when = "ci/db/offsite-backup.sh"
+cmd = ["ci/db/restore-rehearsal.sh"]
+on_exit.1 = """
+the archive restored and the result is not what was backed up. Read the lines above marked
+MISMATCH: each one names an object, the row count and digest the manifest recorded, and the
+row count and digest the restored database produced. The digest is of the ordered COPY
+stream, so a single changed value fails this and a row count alone would not have.
+
+Three other things exit 1, all of them verdicts about the restore path rather than about the
+run: a pre-seeded aggregate row SURVIVING a refresh, which would mean A-W9-2 no longer holds
+and the exclusion of the aggregate levels from the archive needs revisiting; a /span band
+that is still wrong after phase 1, which breaks W4 D-23's restore ordering; and a restored
+configuration database that differs from the one that was dumped."""
+on_exit.2 = """
+the run reached no verdict, so it proved nothing about the restore path either way. No
+server that databases may be created and dropped on, a missing psql / pg_dump / pg_restore /
+rclone / python3, migrations/ that would not apply, an archive whose layout version this
+script does not read, or an aggregate that REFUSED the A-W9-2 probe insert outright -- which
+is a different behaviour from the one the exclusion is argued from and has to be re-measured
+rather than ruled on.
+
+Deliberately not exit 1, following `db-tests` and `conformance` for the same reason
+(docs/reconciliation.md C-W2-20): "there was no database" and "the restore lost a reading"
+must not produce the same red."""
+note = """
+docs/reconciliation.md 7.5 is the reasoning and DESIGN.md D-6 is the mechanism: backup and
+restore is pg_dump plus an aggregate refresh, and no bespoke tool is built. D-6's first half
+had no owner and no schedule, which was latent on pitcairn and load-bearing the moment the
+database became a single-replica local-PV StatefulSet (M0-1). This gate is its second half:
+the restore, REHEARSED rather than written down, because a backup you hesitate to restore
+from is not a backup.
+
+TWO MODES, and the PR gate runs the one that needs no credential.
+
+  default         seed -> dump -> restore -> reconcile, through a LOCAL rclone remote in a
+                  temporary directory. This is what `cmd` above runs. It exercises the
+                  archive layout, the per-year slicing, the explicit column lists, the
+                  byte-for-byte reconciliation and the phase-1 rebuild. It does not touch
+                  R2 and says so on every run.
+  --from-archive  the real archive at MW_BACKUP_REMOTE. This is the mode that proves R2
+                  specifically; it is run by a monthly CronJob next to the cluster rather
+                  than on every PR.
+
+The split is deliberate and it is not a deferral. A gate that is red on every PR because a
+secret is unavailable gets overridden until nobody reads it, which is where
+docs/reconciliation.md G-1 ended up by a different route. So the half that can always run
+runs always, and the half that needs a credential runs on a schedule where its failure is
+visible on its own.
+
+Needs psql, pg_dump, pg_restore, rclone, python3 and a TimescaleDB it may create and drop
+databases on. It fails rather than skipping when it cannot have them, for the reason
+W3 Decision 84 gives for the database tests.
+
+Both halves have been seen failing, which is this repository's standing requirement for
+trusting a check (docs/reconciliation.md G-1): with one row dropped from the restore stream
+the reconciliation reported both raw years MISMATCH and exited 1, and with the layout
+version bumped against an existing archive the restore refused to run at all."""
+
+[[gate]]
 id = "mgmt-schema-drift"
 description = "The management OpenAPI schema and its TypeScript client match the Rust handlers"
 owner = "W5 §4.3 (implementation-plan.md M7-1)"

@@ -282,6 +282,8 @@ jobs:
             ci/spike/armv6-cross-spike.sh \
             ci/db/migrate-twice.sh \
             ci/db/rebuild-aggregates.sh \
+            ci/db/offsite-backup.sh \
+            ci/db/restore-rehearsal.sh \
             ci/db/migrate-from-go/migrate-from-go.sh \
             ci/db/migrate-from-go/extract-go-views.sh \
             ci/db/migrate-from-go/lab/run-in-pod.sh \
@@ -735,6 +737,67 @@ jobs:
       - name: Apply the migrations twice and compare
         run: cargo xtask gate db-migrate-twice
 
+  db-restore-rehearsal:
+    name: off-site backup restored and reconciled
+    runs-on: ubuntu-latest
+    services:
+      timescaledb:
+        # The same image and the same reasoning as the `database` job: DESIGN.md D-2
+        # requires TimescaleDB 2.31 with timescaledb_toolkit.
+        image: timescale/timescaledb-ha:pg17
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgresql://postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      # The same PostgreSQL 17 client the `database` job needs, and for the same reason: the
+      # runner images ship 16, pg_dump refuses a newer server than itself, and /usr/bin/pg_dump
+      # is a postgresql-common wrapper that resolves its version from the local cluster list
+      # rather than from the server.
+      - name: Install PostgreSQL 17 client
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+          echo /usr/lib/postgresql/17/bin >> "$GITHUB_PATH"
+          /usr/lib/postgresql/17/bin/pg_restore --version
+      # rclone is the archive's only transport, in CI as in the cluster -- the default mode
+      # writes to a LOCAL rclone remote, which needs the binary and no configuration at all.
+      # Pinned rather than `apt install rclone`, because the runner image's version is not
+      # something this gate should silently inherit.
+      - name: Install rclone
+        env:
+          RCLONE_VERSION: "1.68.2"
+        run: |
+          curl -fsSL -o /tmp/rclone.zip \
+            "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-amd64.zip"
+          unzip -q -j /tmp/rclone.zip "*/rclone" -d /tmp/rclone-bin
+          sudo install -m 0755 /tmp/rclone-bin/rclone /usr/local/bin/rclone
+          rclone version | head -1
+      # Default mode: seed, dump through a local rclone remote, restore into a second
+      # database, reconcile byte for byte, re-measure A-W9-2 and assert the four /span bands
+      # after phase 1 only. No credential, so this runs on every PR including from a fork.
+      # The R2 half is `--from-archive`, run by a monthly CronJob beside the cluster.
+      - name: Restore the archive and reconcile it
+        run: cargo xtask gate db-restore-rehearsal
+
   db-tests:
     name: database tests (real TimescaleDB)
     runs-on: ubuntu-latest
@@ -864,6 +927,7 @@ jobs:
       - driver-emulators
       - database
       - db-tests
+      - db-restore-rehearsal
       - coverage
     if: always()
     runs-on: ubuntu-latest

@@ -2067,6 +2067,17 @@ this is the one figure here that is extrapolated rather than measured:
 S3 would cost roughly $3.60 *per restore* in egress — and a backup you hesitate to restore from is
 not a backup. That is also why §7.5's deliverable is a **rehearsed** restore rather than a dump.
 
+> **Measured 2026-11-12 by M0-2, and the extrapolation above holds.** `docs/backup-and-restore.md`
+> §4 has the full table. The dump's COPY-text width is **871.9 B/row** and does not move with row
+> count or with hold rate; the *stored* size is almost entirely a function of the hold rate —
+> **80.18 B/row at a 76.88% hold rate, 112.59 at 65.31%, 139.43 at 53.84%, 228.13 at 6.30%**.
+> Production's rate is 59.6% (W6 §5 Group A), which interpolates to ~126 B/row, so **~3.4 GB/year
+> stored and ~34 GB for a decade** against the 40–50 GB above — conservative by about a quarter, in
+> the safe direction. **No decision moves.** What changes is that the only remaining inference is
+> one named variable rather than the whole chain, and the archive's manifest records
+> `rows`/`bytes`/`stored_bytes` per year: the first weekly dump against *production's own* data
+> replaces the interpolation with no further measurement by anyone.
+
 #### Two measured findings the restore path must carry
 
 Both are counter-intuitive and already paid for:
@@ -2080,6 +2091,15 @@ Both are counter-intuitive and already paid for:
   **0.87 s against 467 s**, the difference between "the charts are right" and "everything is
   materialised". A restore runbook that blocks on a full refresh is an outage that did not need to be
   one.
+
+**Both are now mechanisms rather than notes.** M0-2's `db-restore-rehearsal` gate re-measures A-W9-2
+on every run — it pre-seeds `observations_1m`, refreshes, and fails if the row *survives*, because
+the exclusion of the aggregate levels from the archive is argued entirely from that behaviour — and
+it rebuilds with `--recent-only` only, asserting the four `/span` bands against raw before phase 2 is
+even considered. A third finding joined them from M0-1: a new retention policy's first job runs
+**immediately**, so a restore into a freshly migrated database is inside that window by construction
+and the background jobs have to be suspended for the duration. `docs/backup-and-restore.md` §3 is
+the runbook and the `db-restore-rehearsal` gate is what keeps it true.
 
 ### 7.6 The USB-serial station, which is a separate problem from the database
 
