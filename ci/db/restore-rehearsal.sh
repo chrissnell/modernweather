@@ -64,7 +64,11 @@
 #   RCLONE_CONFIG       rclone's own variable, for --from-archive.
 #   MW_REHEARSAL_DB_SRC / _DST   scratch database names.
 
-set -euo pipefail
+# `-E` so the ERR trap below is inherited by shell functions. Without it the trap fires only
+# at top level, and a psql failure inside `seed`, `reconcile` or `apply_migrations` exits with
+# psql's own status -- 3, which `ci/gates.toml` does not declare, or 1, which would be read as
+# a verdict about the restore when no verdict was reached.
+set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
@@ -82,6 +86,7 @@ while [ $# -gt 0 ]; do
 done
 
 no_verdict() { printf 'NO VERDICT: %s\n' "$*" >&2; exit 2; }
+warn()       { printf 'WARNING: %s\n' "$*" >&2; }
 verdict()    { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 step()       { printf '\n=== %s\n' "$*"; }
 
@@ -92,7 +97,11 @@ step()       { printf '\n=== %s\n' "$*"; }
 # this does not catch the two functions above.
 trap 'printf "NO VERDICT: the rehearsal failed at line %s before reaching a verdict. Fix the run, then read its verdict.\n" "$LINENO" >&2; exit 2' ERR
 
-: "${DATABASE_URL:?}" 2>/dev/null || no_verdict "set DATABASE_URL to a server where databases may be created and dropped"
+# A plain test, not `${DATABASE_URL:?}`: the `:?` expansion aborts a non-interactive shell
+# with status 1 immediately, before the `||` and before the ERR trap, so the missing variable
+# was reported as "the result is not what was backed up" -- a verdict about a run that never
+# started.
+[ -n "${DATABASE_URL:-}" ] || no_verdict "set DATABASE_URL to a server where databases may be created and dropped"
 for t in psql pg_dump pg_restore rclone python3 gzip; do
   command -v "$t" >/dev/null 2>&1 || no_verdict "$t is not on PATH"
 done
@@ -216,21 +225,57 @@ seed() {
                            INTERVAL '30 seconds') t,
            (VALUES ('reh-a'), ('reh-b')) AS s(id);
 
-    -- The historical window: one day in the previous calendar year. This is what makes the
-    -- dump produce two year objects, and it is also the only part of the fixture a
+    -- The historical window: the **last** day of the previous calendar year. This is what
+    -- makes the dump produce two year objects, and it is also the only part of the fixture a
     -- retention policy would reach -- which is what suspend_jobs is for.
+    --
+    -- The last day and not an arbitrary one. An earlier version seeded 40 days before Jan 1,
+    -- which drifts out of the 366-day window the daily level serves as the year goes on: from
+    -- about 25 November the 366-day band had no raw rows in it and the assertion below
+    -- reported VACUOUS, which exits 1 as though phase 1 had broken the charts. 31 December
+    -- of the previous year is at most 366 days old on any day of this one, so the band the
+    -- fixture exists to exercise is always populated.
     INSERT INTO observations (time, station_id, outtemp, barometer)
     SELECT t, 'reh-a',
            10 + 3 * sin(extract(epoch from t) / 3600.0),
            30.1
       FROM generate_series(
-             date_trunc('year', now()) - INTERVAL '40 days',
-             date_trunc('year', now()) - INTERVAL '39 days 1 minute',
+             date_trunc('year', now()) - INTERVAL '1 day',
+             date_trunc('year', now()) - INTERVAL '1 minute',
              INTERVAL '5 minutes') t;
 
     INSERT INTO forecasts (station_id, span_hours, data)
     VALUES ('reh-a', 12, '[{\"t\": 1, \"temp\": 20}]'::jsonb),
            ('reh-b', 72, '[]'::jsonb);
+
+    -- The three tables M6-3 added. Seeded rather than left empty: a nought-row table
+    -- reconciles trivially, so an archive that silently dropped one of these would still
+    -- have reported a byte-for-byte match. Each carries the awkward value of its own
+    -- column set -- a NULL expiry the sweep must not take, a NULL accumulation the CHECK
+    -- ties to the event class, and a real that is not representable in binary.
+    INSERT INTO alerts (station_id, alert_id, issued_at, begins_at, expires_at,
+                        name, color, body, body_full, data)
+    VALUES ('reh-a', 'UPSTREAM-1', now() - INTERVAL '2 hours', now() - INTERVAL '1 hour',
+            now() + INTERVAL '6 hours', 'Winter Storm Warning', 'FF00FF',
+            'Snow expected', 'Snow expected, 4 to 8 inches.',
+            '{\"details\": {\"name\": \"Winter Storm Warning\"}}'::jsonb),
+           ('reh-b', 'UPSTREAM-2', NULL, NULL, NULL, 'Special Weather Statement', '',
+            '', '', '{\"details\": {}}'::jsonb);
+
+    INSERT INTO snow_depth_estimates (station_id, bucket, depth_in)
+    SELECT 'reh-a', b, (extract(epoch from b)::int % 97) / 10.0
+      FROM generate_series(date_trunc('year', now()) - INTERVAL '1 day',
+                           date_trunc('year', now()) - INTERVAL '1 hour',
+                           INTERVAL '5 minutes') b;
+
+    INSERT INTO snow_events (station_id, hours, start_time, end_time, event_type,
+                             start_depth_mm, end_depth_mm, accumulation_mm)
+    VALUES ('reh-a', 24,  now() - INTERVAL '20 hours', now() - INTERVAL '14 hours',
+            'accumulation', 10.5, 61.25, 50.75),
+           ('reh-a', 72,  now() - INTERVAL '40 hours', now() - INTERVAL '30 hours',
+            'plateau', 61.25, 61.25, NULL),
+           ('reh-b', 168, now() - INTERVAL '5 days',   now() - INTERVAL '4 days',
+            'spike_then_settle', 0.0, 12.75, 12.75);
   " >/dev/null
   printf '  %s raw rows across %s calendar years\n' \
          "$(onv "$db" -c 'SELECT count(*) FROM observations')" \
@@ -248,6 +293,25 @@ seed() {
 reconcile() {
   local man="$1" db="$2" bad=0 y cols want got rows dbrows
   step "reconciling the restored database against the archive's manifest"
+  # The manifest is flattened to a file **before** the loops read it, and the flattener's own
+  # status is checked. Feeding a `while read` from `< <(python3 ...)` hides a failing reader
+  # as zero iterations, which leaves `bad=0` and prints "reconciled byte for byte" having
+  # compared nothing -- the shape docs/reconciliation.md G-1 names.
+  local raw_list tbl_list compared=0
+  raw_list="$WORK/reconcile.raw"; tbl_list="$WORK/reconcile.tables"
+  python3 -c '
+import json, sys
+m = json.load(open(sys.argv[1]))
+for y, e in sorted(m["objects"]["raw"].items()):
+    print("|".join([y, ",".join(e["columns"]), e["sha256"] or "", str(e["rows"])]))' "$man" >"$raw_list" \
+    || no_verdict "the manifest's raw section could not be read, so nothing was compared"
+  python3 -c '
+import json, sys
+m = json.load(open(sys.argv[1]))
+for t, e in sorted(m["objects"]["tables"].items()):
+    print("|".join([t, ",".join(e["columns"]), e["sha256"] or "", str(e["rows"])]))' "$man" >"$tbl_list" \
+    || no_verdict "the manifest's table section could not be read, so nothing was compared"
+
   while IFS='|' read -r y cols want rows; do
     [ -n "$y" ] || continue
     got="$(onv "$db" -c "COPY (SELECT $cols FROM observations
@@ -264,16 +328,15 @@ reconcile() {
              "$y" "$dbrows" "$rows" "${got:0:16}" "${want:0:16}" >&2
       bad=1
     fi
-  done < <(python3 -c '
-import json, sys
-m = json.load(open(sys.argv[1]))
-for y, e in sorted(m["objects"]["raw"].items()):
-    print("|".join([y, ",".join(e["columns"]), e["sha256"] or "", str(e["rows"])]))' "$man")
+    compared=$((compared + 1))
+  done <"$raw_list"
 
   local t
   while IFS='|' read -r t cols want rows; do
     [ -n "$t" ] || continue
-    got="$(onv "$db" -c "COPY (SELECT $cols FROM public.$t ORDER BY 1) TO STDOUT" \
+    # `ORDER BY $cols`, matching the dump: ordering by the first column alone leaves the tie
+    # order to the plan, and the plan is not the same on a freshly restored table.
+    got="$(onv "$db" -c "COPY (SELECT $cols FROM public.$t ORDER BY $cols) TO STDOUT" \
            | sha256sum | cut -d' ' -f1)"
     dbrows="$(onv "$db" -c "SELECT count(*) FROM public.$t")"
     if [ "$got" = "$want" ] && [ "$dbrows" = "$rows" ]; then
@@ -283,11 +346,27 @@ for y, e in sorted(m["objects"]["raw"].items()):
              "$t" "$dbrows" "$rows" "${got:0:16}" "${want:0:16}" >&2
       bad=1
     fi
-  done < <(python3 -c '
-import json, sys
-m = json.load(open(sys.argv[1]))
-for t, e in sorted(m["objects"]["tables"].items()):
-    print("|".join([t, ",".join(e["columns"]), e["sha256"] or "", str(e["rows"])]))' "$man")
+    compared=$((compared + 1))
+  done <"$tbl_list"
+
+  # A reconciliation that compared nothing is not a reconciliation -- and `compared > 0` is
+  # not enough on its own, because the two sections are independent: a raw section that
+  # flattened to nothing while the tables flattened fine still printed "reconciled byte for
+  # word" with every year unchecked. So each section's line count is compared against the
+  # count the manifest itself declares.
+  local raw_want tbl_want raw_got tbl_got
+  raw_want="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["objects"]["raw"]))' "$man")"
+  tbl_want="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["objects"]["tables"]))' "$man")"
+  raw_got="$(wc -l <"$raw_list")"; tbl_got="$(wc -l <"$tbl_list")"
+  [ "$raw_want" -gt 0 ] || no_verdict "the manifest declares no raw year, so there is nothing
+      to reconcile and nothing to conclude. An archive always holds the current year."
+  [ "$raw_got" = "$raw_want" ] || no_verdict "the manifest declares $raw_want raw year(s) and
+      only $raw_got reached the comparison, so some years were silently not checked."
+  [ "$tbl_got" = "$tbl_want" ] || no_verdict "the manifest declares $tbl_want table(s) and only
+      $tbl_got reached the comparison, so some tables were silently not checked."
+  printf '  %s object(s) compared (%s raw year(s), %s table(s)), which is every object the\n' \
+         "$compared" "$raw_got" "$tbl_got"
+  printf '  manifest declares\n'
 
   # The pg_dump-mode tables carry their own schema, so there is no reproducible stream to
   # compare -- a pg_dump container is not byte-stable. Row count is what is available, and
@@ -506,7 +585,7 @@ if [ "$MODE" = "round-trip" ]; then
       human can re-derive."
   fi
 else
-  : "${MW_BACKUP_REMOTE:?}" 2>/dev/null || no_verdict "--from-archive needs MW_BACKUP_REMOTE"
+  [ -n "${MW_BACKUP_REMOTE:-}" ] || no_verdict "--from-archive needs MW_BACKUP_REMOTE"
   printf 'archive: %s -- the real one\n' "$MW_BACKUP_REMOTE"
   ci/db/offsite-backup.sh manifest >"$MANIFEST" 2>/dev/null \
     || no_verdict "no manifest at $MW_BACKUP_REMOTE. Nothing has been dumped there, or the
@@ -514,6 +593,25 @@ else
   printf 'archive run %s, layout version %s\n' \
     "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run"])' "$MANIFEST")" \
     "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["layout_version"])' "$MANIFEST")"
+
+  # Objects are overwritten in place, so an interrupted dump leaves new objects behind the
+  # previous manifest. That is not a restore defect and must not be reported as one: the
+  # dump's state marker is checked first, and a run that did not finish is no verdict.
+  state="$WORK/state.json"
+  if rclone cat "$MW_BACKUP_REMOTE/manifest/state.json" >"$state" 2>/dev/null && [ -s "$state" ]; then
+    st="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m.get("status",""))' "$state")"
+    sr="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m.get("run",""))' "$state")"
+    mr="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run"])' "$MANIFEST")"
+    if [ "$st" != "complete" ] || [ "$sr" != "$mr" ]; then
+      no_verdict "the archive's last dump did not finish: state.json says run '$sr' ($st) while
+      the manifest describes run '$mr'. The objects and the manifest may be from different
+      runs, so a mismatch here would say nothing about the restore path. Re-run the dump."
+    fi
+    printf 'dump state: run %s, complete\n' "$sr"
+  else
+    warn "no state.json in this archive -- it predates the marker. A dump interrupted before
+      the marker existed cannot be distinguished from a complete one here."
+  fi
 
   step "destination database $DST at HEAD, empty"
   recreate "$DST"
