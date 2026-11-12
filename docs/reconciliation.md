@@ -3144,3 +3144,59 @@ are there, they arrive through `Ingress::accept` — or the schema's comment is 
 that a collector uploads only for stations it collects. The first is M3-4's component and the
 second is a documentation change with W7's consequences; neither belongs to this item, which
 is why the refusal names what it cannot do.
+
+**A-M6-3-1 — §6.3 outranks M6-3's done-criterion, so `/alerts` is not built.**
+*Decided 2026-11-12 on the owner's delegation of these calls ("make your best calls here and keep
+driving the project forward"). Applied: `docs/implementation-plan.md`'s M6-3 criterion is edited in
+the same commit, because a criterion nobody can satisfy is worse than no criterion.*
+
+*What was found.* Two texts on `main` disagreed about whether `/alerts` exists.
+`docs/implementation-plan.md` said M6-3 is done when "`/forecast` **and `/alerts`** are
+conformance-green" — written in `72e6b36`, **2026-10-30**. §6.3 of this document drops `/alerts`
+outright ("no working in-repo client; not in either client's endpoint list; W1 D-13 kept it only
+because D-37 said *frozen*") and §6.4 puts its four fixtures in the `retired` roster, where they fail
+by design — written in `f4d7e7a6`, **2026-10-31**.
+
+*Why §6.3 wins.* Three independent reasons, none of which is a preference:
+
+1. **It is later**, by one day, and it is the owner-informed one — the same commit closed O-6 "under
+   the owner's rule" that the question is not "does anything call this" but "does **iOS** call this".
+2. **The code already implements it.** The conformance runner's rosters, the capture tool's
+   `spec(...)` lines and the gate's green-with-9-failures contract all encode the retirement. The
+   plan's criterion is the only artefact that does not.
+3. **It cannot be satisfied as written.** `/alerts` has no handler and no store capability. Making it
+   conformance-green means building an endpoint that §6.3 deleted for having no client, which no
+   amount of reading resolves in the criterion's favour.
+
+*What this means for M6-3.* Build the four Aeris components — two forecast spans, alerts, and the
+expired-alert `gc` sweep — and the three snow caches. The alert **components** are in scope: they
+fetch and store alerts, which is what makes "alerts failing, forecasts fine" expressible (W2a D-33).
+The alert **endpoint** is not. Do not move fixtures between rosters to make a gate agree with a
+document; that inversion is G-1.
+
+**A-M5-4-1 — the sunrise/sunset formula stays bug-compatible, and the deviation is named.**
+*Decided 2026-11-12 on the same delegation. Nothing is applied: this records a decision not to
+change code.*
+
+*What was found.* M5-3 measured the served `sunrise`/`sunset` strings against a textbook Meeus
+evaluation over 102 270 comparisons — seven stations, both limbs, every day 2026–2045 — and found
+**zero** exact agreements: sunrise 2–7 min late, sunset 1–8 min early, mean absolute difference
+**4.52 min**. The cause is in the ported Go formula, not the port: `pkg/solar.CalculateSunriseSunset`
+puts the sun's **centre** on the **geometric** horizon and carries no term for refraction (34′) or
+solar semidiameter (16′), where a textbook evaluation uses `h0 = −0.8333°`. The rewrite reproduces
+the Go values byte for byte, which is D-37 working exactly as specified.
+
+*The decision.* **Do not add the term.** Two reasons:
+
+1. **D-37 freezes this surface and the iOS client deploys independently of the server.** A silent
+   4½-minute shift in a displayed time, delivered by a server update the client knows nothing about,
+   is precisely the class of change the freeze exists to prevent.
+2. **It is not a correctness emergency.** Four and a half minutes of sunrise is below the resolution
+   anyone reads these values at, and it has been wrong for the life of the Go daemon.
+
+*What would change it.* After cutover, as its own work item: add the `h0 = −0.8333°` term, record it
+as a named deviation with its own fixture, and ship it deliberately rather than folding it into an
+unrelated change. `the_served_strings_are_the_stored_go_tables` and
+`every_configured_station_diverges_from_a_fresh_meeus_evaluation` are the two tests that would move,
+and they are already written — M5-3 built the characterisation before anyone asked for the fix, which
+is why this is a decision and not an investigation.

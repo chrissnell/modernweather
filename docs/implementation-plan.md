@@ -1182,8 +1182,13 @@ forecasts fine" must be expressible (W2a D-33). The snow cache becomes three.
 **`aeris:alerts:gc` stays the `Calendar` component W2a specified**, per C-W2a-15: OQ-C offered W4 a
 retention policy as the alternative and W4 declined to make the alerts table a hypertable, which
 settles it by elimination.
-**Done when:** `/forecast` and `/alerts` are conformance-green; `Freshness` renders "forecast last
+**Done when:** `/forecast` is conformance-green; `Freshness` renders "forecast last
 updated 3 h ago / never" as distinct from component state (W2a D-20).
+**`/alerts` was removed from this criterion on 2026-11-12** — see `docs/reconciliation.md`'s
+**A-M6-3-1**. This line was written 2026-10-30; `docs/reconciliation.md` §6.3 retired `/alerts` the
+next day, so the criterion required an endpoint a later decision had already deleted. Build the
+Aeris alert components and the `gc` sweep; do **not** implement the `/alerts` endpoint, and leave its
+four fixtures in the conformance runner's `retired` roster.
 
 ### M6-4 — the collector
 **Depends on:** M3-2, M1-1, M2-2. W7's `collector.v1.Collector` service in a **new file** —
