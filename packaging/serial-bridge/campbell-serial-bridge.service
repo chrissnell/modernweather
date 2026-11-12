@@ -1,0 +1,94 @@
+# EXAMPLE. Copy and install as /etc/systemd/system/campbell-serial-bridge.service.
+#
+# A serial fan-out for a stream station: `ser2net` owns the character device and serves it
+# to several TCP clients at once. A unit rather than a `screen` session, so that it survives
+# a reboot -- and a unit of its own rather than the distribution's `ser2net.service` with an
+# edited `/etc/ser2net.yaml`, so that a package upgrade cannot take the station off the air
+# and so that this bridge's lifecycle is the one README.md describes.
+#
+# `ser2net.yaml.example` is its configuration; `README.md` is the cutover and the rollback.
+
+[Unit]
+Description=Serial fan-out for a Campbell datalogger
+Documentation=https://github.com/chrissnell/modernweather/tree/main/packaging/serial-bridge
+# If the accepter binds a specific address rather than the loopback, the interface has to be
+# up first. Nothing is ordered against the device: ser2net starts and listens with the cable
+# unplugged and opens the device when a client arrives, which is measured and is what makes a
+# replug a non-event.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# -n keeps it in the foreground, which is what Type=exec requires and what makes the journal
+# the log.
+ExecStart=/usr/bin/ser2net -n -c /etc/ser2net/campbell.yaml
+Restart=always
+RestartSec=5
+
+# Not root: a bridge that is only a reader of one character device has no use for privilege,
+# and this is the process that now stands between the station and every reader of it. The
+# user is not created by any distribution's ser2net package -- README.md step 1 creates it.
+#
+# The supplementary group is whichever one owns serial devices here, and distributions
+# disagree: Arch uses `uucp`, Debian and Ubuntu use `dialout`. A group that does not exist is
+# a startup failure, so check with `ls -l` on the device and keep the one that matches.
+User=ser2net
+Group=ser2net
+SupplementaryGroups=dialout
+
+# SIGTERM, and this is not the default-by-accident kind. gensio takes uucp locks under
+# /run/lock and only removes them on a clean exit; a SIGKILL leaves them behind and the next
+# start then answers its clients `Device open failure: Object was already in use`. SIGKILL
+# remains the escalation after the timeout, which is why README.md says to check
+# /run/lock/LCK..* after an unclean stop.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=15
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+# The uucp lock, and nothing else writable.
+ReadWritePaths=/run/lock
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Serial devices only, and by SUBSYSTEM rather than by a glob. The daemon units in this tree
+# write `DeviceAllow=/dev/ttyUSB*`; `DeviceAllow=` matches a device node path, a
+# `char-<subsystem>` name or a major:minor pair, and whether that glob form expands was not
+# verified by this item -- so it is avoided here rather than relied on. `char-tty` covers
+# every tty device, which is wider than this service needs and is still nothing but ttys,
+# and it means this file does not have to name the device the configuration names.
+#
+# A missing entry is an EPERM at the open, which looks like a cabling fault.
+PrivateDevices=false
+DevicePolicy=closed
+DeviceAllow=char-tty rw
+
+# No SystemCallFilter, deliberately. The daemon units in this tree set
+# `SystemCallFilter=@system-service`, and the same line here is untested against gensio's
+# tty ioctls -- a filter that blocked one would leave the station unread for a reason that
+# looks like a hardware fault. Adding it is a one-line change for whoever can watch a real
+# station while they do it.
+
+LimitNOFILE=4096
+TasksMax=32
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=campbell-serial-bridge
+
+[Install]
+WantedBy=multi-user.target

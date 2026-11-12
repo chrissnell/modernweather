@@ -659,6 +659,30 @@ jobs:
           done
       - run: cargo xtask gate driver-emulators
 
+  serial-bridge:
+    name: a ser2net fan-out broadcasts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      # `ser2net` is the thing under test, not a test dependency that could be stubbed:
+      # GRA-787 exists because `max-connections` is documented to broadcast and the
+      # programme needed that measured rather than read. A hand-written fan-out would prove
+      # only that its author can write one. `socat` provides the pty pair that stands in for
+      # the station, so the whole proof runs with no hardware.
+      #
+      # The runner also reports the version it measured. Debian/Ubuntu and Arch do not ship
+      # the same release, and both were checked by hand (4.6.4 and 4.6.8) -- so a future
+      # divergence should be visible in the log rather than assumed away.
+      - name: Install the bridge under test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ser2net socat
+      - run: cargo xtask gate serial-bridge
+
   database:
     name: migrations and server version
     runs-on: ubuntu-latest
