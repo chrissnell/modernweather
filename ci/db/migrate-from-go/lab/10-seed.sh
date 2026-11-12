@@ -16,8 +16,18 @@
 set -euo pipefail
 POD="${POD:-w9-migration-lab}"
 NS="${NS:-default}"
+IMAGE="${IMAGE:-timescale/timescaledb-ha:pg17}"
+SRC_IMAGE="${SRC_IMAGE:-$IMAGE}"
+# The source is its own pod when the lab is split across two versions. The rule is
+# run-in-pod.sh's and has to stay identical to it, because getting it wrong here seeds the
+# wrong database — so the same SRC_IMAGE that brought the lab up selects the same pod here.
+if [ "$SRC_IMAGE" = "$IMAGE" ]; then
+  SRC_POD="${SRC_POD:-$POD}"
+else
+  SRC_POD="${SRC_POD:-$POD-src}"
+fi
 DB=weather_v2_0_0
-psql_old() { kubectl exec -i "$POD" -n "$NS" -- psql -U postgres -d "$DB" -X -q -v ON_ERROR_STOP=1 "$@"; }
+psql_old() { kubectl exec -i "$SRC_POD" -n "$NS" -- psql -U postgres -d "$DB" -X -q -v ON_ERROR_STOP=1 "$@"; }
 
 FROM="${FROM:-2025-01-01}"
 TO="${TO:-2026-10-30}"
@@ -50,7 +60,7 @@ psql_old -tAc "SELECT drop_chunks('weather_1m', older_than => '$M1_CUT'::timesta
 psql_old -tAc "SELECT drop_chunks('weather_5m', older_than => '$M5_CUT'::timestamptz)"  >/dev/null
 
 echo "=== the state this produced"
-kubectl exec "$POD" -n "$NS" -- psql -U postgres -d "$DB" -X -c "
+kubectl exec "$SRC_POD" -n "$NS" -- psql -U postgres -d "$DB" -X -c "
 SELECT 'weather' AS relation, count(*)::text AS rows, min(time)::date::text AS lo,
        max(time)::date::text AS hi, (max(time)::date - min(time)::date)::text AS days FROM weather
 UNION ALL SELECT 'weather_1m', count(*)::text, min(bucket)::date::text, max(bucket)::date::text,

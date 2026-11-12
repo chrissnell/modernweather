@@ -1060,6 +1060,27 @@ the Go source definition, so `w9.expected_column INTERSECT w9.source_column` wil
 `w9.assert_no_unknown_source_columns()` should raise nothing — and if it does, something has changed
 since 2026-10-31 and that is worth stopping for.
 
+**Status 2026-11-12 — blocked on one credential, and rehearsed while it is.** `pitcairn:5432` accepts
+a connection from an agent runtime and `pg_hba.conf` admits user `weather` on `weather_v2_0_0` from
+the cluster subnet, but it demands a password that is not in the cluster and not in Vault — not at
+`secret/modernweather`, which holds only the R2 backup keys, and not at any other path tried. User
+`postgres` has no `pg_hba` entry at all. O-2 and O-4 cannot be re-checked without it either, since
+both are queries against the source. **This is O-1/O-3/O-4's "credential handoff" arriving as the
+thing that blocks the run** (`docs/reconciliation.md` Group A), and it is the owner's to hand over.
+
+Two things were discharged while waiting.
+
+- **The target was two migrations behind HEAD** and nothing would have fixed that on its own: the
+  daemon applies `migrations/config` at startup, not `migrations/`. `20261112120000` (`alerts`) and
+  `20261112120100` (the two snow tables) are now applied, with the `_sqlx_migrations` row `sqlx`
+  itself would have written — all nine checksums are the SHA-384 of the files on `main`. Verified
+  against a lab target built from the nine files: 2,779 columns, 14 indexes, 28 constraints and all
+  four continuous-aggregate definitions identical.
+- **The procedure was run end to end across the real version pair** — a 2.17.2 source in its own
+  pod, a HEAD target — with the reconciliation passing at 591 of 591 and three of W9's five negative
+  controls re-run. `docs/data-migration.md` §6.4 and the 2026-11-12 note have the numbers. That is a
+  rehearsal, not the deliverable: items 1–4 of this item's "done when" are about production's rows.
+
 ### M5-2 — the diff harness
 **Depends on:** M5-1, M3-1. Build (b) and (c) above as a runnable harness in `ci/diff/`, with its
 expected-diff set encoded as data rather than prose so an unexpected diff is a failure rather than a
