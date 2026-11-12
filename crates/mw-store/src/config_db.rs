@@ -210,7 +210,9 @@ mod tests {
     ///
     /// The extension match is case-insensitive. There is no `.SQL` in the tree today, so
     /// that is not a fix for anything -- but a guard whose scope depends on the case of an
-    /// extension is a guard with a one-keystroke bypass, and both callers below are guards.
+    /// extension is a guard with a one-keystroke bypass, and every caller below is a guard.
+    /// [`the_sun_times_guard_bites`] pins it with an upper-cased file, so reverting the
+    /// match to `x == "sql"` turns that control red rather than quietly narrowing the scope.
     ///
     /// Takes a root rather than closing over `migrations/` so that
     /// [`the_sun_times_guard_bites`] can run **this** function over a synthetic tree. A
@@ -245,9 +247,63 @@ mod tests {
             .collect()
     }
 
-    /// Every `.sql` under `migrations/`, recursively.
+    /// The repository's **tracked** `.sql` under `root`.
+    ///
+    /// [`sql_under`] walks the filesystem, and the filesystem is not the repository.
+    /// `ci/db/migrate-from-go/` is the migration lab's working area: a Go config dump
+    /// staged there by hand is not part of this tree, and a guard that failed on it would
+    /// be advising whoever is running the lab to delete the guard. `git ls-files` is the
+    /// only available definition of "in the tree".
+    ///
+    /// When `git` cannot answer -- no `git` on `PATH`, a source tarball, a non-repository
+    /// checkout -- the walk stands unfiltered rather than silently scanning nothing. Both
+    /// callers assert non-emptiness, so the failure mode of this fallback is reading too
+    /// much, which is the direction a guard should fail in.
+    fn tracked_sql_under(root: &std::path::Path) -> Vec<(PathBuf, String)> {
+        let files = sql_under(root);
+        let Some(tracked) = tracked_sql_paths() else {
+            return files;
+        };
+        files
+            .into_iter()
+            .filter(|(path, _)| {
+                path.canonicalize()
+                    .is_ok_and(|resolved| tracked.contains(&resolved))
+            })
+            .collect()
+    }
+
+    /// Every tracked `.sql` in the repository, canonicalised, or `None` if `git` cannot say.
+    fn tracked_sql_paths() -> Option<std::collections::HashSet<PathBuf>> {
+        let root = repo_root();
+        let top = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&root)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())?;
+        let top = PathBuf::from(String::from_utf8(top.stdout).ok()?.trim());
+
+        let listed = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&root)
+            .args(["ls-files", "-z", "--full-name", "--", "*.sql", "*.SQL"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())?;
+        let paths: std::collections::HashSet<PathBuf> = String::from_utf8(listed.stdout)
+            .ok()?
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .filter_map(|entry| top.join(entry).canonicalize().ok())
+            .collect();
+        (!paths.is_empty()).then_some(paths)
+    }
+
+    /// Every tracked `.sql` under `migrations/`, recursively.
     fn all_migration_sql() -> Vec<(PathBuf, String)> {
-        sql_under(&migrations_root())
+        tracked_sql_under(&migrations_root())
     }
 
     /// `--` line comments removed, so a comment *about* the idiom is not a use of it. The
@@ -437,8 +493,12 @@ mod tests {
             (migrations_root(), Some(migrations_root().join("config"))),
             (repo_root().join("ci/db"), None),
         ] {
-            let files = sql_under(&root);
-            assert!(!files.is_empty(), "{} holds no .sql", root.display());
+            let files = tracked_sql_under(&root);
+            assert!(
+                !files.is_empty(),
+                "{} holds no tracked .sql",
+                root.display()
+            );
             if let Some(nested) = also {
                 assert!(
                     files.iter().any(|(p, _)| p.starts_with(&nested)),
@@ -468,9 +528,13 @@ mod tests {
     ///
     /// So this runs the **real** [`sql_under`] over a synthetic tree and asserts the guard's
     /// own predicate fires on it. That is the point of the shape: every step `sql_under`
-    /// performs is load-bearing here, so dropping its `to_uppercase`, its recursion or its
-    /// extension match turns this test red rather than leaving the guard quietly
-    /// case-sensitive.
+    /// performs is load-bearing here, so dropping its `to_uppercase`, its recursion, its
+    /// extension filter or the case-insensitivity of that filter turns this test red rather
+    /// than leaving the guard quietly narrower than it reads.
+    ///
+    /// It runs `sql_under` and not [`tracked_sql_under`], because the synthetic tree is not
+    /// in the repository and `git ls-files` would correctly report none of it -- a control
+    /// that filtered by tracked-ness would assert against an empty set.
     #[test]
     fn the_sun_times_guard_bites() {
         let scratch = Scratch::new("suntimes");
@@ -492,21 +556,39 @@ mod tests {
             "-- W2a D-36: there is no sun_times table here, deliberately.\nSELECT 1;\n",
         )
         .expect("writable");
+        // An upper-cased extension, which is the one-keystroke bypass `sql_under`'s
+        // `eq_ignore_ascii_case` exists to close. Nothing in the repository is named this
+        // way, so without this file reverting that match to `x == "sql"` leaves every test
+        // here green and the guard case-sensitive.
+        std::fs::write(
+            scratch.0.join("20991231000002_reinstate.SQL"),
+            "CREATE TABLE sun_times (station_name TEXT NOT NULL) STRICT;\n",
+        )
+        .expect("writable");
         // Not `.sql`, and so outside the guard's declared scope in either case.
         std::fs::write(scratch.0.join("notes.md"), "sun_times\n").expect("writable");
 
         let files = sql_under(&scratch.0);
-        let tripped: Vec<_> = files
+        let mut tripped: Vec<String> = files
             .iter()
             .filter(|(_, sql)| sql.contains(SUN_TIMES))
-            .map(|(p, _)| p.file_name().expect("a file name").to_owned())
+            .map(|(p, _)| {
+                p.file_name()
+                    .expect("a file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
+        tripped.sort();
         assert_eq!(
             tripped,
-            vec![std::ffi::OsString::from("20991231000000_reinstate.sql")],
-            "the guard fired on {tripped:?}: it must catch the reinstatement, in a nested \
-             directory and in mixed case, and must not fire on a `--` comment about the \
-             absence. Files read: {:?}",
+            vec![
+                "20991231000000_reinstate.sql".to_owned(),
+                "20991231000002_reinstate.SQL".to_owned(),
+            ],
+            "the guard fired on {tripped:?}: it must catch the reinstatement in a nested \
+             directory, in mixed case and behind an upper-cased extension, and must not \
+             fire on a `--` comment about the absence. Files read: {:?}",
             files.iter().map(|(p, _)| p).collect::<Vec<_>>()
         );
     }
