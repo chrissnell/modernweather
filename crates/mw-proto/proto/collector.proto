@@ -214,11 +214,30 @@ message NodeIdentity {
     repeated StationMeta stations = 4;
 }
 
-// One station a peer owns, as the peer describes it.
+// One station a peer declares, as the peer describes it.
 message StationMeta {
     string station_key = 1;
     string name = 2;
     string station_type = 3;
+
+    // The node that **measures** this station -- `config.stations.owning_node_id` on the
+    // declaring node, 16 bytes. Absent means "the declaring peer itself".
+    //
+    // Not in §5.2's field list, and §2.3's diamond is why it has to be. `NodeIdentity`
+    // announces every `config.stations` row a node has, received ones included, because a
+    // relay's inventory is what makes the nodes behind it resolvable two hops up (§5.1).
+    // Without this field the receiver can only attribute every one of them to the relay
+    // that declared it -- and then in A -> {B, C} -> D, whichever relay said hello first
+    // owns A's station, so the other relay's envelopes for it are refused for ever as
+    // `UnauthorizedOrigin`. §2.3 is explicit that both arrivals are legitimate and that the
+    // dedup gate is what distinguishes them.
+    //
+    // **Authorised, not trusted.** A peer may only declare an owner it is entitled to speak
+    // for: itself always, and a node in its `peer_origins` grant when `peers.relay` is set
+    // (`mw_store::peers::upsert_station`). So this field cannot be used to attribute a
+    // station to a node the declaring peer has no authority over -- which is the same rule
+    // §5.4's layer 3 applies to an envelope's origin, applied to a registration.
+    bytes owning_node = 9;
 
     // `optional` on all three coordinates, which is **D-89**'s field presence applied one
     // level out from the reading. A proto3 bare `double` makes absent and `0.0` the same

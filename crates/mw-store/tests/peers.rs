@@ -63,7 +63,7 @@ impl Drop for Scratch {
 }
 
 /// A migrated configuration database and a peer store over it.
-async fn store(scratch: &Scratch) -> (SqlitePool, Arc<PeerStore>) {
+async fn store(scratch: &Scratch) -> (SqlitePool, Arc<PeerStore>, Arc<ConfigRegistry>) {
     let pool = open_and_migrate(&scratch.db())
         .await
         .expect("the configuration schema applies from empty");
@@ -77,9 +77,13 @@ async fn store(scratch: &Scratch) -> (SqlitePool, Arc<PeerStore>) {
     .await
     .expect("the node row is insertable");
     let registry = Arc::new(ConfigRegistry::new(RegistrySnapshot::default()));
-    let store = Arc::new(PeerStore::new(pool.clone(), registry, node(ME)));
+    let store = Arc::new(PeerStore::new(
+        pool.clone(),
+        Arc::clone(&registry),
+        node(ME),
+    ));
     store.republish().await.expect("an empty peer snapshot");
-    (pool, store)
+    (pool, store, registry)
 }
 
 /// An enrolled, unrevoked `mtls-ca` peer.
@@ -101,6 +105,7 @@ async fn peer(pool: &SqlitePool, name: &str, id: u8) {
 fn station(key: &str) -> PeerStation {
     PeerStation {
         station: StationKey::new(key),
+        owner: None,
         name: key.to_string(),
         kind: "davis".to_string(),
         latitude: Some(39.64),
@@ -120,7 +125,7 @@ fn station(key: &str) -> PeerStation {
 #[tokio::test]
 async fn a_peer_cannot_take_over_a_station_another_peer_owns() {
     let scratch = Scratch::new("steal-peer");
-    let (pool, store) = store(&scratch).await;
+    let (pool, store, _registry) = store(&scratch).await;
     peer(&pool, "satellite-a", 1).await;
     peer(&pool, "satellite-b", 2).await;
 
@@ -175,7 +180,7 @@ async fn a_peer_cannot_take_over_a_station_another_peer_owns() {
 #[tokio::test]
 async fn a_peer_cannot_take_over_a_local_station() {
     let scratch = Scratch::new("steal-local");
-    let (pool, store) = store(&scratch).await;
+    let (pool, store, _registry) = store(&scratch).await;
     peer(&pool, "satellite-a", 1).await;
     sqlx::query(
         "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind, \
@@ -228,7 +233,7 @@ async fn a_peer_cannot_take_over_a_local_station() {
 #[tokio::test]
 async fn an_enrolment_token_is_scoped_to_the_name_it_was_minted_for() {
     let scratch = Scratch::new("token-scope");
-    let (pool, store) = store(&scratch).await;
+    let (pool, store, _registry) = store(&scratch).await;
     let token = store
         .mint_enrolment_token("satellite-d", std::time::Duration::from_secs(3600))
         .await
@@ -282,7 +287,7 @@ async fn an_enrolment_token_is_scoped_to_the_name_it_was_minted_for() {
 #[tokio::test]
 async fn an_enrolment_cannot_clear_a_revocation_or_inherit_relay_grants() {
     let scratch = Scratch::new("takeover");
-    let (pool, store) = store(&scratch).await;
+    let (pool, store, _registry) = store(&scratch).await;
     // A revoked relay granted three origins.
     sqlx::query(
         "INSERT INTO peers (node_id, name, auth_kind, relay, revoked_at) \
@@ -368,7 +373,7 @@ async fn an_enrolment_cannot_clear_a_revocation_or_inherit_relay_grants() {
 #[tokio::test]
 async fn a_re_enrolment_keeps_the_identity_and_drops_the_grants() {
     let scratch = Scratch::new("re-enrol");
-    let (pool, store) = store(&scratch).await;
+    let (pool, store, _registry) = store(&scratch).await;
     sqlx::query(
         "INSERT INTO peers (node_id, name, auth_kind, auth_material, relay) \
          VALUES (?, 'relay-west', 'mtls-pinned', 'aa', 1)",
@@ -416,12 +421,330 @@ async fn a_re_enrolment_keeps_the_identity_and_drops_the_grants() {
     assert_eq!(grants, 1);
 }
 
+/// **Two satellites may call a station the same thing.**
+///
+/// `config.stations.name` is globally UNIQUE — the frozen contract looks a station up by
+/// name — and the station *key* is namespaced while the name is not, so two satellites both
+/// calling a station `backyard` is the ordinary case. Writing the declared name made the
+/// second satellite's every `Hello` fail on that index with an opaque SQLite string
+/// classified `Retryable`: an uplink retrying for ever rather than a message.
+#[tokio::test]
+async fn two_peers_may_declare_stations_with_the_same_name() {
+    let scratch = Scratch::new("same-name");
+    let (pool, store, _registry) = store(&scratch).await;
+    peer(&pool, "satellite-a", 1).await;
+    peer(&pool, "satellite-b", 2).await;
+    store.republish().await.expect("published");
+
+    for (id, key) in [(1u8, "satellite-a:backyard"), (2, "satellite-b:backyard")] {
+        store
+            .record_hello(
+                node(id),
+                "modernweather 1.0",
+                &[PeerStation {
+                    // The same operator-facing name from both.
+                    name: "backyard".to_string(),
+                    ..station(key)
+                }],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("satellite {id} registers: {e}"));
+    }
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM stations")
+        .fetch_one(&pool)
+        .await
+        .expect("countable");
+    assert_eq!(rows, 2, "both registered");
+    // The row's `name` is the KEY, which is unique by its own index. A peer does not get to
+    // choose a value in a global namespace.
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM stations ORDER BY name")
+        .fetch_all(&pool)
+        .await
+        .expect("readable");
+    assert_eq!(names, vec!["satellite-a:backyard", "satellite-b:backyard"]);
+
+    // An operator renames one, and the peer's next `Hello` does not rename it back.
+    sqlx::query("UPDATE stations SET name = 'The Back Yard' WHERE station_key = ?")
+        .bind("satellite-a:backyard")
+        .execute(&pool)
+        .await
+        .expect("an operator may rename a row");
+    store
+        .record_hello(
+            node(1),
+            "modernweather 1.0",
+            &[PeerStation {
+                name: "backyard".to_string(),
+                ..station("satellite-a:backyard")
+            }],
+        )
+        .await
+        .expect("a second Hello");
+    let name: String = sqlx::query_scalar("SELECT name FROM stations WHERE station_key = ?")
+        .bind("satellite-a:backyard")
+        .fetch_one(&pool)
+        .await
+        .expect("readable");
+    assert_eq!(
+        name, "The Back Yard",
+        "the upsert does not touch `name`, so an operator's rename survives the peer"
+    );
+}
+
+/// **A reinstalled satellite can be re-enrolled under its own name**, and gets a message
+/// rather than an infinite retry.
+///
+/// A replaced disk mints a brand-new `NodeId` at first start, so the operator presents a
+/// new id for a name the collector still holds. `peers.name` is UNIQUE, so the INSERT used
+/// to violate it and the peer got a raw constraint string classified `Retryable`.
+#[tokio::test]
+async fn a_name_already_enrolled_under_another_node_id_is_refused_by_name() {
+    let scratch = Scratch::new("name-taken");
+    let (pool, store, _registry) = store(&scratch).await;
+    peer(&pool, "satellite-a", 1).await;
+    let token = store
+        .mint_enrolment_token("satellite-a", std::time::Duration::from_secs(3600))
+        .await
+        .expect("mintable");
+
+    // The same name, a new node id -- the reinstall.
+    let e = store
+        .enrol(&mw_component::Enrolment {
+            token: token.into(),
+            node: node(8),
+            name: "satellite-a".to_string(),
+            software: "modernweather 1.0".to_string(),
+            spki_sha256: [0x22; 32],
+            stations: Vec::new(),
+        })
+        .await
+        .expect_err("adopting a name silently would be a takeover");
+    assert!(matches!(e, PeerWriteError::NameTaken { .. }), "{e}");
+    assert!(
+        !matches!(
+            mw_types::Classify::class(&e),
+            mw_types::Class::Retryable { .. }
+        ),
+        "a retryable classification is what made this an infinite retry instead of a \
+         message"
+    );
+    let message = mw_types::DisplayChain(&e).to_string();
+    assert!(message.contains("satellite-a"), "{message}");
+    assert!(
+        message.contains("revoke") || message.contains("delete"),
+        "the message has to name the operator's next action: {message}"
+    );
+}
+
+/// A token holder may not enrol as **this node**.
+#[tokio::test]
+async fn an_enrolment_cannot_claim_this_nodes_own_identity() {
+    let scratch = Scratch::new("claim-self");
+    let (_pool, store, _registry) = store(&scratch).await;
+    let token = store
+        .mint_enrolment_token("impostor", std::time::Duration::from_secs(3600))
+        .await
+        .expect("mintable");
+    let e = store
+        .enrol(&mw_component::Enrolment {
+            token: token.into(),
+            node: node(ME),
+            name: "impostor".to_string(),
+            software: "modernweather 1.0".to_string(),
+            spki_sha256: [0x33; 32],
+            stations: Vec::new(),
+        })
+        .await
+        .expect_err("a peer may not be this node");
+    assert!(matches!(e, PeerWriteError::BadToken), "{e}");
+}
+
+/// **§2.3's diamond, at the registration layer.**
+///
+/// A → {B, C} → D. Both relays announce A's station as part of their inventory, and both
+/// name A as its owner. D must attribute it to **A** whichever relay says hello first,
+/// because `Gate::check` authorises an envelope against `owner == origin || owner == peer`:
+/// if the row belonged to whichever relay arrived first, the other relay's envelopes for it
+/// would be refused as `UnauthorizedOrigin` — transiently, so that relay's whole uplink
+/// would stall until `max_lag` abandoned its cursor.
+///
+/// Before the `owning_node` field existed there was nothing on the wire to say A measured
+/// it, so this test could not have passed.
+#[tokio::test]
+async fn two_relays_forwarding_one_nodes_station_agree_about_its_owner() {
+    let scratch = Scratch::new("diamond");
+    let (pool, store, _registry) = store(&scratch).await;
+    // Two relays, each granted the origin A (node 1) as well as itself.
+    for (name, id) in [("relay-b", 2u8), ("relay-c", 3u8)] {
+        sqlx::query(
+            "INSERT INTO peers (node_id, name, auth_kind, relay)              VALUES (?, ?, 'mtls-ca', 1)",
+        )
+        .bind(node(id).as_bytes().as_slice())
+        .bind(name)
+        .execute(&pool)
+        .await
+        .expect("insertable");
+        for origin in [id, 1] {
+            sqlx::query("INSERT INTO peer_origins (node_id, origin_node_id) VALUES (?, ?)")
+                .bind(node(id).as_bytes().as_slice())
+                .bind(node(origin).as_bytes().as_slice())
+                .execute(&pool)
+                .await
+                .expect("insertable");
+        }
+    }
+    store.republish().await.expect("published");
+
+    let measured_by_a = PeerStation {
+        owner: Some(node(1)),
+        ..station("satellite-a:backyard")
+    };
+    // B says hello first.
+    store
+        .record_hello(
+            node(2),
+            "modernweather 1.0",
+            std::slice::from_ref(&measured_by_a),
+        )
+        .await
+        .expect("relay B forwards A's inventory");
+    let snapshot = store.republish().await.expect("published");
+    assert_eq!(
+        snapshot.owner(&StationKey::new("satellite-a:backyard")),
+        Some(node(1)),
+        "the row belongs to the node that MEASURED it, not to the relay that declared it"
+    );
+
+    // C says hello second, with the same declaration. The upsert is a no-op on ownership
+    // because the owner matches, so both relays' envelopes authorise against the same id.
+    store
+        .record_hello(node(3), "modernweather 1.0", &[measured_by_a])
+        .await
+        .expect("relay C forwards the same inventory");
+    let snapshot = store.republish().await.expect("published");
+    assert_eq!(
+        snapshot.owner(&StationKey::new("satellite-a:backyard")),
+        Some(node(1)),
+        "and the second relay did not take it over either"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM stations")
+        .fetch_one(&pool)
+        .await
+        .expect("countable");
+    assert_eq!(rows, 1, "one station, not one per relay");
+}
+
+/// A peer may only declare an owner it is entitled to speak for — §5.4's layer 3 applied
+/// to a registration instead of to an envelope.
+///
+/// A leaf with no relay grant naming another node as the measurer has its declaration
+/// attributed to **itself**. Not refused: the station is still inventory it may tell this
+/// node about, and the ownership is the only part it does not get to choose.
+#[tokio::test]
+async fn a_peer_cannot_declare_an_owner_it_has_no_grant_for() {
+    let scratch = Scratch::new("declared-owner");
+    let (pool, store, _registry) = store(&scratch).await;
+    peer(&pool, "satellite-a", 1).await;
+    store.republish().await.expect("published");
+
+    store
+        .record_hello(
+            node(1),
+            "modernweather 1.0",
+            &[PeerStation {
+                owner: Some(node(5)),
+                ..station("satellite-a:backyard")
+            }],
+        )
+        .await
+        .expect("the declaration is accepted, with the ownership corrected");
+    let snapshot = store.republish().await.expect("published");
+    assert_eq!(
+        snapshot.owner(&StationKey::new("satellite-a:backyard")),
+        Some(node(1)),
+        "a leaf has no relay grant, so the only owner it may declare is itself"
+    );
+}
+
+/// **Two peers reconnecting at once cannot publish a snapshot older than the database.**
+///
+/// `republish` is a read, a build and a store with awaits between them, and nothing ordered
+/// two concurrent callers — so the later reader could be overtaken by the earlier one's
+/// store, publishing a snapshot missing a station that had just committed. The window was
+/// reproduced in review at around sixty rounds; this runs a hundred.
+///
+/// The consequence is why it matters: `station_owner` answers `None` for the missing key,
+/// so that peer's envelopes are `Reject::UnknownStation` — transient, so its acknowledgement
+/// never advances and its **whole uplink** stalls until the next `Hello`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_registrations_never_publish_a_stale_snapshot() {
+    let scratch = Scratch::new("concurrent");
+    let (pool, store, registry) = store(&scratch).await;
+    peer(&pool, "satellite-a", 1).await;
+    peer(&pool, "satellite-b", 2).await;
+    store.republish().await.expect("published");
+
+    for round in 0..100 {
+        let key_a = format!("satellite-a:s{round}");
+        let key_b = format!("satellite-b:s{round}");
+        // **Two tasks, because `join!` cannot reach this window.** `join!` polls both
+        // futures on one thread in a fixed order, and `republish`'s store is synchronous
+        // and immediately follows its last read -- so the second future can only interleave
+        // where the first *pends*, and it was measured not to. Real parallelism is what
+        // exercises it.
+        //
+        // `clippy.toml` reserves `tokio::spawn` to `mw_supervisor::task` so that the task
+        // table owns every handle and a leak is unexpressible (§3.2), and that file's own
+        // header allows this escape hatch with a comment. The reason the rule exists does
+        // not apply: both handles are awaited on the next two lines, inside this test, so
+        // neither can outlive it.
+        #[allow(clippy::disallowed_methods)]
+        let (one, two) = {
+            let (a, b) = (Arc::clone(&store), Arc::clone(&store));
+            let (ka, kb) = (key_a.clone(), key_b.clone());
+            (
+                tokio::spawn(async move {
+                    a.record_hello(node(1), "modernweather 1.0", &[station(&ka)])
+                        .await
+                }),
+                tokio::spawn(async move {
+                    b.record_hello(node(2), "modernweather 1.0", &[station(&kb)])
+                        .await
+                }),
+            )
+        };
+        one.await
+            .expect("the task did not panic")
+            .expect("peer A registers");
+        two.await
+            .expect("the task did not panic")
+            .expect("peer B registers");
+
+        // **The snapshot those two calls published**, read straight off the registry --
+        // NOT a fresh `republish`. That distinction is the whole test: an extra sequential
+        // republish is always correct, so asserting on one would pass with no
+        // serialisation at all. Checked: with the mutex removed this fails on the first
+        // round, and with it the hundred rounds hold.
+        let snapshot = registry.peer_snapshot();
+        assert_eq!(
+            snapshot.owner(&StationKey::new(key_a.as_str())),
+            Some(node(1)),
+            "round {round}: the published snapshot lost peer A's station"
+        );
+        assert_eq!(
+            snapshot.owner(&StationKey::new(key_b.as_str())),
+            Some(node(2)),
+            "round {round}: the published snapshot lost peer B's station"
+        );
+    }
+}
+
 /// The total a peer may own is bounded, and the refusal is **whole**: registering some of a
 /// satellite's stations and silently refusing envelopes for the rest is the worse failure.
 #[tokio::test]
 async fn the_stations_one_peer_may_own_are_bounded() {
     let scratch = Scratch::new("station-cap");
-    let (pool, store) = store(&scratch).await;
+    let (pool, store, _registry) = store(&scratch).await;
     peer(&pool, "satellite-a", 1).await;
 
     let limit = usize::try_from(mw_store::peers::MAX_OWNED_STATIONS).expect("a small limit");

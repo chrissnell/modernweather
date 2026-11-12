@@ -307,6 +307,22 @@ pub struct PeerStore {
     /// This node's own `NodeId`, which is what separates a **local** station from one a
     /// peer owns (`PeerSnapshot::with_peer_stations`).
     me: OriginId,
+    /// Serialises [`PeerStore::republish`]'s read-build-publish.
+    ///
+    /// **Without it the published snapshot can be older than the database.** `republish` is
+    /// two awaits between reading the rows and storing the result, and nothing ordered two
+    /// concurrent callers — so the later reader could be overtaken by the earlier one's
+    /// store. Reproduced: two satellites reconnecting at once, and the published snapshot
+    /// is missing the station one of them had just committed. The consequences all come
+    /// from the same window: `station_owner` answers `None`, so that peer's envelopes are
+    /// `Reject::UnknownStation` — transient, so its ack never advances and its whole uplink
+    /// stalls until the next `Hello` — and `HelloAck.accepted_stations` tells it its own
+    /// station was refused.
+    ///
+    /// A `tokio::sync::Mutex` because it is held across awaits. The reads do not need to be
+    /// inside the write transaction: re-reading is monotonic, and all that has to be
+    /// ordered is the publish against the read that produced it.
+    publishing: tokio::sync::Mutex<()>,
 }
 
 impl PeerStore {
@@ -316,7 +332,12 @@ impl PeerStore {
         registry: Arc<crate::registry::ConfigRegistry>,
         me: OriginId,
     ) -> Self {
-        Self { pool, registry, me }
+        Self {
+            pool,
+            registry,
+            me,
+            publishing: tokio::sync::Mutex::new(()),
+        }
     }
 
     /// Read `peers` and the stations they own, and publish the peer half.
@@ -326,6 +347,11 @@ impl PeerStore {
     /// station", and that question is an authorisation one
     /// (`PeerSnapshot::with_peer_stations`).
     pub async fn republish(&self) -> Result<Arc<PeerSnapshot>, ConfigDbError> {
+        // Held across the read, the build and the store, so a snapshot can never be
+        // published over a newer one (see the field's own documentation).
+        // Held across the read, the build and the store, so a snapshot can never be
+        // published over a newer one (see the field's own documentation).
+        let _ordered = self.publishing.lock().await;
         let rows = config_db::peers(&self.pool).await?;
         let snapshot = PeerSnapshot::new(&rows)
             .with_peer_stations(&self.pool, self.me)
@@ -385,8 +411,35 @@ impl PeerStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| query("recording a peer's Hello", e))?;
+        // **Which owner a peer may declare**, which is §5.4's layer 3 applied to a
+        // registration rather than to an envelope: itself always, and a node in its
+        // `peer_origins` grant when `relay` is set. A peer that names an owner it has no
+        // authority over has its declaration attributed to itself instead -- not refused,
+        // because the station is still inventory it is entitled to tell this node about,
+        // and the ownership is the only part it may not choose.
+        let peer = self.registry.peer_snapshot().peer(node);
         for station in stations {
-            upsert_station(&mut tx, node, station).await?;
+            let owner = match station.owner {
+                Some(declared) if declared != node => {
+                    let granted = peer
+                        .as_ref()
+                        .is_some_and(|entry| entry.may_speak_for(declared));
+                    if granted {
+                        declared
+                    } else {
+                        warn!(
+                            node = %node,
+                            declared = %declared,
+                            station = %station.station,
+                            "a peer declared a station as measured by a node it has no \
+                             grant for, so it is attributed to the peer itself"
+                        );
+                        node
+                    }
+                }
+                _ => node,
+            };
+            upsert_station(&mut tx, owner, station).await?;
         }
         // **The total a node may own, counted after the writes and inside the
         // transaction.**
@@ -401,12 +454,24 @@ impl PeerStore {
         // drops un-committed, and every row it wrote goes with it. Counting first would
         // mean deciding how many of the declared keys were new, which is the same question
         // asked less directly.
-        let owned: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM stations WHERE owning_node_id = ?")
-                .bind(node.as_bytes().as_slice())
+        // Counted over every owner this `Hello` wrote, not only the declaring node: a relay
+        // declares its whole inventory, so the rows it creates are spread across the nodes
+        // behind it and a per-node count would miss the growth entirely.
+        let mut owners: std::collections::BTreeSet<OriginId> =
+            stations.iter().filter_map(|s| s.owner).collect();
+        owners.insert(node);
+        let mut owned = 0i64;
+        for owner in owners {
+            owned = owned.max(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM stations WHERE owning_node_id = ?",
+                )
+                .bind(owner.as_bytes().as_slice())
                 .fetch_one(&mut *tx)
                 .await
-                .map_err(|e| query("counting the stations a peer owns", e))?;
+                .map_err(|e| query("counting the stations a peer owns", e))?,
+            );
+        }
         if owned > MAX_OWNED_STATIONS {
             warn!(
                 node = %node,
@@ -463,6 +528,18 @@ impl PeerStore {
             );
             return Err(PeerWriteError::BadToken);
         }
+        if request.node == self.me {
+            // The collector publishes its own `NodeId` in `HelloAck` and `EnrolGrant`, so
+            // a token holder knows it. Enrolling as it would let that peer mint
+            // `config.stations` rows attributed to **this node** -- invisible to the peer
+            // snapshot, which excludes them, and then indistinguishable from local stations
+            // in `/stationinfo`, in the website and in what this node announces upstream.
+            // There is no ingest bypass behind it: an envelope would need `path.last()` and
+            // `path[len - 2]` both equal to this node, which is a repeated hop no `PathSet`
+            // can hold.
+            warn!("an enrolment attempted to claim this node's own identity");
+            return Err(PeerWriteError::BadToken);
+        }
         let digest = request.spki_sha256;
         if digest == [0u8; 32] {
             // An all-zero digest is not a SHA-256 of anything a caller could have hashed;
@@ -490,6 +567,43 @@ impl PeerStore {
         .map_err(|e| query("burning the enrolment token", e))?;
         if burned.rows_affected() == 0 {
             return Err(PeerWriteError::BadToken);
+        }
+        // **Every refusal below rolls this burn back**, because `tx` drops un-committed --
+        // so a token survives a failed attempt. That is deliberate rather than overlooked:
+        // the attempts that can fail here are an operator typing the wrong name or the
+        // wrong node id, and burning their one token for a typo is worse than the
+        // alternative. The alternative is a token that can be probed, and probing needs a
+        // 128-bit `node_id` guess from someone who already holds an operator-minted,
+        // name-scoped, expiring token -- so what it buys an attacker is nothing.
+        //
+        // What it does cost is visibility: a probed token stays open, so `Enroll` stays
+        // open and W5 keeps reporting enrolment as available. The INFO line on every
+        // attempt (§5.3) is what an operator reads instead.
+        // **`peers.name` is UNIQUE, so the name-taken case is refused by name.**
+        //
+        // The ordinary reinstall path reaches it: a satellite whose disk was replaced mints
+        // a brand-new `NodeId` at first start, so an operator who re-enrols it under the
+        // same name presents a new `node_id` for a name the collector still holds. Without
+        // this the INSERT below violates `stations_name`'s sibling index and the peer gets
+        // an opaque SQLite string classified `Retryable` -- an uplink retrying for ever
+        // rather than a message. Adopting the name silently would be a takeover, so the
+        // answer is a named refusal with the operator's next action in it.
+        let taken: Option<Vec<u8>> = sqlx::query_scalar("SELECT node_id FROM peers WHERE name = ?")
+            .bind(&request.name)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| query("checking whether that peer name is enrolled", e))?;
+        if let Some(existing) = taken {
+            if existing != request.node.as_bytes().as_slice() {
+                warn!(
+                    peer = %request.name,
+                    node = %request.node,
+                    "that peer name is already enrolled under a different node id"
+                );
+                return Err(PeerWriteError::NameTaken {
+                    name: request.name.clone(),
+                });
+            }
         }
         // **Three clauses on the `DO UPDATE`, and each one closes a takeover.**
         //
@@ -654,7 +768,6 @@ async fn upsert_station(
                                aprs_callsign, last_seen) \
          VALUES (?, ?, ?, ?, 'from_registration', ?, ?, ?, ?, ?, unixepoch()) \
          ON CONFLICT (station_key) DO UPDATE SET \
-             name = excluded.name, \
              type = excluded.type, \
              latitude = excluded.latitude, \
              longitude = excluded.longitude, \
@@ -667,7 +780,23 @@ async fn upsert_station(
     )
     .bind(station.station.as_str())
     .bind(owner.as_bytes().as_slice())
-    .bind(&station.name)
+    // **The station KEY, not the name the peer declared.** `config.stations` carries
+    // `CREATE UNIQUE INDEX stations_name ON stations (name)` -- the frozen contract looks a
+    // station up by name, so the column is one global namespace and the schema's own comment
+    // says a collision has to be a loud failure. A peer does not get to choose a value in
+    // that namespace: two satellites both calling a station `backyard` is the ordinary case
+    // (the key is namespaced, the name is not), and writing the declared name made the
+    // second satellite's EVERY `Hello` fail on that index -- an opaque SQLite string,
+    // classified `Retryable`, so the symptom was an uplink retrying for ever rather than a
+    // message.
+    //
+    // The key is unique by its own index, so this cannot collide. It is also not pretty,
+    // which is the right trade: an operator can rename the row afterwards and the `DO
+    // UPDATE` below deliberately does **not** touch `name`, so a peer cannot rename it
+    // back. `StationMeta.name` reaches this node and is logged at registration; it is not
+    // the row's name, and that is recorded as a proposed amendment to §5.2 in this item's
+    // PR.
+    .bind(station.station.as_str())
     .bind(&station.kind)
     .bind(station.latitude)
     .bind(station.longitude)

@@ -177,8 +177,18 @@ impl Serving {
             .enable_all()
             .build()
             .expect("a runtime for the collector's listener");
-        let table = mw_collector::service::route_table(Arc::clone(&collector.state))
-            .expect("the collector's route table");
+        // A `grpc` row, which is what puts the three `collector.v1.Collector` methods on
+        // the table (`mw_collector::service::manifest`).
+        let table = mw_collector::service::route_table(
+            Arc::clone(&collector.state),
+            &[mw_collector::IngestRow {
+                listen: mw_collector::IngestRow::GRPC.to_string(),
+                peer_auth: "mtls-ca".to_string(),
+                ca_path: None,
+                allow_insecure: false,
+            }],
+        )
+        .expect("the collector's route table");
         let (mount, _) = Mount::new(vec![table], HostTable::default()).expect("one mount");
         let listen = Listen {
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -279,6 +289,7 @@ fn uplink(satellite: &Satellite, port: u16) -> Uplink {
                     altitude_m: Some(1800.0),
                     snow_base_distance_mm: None,
                 },
+                satellite_node(),
             )],
         },
         Arc::clone(&satellite.spool),

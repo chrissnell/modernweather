@@ -568,16 +568,13 @@ where
     // is the state `mw_station::plan` refuses by name for a station type with no driver,
     // and which nothing else here would mention. A warning rather than a plan error
     // because the row is a legitimate thing to have configured ahead of M6-4.
-    for row in cfg.ingest() {
-        if row.listen != IngestRow::GRPC {
-            warn!(
-                listen = %row.listen,
-                "a `config.ingest` row names a listener this build has no driver for, so \
-                 this node accepts nothing on it: only `listen = 'grpc'` is served until \
-                 implementation-plan.md M6-4 lands `POST /v1/ingest`"
-            );
-        }
-    }
+    // **No warning for a `rest` row any more**, and the removal is the point: that row is
+    // `mw_collector`'s, which serves `POST /v1/ingest` for it. The message that used to be
+    // here said "only `listen = 'grpc'` is served until implementation-plan.md M6-4 lands
+    // `POST /v1/ingest`" -- which became false on the documented collector shape of §8.3,
+    // where both rows are present and both are served. What a `rest`-only node is told is
+    // `mw_collector::service::register`'s to say, because that is the component that serves
+    // it.
     let Some(row) = cfg
         .ingest()
         .iter()

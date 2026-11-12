@@ -123,8 +123,15 @@ pub struct PeerEntry {
     /// `peer_origins.origin_node_id` — which origins this peer may deliver.
     ///
     /// Read only when [`PeerEntry::relay`] is set: with `relay = false` the one legal
-    /// origin is the peer itself, and §8.5's `PlanError::RelayNotGranted` is what stops a
-    /// row from carrying a list it cannot use.
+    /// origin is the peer itself.
+    ///
+    /// §8.5 lists `PlanError::RelayNotGranted` — a `[[peer]]` with `relay = false` and more
+    /// than one entry here — and **this build does not have it**. Said rather than implied:
+    /// nothing in `plan()` reads the `peers` table at all, so the check has nowhere to
+    /// live yet. It is safe to be without, because [`PeerEntry::may_speak_for`] ignores
+    /// this set entirely when `relay` is clear — an ungranted list is inert rather than
+    /// permissive. What is lost is the tidiness warning an operator would get for writing
+    /// one.
     pub origins: BTreeSet<OriginId>,
     /// `peers.revoked_at`. Revocation is a timestamp rather than a deletion, because "this
     /// peer was trusted until Tuesday" is what an operator needs to read off the fleet
@@ -158,9 +165,11 @@ impl PeerEntry {
     /// this method having to know what a path is.
     pub fn may_speak_for(&self, origin: OriginId) -> bool {
         if origin == self.node {
-            // A peer may always speak for itself, with or without the grant, which is what
-            // makes §8.5's `PeerCannotSpeakForItself` a plan-time tidiness check rather
-            // than something admission depends on.
+            // A peer may always speak for itself, with or without the grant. §8.5's
+            // `PeerCannotSpeakForItself` -- a `[[peer]]` whose `origins` omits the peer --
+            // is therefore a plan-time tidiness check and nothing admission depends on,
+            // which is why **this build does not have it** and is safe without it. Said
+            // rather than implied: nothing in `plan()` reads the `peers` table.
             return true;
         }
         self.relay && self.origins.contains(&origin)
@@ -179,6 +188,15 @@ pub struct PeerStation {
     /// The key the peer resolved at its own end (W2a §4a.6). There is no envelope without
     /// one.
     pub station: StationKey,
+    /// The node that **measures** this station, if the declaring peer named one.
+    ///
+    /// `None` means "the declaring peer itself", which is every leaf. A **relay** declares
+    /// its whole inventory — the nodes behind it included — so it names their ids here, and
+    /// the registration path authorises each one against that peer's `peer_origins` grant
+    /// before writing it. §2.3's diamond is the case that needs it: without an owner on the
+    /// wire, two relays forwarding the same node's station make the first one to say hello
+    /// its owner, and the second relay's envelopes for it are refused for ever.
+    pub owner: Option<OriginId>,
     /// Operator-facing name.
     pub name: String,
     /// The peer's `station_type`, stored as given.
@@ -229,6 +247,22 @@ pub enum PeerWriteError {
     /// The request carried nothing to pin and no PSK to hash.
     #[error("the enrolment request carries no key material to record")]
     NoMaterial,
+
+    /// Another node is already enrolled under this name.
+    ///
+    /// `peers.name` is UNIQUE, and the ordinary reinstall path reaches this: a satellite
+    /// whose disk was replaced mints a brand-new `NodeId` at first start, so re-enrolling
+    /// it under the same name presents a new id for a name the collector still holds.
+    /// Adopting the name would be a takeover, so it is a named refusal — and a named one,
+    /// because the alternative was a raw constraint violation classified as retryable,
+    /// which an uplink retries for ever.
+    #[error(
+        "`{name}` is already enrolled under a different node id: revoke or delete that          `peers` row first, or enrol under a different name"
+    )]
+    NameTaken {
+        /// The name that is taken.
+        name: String,
+    },
 
     /// Registering these stations would take one node past the number it may own.
     ///

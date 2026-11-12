@@ -763,6 +763,15 @@ fn node_identity(cfg: &Config) -> mw_collector::Identity {
                     altitude_m: row.altitude_m,
                     snow_base_distance_mm: row.snow_base_distance_mm,
                 },
+                // **The row's own owner, not this node's id.** For a local sensor the two
+                // are the same; for a station this node received from a peer they are not,
+                // and a collector two hops up needs the difference or §2.3's diamond
+                // refuses one of two legitimate arrivals for ever. A row whose column is
+                // not 16 bytes falls back to this node, which the receiving end then
+                // refuses to attribute elsewhere -- the fail-closed direction.
+                <[u8; 16]>::try_from(row.owning_node_id.as_slice())
+                    .map(mw_types::OriginId::new)
+                    .unwrap_or(node),
             )
         })
         .collect();
@@ -908,23 +917,27 @@ fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<
         );
         cfg.set_grpcrx_service(state);
     }
-    // `collector.v1.Collector`'s three methods and `POST /v1/ingest`, on the same
-    // predicate `mw_collector::service::register` plans on. Mounted beside the compat
-    // shim's two, because they are the same endpoint carrying two schemas (W7 §9.2).
-    let collector_state = if cfg
-        .ingest
-        .iter()
-        .any(|row| row.listen == mw_collector::IngestRow::GRPC)
-    {
+    // `collector.v1.Collector`'s three methods and `POST /v1/ingest`, on the same predicate
+    // `mw_collector::service::register` plans on -- **either** ingest row, because the gRPC
+    // row brings the service and the REST row brings the path (§8.3's collector has both).
+    // The rows also decide *which* paths the table carries, which is why they travel into
+    // it: `mw_collector::service::manifest` has why.
+    //
+    // Mounted beside the compat shim's two, because they are the same endpoint carrying two
+    // schemas (W7 §9.2).
+    let collector_state = if cfg.ingest.is_empty() {
+        None
+    } else {
         let state = Arc::new(mw_collector::ServiceState::new());
         tables.push(
-            mw_collector::service::route_table(Arc::clone(&state))
-                .map_err(|e| anyhow::anyhow!("{e}"))
-                .context("building the collector's route table")?,
+            mw_collector::service::route_table(
+                Arc::clone(&state),
+                mw_collector::CollectorConfig::ingest(cfg),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("building the collector's route table")?,
         );
         Some(state)
-    } else {
-        None
     };
     tables.extend(mw_web::tables(cfg).context("building the website's route tables")?);
 
@@ -978,7 +991,23 @@ fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<
     // node with no TLS port has nothing to present and the socket stays plaintext, which
     // `ingest:grpc`'s own plan check is what refuses.
     let ingest_tls = match (&collector_state, &sni, &cfg.peer_registry) {
-        (Some(_), Some(resolver), Some(peers)) => {
+        // The **gRPC** row, because the TLS this configures is the gRPC socket's: a node
+        // whose only ingest row is `rest` is served on the main socket's own certificate
+        // and has no client-certificate verifier to configure.
+        // **`!resolver.is_empty()`, not merely `Some`.** `sni` exists whenever
+        // `listener.https_port` is set, without consulting the certificate store -- so a
+        // node with a TLS port and no readable certificate would have reported TLS as
+        // available, skipped D-35's opt-out, and then failed every ingest handshake with
+        // nothing at plan time saying why. `mw_http::bind` refuses a wholly empty resolver,
+        // but this is the predicate `CollectorConfig::ingest_tls_available` is documented
+        // against.
+        (Some(_), Some(resolver), Some(peers))
+            if !resolver.is_empty()
+                && cfg
+                    .ingest
+                    .iter()
+                    .any(|row| row.listen == mw_collector::IngestRow::GRPC) =>
+        {
             let row = cfg
                 .ingest
                 .iter()
@@ -987,7 +1016,8 @@ fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<
                 .and_then(|row| mw_collector::PeerAuthKind::parse(&row.peer_auth))
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "`config.ingest.peer_auth` is not one this build knows: expected                          `mtls-ca`, `mtls-pinned` or `psk`"
+                        "`config.ingest.peer_auth` is not one this build knows: expected \
+                         `mtls-ca`, `mtls-pinned` or `psk`"
                     )
                 })?;
             // The CA is a **node-level** trust store a listener may name rather than a
@@ -1016,7 +1046,11 @@ fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<
             // but said once, because an operator who configured `peer_auth` and no TLS
             // port should not have to infer that it does nothing.
             warn!(
-                "a `config.ingest` row configures peer authentication and this node has no                  TLS certificate for the ingest socket to present, so the handshake                  authenticates nobody: set `listener.https_port` and a website certificate"
+                "a `config.ingest` row configures peer authentication and this node has no \
+                 readable TLS certificate for the ingest socket to present, so the \
+                 handshake authenticates nobody: set `listener.https_port` and a website \
+                 certificate, or set `config.ingest.allow_insecure = 1` and use \
+                 `peer_auth = \'psk\'`"
             );
             None
         }
@@ -1410,6 +1444,7 @@ mod tests {
             declared_ingest: Vec::new(),
             declared_collector_ingest: Vec::new(),
             declared_uplinks: Vec::new(),
+            unjoinable_uplinks: Vec::new(),
             peer_registry: None,
             ingest_service: None,
             node_identity: None,

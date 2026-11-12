@@ -1126,9 +1126,20 @@ pub enum UplinkPlanError {
     /// the filter and for `forward`, and there is nowhere else to get one. Without this the
     /// component would have to invent an id, which is a loop guard comparing against the
     /// wrong node.
+    ///
+    /// **This is also the one check that makes §8.2's rendering incomplete**, and that is
+    /// worth being explicit about: that section's satellite is `[node]` + `[[station]]` +
+    /// `[[uplink]]` with no `[[peer]]` block, because a satellite accepts nobody. But the
+    /// uplink still needs its collector's `NodeId`, and the only place a node id lives is
+    /// a `peers` row — so a satellite needs one for its collector even though nothing will
+    /// ever connect *to* it. §5.3's `mw-admin uplink join` is what writes both rows in
+    /// practice; recorded as a proposed amendment to §8.2 in this item's PR.
     #[error(
-        "`uplink` names the peer `{peer}`, which has no `peers` row: the uplink needs that \
-         peer's node id for the loop filter, so enrol it or insert the row"
+        "`uplink` names the peer `{peer}`, which has no `peers` row -- and an uplink needs \
+         that peer's node id for the loop filter and for `Envelope::forward`, so there is \
+         nothing to plan. Insert the `peers` row for `{peer}` (its `node_id` is the \
+         `collector_node_id` that collector reports at enrolment), or remove the `uplink` \
+         row"
     )]
     UnknownPeer {
         /// The peer's name.
@@ -1144,6 +1155,15 @@ pub trait UplinkConfig {
     /// other half of W7 **D-44**.
     fn uplinks(&self) -> &[UplinkRow];
 
+    /// The `uplink` rows whose peer this node has no `peers` row for.
+    ///
+    /// Separate from [`UplinkConfig::uplinks`] because they cannot be the same type: a row
+    /// without its peer's `NodeId` is not an `UplinkRow`, and the join that produces one is
+    /// the binary's. Carrying the names is what makes
+    /// [`UplinkPlanError::UnknownPeer`] reachable — before this existed the rows were
+    /// filtered out by the join and nothing anywhere mentioned them.
+    fn unjoinable_peers(&self) -> &[String];
+
     /// What a `Hello` announces about this node.
     fn identity(&self) -> Option<&Identity>;
 
@@ -1156,6 +1176,23 @@ pub fn register<C>(cfg: &C, out: &mut Vec<ComponentSpec>) -> Result<(), UplinkPl
 where
     C: UplinkConfig + ?Sized,
 {
+    // **Before anything else**, because an `uplink` row naming a peer this node has no
+    // row for cannot be planned at all: the component needs that peer's `NodeId` for the
+    // loop filter and for `forward`, and inventing one would make the loop guard compare
+    // against the wrong node and the collector refuse every envelope as
+    // `NotAddressedHere`.
+    //
+    // **A refusal and not a warning**, because the alternative was measured: dropping the
+    // row planned no uplink, said nothing, and left the node spooling readings it would
+    // never forward until `max_lag` abandoned the cursor. A satellite configured by
+    // `docs/collector.md` §8.2 -- which has an `[[uplink]]` and no `[[peer]]` -- is exactly
+    // that shape, so this is the error an operator following the document gets, and its
+    // message is what tells them the row they are missing. The satellite half of §5.3's
+    // enrolment is what writes both rows; until that command exists the `peers` row is an
+    // operator's own insert.
+    if let Some(peer) = cfg.unjoinable_peers().first() {
+        return Err(UplinkPlanError::UnknownPeer { peer: peer.clone() });
+    }
     let rows = cfg.uplinks();
     if rows.is_empty() {
         return Ok(());
@@ -1270,6 +1307,7 @@ mod tests {
 
     struct Cfg {
         rows: Vec<UplinkRow>,
+        unjoinable: Vec<String>,
         identity: Option<Identity>,
         spool: Option<Arc<mw_pipeline::Spool>>,
     }
@@ -1277,6 +1315,9 @@ mod tests {
     impl UplinkConfig for Cfg {
         fn uplinks(&self) -> &[UplinkRow] {
             &self.rows
+        }
+        fn unjoinable_peers(&self) -> &[String] {
+            &self.unjoinable
         }
         fn identity(&self) -> Option<&Identity> {
             self.identity.as_ref()
@@ -1289,6 +1330,7 @@ mod tests {
     fn cfg(rows: Vec<UplinkRow>) -> Cfg {
         Cfg {
             rows,
+            unjoinable: Vec::new(),
             identity: Some(identity()),
             spool: Some(crate::testing::null_spool()),
         }
@@ -1301,6 +1343,31 @@ mod tests {
             id("suncrest").expect("a legal id").as_str(),
             "uplink:suncrest"
         );
+    }
+
+    /// §8.2's satellite -- an `[[uplink]]` with no `[[peer]]` -- used to plan **nothing**
+    /// and say nothing. It is now a refusal that names the row to add.
+    #[test]
+    fn an_uplink_whose_peer_has_no_row_is_a_plan_error() {
+        let mut out = Vec::new();
+        let err = register(
+            &Cfg {
+                rows: Vec::new(),
+                unjoinable: vec!["suncrest".to_string()],
+                identity: Some(identity()),
+                spool: Some(crate::testing::null_spool()),
+            },
+            &mut out,
+        )
+        .expect_err("an uplink with no peer id cannot be planned");
+        assert!(matches!(err, UplinkPlanError::UnknownPeer { .. }), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("suncrest"), "{message}");
+        assert!(
+            message.contains("peers"),
+            "the message has to name the row to insert: {message}"
+        );
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -1359,6 +1426,7 @@ mod tests {
         register(
             &Cfg {
                 rows: vec![row("suncrest", 9)],
+                unjoinable: Vec::new(),
                 identity: Some(identity()),
                 spool: None,
             },

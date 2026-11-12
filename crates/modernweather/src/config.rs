@@ -240,6 +240,16 @@ pub struct Config {
     /// may not read a database.
     pub(crate) declared_uplinks: Vec<mw_collector::UplinkRow>,
 
+    /// The `uplink` rows whose `peer_name` matched no `peers` row.
+    ///
+    /// **Carried rather than dropped**, because dropping them was a silent no-op on the
+    /// documented satellite: §8.2's `[[uplink]]` has no `[[peer]]` beside it, so the join
+    /// found nothing, `declared_uplinks` was empty, and `register` planned no uplink and
+    /// said nothing. The node admitted and spooled its readings, forwarded none of them,
+    /// and `[spool].max_lag` eventually abandoned the cursor. `mw_collector`'s
+    /// `UplinkPlanError::UnknownPeer` is what these become.
+    pub(crate) unjoinable_uplinks: Vec<String>,
+
     /// The peer registry and the registration path (W7 §5.1), once `main` has built it.
     ///
     /// A root resource for [`Config::registry`]'s reason and the same object's other half:
@@ -304,6 +314,11 @@ impl Config {
             declared_uplinks: uplinks
                 .iter()
                 .filter_map(|row| declare_uplink(row, &peers))
+                .collect(),
+            unjoinable_uplinks: uplinks
+                .iter()
+                .filter(|row| declare_uplink(row, &peers).is_none())
+                .map(|row| row.peer_name.clone())
                 .collect(),
             peer_registry: None,
             ingest_service: None,
@@ -879,6 +894,10 @@ impl mw_collector::UplinkConfig for Config {
         &self.declared_uplinks
     }
 
+    fn unjoinable_peers(&self) -> &[String] {
+        &self.unjoinable_uplinks
+    }
+
     fn identity(&self) -> Option<&mw_collector::Identity> {
         self.node_identity.as_ref()
     }
@@ -900,10 +919,12 @@ fn declare_collector_ingest(row: &config_db::IngestRow) -> mw_collector::IngestR
 
 /// One `uplink` row joined to the peer it names, or `None` when there is no such peer.
 ///
-/// `None` rather than a plan error, and the plan error is `mw_collector::register`'s: the
-/// uplink needs the peer's `NodeId` for the loop filter and for `forward`, and there is
-/// nowhere else to get one — so a row whose peer is unknown cannot be planned, and the
-/// message that says so belongs with the component rather than with the query.
+/// A `None` is **not** dropped: it is carried to `mw_collector::uplink::register` through
+/// [`Config::unjoinable_uplinks`] and becomes `UplinkPlanError::UnknownPeer`. The uplink
+/// needs the peer's `NodeId` for the loop filter and for `forward` and there is nowhere
+/// else to get one, so a row whose peer is unknown cannot be planned — and the difference
+/// between saying that and planning nothing is the difference between a daemon that will
+/// not start and a satellite that silently forwards nothing.
 fn declare_uplink(
     row: &config_db::UplinkRow,
     peers: &[config_db::PeerRow],
@@ -1131,6 +1152,7 @@ mod tests {
             declared_ingest: Vec::new(),
             declared_collector_ingest: Vec::new(),
             declared_uplinks: Vec::new(),
+            unjoinable_uplinks: Vec::new(),
             peer_registry: None,
             ingest_service: None,
             node_identity: None,

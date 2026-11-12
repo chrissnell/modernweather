@@ -675,6 +675,7 @@ impl Handlers {
                     PeerWriteError::EnrolmentClosed => "closed",
                     PeerWriteError::NoMaterial => "no_material",
                     PeerWriteError::TooManyStations { .. } => "too_many_stations",
+                    PeerWriteError::NameTaken { .. } => "name_taken",
                     PeerWriteError::CannotIssueCertificates => "cannot_issue",
                     PeerWriteError::Backend { .. } => "error",
                 };
@@ -862,16 +863,36 @@ impl ServiceState {
 }
 
 /// Every path this service claims, as **D-51**'s pure declaration.
-pub fn manifest() -> RouteManifest {
-    RouteManifest::new(
-        Scope::Any,
-        vec![
-            RouteEntry::exact(wire::HELLO, Methods::POST),
-            RouteEntry::exact(wire::INGEST, Methods::POST),
-            RouteEntry::exact(wire::ENROL, Methods::POST),
-            RouteEntry::exact(wire::REST_INGEST, Methods::POST),
-        ],
-    )
+///
+/// **Driven by which `config.ingest` rows exist**, because the two listeners are configured
+/// separately: §8.3's collector has a `grpc` row and a `rest` row, and the schema admits
+/// either alone. Declaring all four paths whatever the rows said meant a `grpc`-only node
+/// served `POST /v1/ingest` that nothing had asked for, and a `rest`-only node served
+/// nothing at all while `mw_grpc::grpcrx` warned that `POST /v1/ingest` was still M6-4's to
+/// write.
+///
+/// # What REST ingest can and cannot reach
+///
+/// `Scope::Any` puts `/v1/ingest` on the **main** socket as well as the gRPC one, which is
+/// what §4.5 asks for — it is additive to the frozen surface. Admission is the part that
+/// does not follow: the main socket is `with_no_client_auth` (it serves a website, and a
+/// browser has no peer certificate), so a request arriving there carries no
+/// `ConnectInfo<PeerCerts>` and `Handlers::presented` refuses it. **REST ingest is
+/// therefore reachable on the ingest socket only.** That is stated here rather than
+/// discovered: closing it needs client-certificate negotiation on the website's port, which
+/// is a change to what §6 says that socket is for, and it is recorded as a proposed
+/// amendment in this item's PR.
+pub fn manifest(rows: &[IngestRow]) -> RouteManifest {
+    let mut entries = Vec::with_capacity(4);
+    if rows.iter().any(|row| row.listen == IngestRow::GRPC) {
+        entries.push(RouteEntry::exact(wire::HELLO, Methods::POST));
+        entries.push(RouteEntry::exact(wire::INGEST, Methods::POST));
+        entries.push(RouteEntry::exact(wire::ENROL, Methods::POST));
+    }
+    if rows.iter().any(|row| row.listen == IngestRow::REST) {
+        entries.push(RouteEntry::exact(wire::REST_INGEST, Methods::POST));
+    }
+    RouteManifest::new(Scope::Any, entries)
 }
 
 /// The component id, which is a constant and is still validated.
@@ -880,8 +901,15 @@ pub fn component_id() -> Result<ComponentId, ComponentIdError> {
 }
 
 /// The route table the one listener mounts.
-pub fn route_table(state: Arc<ServiceState>) -> Result<mw_http::RouteTable, ComponentIdError> {
+///
+/// `rows` decides which paths are on it, and [`manifest`] has why.
+pub fn route_table(
+    state: Arc<ServiceState>,
+    rows: &[IngestRow],
+) -> Result<mw_http::RouteTable, ComponentIdError> {
     let owner = component_id()?;
+    let grpc = rows.iter().any(|row| row.listen == IngestRow::GRPC);
+    let rest = rows.iter().any(|row| row.listen == IngestRow::REST);
     let hello = {
         let state = Arc::clone(&state);
         axum::routing::post(move |request: axum::extract::Request| {
@@ -903,22 +931,24 @@ pub fn route_table(state: Arc<ServiceState>) -> Result<mw_http::RouteTable, Comp
             async move { unary_enrol(state, request).await }
         })
     };
-    let rest = {
+    let rest_ingest = {
         let state = Arc::clone(&state);
         axum::routing::post(move |request: axum::extract::Request| {
             let state = Arc::clone(&state);
             async move { crate::rest::ingest(state, request).await }
         })
     };
-    Ok(mw_http::RouteTable::new(
-        owner,
-        manifest(),
-        Router::new()
+    let mut router = Router::new();
+    if grpc {
+        router = router
             .route(wire::HELLO, hello)
             .route(wire::INGEST, ingest)
-            .route(wire::ENROL, enrol)
-            .route(wire::REST_INGEST, rest),
-    ))
+            .route(wire::ENROL, enrol);
+    }
+    if rest {
+        router = router.route(wire::REST_INGEST, rest_ingest);
+    }
+    Ok(mw_http::RouteTable::new(owner, manifest(rows), router))
 }
 
 /// What a request gets while the component is not running.
@@ -1423,13 +1453,32 @@ pub fn register<C>(cfg: &C, out: &mut Vec<ComponentSpec>) -> Result<(), IngestPl
 where
     C: CollectorConfig + ?Sized,
 {
-    let Some(row) = cfg
+    // **Either row makes this node a collector.** The gRPC row brings
+    // `collector.v1.Collector`; the REST row brings `POST /v1/ingest`. §8.3's collector has
+    // both, and the schema admits either alone -- so planning on the gRPC row alone left a
+    // `rest`-only node with no ingest surface and nothing saying so.
+    let grpc = cfg
         .ingest()
         .iter()
-        .find(|row| row.listen == IngestRow::GRPC)
-    else {
+        .find(|row| row.listen == IngestRow::GRPC);
+    let rest = cfg
+        .ingest()
+        .iter()
+        .find(|row| row.listen == IngestRow::REST);
+    let Some(row) = grpc.or(rest) else {
         return Ok(());
     };
+    if grpc.is_none() {
+        // A node whose only ingest row is `rest`. It is served, and the limit is worth one
+        // line at startup: admission needs a client certificate or a PSK over a socket this
+        // node knows is the ingest one, and the main socket is neither -- see `manifest`.
+        warn!(
+            "`config.ingest` has a `rest` row and no `grpc` row, so this node serves \
+             `POST /v1/ingest` and no `collector.v1.Collector`. That path is reachable on \
+             the gRPC socket only: the main socket requests no client certificate, so a \
+             request arriving there cannot be authenticated and is refused."
+        );
+    }
     let auth =
         PeerAuthKind::parse(&row.peer_auth).ok_or_else(|| IngestPlanError::UnknownPeerAuth {
             peer_auth: row.peer_auth.clone(),
@@ -1506,7 +1555,7 @@ where
             }),
         )
         .requires([Need::hard_write(mw_component::Capability::ReadingStream)])
-        .provides([Provision::routes(manifest())])
+        .provides([Provision::routes(manifest(cfg.ingest()))])
         .identity(mw_component::IdentityShape {
             // Inbound, resolved from a registration, N nodes on one endpoint, and a stream.
             // `GrpcIn` is not a `Transport` variant -- the gRPC receiver is an `ingest` row
@@ -1578,20 +1627,24 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// A `rest`-only row does not plan this component either: `POST /v1/ingest` shares the
-    /// route table, and a node with only that row is handled by the warning in the binary.
+    /// A `rest`-only row **does** make this node a collector: it is what brings
+    /// `POST /v1/ingest`. Planning only on the `grpc` row left such a node with no ingest
+    /// surface at all and nothing saying so.
     #[test]
-    fn a_rest_only_row_does_not_plan_the_grpc_service() {
+    fn a_rest_only_row_plans_the_component() {
         let mut out = Vec::new();
         register(
             &Cfg {
                 ingest: vec![row("rest", true)],
+                state: Some(Arc::new(ServiceState::new())),
                 ..Cfg::default()
             },
             &mut out,
         )
-        .expect("no grpc row");
-        assert!(out.is_empty());
+        .expect("a rest row is an ingest row");
+        // No spool in this `Cfg`, so it stops at the root-resource check -- the point is
+        // that it got past the "is this node a collector" question.
+        assert!(out.is_empty(), "no spool, so no component");
     }
 
     /// **D-35**, and the condition that changed: plaintext is a plan error unless the
@@ -1655,18 +1708,34 @@ mod tests {
         );
     }
 
+    /// **The rows decide the paths.** A `grpc`-only node must not serve a REST path
+    /// nothing asked for, and a `rest`-only node must not serve the gRPC methods.
     #[test]
-    fn the_route_manifest_claims_the_three_methods_and_the_rest_path() {
-        let manifest = manifest();
-        let paths: Vec<&str> = manifest
-            .entries
-            .iter()
-            .map(|e| e.pattern.as_str())
-            .collect();
-        assert!(paths.contains(&wire::HELLO));
-        assert!(paths.contains(&wire::INGEST));
-        assert!(paths.contains(&wire::ENROL));
-        assert!(paths.contains(&wire::REST_INGEST));
+    fn the_route_manifest_follows_the_ingest_rows() {
+        let paths = |rows: &[IngestRow]| -> Vec<String> {
+            manifest(rows)
+                .entries
+                .iter()
+                .map(|e| e.pattern.clone())
+                .collect()
+        };
+
+        let both = paths(&[row("grpc", true), row("rest", true)]);
+        for path in [wire::HELLO, wire::INGEST, wire::ENROL, wire::REST_INGEST] {
+            assert!(both.contains(&path.to_string()), "{path}");
+        }
+
+        let grpc_only = paths(&[row("grpc", true)]);
+        assert!(grpc_only.contains(&wire::HELLO.to_string()));
+        assert!(
+            !grpc_only.contains(&wire::REST_INGEST.to_string()),
+            "a node with no `rest` row must not serve `POST /v1/ingest`"
+        );
+
+        let rest_only = paths(&[row("rest", true)]);
+        assert_eq!(rest_only, vec![wire::REST_INGEST.to_string()]);
+
+        assert!(paths(&[]).is_empty(), "a satellite claims no ingest path");
     }
 
     #[test]

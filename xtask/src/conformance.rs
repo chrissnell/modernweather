@@ -1255,6 +1255,24 @@ fn clear_workdir(opts: &Options) -> Result<(), String> {
             std::fs::remove_file(&p).map_err(|e| format!("{}: {e}", p.display()))?;
         }
     }
+    // **The spool, because a `node_id` is stamped into it.** A first start mints an
+    // identity and opens a spool beside `config.db` (W7 D-5, D-10), and a spool refuses to
+    // open under an identity that is not the one in its `MANIFEST` -- so a second
+    // consecutive run in the same tree would find last run's spool, stamped with last run's
+    // seeded `node_id`, and the bootstrap daemon would exit with a fatal error on every
+    // repeat. The run recovers (the migration ledger commits before the spool opens) but
+    // the error and the log line are noise that reads like a failure.
+    //
+    // Here rather than only after the seed so that **one place decides what a fresh run
+    // starts from**, which is what this function's own comment in `bootstrap_configuration`
+    // says. The post-seed removal stays as well, because it answers a different question:
+    // the re-identification that happens *within* a run.
+    for name in ["logs", "spool"] {
+        let p = opts.workdir.join(name);
+        if p.exists() {
+            std::fs::remove_dir_all(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        }
+    }
     if opts.log_dir.exists() {
         std::fs::remove_dir_all(&opts.log_dir)
             .map_err(|e| format!("{}: {e}", opts.log_dir.display()))?;

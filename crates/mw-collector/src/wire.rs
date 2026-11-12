@@ -167,6 +167,12 @@ pub fn station(meta: &pb::StationMeta) -> Option<PeerStation> {
     }
     Some(PeerStation {
         station: StationKey::new(key),
+        // Absent, or not 16 bytes, means "the declaring peer itself" -- which is every
+        // leaf. The registration path authorises whatever is here against the peer's own
+        // grant, so a malformed value failing closed to the peer costs nothing.
+        owner: <[u8; 16]>::try_from(meta.owning_node.as_slice())
+            .ok()
+            .map(mw_types::OriginId::new),
         name: non_empty(&meta.name).unwrap_or_else(|| key.to_string()),
         kind: non_empty(&meta.station_type).unwrap_or_else(|| "grpcreceiver".to_string()),
         latitude: meta.latitude.filter(|v| v.is_finite()),
@@ -177,10 +183,20 @@ pub fn station(meta: &pb::StationMeta) -> Option<PeerStation> {
     })
 }
 
-/// The reverse, for a satellite describing its own stations in `Hello`.
-pub fn station_meta(key: &StationKey, projection: &StationProjection) -> pb::StationMeta {
+/// The reverse, for a node describing a station in `Hello`.
+///
+/// `owner` is the row's `config.stations.owning_node_id`: a leaf's own id for its own
+/// sensors, and the node behind it for a station a **relay** received. A collector two hops
+/// up needs that to attribute the row correctly, and §2.3's diamond is the case where
+/// getting it wrong refuses one of two legitimate arrivals for ever.
+pub fn station_meta(
+    key: &StationKey,
+    projection: &StationProjection,
+    owner: mw_types::OriginId,
+) -> pb::StationMeta {
     pb::StationMeta {
         station_key: key.as_str().to_string(),
+        owning_node: owner.as_bytes().to_vec(),
         name: projection.name.clone(),
         station_type: projection.kind.clone(),
         latitude: projection.latitude,
@@ -261,6 +277,26 @@ mod tests {
         }
     }
 
+    /// An absent owner means "the declaring peer itself", which is every leaf — so a
+    /// satellite that predates the field still registers correctly.
+    #[test]
+    fn an_absent_owner_means_the_declaring_peer() {
+        let s = station(&pb::StationMeta {
+            station_key: "satellite-a:backyard".into(),
+            ..Default::default()
+        })
+        .expect("a keyed station");
+        assert_eq!(s.owner, None);
+        // …and so does one that is not 16 bytes, which fails closed to the peer.
+        let s = station(&pb::StationMeta {
+            station_key: "satellite-a:backyard".into(),
+            owning_node: vec![1, 2, 3],
+            ..Default::default()
+        })
+        .expect("a keyed station");
+        assert_eq!(s.owner, None);
+    }
+
     #[test]
     fn a_station_with_no_key_is_not_a_station() {
         assert!(station(&pb::StationMeta::default()).is_none());
@@ -326,8 +362,15 @@ mod tests {
             snow_base_distance_mm: Some(1500.0),
         };
         let key = StationKey::new("satellite-a:backyard");
-        let back = station(&station_meta(&key, &projection)).expect("a keyed station");
+        let owner = mw_types::OriginId::new([2; 16]);
+        let back = station(&station_meta(&key, &projection, owner)).expect("a keyed station");
         assert_eq!(back.station, key);
+        assert_eq!(
+            back.owner,
+            Some(owner),
+            "the measuring node survives the hop, which is what lets a relay forward a \
+             station it did not measure (§2.3)"
+        );
         assert_eq!(back.name, "Back Yard");
         assert_eq!(back.kind, "davis");
         assert_eq!(back.timezone.as_deref(), Some("America/Denver"));
