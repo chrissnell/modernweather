@@ -238,8 +238,8 @@ green while running nothing is docs/reconciliation.md G-1."""
 [[gate]]
 id = "serial-bridge"
 description = "A `ser2net` fan-out broadcasts every byte to every client, with its controls"
-owner = "GRA-787 (the Campbell multiplexer on pitcairn); consumed by M5-2 mechanism (b)"
-arms_when = "packaging/serial-bridge/ser2net.yaml"
+owner = "GRA-787 (the serial multiplexer); consumed by M5-2 mechanism (b)"
+arms_when = "packaging/serial-bridge/ser2net.yaml.example"
 cmd = ["ci/serial-bridge/prove.sh"]
 note = """
 M5-2's mechanism (b) diffs the two implementations by value on real data, which needs both
@@ -255,8 +255,8 @@ thing; this gate is the measurement, byte for byte, with two negative controls (
 misconfigured bridge, one unbridged character device read twice).
 
 `ser2net` and `socat` are hard requirements and the runner says so rather than skipping: the
-binary under test is the one that runs on pitcairn, and a faked fan-out would prove only that
-its author can write one. The runner asserts the declared number of tests passed, because a
+binary under test is the one `packaging/serial-bridge/` deploys, and a faked fan-out would
+prove only that its author can write one. The runner asserts the declared number of tests passed, because a
 `--ignored` filter that matches no tests exits zero and a gate that reports green while
 running nothing is docs/reconciliation.md G-1 -- the same rule `cargo xtask emulator-tests`
 applies.

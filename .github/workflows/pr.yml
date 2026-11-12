@@ -674,10 +674,9 @@ jobs:
       # only that its author can write one. `socat` provides the pty pair that stands in for
       # the station, so the whole proof runs with no hardware.
       #
-      # The runner also reports the version it measured. Debian/Ubuntu and the Arch package
-      # pitcairn installs from are not the same release, and both were checked by hand (4.6.4
-      # and 4.6.8) -- so a future divergence should be visible in the log rather than assumed
-      # away.
+      # The runner also reports the version it measured. Debian/Ubuntu and Arch do not ship
+      # the same release, and both were checked by hand (4.6.4 and 4.6.8) -- so a future
+      # divergence should be visible in the log rather than assumed away.
       - name: Install the bridge under test
         run: |
           sudo apt-get update

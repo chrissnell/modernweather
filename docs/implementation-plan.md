@@ -1063,31 +1063,31 @@ the Go source definition, so `w9.expected_column INTERSECT w9.source_column` wil
 `w9.assert_no_unknown_source_columns()` should raise nothing — and if it does, something has changed
 since 2026-10-31 and that is worth stopping for.
 
-### M5-1a — the serial multiplexer on pitcairn *(GRA-787)*
-**Depends on:** nothing — both ends already support it. **Blocks:** M5-2's mechanism (b) on the
-Campbell station, and nothing else.
+### M5-1a — a serial multiplexer, so two daemons can read one station *(GRA-787)*
+**Depends on:** nothing — both ends already support it. **Blocks:** M5-2's mechanism (b) on a serial
+station, and nothing else.
 
-**Not in the original plan.** The owner proposed it on 2026-11-12 and it is recorded here rather
-than left on an issue, because it is the only thing that makes (b) available on his own station and
-because it touches a production machine. It is **N-20**'s production path arriving a milestone
-early: `ser2net` on pitcairn owns `/dev/ttyS0`, and both daemons read it over TCP. The Go side is a
-configuration change and not a code change (`campbell/station.go:254` takes the serial path only
-when `serial_device` is non-empty); the Rust side already maps Campbell as `Serial | TcpOut`.
+**Not in the original plan.** Proposed on 2026-11-12 and recorded here rather than left on an issue,
+because it is the only thing that makes (b) available on a serial station and because deploying it
+touches a live machine. It is **N-20**'s production path arriving a milestone early: `ser2net` owns
+the character device, and both daemons read it over TCP. The Go side is a configuration change and
+not a code change (`campbell/station.go:254` takes the serial path only when `serial_device` is
+non-empty); the Rust side already maps Campbell as `Serial | TcpOut`.
 
 **The deliverable is the proof before it is the bridge.** The question that decides whether any of
 this is worth doing is whether the multiplexer *broadcasts* every byte to every connected client or
 hands bytes to whichever client reads first. If it is the second, the two daemons split the stream
 and **both** produce gap-ridden data that still parses — nothing downstream could tell it from
-weather, which makes it the worst available outcome and strictly worse than having no (b) for this
+weather, which makes it the worst available outcome and strictly worse than having no (b) for that
 station at all. `ser2net`'s documentation says `max-connections` broadcasts; the documentation is
 not the measurement.
 
 **Done when:** `ci/serial-bridge/prove.sh` is green — two clients connected at once receive the
 identical byte stream, asserted byte for byte over a known sequence pushed through a `socat` pty, so
-the whole proof runs with no hardware and without touching the live station; the bridge runs on
-pitcairn as a unit that survives a reboot; `remoteweather` reads it over TCP with the live site
-serving current readings, checked by a timestamp and not by a process being up; and
-`modernweather`'s Campbell driver reads the same stream at the same time.
+the whole proof runs with no hardware and without touching a live station; the bridge runs as a unit
+that survives a reboot; the Go daemon reads it over TCP with its site serving current readings,
+checked by a timestamp and not by a process being up; and `modernweather`'s Campbell driver reads
+the same stream at the same time.
 
 **Test strategy:** the assertion plus **two** negative controls, because an identity assertion that
 cannot be made to fail proves nothing (W1 **D-10**): the same apparatus with `max-connections: 1`,
@@ -1099,14 +1099,15 @@ with no error anywhere. That is why `packaging/serial-bridge/README.md`'s cutove
 measured requirement rather than caution.
 
 **What this item introduces, stated rather than discovered:** the port is writable. `ser2net`
-forwards what a client sends to the datalogger. Neither daemon writes to this line — checked in both
-trees — but before this change the only thing that *could* was a descriptor `remoteweather` held.
+forwards what a client sends to the datalogger. Neither daemon writes to a Campbell line — checked
+in both trees — but before this change the only thing that *could* was a descriptor the daemon held.
 That is the one new hazard and it is in the README beside the mitigation.
 
-**Left to the owner, because the box is the only thing that can answer it:** whether the station is
-on `/dev/ttyS0` or on USB serial — the issue and `crates/mw-station/src/stream.rs` disagree, and one
-of them is wrong — and the line rate, which is the station's `baud` column and whose wrong value
-produces parse failures rather than silence.
+**Nothing in this repository records a particular installation.** The device path, the line rate and
+the listen address are site-specific, and each of them fails *quietly* when guessed wrong, so
+`packaging/serial-bridge/ser2net.yaml.example` leaves them as placeholders that are deliberately not
+valid rather than shipping a plausible default. An operator's actual values belong wherever that
+machine's configuration is kept, which is not here.
 
 ### M5-2 — the diff harness
 **Depends on:** M5-1, M3-1, and **M5-1a** for the Campbell half of (b). Build (b) and (c) above as a

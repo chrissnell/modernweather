@@ -553,9 +553,9 @@ impl Drop for PtyBridge {
 /// `socat` pty pair standing in for the station — GRA-787's apparatus.
 ///
 /// This is the one piece of the station path that is neither a driver nor an emulator: it
-/// is the *bridge*, and M5-2's mechanism (b) on the owner's Campbell station depends on a
-/// property of it that no amount of reading the documentation establishes. One serial line
-/// has one reader, so feeding both daemons the same readings means a multiplexer — and if
+/// is the *bridge*, and M5-2's mechanism (b) on a serial station depends on a property of
+/// it that no amount of reading the documentation establishes. One serial line has one
+/// reader, so feeding two daemons the same readings means a multiplexer — and if
 /// that multiplexer hands bytes to whichever client reads first instead of broadcasting
 /// every byte to all of them, the two daemons silently split the stream and both produce
 /// gap-ridden data that still parses. `tests/serial_bridge.rs` is the assertion that it
@@ -564,10 +564,10 @@ impl Drop for PtyBridge {
 /// # Why the real binary and not a double
 ///
 /// A hand-written fan-out would prove only that the test author can write one. The claim
-/// under test is about **`ser2net` 4.x's `max-connections`**, which is what will run on
-/// pitcairn (`packaging/serial-bridge/`), so the binary is the thing under test and a
-/// missing binary is a failure rather than a skip — the same rule [`PtyBridge`] follows
-/// for `socat`.
+/// under test is about **`ser2net` 4.x's `max-connections`**, and `ser2net` is what
+/// `packaging/serial-bridge/` deploys — so the binary is the thing under test and a missing
+/// binary is a failure rather than a skip, the same rule [`PtyBridge`] follows for
+/// `socat`.
 ///
 /// `SER2NET` overrides the executable, because the Debian package installs it in
 /// `/usr/sbin` and that is not on a non-root `PATH`. `GENSIO_LIBRARY_PATH` is gensio's own
@@ -575,7 +575,7 @@ impl Drop for PtyBridge {
 /// a `ser2net` whose gensio modules are somewhere unusual answers every connector with
 /// `Unknown gensio type: serialdev,…` while still listening on the port.
 ///
-/// # Two things this apparatus does that the pitcairn configuration must not copy
+/// # Two things this apparatus does that a deployed configuration must not copy
 ///
 /// **`nouucplock`.** gensio takes a uucp lock per device — one keyed by the path and one
 /// keyed by the device's *major.minor*, which for a `socat` pty is whichever `/dev/pts/N`
@@ -583,11 +583,12 @@ impl Drop for PtyBridge {
 /// leaves both behind; the next test gets the same `/dev/pts/N`, finds the stale lock, and
 /// answers its client `Device open failure: Object was already in use` while looking
 /// perfectly healthy. The lock is a real safeguard on a real port and stays on in
-/// `packaging/serial-bridge/ser2net.yaml` — with the consequence recorded there, because it
+/// `packaging/serial-bridge/ser2net.yaml.example` — with the consequence recorded there,
+/// because it
 /// is also why that unit must be stopped with `SIGTERM`.
 ///
-/// **An ephemeral port.** pitcairn's is fixed and in the configuration; this one is chosen
-/// per bridge so the tests may run beside each other.
+/// **A guessed port.** A deployment's is fixed and in its configuration; this one is
+/// chosen per bridge so the tests may run beside each other.
 #[derive(Debug)]
 pub struct Ser2netBridge {
     socat: tokio::process::Child,
@@ -740,7 +741,7 @@ impl Ser2netBridge {
     }
 
     /// The character device the *bridge* owns — the near end of the pty pair, standing in
-    /// for `/dev/ttyS0`. A test opens this to show that nothing else can.
+    /// for the station's serial port. A test opens this to show that nothing else can.
     pub fn line_side(&self) -> &std::path::Path {
         &self.line_side
     }

@@ -2,9 +2,9 @@
 //!
 //! M5-2's mechanism (b) diffs the two implementations by value on real data, which needs
 //! both daemons fed the same readings. The WeatherLink Live gives that away — it broadcasts
-//! over UDP and both can listen. The owner's Campbell station is on a serial line, and a
-//! serial line has exactly one reader, so for that station mechanism (b) does not exist
-//! without a multiplexer in front of the port.
+//! over UDP and both can listen. A Campbell datalogger is on a serial line, and a serial
+//! line has exactly one reader, so for such a station mechanism (b) does not exist without
+//! a multiplexer in front of the port.
 //!
 //! `ser2net`'s `max-connections` is the documented way to build one. **The documentation is
 //! not the proof.** The question these tests exist to answer is the one that decides whether
@@ -30,8 +30,9 @@
 //! # What runs these
 //!
 //! `ser2net` and `socat`, as real processes. Neither is a Rust dependency and neither is a
-//! double: the binary under test is the one that will run on pitcairn. A missing binary is
-//! a **failure** rather than a skip, for the reason `emulator_campbell.rs` gives for
+//! double: the binary under test is the one `packaging/serial-bridge/` deploys. A missing
+//! binary is a **failure** rather than a skip, for the reason `emulator_campbell.rs` gives
+//! for
 //! `socat` — a gate that reports green while running nothing is
 //! `docs/reconciliation.md` G-1. `#[ignore]`d so that `cargo test` on a machine with
 //! neither stays green; `ci/serial-bridge/prove.sh` is what runs them and it asserts the
@@ -77,7 +78,7 @@ fn records(n: usize) -> Vec<u8> {
 async fn bridge_or_fail(name: &str, slots: u32) -> Ser2netBridge {
     Ser2netBridge::spawn(name, slots).await.expect(
         "`ser2net` and `socat` are test dependencies of GRA-787: the bridge under test is the \
-         binary that will run on pitcairn, so a missing one is a failure and not a skip. \
+         binary a deployment actually runs, so a missing one is a failure and not a skip. \
          `SER2NET` overrides the path (the Debian package installs it in /usr/sbin, which is \
          not on a non-root PATH) and `GENSIO_LIBRARY_PATH` is gensio's own.",
     )
@@ -209,8 +210,8 @@ async fn the_control_bites_when_the_bridge_has_only_one_client_slot() {
 }
 
 /// **Negative control, for the apparatus.** Take the bridge out and let two readers share
-/// the character device, which is what happens on pitcairn if the multiplexer is started
-/// while `remoteweather` is still holding `/dev/ttyS0`.
+/// the character device, which is what happens if the multiplexer is started while an
+/// older daemon is still holding the port.
 ///
 /// `github.com/tarm/goserial` — `remoteweather`'s serial library — sets neither `TIOCEXCL`
 /// nor `O_EXCL` nor a `flock`, so that second `open(2)` **succeeds**: the kernel hands each
@@ -451,9 +452,9 @@ async fn the_campbell_driver_reads_the_bridge_while_a_second_client_reads_the_sa
 ///
 /// This is the fail-safe half of the asymmetry
 /// [`two_readers_of_one_character_device_do_not_both_get_the_stream`] measures. Started in
-/// the right order, a `remoteweather` that is accidentally left pointing at `/dev/ttyS0`
-/// logs `failed to open serial port … device or resource busy` and retries — loud, and not
-/// a split stream.
+/// the right order, a daemon that is accidentally left pointing at the serial port logs
+/// `failed to open serial port … device or resource busy` and retries — loud, and not a
+/// split stream.
 #[tokio::test]
 #[ignore = "needs `ser2net` and `socat`; `ci/serial-bridge/prove.sh` runs it"]
 async fn the_bridge_owns_the_line_exclusively_once_it_has_a_client() {

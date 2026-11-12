@@ -12,20 +12,23 @@
 #   ./cutover.sh revert               apply the rollback.sql written by `apply`
 #
 # Environment:
-#   CONFIG_DB     default /var/lib/remoteweather/config.db
-#   BRIDGE_HOST   default 10.50.0.35      (must match the accepter in ser2net.yaml)
+#   CONFIG_DB     default /var/lib/remoteweather/config.db, which is the path that
+#                 project's own systemd unit uses
+#   BRIDGE_HOST   default 127.0.0.1, and it must match the accepter in the bridge's
+#                 configuration. Only set it to something else if a reader is on another
+#                 machine -- see "the port is writable" in README.md
 #   BRIDGE_PORT   default 7001
 #   DEVICE_NAME   default: the single enabled `campbellscientific` row, and an error if
 #                 there is more than one
 #   ROLLBACK      default ./rollback.sql
 #
-# This writes to the live configuration of a production weather server. It does NOT restart
-# anything: the order in which the daemon and the bridge are restarted is the part that
-# matters and it is in README.md, not here.
+# This writes to a live weather server's configuration. It does NOT restart anything: the
+# order in which the daemon and the bridge are restarted is the part that matters, and it is
+# in README.md rather than here.
 set -euo pipefail
 
 CONFIG_DB=${CONFIG_DB:-/var/lib/remoteweather/config.db}
-BRIDGE_HOST=${BRIDGE_HOST:-10.50.0.35}
+BRIDGE_HOST=${BRIDGE_HOST:-127.0.0.1}
 BRIDGE_PORT=${BRIDGE_PORT:-7001}
 ROLLBACK=${ROLLBACK:-./rollback.sql}
 
@@ -82,8 +85,8 @@ apply)
   # Captured BEFORE the change, so the rollback restores what was actually there rather than
   # what this script assumed was there.
   cat > "$ROLLBACK" <<EOF
--- Rollback for the GRA-787 cutover of '$name', generated $(date -Is) from the row as it
--- was. Apply with:  sqlite3 $CONFIG_DB < $(basename "$ROLLBACK")
+-- Rollback for the serial-bridge cutover of '$name', generated $(date -Is) from the row as
+-- it was. Apply with:  sqlite3 $CONFIG_DB < $(basename "$ROLLBACK")
 -- Then restart remoteweather. The station is back on the serial line, so the bridge must be
 -- stopped first or they will both read the port and split the stream.
 UPDATE devices
