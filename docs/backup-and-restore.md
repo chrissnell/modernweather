@@ -214,10 +214,10 @@ exact Cloudflare and Vault steps; the requirements, because three of them are lo
 | | |
 |---|---|
 | Bucket | `modernweather-backups`, **private** — no public access, no custom domain |
-| Token | **Object Read & Write**, scoped to that bucket alone. `GetObject`, `PutObject`, `ListBucket` and `DeleteObject` are all used; nothing needs bucket-level admin |
+| Token | **Object Read & Write**, scoped to that bucket alone. The jobs use `GetObject`, `PutObject` and `ListBucket`; nothing needs bucket-level admin |
 | **No lifecycle / expiry rule** | **The per-year design cannot survive one.** A historical year is written once and never rewritten, so a 30-day expiry deletes nine years of a decade and leaves the current one |
 | **No object versioning** | The current year is overwritten weekly. With versioning on, storage grows without bound for no benefit |
-| `no_check_bucket = true` in `rclone.conf` | so the job never calls `CreateBucket`/`HeadBucket` and the token needs no permission to |
+| `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` | so the job never calls `CreateBucket`/`HeadBucket` and the token needs no permission to |
 
 **An earlier revision of this document specified a prefix inside the bucket that holds the
 Vault raft snapshots.** That was not a preference — it was the only destination the *existing*
@@ -248,9 +248,25 @@ disappearing. A missing object re-dumps the year and says so loudly; a length th
 with the manifest also re-dumps, because an object of the wrong size is not the object the
 recorded digest was computed over.
 
-The credential reaches the job through an `ExternalSecret` against the existing `vault`
-`ClusterSecretStore`, which is the pattern every other credential in this cluster uses. The
-manifests — the weekly dump `CronJob`, the monthly `--from-archive` rehearsal `CronJob` and the
+### The credential, which is three fields and no config file
+
+Vault holds it at `secret/modernweather` (KV v2) as `accessKeyId`, `secretAccessKey` and
+`endpoint`, and an `ExternalSecret` against the existing `vault` `ClusterSecretStore` — the
+pattern every other credential in this cluster uses — projects those three into the namespace.
+
+**There is no `rclone.conf` anywhere.** rclone takes a whole remote from the environment as
+`RCLONE_CONFIG_<REMOTE>_<KEY>`, so the CronJobs set `RCLONE_CONFIG_R2_ACCESS_KEY_ID` and
+friends and the remote `r2:` exists with no file to write. That matters for one specific
+reason: assembling a config file in a shell means a secret passing through a heredoc, and a
+quoting bug there is invisible until a restore. The bucket name is a plain env var in the two
+CronJobs — a bucket name is not a secret, and a value that lives in git is one you can read in
+a review.
+
+A fourth field, `apiToken`, is deliberately **not** pulled in. It is a token for Cloudflare's
+own API rather than for S3; nothing here can use it, and a credential a workload cannot use is
+a privilege it should not be holding.
+
+The manifests — the weekly dump `CronJob`, the monthly `--from-archive` rehearsal `CronJob` and the
 `ExternalSecret` — are in `kube-cluster-helm-values` under `apps/modernweather-db/backup/`, not
 here: this repository is public and `/deploy/` is in `.gitignore` for that reason.
 

@@ -68,7 +68,10 @@
 # Environment:
 #   DATABASE_URL                     the weather database. Required unless PSQL is given.
 #   MW_BACKUP_REMOTE                 rclone destination, e.g. r2:bucket/modernweather.
-#   RCLONE_CONFIG                    rclone's own variable; point it at the rclone.conf.
+#   RCLONE_CONFIG                    rclone's own variable. The in-cluster CronJobs set it to
+#                                    /dev/null and define the remote entirely through
+#                                    RCLONE_CONFIG_R2_* instead, so no config file exists to
+#                                    assemble a credential into.
 #   MW_CONFIG_DB                     the daemon's SQLite configuration database.
 #   MW_BACKUP_ALLOW_NO_CONFIG_DB=1   tolerate MW_CONFIG_DB not existing yet.
 #   MW_RESTORE_CONFIG_DB             where `restore` writes the configuration database.
