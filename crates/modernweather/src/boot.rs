@@ -82,6 +82,7 @@ const REGISTRARS: &[&dyn Registrar<Config>] = &[
     &Rollup,
     &Snapshot,
     &Legacy,
+    &Outputs,
     &Web,
     &Listener,
 ];
@@ -288,6 +289,34 @@ impl Registrar<Config> for Snapshot {
         out: &mut Vec<mw_component::ComponentSpec>,
     ) -> Result<(), RegisterError> {
         mw_pipeline::snapshot::register(cfg, out)
+            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
+    }
+}
+
+/// `aprs:*`, `pws:*` and `wu:*` -- the rate-limited outputs.
+///
+/// An adapter here for `Rollup`'s reason: `Registrar` is `mw-supervisor`'s and `mw-output`
+/// is a higher layer, so the trait is implemented in the binary over
+/// `mw_output::register`, which is the pure function that does the work.
+///
+/// Conditional on two things, both of which `mw_output::register` decides: an enabled
+/// `uploader` row, and a `WindowedView` to resolve against. The second is the interesting
+/// one — an uploader sends **windows**, so a node with no rollup has nothing to upload and
+/// the registrar says so at `info` rather than refusing the configuration.
+#[derive(Debug)]
+struct Outputs;
+
+impl Registrar<Config> for Outputs {
+    fn name(&self) -> &'static str {
+        "mw-output (the rate-limited outputs)"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        mw_output::register(cfg, out)
             .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
     }
 }
@@ -935,6 +964,10 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
 
     // Step 4c: identity resolution and the write end of the pipeline.
     mw_station::metrics::register();
+    // The two series the rate-limited outputs own, described beside the others so that a
+    // component that has sent nothing is distinguishable from one whose metrics are broken
+    // (§5.10).
+    mw_output::metrics::register();
     attach_registry(&mut cfg).context("publishing the station registry")?;
     if let Some(fanout) = &fanout {
         attach_ingress(&mut cfg, fanout).context("assembling the reading pipeline")?;
@@ -1080,6 +1113,7 @@ mod tests {
     /// crate; here it would only mean every plan assertion below asserted the refusal.
     fn config(with_database: bool) -> Config {
         let mut cfg = Config {
+            declared_uploaders: Vec::new(),
             stations: Vec::new(),
             declared_stations: Vec::new(),
             websites: Vec::new(),
@@ -1629,6 +1663,267 @@ mod tests {
             "got {ids:?}"
         );
         pool.close().await;
+    }
+
+    /// **Every window the three encoders declare is one `window:rollup` can resolve.**
+    ///
+    /// The half of that check `mw-output` cannot make: the ring's span and the maintained
+    /// set are `mw-pipeline`'s constants, and this is the only crate that may name both
+    /// (`ci/layers.toml` puts them in the same layer, so neither may name the other). The
+    /// registry half — "does `metrics/registry.toml` declare this strategy for this metric"
+    /// — is asserted inside `mw-output`.
+    ///
+    /// Why it is worth a test at all: `RollupState::one` routes a window shorter than the
+    /// ring to the ring and everything else to the maintained set, which refuses anything
+    /// but `Agg::Sum`. A declaration that falls between the two answers
+    /// `WindowError::TooLong`, which classifies **`Fatal`** — so the component fails every
+    /// occurrence, forever, and no test with a stubbed `WindowedView` can see it.
+    #[test]
+    fn every_declared_window_is_one_the_rollup_can_resolve() {
+        use mw_output::encoder::{cwop, pws, wu};
+        use mw_pipeline::rollup::ring::RING_SPAN;
+        use mw_pipeline::rollup::state::MAINTAINED;
+        use mw_types::Agg;
+
+        for table in [cwop::REQUIRED, wu::REQUIRED, pws::REQUIRED] {
+            for (metric, window, agg) in table.iter().copied() {
+                match window.length() {
+                    // Inside the ring: every strategy resolves, from bucket state.
+                    Some(length) if length <= RING_SPAN => {}
+                    // Outside it: the window must be one the rollup maintains, and a
+                    // maintained window resolves only a total.
+                    _ => {
+                        assert!(
+                            MAINTAINED.contains(&window),
+                            "`({metric:?}, {window}, {agg})` is longer than the \
+                             {}-second ring and is not in the rollup's maintained set",
+                            RING_SPAN.as_secs()
+                        );
+                        assert_eq!(
+                            agg,
+                            Agg::Sum,
+                            "`({metric:?}, {window})` is maintained, and \
+                             `RollupState::maintained` resolves only `Agg::Sum`"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **Every station the rollup holds has a resolved time zone**, which is what makes the
+    /// three calendar-window declarations resolvable rather than `Fatal`.
+    ///
+    /// The invariant is real and is enforced three crates away, so it is worth pinning
+    /// here. `WindowedView::resolve` answers `WindowError::NoZone` — `Fatal` — for a
+    /// `Window::Day`, `Month` or `Year` declaration against a station with no zone, and all
+    /// three encoder tables declare at least one. What stops that reaching a running
+    /// uploader is that a *collecting* station with no usable zone makes `plan()` refuse the
+    /// whole configuration: `rollup_stations` hands the unresolved `None` to
+    /// `rain:rollover:<station>`'s `TzSource`, and `mw_supervisor::plan` answers
+    /// `PlanError::MissingTimeZone`. (An unparseable zone is caught earlier still, by
+    /// `attach_registry`.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_collecting_station_with_no_time_zone_refuses_the_whole_configuration() {
+        let scratch = Scratch::new("nozone");
+        // The beaconing station, with its `timezone` column left NULL -- which
+        // `mw_store::registry` treats as absent rather than as a problem, so startup
+        // proceeds and `plan()` is where it is caught.
+        let station = "INSERT INTO stations (station_key, owning_node_id, name, type,
+                                             identity_kind, transport_kind, transport_dev,
+                                             transport_baud, latitude, longitude)
+                       VALUES ('backyard', x'07070707070707070707070707070707', 'backyard',
+                               'davis', 'fixed', 'serial', '/dev/ttyUSB0', 19200,
+                               45.1, -122.05)"
+            .to_string();
+        let pool = configure(&scratch, &[station]).await;
+        let mut cfg = Config::load(&pool).await.expect("the configuration reads");
+        let node = cfg.node.clone().expect("the node row was inserted");
+        let fanout = spool::open(&node).expect("the spool opens");
+        attach_registry(&mut cfg).expect("a blank zone is not a registry problem");
+        attach_ingress(&mut cfg, &fanout).expect("the pipeline assembles");
+        attach_listener(&mut cfg, Arc::new(String::new)).expect("the route tables mount");
+        cfg.weather_database = Some(config_db::WeatherDatabase {
+            url: secrecy::SecretString::from(
+                "postgresql://mw@127.0.0.1:5432/modernweather".to_string(),
+            ),
+        });
+
+        let roots = Roots {
+            schedule: Arc::new(mw_supervisor::testing::MemoryScheduleStore::new()),
+            stream: Some(Arc::clone(&fanout.stream) as Arc<dyn mw_component::ReadingStream>),
+            log: Arc::new(mw_supervisor::testing::MemoryLogControl::new("info")),
+        };
+        let ctx = PlanContext::new(Generation::ZERO).with_roots(roots.capabilities());
+        let e = plan(&cfg, REGISTRARS, &ctx).expect_err("a station with no zone");
+        let text = mw_types::DisplayChain(&e).to_string();
+        assert!(text.contains("backyard"), "{text}");
+        assert!(
+            text.contains("time zone") || text.contains("timezone"),
+            "{text}"
+        );
+        pool.close().await;
+    }
+
+    /// A station with coordinates and a callsign, which is what an APRS uploader needs.
+    ///
+    /// `timezone` is set for the reason [`broadcast_station`] records, and the three APRS
+    /// columns are on the **station** row rather than the uploader because the callsign is
+    /// public identity and the position is where the station is (**D-66**).
+    fn beaconing_station(key: &str) -> String {
+        format!(
+            "INSERT INTO stations (station_key, owning_node_id, name, type, identity_kind,
+                                   transport_kind, transport_dev, transport_baud,
+                                   latitude, longitude, aprs_callsign, timezone)
+             VALUES ('{key}', x'07070707070707070707070707070707', '{key}',
+                     'davis', 'fixed', 'serial', '/dev/ttyUSB0', 19200,
+                     45.1, -122.05, 'N0CALL', 'America/Denver')"
+        )
+    }
+
+    /// **The rate-limited outputs plan, over the rollup's own `WindowedView`.**
+    ///
+    /// End to end through the real configuration database, because the half this covers is
+    /// the wiring no unit test in `mw-output` can reach: `mw_store::config_db::uploaders`'
+    /// three-table join, `declare_uploader`'s column-into-field copy, and the fact that
+    /// `Config::set_rollup` is what both `OutputConfig::windowed_view` and
+    /// `SnapshotConfig::snapshot_windows` answer from — so an uploader and `/latest` cannot
+    /// disagree about what the five-minute wind average is.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_enabled_uploader_plans_a_component_over_the_rollups_own_view() {
+        let scratch = Scratch::new("uploaders");
+        let pool = configure(&scratch, &[beaconing_station("backyard")]).await;
+        for sql in [
+            "INSERT INTO uploader (id, kind, name, enabled, api_key, interval_seconds)
+             VALUES (1, 'wunderground', 'backyard', 1, 'hunter2', 300)",
+            "INSERT INTO station_service (station_key, service, uploader_id,
+                                          remote_station_id)
+             VALUES ('backyard', 'wunderground', 1, 'KWABACKYARD')",
+            // A second uploader for the same station needs its own `uploader.name`: the
+            // column is UNIQUE across kinds, because it is the component id's suffix and
+            // `wu:backyard` has to survive a rename of anything else.
+            //
+            // A KISS beacon at fifteen minutes, which is above the RF floor O-8 fixed at
+            // 600 s -- and at the Go default of 300 s this row would be a plan error.
+            "INSERT INTO uploader (id, kind, name, enabled, interval_seconds,
+                                   aprs_transport, aprs_kiss_tcp_address)
+             VALUES (2, 'aprs', 'backyard-rf', 1, 900, 'kiss-tcp', 'tnc.lan:8001')",
+            "INSERT INTO station_service (station_key, service, uploader_id)
+             VALUES ('backyard', 'aprs', 2)",
+            // Disabled, which is W5 §1.4's "Stop sharing with PWS Weather": the plan must
+            // not contain it.
+            "INSERT INTO uploader (id, kind, name, enabled, api_key)
+             VALUES (3, 'pwsweather', 'backyard-pws', 0, 'hunter3')",
+            "INSERT INTO station_service (station_key, service, uploader_id,
+                                          remote_station_id)
+             VALUES ('backyard', 'pwsweather', 3, 'BACKYARD')",
+        ] {
+            sqlx::query(sql)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("the schema rejected a row: {e}\n{sql}"));
+        }
+
+        let mut cfg = Config::load(&pool).await.expect("the configuration reads");
+        assert_eq!(
+            cfg.declared_uploaders.len(),
+            2,
+            "the disabled row is not read at all"
+        );
+        let node = cfg.node.clone().expect("the node row was inserted");
+        let fanout = spool::open(&node).expect("the spool opens");
+        attach_registry(&mut cfg).expect("the registry publishes");
+        attach_ingress(&mut cfg, &fanout).expect("the pipeline assembles");
+        attach_listener(&mut cfg, Arc::new(String::new)).expect("the route tables mount");
+        // The `weather_database` row, without which there is no `db:postgres`, no
+        // `window:rollup` and therefore nothing to upload (**D-44**). Set on the loaded
+        // configuration rather than inserted, for the reason
+        // `a_weather_database_and_a_spool_plan_the_pool_and_the_writer` records.
+        cfg.weather_database = Some(config_db::WeatherDatabase {
+            url: secrecy::SecretString::from(
+                "postgresql://mw@127.0.0.1:5432/modernweather".to_string(),
+            ),
+        });
+
+        let roots = Roots {
+            schedule: Arc::new(mw_supervisor::testing::MemoryScheduleStore::new()),
+            stream: Some(Arc::clone(&fanout.stream) as Arc<dyn mw_component::ReadingStream>),
+            log: Arc::new(mw_supervisor::testing::MemoryLogControl::new("info")),
+        };
+        let ctx = PlanContext::new(Generation::ZERO).with_roots(roots.capabilities());
+        let planned = plan(&cfg, REGISTRARS, &ctx).expect("the uploaders plan");
+        let ids: Vec<&str> = planned
+            .ids()
+            .map(mw_component::ComponentId::as_str)
+            .collect();
+        // The provider, and the two consumers of it this item adds.
+        assert!(ids.contains(&"window:rollup"), "got {ids:?}");
+        assert!(ids.contains(&"wu:backyard"), "got {ids:?}");
+        assert!(ids.contains(&"aprs:backyard-rf"), "got {ids:?}");
+        assert!(
+            !ids.contains(&"pws:backyard-pws"),
+            "a disabled uploader is not in the plan: got {ids:?}"
+        );
+        pool.close().await;
+    }
+
+    /// **A node that collects for nothing plans no uploader, and still starts.**
+    ///
+    /// The other direction of `OutputConfig::windowed_view`'s condition, and the one that
+    /// would be a refusal rather than an absence if it were got wrong: the uploaders declare
+    /// `WindowedView` as a hard need, `window:rollup` is not planned for a node with no
+    /// collecting station, and a hard need nobody provides refuses the **whole**
+    /// configuration (**D-44**) — so the daemon would not start at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_uploader_on_a_node_with_no_rollup_is_absent_rather_than_a_refusal() {
+        let mut cfg = config(true);
+        cfg.registry = Some(Arc::new(mw_store::ConfigRegistry::new(
+            mw_store::RegistrySnapshot::default(),
+        )));
+        // `config(true)` has a weather database and no station rows, so
+        // `rollup_stations()` is empty and `window:rollup` is not planned.
+        assert!(mw_pipeline::RollupConfig::rollup_stations(&cfg).is_empty());
+        cfg.declared_uploaders = vec![mw_output::UploaderRow {
+            kind: "wunderground".to_string(),
+            name: "backyard".to_string(),
+            interval_seconds: None,
+            api_endpoint: None,
+            api_key: Some(secrecy::SecretString::from("hunter2")),
+            station_key: Some("backyard".to_string()),
+            remote_station_id: Some("KWABACKYARD".to_string()),
+            latitude: None,
+            longitude: None,
+            aprs_callsign: None,
+            station_enabled: Some(true),
+            station_transport_kind: Some("serial".to_string()),
+            aprs_passcode: None,
+            aprs_symbol_table: None,
+            aprs_symbol_code: None,
+            aprs_comment: None,
+            aprs_server: None,
+            aprs_transport: None,
+            aprs_kiss_serial_device: None,
+            aprs_kiss_serial_baud: None,
+            aprs_kiss_tcp_address: None,
+            aprs_kiss_path: None,
+            aprs_kiss_destination: None,
+        }];
+        attach_listener(&mut cfg, Arc::new(String::new)).expect("the route tables mount");
+
+        let roots = Roots {
+            schedule: Arc::new(mw_supervisor::testing::MemoryScheduleStore::new()),
+            stream: None,
+            log: Arc::new(mw_supervisor::testing::MemoryLogControl::new("info")),
+        };
+        let ctx = PlanContext::new(Generation::ZERO).with_roots(roots.capabilities());
+        let planned = plan(&cfg, REGISTRARS, &ctx)
+            .expect("a node with an uploader and no rollup still starts");
+        let ids: Vec<&str> = planned
+            .ids()
+            .map(mw_component::ComponentId::as_str)
+            .collect();
+        assert!(!ids.contains(&"window:rollup"), "got {ids:?}");
+        assert!(!ids.contains(&"wu:backyard"), "got {ids:?}");
     }
 
     /// The satellite shape (W7 §8.2): a weather database and **no** spool.

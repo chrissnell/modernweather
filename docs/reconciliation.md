@@ -2350,8 +2350,8 @@ A-W2-1 and A-W2-2, W2a's D-30 split, W3's A-W3-1 to A-W3-4, W4's A-W4-1 to A-W4-
 A-W5-3, W7's A-W7-1 to A-W7-4, W8's A-1 to A-4 and W9's A-W9-1 to A-W9-3. All are applied there under
 the protocol; none is edited in place. See `docs/DESIGN.md`'s `## Amendments` section.
 
-This document proposes **one** amendment of its own, which is not to a decision. Thirteen more
-were appended later by implementation items and are marked as such.
+This document proposes **one** amendment of its own, which is not to a decision. Eighteen
+more were appended later by implementation items and are marked as such.
 
 **A-M4-2-1 — a `Soft` capability handle is read when it is used, not once at build.**
 *Proposed by implementation-plan.md **M4-2**, 2026-11-09. Not applied: the protocol above reserves
@@ -2930,3 +2930,217 @@ and §4a.6's entire argument is that the endpoint's authentication is the thing 
 not have. The parameters differ from the administrator password's deliberately —
 `mw_store::registry::hash_ingest_secret` has the three reasons — and the PHC string carries its own,
 so a hash written by any other tool still verifies.
+
+**A-M6-2-1 — D-32's crate table has no HTTP client, and the uploaders need a trust store.**
+*Proposed by implementation-plan.md **M6-2**, 2026-11-11. Not applied: the protocol above
+reserves that for a work item that owns the ledger.*
+
+*What was found.* **D-32** names `axum`/`tonic` for HTTP and, as **A-4** already recorded,
+lists no HTTP *client*. `crates/mw-output/src/lib.rs` has carried the consequence as a note
+since the crate was created: *"The outbound HTTP client is not named by any design document;
+it arrives with the work item that writes `Uploader`."* This is that item, and the gap is
+real: Weather Underground and PWS Weather are `https` endpoints and a credential crosses the
+public internet on that path.
+
+*What was chosen.* **The request is written out**, not taken from a client crate —
+`mw_output::https` is one `GET` with no body, a response-head parse, a `Retry-After` parse
+and a status classification, all pure functions over byte strings with unit tests. That is
+the same answer `mw_station::http` reached and for the same reason, which is recorded there:
+`hyper`'s client splits a connection into a sender and a connection future something else
+must drive, and on this path that means the `tokio::spawn` `clippy.toml` forbids.
+
+*What that leaves, and the one addition.* A root certificate store, which is the one part of
+a TLS client that cannot be written out. `rustls` + `ring` are already pinned for the
+listener (**A-W8-3**) and `tokio-rustls` with them; the addition is **`webpki-roots`**, a
+pure-data crate with no build step and no transitive dependency beyond
+`rustls-pki-types`. `ci/layers.toml`'s `webpki-roots-only-for-the-uploaders` rule confines it
+to `mw-output`, because nothing else in this daemon verifies a public endpoint: the SNI
+resolver serves certificates this node owns and `sqlx` verifies PostgreSQL against a CA an
+operator configured.
+
+*Why the compiled-in store rather than the platform's.* `rustls-native-certs` and
+`rustls-platform-verifier` would both answer the same question and are **not** equivalent
+here. The daemon ships as a static musl binary to four targets (`docs/release.md`) and into a
+container whose `/etc/ssl/certs` is the base image's, so a platform store makes the trust
+decision a property of the artefact: it succeeds on one target and fails on another, and the
+failure arrives as a handshake error once per upload period. A compiled-in anchor set behaves
+identically everywhere, which for two fixed public endpoints is the property worth having.
+The cost is stated: a root rotation is a release rather than a package update.
+
+*Why `reqwest` was not chosen.* It would answer the whole problem in one line. Measured
+rather than asserted: `cargo add reqwest --no-default-features --features
+rustls-no-provider` in a scratch crate resolves **132 packages** and pulls
+`rustls-platform-verifier`, `rustls-native-certs` and `hyper-rustls` — a second HTTP client
+stack beside `axum`'s server one, and a platform trust decision, against a release matrix
+whose ARMv6 member was measured once by `ci/spike/probe` (the evidence behind
+`docs/release.md` Appendix A). The figure is for that one feature set and would differ for
+another; it is recorded with the command that produced it so the next reader can re-measure
+rather than re-derive the trade.
+
+**A-M6-2-2 — an output reads a current value as the newest one-minute mean, because the
+capability it is given cannot answer anything finer.**
+*Proposed by implementation-plan.md **M6-2**, 2026-11-11. A departure from prose, not from a
+decision.*
+
+*What was found.* **D-50** removes `Agg::Last` and says an output needing a metric's current
+value reads `LatestSnapshot`. The three uploaders cannot. `docs/component-model.md` §4b's
+component table gives `aprs:*`, `pws:*` and `wu:*` exactly `WindowedView` and
+`StationRegistry` — no `LatestSnapshot` — and that is not an omission: `LatestSnapshot` is
+keyed per `(website, station)` (**D-31**), and an uploader is configured per *station*
+through a `station_service` pairing. A station may appear on several websites or none, so
+there is no key an uploader could form, and inventing a rule for which website's snapshot a
+CWOP packet is cut from would be a second answer to a question **D-31** settled.
+
+*What replaces it.* The six "current" rows across the three tables declare
+`Window::Rolling(60 s)` with the metric's own strategy — the newest **complete one-minute
+mean**, which is the finest thing `WindowedView` resolves, because `window:rollup` holds
+1-minute aggregate buckets and a one-minute window is one bucket.
+
+*Why that is better rather than merely possible.* It is also what the Go uploaders send
+today, accidentally: their "latest reading" is a `weather_1m` row selected by
+`WHERE bucket > NOW() - INTERVAL '2 minutes' LIMIT 1` with no `ORDER BY`
+(`internal/database/client.go:121`), which is a 1-minute average of an arbitrary bucket up to
+two minutes stale. The difference is that this one is the newest complete minute,
+deliberately, and says so in a declaration a reviewer can check against the service's
+documentation. **D-50 is untouched**: nothing here declares `Agg::Last`, and nothing claims
+`LatestSnapshot` is the wrong home for an instantaneous value — the surfaces that have a
+website key still read it.
+
+**A-M6-2-3 — D-57's layer ORDER holds; its `ServiceBuilder` expression does not compile.**
+*Proposed by implementation-plan.md **M6-2**, 2026-11-11. A departure from a mechanism, not
+from the decision it implements.*
+
+*What was found.* **D-57** and `docs/component-model.md` §4b.5 both write the stack
+literally:
+
+```rust
+ServiceBuilder::new()
+    .layer(RetryLayer::new(ClassPolicy::new(budget)))  // outermost
+    .layer(RateLimitLayer::new(1, period))
+    .layer(TimeoutLayer::new(attempt_timeout))         // innermost
+    .service(http)
+```
+
+Two of those three layers cannot be composed in that order against `tower` 0.5:
+
+- **`tower::retry::Retry<P, S>` requires `S: Clone`** and `tower::limit::RateLimit<S>` is not
+  `Clone` — it owns a `Pin<Box<Sleep>>`. So `Retry` cannot wrap `RateLimit`, which is the one
+  relationship the decision is about.
+- **`tower::timeout::Timeout` erases the error to `BoxError`**, and §4.2's entire mechanism is
+  that the retry decision is read from `Classify` on a **typed** error. A layer that turned
+  `UploadError::RateLimited { retry_after }` into a `Box<dyn Error>` would make the policy
+  above it unable to honour the header, which is W2a Decision 59's whole path.
+
+`tower`'s own answer to the first is `buffer::Buffer`, which makes a service `Clone` by moving
+it behind a channel into a **spawned task** — and `clippy.toml` forbids `tokio::task::spawn`
+with "spawn through `mw_supervisor::task`, so the task table owns the handle and a leak is
+unexpressible", a mechanism a component's own tick cannot reach.
+
+*What replaces it.* The order, kept, with two substitutions and no change to the behaviour:
+
+| D-57 writes | `mw_output::uploader` has |
+|---|---|
+| `RetryLayer` outermost | an attempt loop in the component body, driven by `ClassPolicy` |
+| `RateLimitLayer` | `tower::limit::RateLimitLayer`, unchanged |
+| `TimeoutLayer` innermost | `AttemptTimeout`, this crate's own, over `UploadError` |
+
+The loop calls `ServiceExt::ready()` before **every** attempt, and
+`RateLimit::poll_ready` is where a permit is spent — so a retry *waits for the limiter*
+rather than bypassing it, which is the property D-57 states in words: *"each attempt takes
+its own permit."* `uploader::tests::each_retry_takes_its_own_permit_from_the_limiter`
+asserts it as elapsed time between attempts under a paused clock, which is the form the
+reversed stack would fail in.
+
+*The door a reader will try next, so they do not have to.* A **`Clone`-able** limiter —
+shared state behind an `Arc<Mutex<…>>` rather than `tower`'s owned `Pin<Box<Sleep>>` — would
+compose with `tower::retry::Retry` and *would* have the property: `Retry::call` binds
+`self.service.call(request)` on the line before it clones itself, so the clone the retry path
+drives inherits the post-call limiter state. The composed form is therefore available at the
+cost of a second rate limiter to audit against `tower`'s, for a saving of about thirty lines
+in one component — which is why it was not built, and is the thing to build if a second tower
+stack in this process ever needs it.
+
+*Why this is more than inconvenient.* The decision's content is the ordering and the reason
+for it — *"reversed, the first failure spends one permit and then hammers the service as fast
+as the retry policy allows, which is worst exactly when the remote service is already
+struggling"* — and an implementation that followed the expression instead of the reasoning
+would have had to choose between inverting the order and spawning a task. `ClassPolicy` is
+still generic over `E: Classify` and knows nothing about uploads, so the first stack that
+*can* use `tower::retry` has one line to write.
+
+*One half of §4b.5 is not implemented and is not taken.* Adaptive pushback has a
+supervisor-side half: *"the limiter accepts an external 'not before T' signal, and the
+supervisor skips any occurrence falling before T, counting it as a skip with a distinct
+reason."* The limiter's half is here — `Uploader` holds the `Retry-After` across occurrences
+and skips one that falls inside it, counted as `mw_output_uploads_total{outcome="held"}` —
+but the **supervisor** has no "not before" input and no skip reason beyond `Outcome::Skipped`.
+Adding one is a change to `mw-supervisor`, which is M2-3's crate, so it is reported here
+rather than taken. The observable difference is where the skip is counted, not whether the
+service is obeyed.
+
+**A-M6-2-4 — `aprs:*` does not declare `StationRegistry`, because nothing provides it.**
+*Proposed by implementation-plan.md **M6-2**, 2026-11-11. A departure from prose, not from a
+decision.*
+
+*What was found.* `docs/component-model.md` §4.2's component table gives `aprs:<device>` the
+needs `WindowedView` H **and `StationRegistry` H**; `pws:<device>` and `wu:<device>` get
+`WindowedView` H alone, and `docs/service-architecture.md` §9.3's one-line summary gives all
+three both. So one of the three components is specified with a need the other two are not.
+
+Declaring it refuses every configuration this program can have. W2a §4.1b gives
+`StationRegistry` to a `config:sqlite` component, no work item in
+`docs/implementation-plan.md` creates one, and a hard need nobody provides makes `plan()`
+refuse the whole configuration (**D-44**). That is not a new discovery: **A-M3-3-1** reached
+it for `writer:timescale`, which wants the same handle for a related reason and takes it
+*through the registrar* instead.
+
+*What replaces it.* The uploaders declare `WindowedView` **only**, and what they want from a
+station — its `station_key`, its coordinates and its `aprs_callsign` — is read from
+`config.stations` by `mw_output::plan` at plan time, joined in by
+`mw_store::config_db::uploaders`. The APRS encoder therefore holds a validated
+`mw_aprs::Position` and `Callsign` from the moment it is built, rather than resolving a
+station at run time.
+
+*Why that is better rather than merely possible.* A beacon's position is **configuration**,
+not a property of a reading: W4 assumption 24 says as much for the same columns, and the Go
+controller's readiness predicate — `device.Latitude != 0 && device.Longitude != 0` — is what
+reading it per send looks like. Resolved once, at plan time, a station with no coordinates is
+a refusal that names the row (`OutputPlanError::NoPosition`) instead of a worker that is
+never started with one `Debugf` nobody reads.
+
+*The need becomes declarable with the item that builds `config:sqlite`*, which is the same
+sentence A-M3-3-1 ends on, and at that point there is a second question to settle: what the
+uploaders would actually use the handle for, given the registrar already has the rows.
+
+**A-M6-2-5 — `window:rollup` maintains windows only for the stations this node collects
+for, and an uploader cannot share any other.**
+*Raised by implementation-plan.md **M6-2**, 2026-11-11. Not resolved here — it needs a
+decision in M3-4's component or M6-4's, and this records the conflict rather than taking
+it.*
+
+*What was found.* `window:rollup`'s station set is the stations this node **collects** for:
+`RollupState` is built from `RollupConfig::rollup_stations`, which keeps a station only if it
+is enabled and has a `transport_kind`. `WindowedView::resolve` answers
+`WindowError::UnknownStation` for anything else, which classifies `Fatal` — so an uploader
+paired with such a station fails **every occurrence, forever**, with the reason visible only
+in that component's `last_error`.
+
+That is reachable, and the configuration schema **endorses** the case. The `uploader`
+table's D-45 / A-W7-2 comment reads: *"A collector that uploads on behalf of a satellite
+selects the station and uses its own account."* A station a satellite forwards readings for
+has no `transport_kind` on the collector — it is inventory there rather than a component —
+so the endorsed configuration is exactly the one the rollup's station set excludes.
+
+*What this item did.* Refused the pairing at plan time, naming the uploader, the station and
+the reason (`OutputPlanError::StationNotCollected`), and skipped-with-a-warning the one
+sub-case that is a reversible operator action (a station whose `enabled` is 0). A refusal is
+not the right long-term answer for a configuration the schema endorses; it is the right
+answer to "this component would fail forever", which is the failure mode this programme keeps
+finding.
+
+*What would resolve it.* Either `window:rollup` maintains windows for every station whose
+readings reach this node's database rather than only those it collects from — the readings
+are there, they arrive through `Ingress::accept` — or the schema's comment is narrowed to say
+that a collector uploads only for stations it collects. The first is M3-4's component and the
+second is a documentation change with W7's consequences; neither belongs to this item, which
+is why the refusal names what it cannot do.

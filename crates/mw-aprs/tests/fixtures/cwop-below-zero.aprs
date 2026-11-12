@@ -1,0 +1,5 @@
+# CONSTRUCTED conformance vector (not a capture).
+# A sub-zero temperature, which the protocol writes as `-NN` in the same three bytes a
+# positive temperature uses three digits for. Interior Alaska in winter: 64 50.00 N,
+# 147 48.00 W, -15 F, wind from 270 deg at 12 mph gusting 19, 1028.5 hPa.
+!6450.00N/14748.00W_270/012g019t-15r000p000P000h78b10285.mw1.0

@@ -1,0 +1,7 @@
+# CONSTRUCTED conformance vector (not a capture).
+# A station that reports humidity and pressure and no wind or temperature -- an indoor
+# barometer-and-hygrometer station, which CWOP accepts. The dotted fields are the protocol's
+# "unavailable", and the case the Go builder renders as `.../...g...t000` because it formats
+# a non-nullable struct: `t000` is -18 C and no receiver can tell it from a reading.
+# Southern hemisphere, so the latitude hemisphere byte is `S` and the longitude `W`.
+!3345.00S/07030.00W_.../...g...t...h72b10131.mw1.0

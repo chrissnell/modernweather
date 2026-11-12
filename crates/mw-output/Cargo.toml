@@ -16,9 +16,44 @@ workspace = true
 mw-component.workspace = true
 mw-types.workspace = true
 mw-aprs.workspace = true
+# `Transport`, `ByteStream` and `stream::open` -- and nothing else. The two KISS transports
+# are a character device and a socket, and the serial open is the one `unsafe` block in this
+# workspace (`mw_station::stream::serial`, an `AsyncFd` over an owned `File`); a second copy
+# of it here would be a second safety argument to audit. `crate::frame`'s module
+# documentation has the whole of that reasoning.
+mw-station.workspace = true
 
 tower.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+# The credential on an `uploader` row is a secret from the moment it is read (D-33). It
+# leaves `secrecy` in exactly one place -- `encoder::account::Account::preamble` -- and what
+# it goes into is `crate::Form`, whose own `Debug` redacts.
+secrecy.workspace = true
+# The two series of `metrics.rs`. The recorder is `mw-obs`'s; this crate names the series it
+# owns (A-W3-1, §5.10).
+metrics.workspace = true
+
+# The outbound HTTPS request. `crate::https`'s module documentation has why there is no
+# client crate here and why these three are what replace one: `rustls` and `tokio-rustls`
+# are already pinned for the listener (A-W8-3, `ring` rather than `aws-lc-rs`), and
+# `webpki-roots` is the one addition -- a compiled-in trust store, which is the only kind
+# that behaves the same on four cross-compiled targets and inside a container whose
+# `/etc/ssl/certs` is the base image's. Recorded as amendment A-M6-2-1 in
+# docs/reconciliation.md, because D-32 governs the daemon's dependencies and named no
+# client.
+rustls.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
+
+[dev-dependencies]
+# `macros` for `#[tokio::test]`, and `test-util` for `start_paused`: the rate limiter's
+# "each attempt takes its own permit" property and the `Retry-After` hold are both about
+# elapsed time, and a test that slept for them would take eleven minutes.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# `CancellationToken`, to construct the `Cx` a `Tick` body is handed. The library itself
+# does not name it: a component observes cancellation through `Cx::cancelled`, which is
+# `mw-component`'s surface.
+tokio-util.workspace = true

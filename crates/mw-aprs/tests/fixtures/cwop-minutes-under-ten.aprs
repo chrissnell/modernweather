@@ -1,0 +1,7 @@
+# CONSTRUCTED conformance vector (not a capture).
+# CWOP traffic in the shape the live network carries, for a station at 45 06.00 N
+# 122 03.00 W -- the case the Go packet builder renders as a SEVEN-byte latitude, because
+# `fmt.Sprintf("%2d%2.2f%v", ...)` is a minimum width of two rather than a zero-padded five.
+# Any station between 45 00' and 45 10' hits it. Captured shape: 0.12 in of rain in the last
+# 24 h, 0.05 in since local midnight, 1020.4 hPa.
+!4506.00N/12203.00W_010/003g007t041r000p012P005h88b10204.mw1.0

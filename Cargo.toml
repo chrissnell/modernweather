@@ -80,6 +80,15 @@ tonic-prost = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-pemfile = "2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
+# The trust anchors the two upload endpoints are verified against (amendment A-M6-2-1,
+# implementation-plan.md M6-2). D-32 named no HTTP CLIENT, and `mw_output::https` writes the
+# request out rather than adding one -- which leaves the root store as the only thing it
+# cannot write. Compiled in rather than read from the platform, because the daemon ships as
+# a static musl binary to four targets and into a container whose `/etc/ssl/certs` is the
+# base image's: a trust store that depends on the image fails on one target and not another.
+# `ci/layers.toml`'s `webpki-roots-only-for-the-uploaders` rule is what keeps this to the one
+# crate that needs it.
+webpki-roots = "1"
 
 # Both databases (D-32). One driver, two backends; `tls-rustls-ring` so there is one TLS
 # stack in the binary rather than two.
