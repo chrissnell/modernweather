@@ -198,25 +198,44 @@ mod tests {
             .expect("the ledger is readable")
     }
 
-    fn migrations_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations")
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
 
-    /// Every `.sql` under `migrations/`, recursively, as (path, comment-stripped body).
-    fn all_migration_sql() -> Vec<(PathBuf, String)> {
+    fn migrations_root() -> PathBuf {
+        repo_root().join("migrations")
+    }
+
+    /// Every `.sql` under `root`, recursively, as (path, comment-stripped upper-cased body).
+    ///
+    /// The extension match is case-insensitive. There is no `.SQL` in the tree today, so
+    /// that is not a fix for anything -- but a guard whose scope depends on the case of an
+    /// extension is a guard with a one-keystroke bypass, and every caller below is a guard.
+    /// [`the_sun_times_guard_bites`] pins it with an upper-cased file, so reverting the
+    /// match to `x == "sql"` turns that control red rather than quietly narrowing the scope.
+    ///
+    /// Takes a root rather than closing over `migrations/` so that
+    /// [`the_sun_times_guard_bites`] can run **this** function over a synthetic tree. A
+    /// negative control that reimplements the pipeline it is controlling for proves only
+    /// that it agrees with itself.
+    fn sql_under(root: &std::path::Path) -> Vec<(PathBuf, String)> {
         fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-            let entries = std::fs::read_dir(dir).expect("migrations/ is readable");
+            let entries = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("{} is readable: {e}", dir.display()));
             for entry in entries.filter_map(Result::ok) {
                 let path = entry.path();
                 if path.is_dir() {
                     walk(&path, out);
-                } else if path.extension().is_some_and(|x| x == "sql") {
+                } else if path
+                    .extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("sql"))
+                {
                     out.push(path);
                 }
             }
         }
         let mut paths = Vec::new();
-        walk(&migrations_root(), &mut paths);
+        walk(root, &mut paths);
         paths.sort();
         paths
             .into_iter()
@@ -226,6 +245,65 @@ mod tests {
                 (path, stripped)
             })
             .collect()
+    }
+
+    /// The repository's **tracked** `.sql` under `root`.
+    ///
+    /// [`sql_under`] walks the filesystem, and the filesystem is not the repository.
+    /// `ci/db/migrate-from-go/` is the migration lab's working area: a Go config dump
+    /// staged there by hand is not part of this tree, and a guard that failed on it would
+    /// be advising whoever is running the lab to delete the guard. `git ls-files` is the
+    /// only available definition of "in the tree".
+    ///
+    /// When `git` cannot answer -- no `git` on `PATH`, a source tarball, a non-repository
+    /// checkout -- the walk stands unfiltered rather than silently scanning nothing. Both
+    /// callers assert non-emptiness, so the failure mode of this fallback is reading too
+    /// much, which is the direction a guard should fail in.
+    fn tracked_sql_under(root: &std::path::Path) -> Vec<(PathBuf, String)> {
+        let files = sql_under(root);
+        let Some(tracked) = tracked_sql_paths() else {
+            return files;
+        };
+        files
+            .into_iter()
+            .filter(|(path, _)| {
+                path.canonicalize()
+                    .is_ok_and(|resolved| tracked.contains(&resolved))
+            })
+            .collect()
+    }
+
+    /// Every tracked `.sql` in the repository, canonicalised, or `None` if `git` cannot say.
+    fn tracked_sql_paths() -> Option<std::collections::HashSet<PathBuf>> {
+        let root = repo_root();
+        let top = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&root)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())?;
+        let top = PathBuf::from(String::from_utf8(top.stdout).ok()?.trim());
+
+        let listed = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&root)
+            .args(["ls-files", "-z", "--full-name", "--", "*.sql", "*.SQL"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())?;
+        let paths: std::collections::HashSet<PathBuf> = String::from_utf8(listed.stdout)
+            .ok()?
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .filter_map(|entry| top.join(entry).canonicalize().ok())
+            .collect();
+        (!paths.is_empty()).then_some(paths)
+    }
+
+    /// Every tracked `.sql` under `migrations/`, recursively.
+    fn all_migration_sql() -> Vec<(PathBuf, String)> {
+        tracked_sql_under(&migrations_root())
     }
 
     /// `--` line comments removed, so a comment *about* the idiom is not a use of it. The
@@ -369,6 +447,150 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// W2a Decision 36: the Go `sun_times` table is **not** carried forward, and sunrise
+    /// and sunset are evaluated per request from the station's coordinates instead
+    /// (`mw_api_legacy::sun`). Both schemas were authored without the table rather than
+    /// authored with it and then dropped, so no `DROP TABLE sun_times` exists anywhere and
+    /// "the table is gone" is a property of the *absence* of a statement. Nothing would
+    /// notice that being undone, which is why the deletion gets a test and not a migration.
+    ///
+    /// **Two roots, and the second is the one that matters.** `migrations/` covers both
+    /// schemas, the weather one included -- that is the wrong home for the table twice
+    /// over, and therefore the likelier hand-edit. But `migrations/` is **not** the only
+    /// SQL this system executes: `ci/db/migrate-from-go/` creates `observations_1d_legacy`
+    /// and the whole `w9` staging schema outside it, and it is the one place in this tree
+    /// that carries Go data forward -- so it is where 366 rows per station would land if
+    /// anyone decided they were worth keeping. D-8 forbids DDL at *startup*; it does not
+    /// make `migrations/` the only creator of objects, and a guard that assumed otherwise
+    /// would be scoped to the less likely vector alone.
+    ///
+    /// Text over the SQL sources rather than a query against an applied schema, because the
+    /// two roots target different engines and one of them is never applied in a unit test.
+    ///
+    /// Only `--` comments are stripped ([`strip_sql_comments`]), so prose about the absence
+    /// must use that form; a `/* ... */` block naming the table would fail this test.
+    ///
+    /// **This guards the table, not the capability**, and the capability needs no guard of
+    /// its own: `Capability` is a closed enum and `mw-component/src/capability.rs` already
+    /// asserts `Capability::ALL.len() == 12`, so a `SunTimes` variant turns that test red.
+    /// The table has no such single home -- it can arrive in any `.sql` under either root.
+    ///
+    /// The *values* are guarded elsewhere and by measurement:
+    /// `mw-api-legacy/tests/sun_times.rs`'s `the_served_strings_are_the_stored_go_tables`
+    /// shows the per-request evaluation reproduces the six captured `/latest` values the Go
+    /// daemon served from its table. Six captures sharing one day-of-year key, not the
+    /// 366-key table -- that test states its own reach and this comment does not widen it.
+    ///
+    /// **If the fallback is ever wanted**, W2a §4.3 specifies its shape -- a
+    /// `Calendar { yearly, Jan 1, Station }` component with a reactive rebuild on a
+    /// coordinate change -- and reinstating it starts by deleting this test. That is the
+    /// intended way to undo it: one deliberate edit rather than a silent one.
+    #[test]
+    fn the_sun_times_table_is_not_carried_forward() {
+        for (root, also) in [
+            (migrations_root(), Some(migrations_root().join("config"))),
+            (repo_root().join("ci/db"), None),
+        ] {
+            let files = tracked_sql_under(&root);
+            assert!(
+                !files.is_empty(),
+                "{} holds no tracked .sql",
+                root.display()
+            );
+            if let Some(nested) = also {
+                assert!(
+                    files.iter().any(|(p, _)| p.starts_with(&nested)),
+                    "{} holds no .sql, so this guard is scanning one schema alone",
+                    nested.display()
+                );
+            }
+            for (path, sql) in files {
+                assert!(
+                    !sql.contains(SUN_TIMES),
+                    "{}: `sun_times` is back. W2a D-36 deletes it in favour of a \
+                     per-request evaluation, and the fallback shape is W2a §4.3 -- \
+                     adopting it means deleting \
+                     `the_sun_times_table_is_not_carried_forward`, not slipping a table \
+                     past it.",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// The identifier the guard above looks for, as [`sql_under`] would have upper-cased it.
+    const SUN_TIMES: &str = "SUN_TIMES";
+
+    /// And the converse, in the same spirit as `re_running_a_migration_body_fails`: a guard
+    /// over a name that is absent from the whole tree passes whether or not it works.
+    ///
+    /// So this runs the **real** [`sql_under`] over a synthetic tree and asserts the guard's
+    /// own predicate fires on it. That is the point of the shape: every step `sql_under`
+    /// performs is load-bearing here, so dropping its `to_uppercase`, its recursion, its
+    /// extension filter or the case-insensitivity of that filter turns this test red rather
+    /// than leaving the guard quietly narrower than it reads.
+    ///
+    /// It runs `sql_under` and not [`tracked_sql_under`], because the synthetic tree is not
+    /// in the repository and `git ls-files` would correctly report none of it -- a control
+    /// that filtered by tracked-ness would assert against an empty set.
+    #[test]
+    fn the_sun_times_guard_bites() {
+        let scratch = Scratch::new("suntimes");
+        let nested = scratch.0.join("config");
+        std::fs::create_dir_all(&nested).expect("a nested directory");
+
+        // Mixed case, a nested directory and a trailing `--` comment, because that is what
+        // a hand-edit reinstating the Go table looks like.
+        std::fs::write(
+            nested.join("20991231000000_reinstate.sql"),
+            "create table Sun_Times (\n               station_name TEXT NOT NULL,\n               day_of_year INTEGER NOT NULL\n             ) STRICT; -- W2a 4.3\n",
+        )
+        .expect("writable");
+        // And prose about the absence, which is what every `--` reference to the table in
+        // this repository now is. It must NOT trip the guard, or the guard would forbid
+        // explaining itself.
+        std::fs::write(
+            scratch.0.join("20991231000001_prose.sql"),
+            "-- W2a D-36: there is no sun_times table here, deliberately.\nSELECT 1;\n",
+        )
+        .expect("writable");
+        // An upper-cased extension, which is the one-keystroke bypass `sql_under`'s
+        // `eq_ignore_ascii_case` exists to close. Nothing in the repository is named this
+        // way, so without this file reverting that match to `x == "sql"` leaves every test
+        // here green and the guard case-sensitive.
+        std::fs::write(
+            scratch.0.join("20991231000002_reinstate.SQL"),
+            "CREATE TABLE sun_times (station_name TEXT NOT NULL) STRICT;\n",
+        )
+        .expect("writable");
+        // Not `.sql`, and so outside the guard's declared scope in either case.
+        std::fs::write(scratch.0.join("notes.md"), "sun_times\n").expect("writable");
+
+        let files = sql_under(&scratch.0);
+        let mut tripped: Vec<String> = files
+            .iter()
+            .filter(|(_, sql)| sql.contains(SUN_TIMES))
+            .map(|(p, _)| {
+                p.file_name()
+                    .expect("a file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        tripped.sort();
+        assert_eq!(
+            tripped,
+            vec![
+                "20991231000000_reinstate.sql".to_owned(),
+                "20991231000002_reinstate.SQL".to_owned(),
+            ],
+            "the guard fired on {tripped:?}: it must catch the reinstatement in a nested \
+             directory, in mixed case and behind an upper-cased extension, and must not \
+             fire on a `--` comment about the absence. Files read: {:?}",
+            files.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
     }
 
     /// Foreign keys are per-connection and OFF by default in SQLite, so the pragma in
