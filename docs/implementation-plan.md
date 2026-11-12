@@ -72,7 +72,7 @@ first" recommendation was withdrawn rather than deleted.
 **Done when:** `ci/sql/assert-timescaledb-version.sql` passes against it; the schema migrations apply
 from empty into a fresh `modernweather` database; the node is tainted and the PV is bound.
 
-### M0-2 — weekly off-site backup, and a restore rehearsal in CI *(N-19)*
+### M0-2 — weekly off-site backup, and a restore rehearsal in CI *(N-19)* — ✅ **DONE 2026-11-12**
 **Depends on:** M0-1. **Blocks:** cutover (M7-5). **This is the owner's stated condition for
 accepting a single replica**, so it is not optional and it is not after cutover.
 A weekly `CronJob` dumping **per year** to Cloudflare R2 — so the recurring upload is the current year
@@ -87,6 +87,15 @@ dump size, which replaces §7.5's only extrapolated figure.
 on the next refresh, so pre-seeded aggregate rows are not a restore mechanism; and W4 D-23's
 phase-1-first ordering (0.87 s to make the charts right against 467 s to materialise everything), so
 a restore runbook does not block on a full rebuild.
+**Landed:** `ci/db/offsite-backup.sh` (a closed relation inventory; raw per calendar year; the legacy
+archive dumped with its schema because `migrations/` does not create it; the four aggregate levels
+excluded), `ci/db/restore-rehearsal.sh` and the `db-restore-rehearsal` gate, which reconciles the
+restored database against the manifest's **sha256 of the ordered COPY stream** rather than against a
+row count, re-measures A-W9-2 instead of citing it, and asserts the four `/span` bands after phase 1
+only. A restore of 1 382 400 rows from a real R2 object reconciled byte for byte in CI's database.
+The dump size is measured and §7.5's extrapolation holds — ~3.4 GB/year stored against its 40–50 GB
+decade; `docs/backup-and-restore.md` §4. Manifests in `kube-cluster-helm-values` under
+`apps/modernweather-db/backup/`.
 
 ---
 
