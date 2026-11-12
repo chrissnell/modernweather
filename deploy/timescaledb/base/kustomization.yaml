@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The generic half: everything that is true of this deployment anywhere.
+#
+# There is no PersistentVolume here, and that is the point -- a `local` volume names a
+# node and a path on that node's disk, which are facts about one cluster and not about
+# this software. A site overlay supplies it; see ../site.example/ and ../README.md.
+#
+# Applying this directory on its own is valid and leaves the PVC `Pending` until an
+# overlay provides a volume for it to bind to.
+#
+# The Secret is not here on purpose; secret.example.yaml gives the one command that
+# creates it.
+resources:
+  - 00-namespace.yaml
+  - 10-storageclass.yaml
+  - 30-service.yaml
+  - 40-statefulset.yaml
+  - 50-poddisruptionbudget.yaml

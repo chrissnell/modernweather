@@ -32,10 +32,10 @@ spec:
         app.kubernetes.io/name: modernweather-db
         app.kubernetes.io/part-of: modernweather
     spec:
-      # The taint lil-bulky carries is Talos-owned (workload-class=database:NoSchedule) and
-      # exists so that nothing else lands on this node. The nodeSelector is the other half:
-      # the toleration lets this pod in, the selector keeps it from going anywhere else if
-      # the volume's nodeAffinity were ever loosened.
+      # The database node carries `workload-class=database:NoSchedule` so that nothing else
+      # lands on it, and the matching label. The nodeSelector is the other half of the
+      # pair: the toleration lets this pod in, the selector keeps it from going anywhere
+      # else if the volume's nodeAffinity were ever loosened.
       tolerations:
         - key: workload-class
           operator: Equal
@@ -43,11 +43,11 @@ spec:
           effect: NoSchedule
       nodeSelector:
         workload-class: database
-      # No initContainer and no chown job. /var/mnt/modernweather-db is root:root 0755 as
-      # Talos mounts it, and the image runs as postgres (uid 1000), so a container writing
-      # straight to the mount gets EACCES. fsGroup is the fix that needs no privileged
-      # container: kubelet applies group ownership and the group write bit to the volume
-      # root, and PGDATA is then a subdirectory postgres creates itself.
+      # No initContainer and no chown job. A Talos user volume is mounted root:root 0755
+      # and the image runs as postgres (uid 1000), so a container writing straight to the
+      # mount gets EACCES. fsGroup is the fix that needs no privileged container: kubelet
+      # applies group ownership and the group write bit to the volume root, and PGDATA is
+      # then a subdirectory postgres creates itself.
       #
       # OnRootMismatch, not Always: the recursive walk runs once, on the empty volume, and
       # is then skipped on every later start. At a decade of history an unconditional
@@ -83,8 +83,8 @@ spec:
               value: /var/lib/postgresql/pgdata
             - name: POSTGRES_DB
               value: modernweather
-            # scram-sha-256 for host connections. The CI pod uses `trust`, which is right
-            # for a disposable emptyDir and wrong here.
+            # scram-sha-256 for host connections. `trust` is right for a disposable
+            # emptyDir test instance and wrong for a database that keeps anything.
             - name: POSTGRES_HOST_AUTH_METHOD
               value: scram-sha-256
             - name: POSTGRES_INITDB_ARGS

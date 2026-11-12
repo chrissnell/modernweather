@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The site overlay: the generic deployment, plus the one object that names a machine.
+#
+# Copy this directory to ../site/ (gitignored) and edit persistentvolume.yaml. Then:
+#
+#   kubectl apply -k deploy/timescaledb/site
+resources:
+  - ../base
+  - persistentvolume.yaml

@@ -6,3 +6,7 @@ Cargo.lock.orig
 # Client binaries lifted out of the TimescaleDB pod so that the database gates can run
 # where `apt` is not available. Not part of the build and not portable between hosts.
 /.tools
+
+# Site-specific deployment overlays: a node name and a path on that node name one
+# person's cluster, not this software. deploy/*/site.example/ is the committed shape.
+/deploy/*/site/

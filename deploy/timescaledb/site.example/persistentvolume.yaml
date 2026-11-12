@@ -1,0 +1,52 @@
+# The one site-specific object: a `local` PersistentVolume.
+#
+# COPY THIS DIRECTORY to ../site/ and fill in the three values below. ../site/ is
+# gitignored, because a node name and a path on that node's disk describe one person's
+# cluster and have no business in a repository that ships.
+#
+# What has to be true of the volume, from docs/reconciliation.md §7.3 and §7.4:
+#
+#   * NOT NFS. This is the one hard constraint. A durable aggregate refresh is dominated
+#     by WAL fsync (A-W4-3), so disk *latency* is the specification -- it is what consumes
+#     W4 D-26's 10-second refresh budget.
+#   * SSD or NVMe, not spinning.
+#   * Capacity is nearly irrelevant: a decade of history is ~36 GB compressed (§7.3). Any
+#     volume large enough to satisfy the StatefulSet's claim is large enough.
+#   * Mounted by the node's own configuration before Kubernetes sees it. On Talos that is
+#     a user volume under /var/mnt/; the PV only points at it.
+#
+# Measure the volume before trusting it -- `pg_test_fsync -s 3` from inside a pod with it
+# mounted, and keep the numbers. ../README.md says why they matter and what one real SATA
+# SSD produced.
+#
+# `Retain` and the nodeAffinity are not negotiable. The affinity is also what makes this a
+# single point of failure: the pod can only run on that one node, and if the node is down
+# the pod is `Pending`. That is what a `local` volume means, it was accepted explicitly
+# (§7.4), and M0-2's off-site backup is the condition that makes it acceptable.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: modernweather-db-NODE
+  labels:
+    app.kubernetes.io/part-of: modernweather
+spec:
+  capacity:
+    # Informational for a no-provisioner volume -- the filesystem is whatever the node
+    # mounted -- but it is what the StatefulSet's claim is matched against, so it must be
+    # at least the claim's request and should track the real figure.
+    storage: CAPACITY
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: modernweather-db-local
+  volumeMode: Filesystem
+  local:
+    path: /var/mnt/PATH-ON-THE-NODE
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - NODE
