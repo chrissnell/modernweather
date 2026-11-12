@@ -1646,6 +1646,8 @@ dependencies = [
  "mw-types",
  "rustls",
  "secrecy",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-rustls",

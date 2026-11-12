@@ -338,6 +338,17 @@ mod driven {
             Box::pin(async move { Ok(out) })
         }
 
+        /// `window:rollup` maintains gusts, rates and calendar totals, every one of which
+        /// is a `total` or a `max` -- so it has no caller for the `mean` shape the `snow:*`
+        /// components read. Empty rather than `unimplemented!`, for `FakeStore`'s own
+        /// reason.
+        fn mean_series<'a>(
+            &'a self,
+            _q: mw_component::MeanSeriesQuery,
+        ) -> BoxFuture<'a, Result<Vec<mw_component::MeanBucket>, StoreError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
         /// `window:rollup` never calls this -- the raw hypertable is the writer's business
         /// and this component reads composable aggregate state (`mw_component::store`).
         /// Recorded in `asked` rather than panicking, so that a tick which started reading
@@ -751,6 +762,12 @@ mod driven {
                 &'a self,
                 _q: SeriesQuery,
             ) -> BoxFuture<'a, Result<Vec<Bucketed>, StoreError>> {
+                Box::pin(async move { Ok(Vec::new()) })
+            }
+            fn mean_series<'a>(
+                &'a self,
+                _q: mw_component::MeanSeriesQuery,
+            ) -> BoxFuture<'a, Result<Vec<mw_component::MeanBucket>, StoreError>> {
                 Box::pin(async move { Ok(Vec::new()) })
             }
             /// Not reachable from this component; see `FakeStore`'s own note.

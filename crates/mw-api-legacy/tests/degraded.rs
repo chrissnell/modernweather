@@ -192,6 +192,13 @@ impl mw_component::ReadingStore for DeadPool {
     {
         Self::gone()
     }
+    fn mean_series<'a>(
+        &'a self,
+        _q: mw_component::MeanSeriesQuery,
+    ) -> mw_component::BoxFuture<'a, Result<Vec<mw_component::MeanBucket>, mw_component::StoreError>>
+    {
+        Self::gone()
+    }
     fn latest<'a>(
         &'a self,
         _q: mw_component::LatestQuery,
@@ -223,6 +230,14 @@ impl ForecastStore for DeadPool {
     {
         Self::gone()
     }
+    fn store_forecast<'a>(
+        &'a self,
+        _station: &'a StationKey,
+        _span_hours: u32,
+        _data: &'a str,
+    ) -> mw_component::BoxFuture<'a, Result<(), mw_component::StoreError>> {
+        Self::gone()
+    }
 }
 
 impl SnowCache for DeadPool {
@@ -233,6 +248,58 @@ impl SnowCache for DeadPool {
         'a,
         Result<Option<mw_component::SnowTotals>, mw_component::StoreError>,
     > {
+        Self::gone()
+    }
+    fn store_totals<'a>(
+        &'a self,
+        _station: &'a StationKey,
+        _patch: mw_component::SnowPatch,
+    ) -> mw_component::BoxFuture<'a, Result<(), mw_component::StoreError>> {
+        Self::gone()
+    }
+    fn newest_estimate<'a>(
+        &'a self,
+        _station: &'a StationKey,
+    ) -> mw_component::BoxFuture<
+        'a,
+        Result<Option<mw_component::DepthEstimate>, mw_component::StoreError>,
+    > {
+        Self::gone()
+    }
+    fn estimate_before<'a>(
+        &'a self,
+        _station: &'a StationKey,
+        _at: chrono::DateTime<chrono::Utc>,
+    ) -> mw_component::BoxFuture<
+        'a,
+        Result<Option<mw_component::DepthEstimate>, mw_component::StoreError>,
+    > {
+        Self::gone()
+    }
+    fn replace_estimates<'a>(
+        &'a self,
+        _station: &'a StationKey,
+        _from: chrono::DateTime<chrono::Utc>,
+        _rows: &'a [mw_component::DepthEstimate],
+    ) -> mw_component::BoxFuture<'a, Result<(), mw_component::StoreError>> {
+        Self::gone()
+    }
+    fn estimate_window<'a>(
+        &'a self,
+        _station: &'a StationKey,
+        _from: chrono::DateTime<chrono::Utc>,
+    ) -> mw_component::BoxFuture<
+        'a,
+        Result<Option<mw_component::EstimateWindow>, mw_component::StoreError>,
+    > {
+        Self::gone()
+    }
+    fn replace_events<'a>(
+        &'a self,
+        _station: &'a StationKey,
+        _hours: u32,
+        _events: &'a [mw_component::SnowEvent],
+    ) -> mw_component::BoxFuture<'a, Result<(), mw_component::StoreError>> {
         Self::gone()
     }
 }

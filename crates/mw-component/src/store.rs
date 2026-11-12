@@ -175,6 +175,33 @@ pub trait ReadingStore: Send + Sync + 'static {
     /// last 24 hours" with a comment saying `-- Simple approach`.
     fn series<'a>(&'a self, q: SeriesQuery) -> BoxFuture<'a, Result<Vec<Bucketed>, StoreError>>;
 
+    /// A `mean`-strategy metric's **finalised mean** per bucket at one level, oldest first.
+    ///
+    /// [`ReadingStore::series`]' counterpart for the other strategy, and a separate method
+    /// rather than a flag on that one because the arithmetic differs: a `total` metric is
+    /// one column and a `mean` metric is a `_sum`/`_count` pair that has to be divided
+    /// (**D-11** — the aggregate levels hold composable *state*, not values). A caller that
+    /// had to know that would be a caller reimplementing `mw_circular_mean()`'s mistake in
+    /// a different place.
+    ///
+    /// Added by the `snow:*` components (M6-3), which are the first consumer of a shaped
+    /// read of a non-`total` metric: every one of the seven numbers `/snow` serves is a
+    /// function of the *shape* of `snowdistance` over a window — a dual-threshold walk, a
+    /// quantile smoother, a changepoint detector — and none of them is expressible as a
+    /// sum. `window:rollup` never needed it because the nine values it maintains are gusts,
+    /// rates and calendar totals, which are maxima and sums.
+    ///
+    /// `None` for a bucket whose `_count` is zero or NULL, which the caller skips rather
+    /// than interpolates: a gauge that was unplugged for an hour did not measure a depth of
+    /// zero, and [`ReadingStore::totals`]' note has the general form of that argument.
+    ///
+    /// `Err` for a metric that declares no `mean` strategy at `level`, which is a property
+    /// of the *request* and therefore `Fatal` — the next call asks the same thing.
+    fn mean_series<'a>(
+        &'a self,
+        q: MeanSeriesQuery,
+    ) -> BoxFuture<'a, Result<Vec<MeanBucket>, StoreError>>;
+
     /// The newest **raw** reading for one station at or after `since`, whole.
     ///
     /// `since` rather than "the newest, ever", because the one caller's question is W1's
@@ -395,6 +422,38 @@ pub struct SeriesQuery {
     pub since: chrono::DateTime<chrono::Utc>,
     /// How many to return at most. Bounded for [`BucketQuery::limit`]'s reason.
     pub limit: usize,
+}
+
+/// Which series [`ReadingStore::mean_series`] should return.
+///
+/// Carries an `until` where [`SeriesQuery`] does not, because its callers read *closed*
+/// windows: the smoothing pass re-derives a trailing overlap and must not include buckets
+/// a later pass will revise, and the snowfall rate reads a two-minute window around an
+/// instant thirty minutes ago. A caller that had to trim the tail itself would be a caller
+/// paging rows across the network to drop them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeanSeriesQuery {
+    /// Whose.
+    pub station: mw_types::StationKey,
+    /// Which metric. Must declare `Strategy::Mean` at `level`.
+    pub metric: mw_types::MetricKey,
+    /// Which level's buckets.
+    pub level: BucketLevel,
+    /// The oldest bucket wanted, inclusive.
+    pub since: chrono::DateTime<chrono::Utc>,
+    /// The first bucket **not** wanted, or `None` for "everything from `since` onward".
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+    /// How many to return at most. Bounded for [`BucketQuery::limit`]'s reason.
+    pub limit: usize,
+}
+
+/// One bucket of a single metric's finalised `mean`, for [`ReadingStore::mean_series`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeanBucket {
+    /// The bucket's start instant.
+    pub bucket: chrono::DateTime<chrono::Utc>,
+    /// `_sum / _count`, or `None` if no reading in the bucket carried the metric.
+    pub mean: Option<f64>,
 }
 
 /// Why a store call failed.
@@ -658,6 +717,44 @@ pub trait ForecastStore: Send + Sync + 'static {
         &'a self,
         q: ForecastQuery,
     ) -> BoxFuture<'a, Result<Option<Forecast>, StoreError>>;
+
+    /// Replace one `(station, span)` forecast with freshly fetched JSON, stamping
+    /// `updated_at`.
+    ///
+    /// The write half, added by the `aeris:forecast:*` components (M6-3) — the item that
+    /// knows the queries, which is what the `lib`-level note on handle traits means by "a
+    /// handle trait is a query set". It shares `Capability::ForecastStore` with the read
+    /// above for [`ReadingSink`]'s reason: it is one table seen from the other end, and
+    /// `Access::Read` against `Access::Write` is what distinguishes the two consumers.
+    /// `api:legacy` is handed this same trait object and **cannot** reach this method with
+    /// anything to write, because the only thing it has is a [`ForecastQuery`].
+    ///
+    /// `data` is a JSON **array** as text. Two properties of that, both load-bearing:
+    ///
+    /// - **It is text and not a parsed document**, because nothing in this program parses
+    ///   the forecast (**D-39**). The server casts it to `jsonb` on the way in, which is
+    ///   where the key normalisation and the numeric text that `/forecast` serves verbatim
+    ///   come from; a `serde_json::Value` round trip here would normalise it twice and the
+    ///   second normalisation would be this program's.
+    /// - **It must be an array**, which the column's own
+    ///   `CHECK (jsonb_typeof(data) = 'array')` enforces: `/forecast?period=N` indexes it
+    ///   and its out-of-range message names `len(data) - 1`, so an object would make that
+    ///   branch unexpressible. A non-array is therefore `StoreError::rejected` — a
+    ///   `Fatal`, because the next fetch produces the same shape.
+    ///
+    /// `updated_at` is set on both the insert and the update. The table's own comment has
+    /// why that is spelled out rather than left to a default: the column has a `DEFAULT`
+    /// and no trigger, so an upsert that forgets it leaves the contract-visible
+    /// `lastUpdated` at the row's first-insert time — a forecast that refreshes hourly and
+    /// reports the day it was first fetched — and **DEV-13** makes the same column the
+    /// tiebreak for an unqualified `/forecast`, so a stale value changes which row is
+    /// served as well as what it claims.
+    fn store_forecast<'a>(
+        &'a self,
+        station: &'a mw_types::StationKey,
+        span_hours: u32,
+        data: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 }
 
 impl CapabilityHandle for Arc<dyn ForecastStore> {
@@ -688,6 +785,99 @@ pub struct Forecast {
     pub data: String,
 }
 
+/// Aeris alert rows — `Capability::AlertStore`.
+///
+/// **Write-only, and that is not an oversight.** W2a §2.1 lists this capability beside
+/// `ForecastStore` and `SnowCache`, and `db:postgres`'s spec has carried the note that it
+/// is "still absent, because `/alerts` is not carried forward (**D-69**) and a capability
+/// with no consumer is a handle trait nobody has checked against a query" since M4-2. It
+/// arrives here because M6-3 brings the two components that *write* alerts, and
+/// `docs/reconciliation.md` **A-M6-3-1** settles that those components are in scope while
+/// the endpoint is not: the alert components exist so that "alerts are failing, forecasts
+/// are fine" is expressible (W2a **D-33**), which needs the fetch and the store and not a
+/// reader.
+///
+/// So the trait has exactly the two methods the two components need, and no `alerts(…)`
+/// read. A read method here would be a query set written against no caller — which is the
+/// thing the note above refused to do for a year — and adding one when a surface finally
+/// wants alerts is an edit to this trait and its one implementation.
+pub trait AlertStore: Send + Sync + 'static {
+    /// Insert or revise one fetch's worth of alerts for one station.
+    ///
+    /// **Revise, not replace.** The Go controller upserts per alert id and never deletes on
+    /// fetch, so an alert that drops out of the upstream's current response stays in the
+    /// table until it expires and the sweep takes it. That is the behaviour, and it is the
+    /// right one: an alert that has begun does not become untrue because the API stopped
+    /// listing it, and the expiry the issuing office set is the only authority on when it
+    /// stops mattering. A `DELETE`-then-`INSERT` here would make a single failed fetch
+    /// erase every active warning.
+    ///
+    /// An **empty slice is a successful call that writes nothing** — the ordinary case,
+    /// since most stations have no active alert most of the time. It is not an error and it
+    /// is not a reason to delete anything, for the paragraph above's reason.
+    ///
+    /// `Ok(n)` is the number of rows written, for the component's log line and its metric.
+    fn store_alerts<'a>(
+        &'a self,
+        station: &'a mw_types::StationKey,
+        alerts: &'a [Alert],
+    ) -> BoxFuture<'a, Result<u64, StoreError>>;
+
+    /// Delete every alert that expired before `cutoff`, returning how many went.
+    ///
+    /// `aeris:alerts:gc`'s whole body. The cutoff is computed by the **caller** for
+    /// [`LatestQuery::since`]'s reason: twenty-four hours past expiry is a retention
+    /// decision and the store should not hold a copy of it.
+    ///
+    /// An alert with **no** expiry is never swept. `expires_at < $1` already has that
+    /// property in SQL — a NULL comparison is NULL and a NULL predicate does not delete —
+    /// and it is stated here because the obvious "sweep anything old" rewrite over
+    /// `fetched_at` does not, and an alert the upstream declined to put an expiry on is the
+    /// one alert an operator would least like to lose.
+    fn sweep_expired_alerts<'a>(
+        &'a self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> BoxFuture<'a, Result<u64, StoreError>>;
+}
+
+impl CapabilityHandle for Arc<dyn AlertStore> {
+    const CAPABILITY: Capability = Capability::AlertStore;
+}
+
+/// One alert, as [`AlertStore::store_alerts`] takes it.
+///
+/// The four promoted strings and the three timestamps are columns; everything else the
+/// upstream sent is `data`. The split is the Go row's and the reason is a list view that
+/// does not parse `jsonb` per row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Alert {
+    /// The upstream's own identifier, which is what makes a revision an update rather than
+    /// a duplicate. Half of the natural key; the station is the other half.
+    pub alert_id: String,
+    /// When the issuing office published it. `None` for an upstream that omitted it, which
+    /// is a NULL and not the epoch.
+    pub issued_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the alert takes effect.
+    pub begins_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When it stops applying. The sweep's column; `None` is an alert that is never swept.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `details.name` — "Winter Storm Warning".
+    pub name: String,
+    /// `details.color` — the upstream's RGB hex, without a `#`.
+    pub color: String,
+    /// `details.body` — the summary.
+    pub body: String,
+    /// `details.bodyFull` — the whole product text.
+    pub body_full: String,
+    /// The entire upstream alert object, as JSON **text**.
+    ///
+    /// Text and not a parsed document for [`ForecastStore::store_forecast`]'s reason, with
+    /// one difference: it is an **object** here and an array there, because `/alerts` paged
+    /// over a list of these and each row is one. The column's
+    /// `CHECK (jsonb_typeof(data) = 'object')` is what makes a mistake a refusal.
+    pub data: String,
+}
+
 /// The snow depth, event and smoothing cache rows — `Capability::SnowCache`.
 ///
 /// One row per station and every column `NOT NULL DEFAULT 0`, because `/snow` emits all
@@ -707,10 +897,260 @@ pub trait SnowCache: Send + Sync + 'static {
         &'a self,
         station: &'a mw_types::StationKey,
     ) -> BoxFuture<'a, Result<Option<SnowTotals>, StoreError>>;
+
+    /// Write the columns one component owns, leaving every other column alone.
+    ///
+    /// **A patch and not a row, because four components write this table.**
+    /// `docs/component-model.md` §4.3 gives `snow:depth`, `snow:events`, `snow:smoothing`
+    /// and `snow:season` one row each, with different periods and independent failures —
+    /// which is W2a **D-33** ("one component, one trigger") applied to the snow cache. If
+    /// the handle took a whole [`SnowTotals`], each of the four would have to read the
+    /// other three's columns and write them back, and a tick that raced another would
+    /// silently revert it. A `None` field here is "not mine", and the implementation
+    /// coalesces it against the stored value.
+    ///
+    /// Which component owns which column is [`SnowPatch`]'s documentation.
+    ///
+    /// `source_through` is the newest bucket the computation consumed, or `None` to leave
+    /// it. It is **not** a recency filter and must never become one: `/snow` has none and
+    /// must not acquire one (W1 Decision 16, fixture `snow-device-stale`), so this column
+    /// is for the management UI's per-tier age and for nothing a response branches on.
+    fn store_totals<'a>(
+        &'a self,
+        station: &'a mw_types::StationKey,
+        patch: SnowPatch,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// The newest smoothed depth estimate for one station, if there is one.
+    ///
+    /// `None` is a station the smoother has never run for, which is what makes the next
+    /// pass a **backfill from the season start** rather than an incremental update. The
+    /// distinction is the whole of why this is its own method and not an
+    /// [`SnowCache::estimate_window`] with a one-bucket range: the answer "there is nothing
+    /// at all" selects a different algorithm, and a `max()` that returned the epoch would
+    /// hide it.
+    fn newest_estimate<'a>(
+        &'a self,
+        station: &'a mw_types::StationKey,
+    ) -> BoxFuture<'a, Result<Option<DepthEstimate>, StoreError>>;
+
+    /// The newest estimate strictly **before** `at`.
+    ///
+    /// The rate limiter's carried state. An incremental pass re-derives a trailing overlap,
+    /// so it needs the last estimate *outside* that overlap to limit the first one inside
+    /// it against — without which every pass would restart the limiter at its own first
+    /// smoothed value and a step the limiter had flattened would reappear at the seam.
+    fn estimate_before<'a>(
+        &'a self,
+        station: &'a mw_types::StationKey,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> BoxFuture<'a, Result<Option<DepthEstimate>, StoreError>>;
+
+    /// Replace every estimate at or after `from` with `rows`, in one transaction.
+    ///
+    /// Delete-then-insert rather than upsert, and the reason is that a pass can produce
+    /// **fewer** rows than it replaces: the source query drops a bucket whose distance is
+    /// within 2 mm of the base, so a gauge that goes bare mid-window leaves estimates
+    /// behind that an upsert would never remove. One transaction, because the window is
+    /// empty between the two statements and a reader in that gap would compute
+    /// `max - min` over nothing.
+    ///
+    /// `rows` must be sorted by bucket and must all be at or after `from`; the
+    /// implementation does not sort them, because the smoother's output is already in order
+    /// and a re-sort here would hide a caller that had lost it.
+    fn replace_estimates<'a>(
+        &'a self,
+        station: &'a mw_types::StationKey,
+        from: chrono::DateTime<chrono::Utc>,
+        rows: &'a [DepthEstimate],
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// The first, smallest and largest estimate at or after `from`, in one statement.
+    ///
+    /// Four numbers because three different totals are three different combinations of
+    /// them, and asking for them separately would be three round trips against a window
+    /// that is advancing underneath:
+    ///
+    /// | Total | Expression |
+    /// |---|---|
+    /// | `snowlast24`, `snowlast72` | `max - min` over the window |
+    /// | `snowseason` | `max - first` since the season's start |
+    ///
+    /// `None` is a window with no estimates in it, which the caller renders as zero
+    /// *without writing* — see [`SnowPatch`]. An empty window and a flat one are different
+    /// facts and collapsing them here would make the first unobservable.
+    fn estimate_window<'a>(
+        &'a self,
+        station: &'a mw_types::StationKey,
+        from: chrono::DateTime<chrono::Utc>,
+    ) -> BoxFuture<'a, Result<Option<EstimateWindow>, StoreError>>;
+
+    /// Replace one `(station, hours)` window's classified events, in one transaction.
+    ///
+    /// Wholesale for [`SnowCache::replace_estimates`]' reason — a pass can detect fewer
+    /// segments than the last one — and transactional for the same reason: the website's
+    /// accumulation bands read this table, and a reader between the delete and the insert
+    /// would draw an empty chart.
+    fn replace_events<'a>(
+        &'a self,
+        station: &'a mw_types::StationKey,
+        hours: u32,
+        events: &'a [SnowEvent],
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 }
 
 impl CapabilityHandle for Arc<dyn SnowCache> {
     const CAPABILITY: Capability = Capability::SnowCache;
+}
+
+/// The columns of one `snow_totals_cache` row that one component owns.
+///
+/// Every field is `None` by default ([`SnowPatch::NOTHING`]) and a `Some` is a column this
+/// write owns. Which component owns which, from `docs/component-model.md` §4.3 as
+/// reconciled with `docs/service-architecture.md` §2a.7:
+///
+/// | Component | Trigger | Columns |
+/// |---|---|---|
+/// | `snow:depth` | `Every { 30 s }` | `depth`, `today`, `storm`, `fall_rate` |
+/// | `snow:smoothing` | `Every { 15 min }` | `last24`, `last72` |
+/// | `snow:season` | `Calendar { daily 00:10, Station }` | `season` |
+/// | `snow:events` | `Every { 15 min }` | *none* — it writes `snow_events` |
+///
+/// **A `None` is "leave it", which is also how a failed sub-computation is reported.** The
+/// Go cache refresh reads its own previous row and writes the old value back when a
+/// calculation fails (`internal/snow/cache.go`'s three `keeping previous value` branches),
+/// which needs a read, a decision and a write where this needs an absence. Same behaviour,
+/// one fewer round trip, and no window in which the component holds a value it is about to
+/// overwrite with itself.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SnowPatch {
+    /// `snowdepth`, inches — the gauge's current depth.
+    pub depth: Option<f32>,
+    /// `snowtoday`, inches — new snow since the station's local midnight.
+    pub today: Option<f32>,
+    /// `snowlast24`, inches.
+    pub last24: Option<f32>,
+    /// `snowlast72`, inches.
+    pub last72: Option<f32>,
+    /// `snowseason`, inches.
+    pub season: Option<f32>,
+    /// `snowstorm`, inches.
+    pub storm: Option<f32>,
+    /// `snowfallrate`, inches per hour.
+    pub fall_rate: Option<f32>,
+    /// `source_through` — the newest bucket this computation consumed.
+    pub source_through: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl SnowPatch {
+    /// A patch that writes no column.
+    ///
+    /// Not useless: it still stamps `computed_at`, so a tick that found nothing to compute
+    /// is distinguishable from a component that is not running. Named rather than written
+    /// as `SnowPatch::default()` at a call site, because "this tick deliberately wrote no
+    /// number" is a statement and `default()` is not.
+    pub const NOTHING: Self = Self {
+        depth: None,
+        today: None,
+        last24: None,
+        last72: None,
+        season: None,
+        storm: None,
+        fall_rate: None,
+        source_through: None,
+    };
+
+    /// Whether this patch carries any column at all.
+    pub fn is_empty(&self) -> bool {
+        self.depth.is_none()
+            && self.today.is_none()
+            && self.last24.is_none()
+            && self.last72.is_none()
+            && self.season.is_none()
+            && self.storm.is_none()
+            && self.fall_rate.is_none()
+    }
+}
+
+/// One `snow_depth_estimates` row: a smoothed, rate-limited depth in **inches**.
+///
+/// Inches and not the millimetres `observations.snowdepth` carries, which is Q-4's unit
+/// split arriving one layer earlier than the DTO: the rate limit is expressed in inches per
+/// hour, so converting at the end would mean limiting in one unit and storing in another.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DepthEstimate {
+    /// The 5-minute bucket.
+    pub bucket: chrono::DateTime<chrono::Utc>,
+    /// The estimated depth, inches.
+    pub depth_in: f32,
+}
+
+/// What [`SnowCache::estimate_window`] answers: a window's first, smallest and largest.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EstimateWindow {
+    /// The oldest bucket in the window.
+    pub first_at: chrono::DateTime<chrono::Utc>,
+    /// The depth at `first_at` — the season total's subtrahend.
+    pub first_in: f32,
+    /// The smallest depth in the window.
+    pub min_in: f32,
+    /// The largest depth in the window.
+    pub max_in: f32,
+}
+
+/// One classified segment of the depth series — a `snow_events` row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SnowEvent {
+    /// When the segment starts.
+    pub start: chrono::DateTime<chrono::Utc>,
+    /// When it ends.
+    pub end: chrono::DateTime<chrono::Utc>,
+    /// What kind of segment it is.
+    pub class: EventClass,
+    /// The smoothed depth at the start, **millimetres**.
+    pub start_depth_mm: f32,
+    /// The smoothed depth at the end, millimetres.
+    pub end_depth_mm: f32,
+    /// How much snow it contributed, millimetres. `None` for the two classes that
+    /// contribute none, which the table's own `CHECK` ties to `class`.
+    pub accumulation_mm: Option<f32>,
+}
+
+/// What a segment of the depth series turned out to be.
+///
+/// The four classes of `internal/snow/pelt_computer.go`'s `classifySegments`, which are the
+/// `snow_events.event_type` `CHECK`'s four values. A closed enum rather than a string for
+/// [`Capability`]'s reason: which classes contribute snow is a decision, and a fifth one
+/// would have to be made here, in the classifier, and in the migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EventClass {
+    /// The depth rose and stayed up. Contributes its **net** change.
+    Accumulation,
+    /// Neither a rise nor a fall worth the threshold. Contributes nothing.
+    Plateau,
+    /// The depth fell past the threshold — wind, melt or settling. Contributes nothing.
+    Redistribution,
+    /// The depth rose past the threshold and came most of the way back. Contributes its
+    /// **maximum** rise, not its net: a drift that blew in and blew out still fell as snow.
+    SpikeThenSettle,
+}
+
+impl EventClass {
+    /// The `event_type` column's value, which is also the log field.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EventClass::Accumulation => "accumulation",
+            EventClass::Plateau => "plateau",
+            EventClass::Redistribution => "redistribution",
+            EventClass::SpikeThenSettle => "spike_then_settle",
+        }
+    }
+
+    /// Whether this class carries an accumulation, which the table ties to the column's
+    /// nullability.
+    pub const fn contributes(self) -> bool {
+        matches!(self, EventClass::Accumulation | EventClass::SpikeThenSettle)
+    }
 }
 
 /// One `snow_totals_cache` row.

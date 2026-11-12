@@ -363,9 +363,41 @@ async fn upload(endpoint: Arc<Endpoint>, form: Form) -> Result<(), UploadError> 
             target: target.clone(),
             source,
         })?;
-    let response = read_response(wire.as_mut(), &target).await?;
+    let response = read_response(wire.as_mut(), &target, MAX_RESPONSE_BYTES).await?;
     let head = parse_head(&response, &target)?;
     classify(&head, &target, Utc::now())
+}
+
+/// One `GET`, read to `max` bytes, with the head parsed and the body decoded.
+///
+/// The upload path above is this function with the body thrown away and the status
+/// classified. It is separate because the two callers want opposite halves of the same
+/// exchange: an upload reads the status and the reason, and a fetch reads the payload. Both
+/// go through the same [`connect`], the same [`request_bytes`] and the same three framings,
+/// which is what stops a second HTTP client appearing in this workspace the first time
+/// something needs a response body.
+///
+/// The caller classifies. [`classify`] is right here for an upload and is **not** right for
+/// a fetch of an API that answers `200` with `{"success": false}` -- which is what Aeris
+/// does for a bad credential -- so this function returns the exchange and leaves the verdict
+/// to whoever knows what a successful response looks like.
+pub async fn get(
+    endpoint: &Endpoint,
+    query: &str,
+    max: usize,
+) -> Result<(Head, Vec<u8>), UploadError> {
+    let target = endpoint.target();
+    let mut wire = connect(endpoint, &target).await?;
+    let request = request_bytes(endpoint, query);
+    wire.write_all(&request)
+        .await
+        .map_err(|source| UploadError::Connect {
+            what: "could not write a request to",
+            target: target.clone(),
+            source,
+        })?;
+    let response = read_response(wire.as_mut(), &target, max).await?;
+    parse_response(&response, &target)
 }
 
 /// Build the request bytes.
@@ -445,8 +477,22 @@ impl RetryAfter {
     }
 }
 
-/// Parse a response head and body.
+/// Parse a response head, discarding the body past [`MAX_BODY_EXCERPT`].
+///
+/// What an upload needs: the status, `Retry-After` and a short reason string. A caller that
+/// wants the body itself -- `crate::aeris`, whose whole purpose is the JSON in it -- calls
+/// [`parse_response`] and gets both.
 pub fn parse_head(response: &[u8], target: &Target) -> Result<Head, UploadError> {
+    parse_response(response, target).map(|(head, _)| head)
+}
+
+/// Parse a response head **and** its decoded body.
+///
+/// The body is decoded, not raw: chunk sizes are framing, and a caller that handed
+/// `1f\r\n{"success":true}` to a JSON parser would be parsing the framing. `Content-Length`
+/// truncates to exactly its value, a chunked body is de-chunked, and neither leaves this
+/// function with a trailer or a chunk header in it.
+pub fn parse_response(response: &[u8], target: &Target) -> Result<(Head, Vec<u8>), UploadError> {
     let malformed = |why: &'static str| UploadError::Malformed {
         target: target.clone(),
         expected: "HTTP",
@@ -504,16 +550,19 @@ pub fn parse_head(response: &[u8], target: &Target) -> Result<Head, UploadError>
             None => body.to_vec(),
         }
     };
-    Ok(Head {
-        status,
-        retry_after,
-        // Truncated before the lossy decode rather than after, so a 64 KiB page is not
-        // allocated as a `String` to take 200 characters from it.
-        body: String::from_utf8_lossy(&decoded[..MAX_BODY_EXCERPT.min(decoded.len())])
-            .chars()
-            .take(MAX_BODY_EXCERPT)
-            .collect(),
-    })
+    Ok((
+        Head {
+            status,
+            retry_after,
+            // Truncated before the lossy decode rather than after, so a 64 KiB page is not
+            // allocated as a `String` to take 200 characters from it.
+            body: String::from_utf8_lossy(&decoded[..MAX_BODY_EXCERPT.min(decoded.len())])
+                .chars()
+                .take(MAX_BODY_EXCERPT)
+                .collect(),
+        },
+        decoded,
+    ))
 }
 
 /// Parse a `Retry-After` value.
@@ -587,7 +636,11 @@ pub fn classify(head: &Head, target: &Target, now: DateTime<Utc>) -> Result<(), 
 /// `ErrorKind::UnexpectedEof` from a read when the peer closed TCP without `close_notify`,
 /// which a load balancer that resets after the body does routinely — and treating that as a
 /// failure turned a successful `200` into three retried attempts and a failed occurrence.
-async fn read_response(wire: &mut dyn ByteStream, target: &Target) -> Result<Vec<u8>, UploadError> {
+async fn read_response(
+    wire: &mut dyn ByteStream,
+    target: &Target,
+    max: usize,
+) -> Result<Vec<u8>, UploadError> {
     let mut response = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
     loop {
@@ -627,7 +680,7 @@ async fn read_response(wire: &mut dyn ByteStream, target: &Target) -> Result<Vec
             break;
         }
         response.extend_from_slice(&chunk[..read]);
-        if response.len() >= MAX_RESPONSE_BYTES {
+        if response.len() >= max {
             break;
         }
     }
@@ -1400,7 +1453,7 @@ mod tests {
                 bytes: Some(b"HTTP/1.1 200 OK\r\n\r\nsuccess".to_vec()),
                 kind,
             };
-            let response = read_response(&mut wire, &target)
+            let response = read_response(&mut wire, &target, MAX_RESPONSE_BYTES)
                 .await
                 .unwrap_or_else(|e| panic!("{kind:?} after a complete head is the end: {e}"));
             let head = parse_head(&response, &target).expect("parses");
@@ -1422,7 +1475,7 @@ mod tests {
                 bytes: Some(b"HTTP/1.1 200 OK\r\nContent-".to_vec()),
                 kind,
             };
-            let e = read_response(&mut wire, &target)
+            let e = read_response(&mut wire, &target, MAX_RESPONSE_BYTES)
                 .await
                 .expect_err("a truncated head is a failure");
             assert!(matches!(e, UploadError::Connect { .. }), "{kind:?}: {e}");

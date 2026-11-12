@@ -1735,6 +1735,60 @@ pub async fn aeris_stations(pool: &SqlitePool) -> Result<Vec<String>, ConfigDbEr
     Ok(rows.into_iter().map(|r| r.get("station_key")).collect())
 }
 
+/// One `aeris_account` row.
+///
+/// One per node, which that table's own migration argues for: the credential is a property
+/// of the **account**, and the Go `devices` row carries a copy per device.
+#[derive(Debug, Clone)]
+pub struct AerisAccountRow {
+    /// `enabled` — W5 §1.4's "Stop fetching forecasts".
+    pub enabled: bool,
+    /// `client_id`. Not a credential on its own, and the `CHECK` makes it non-NULL whenever
+    /// `enabled` is set.
+    pub client_id: Option<String>,
+    /// `client_secret`. A [`SecretString`] from the moment it is read (**D-33**).
+    pub client_secret: Option<SecretString>,
+    /// `api_endpoint`, or `None` for the vendor's default.
+    pub api_endpoint: Option<String>,
+    /// `refresh_interval_seconds`, or `None` for the derived span/4.
+    pub refresh_interval_seconds: Option<i64>,
+}
+
+/// The Aeris account, if this node has one.
+///
+/// `None` is a node with no row, which is every node that has never configured Aeris — and
+/// is the ordinary case. Whether an existing row is *usable* is `enabled`'s business and the
+/// registrar's, not this function's: a disabled account with a credential in it is a state
+/// an operator can see in the management API, and collapsing it to `None` here would make it
+/// invisible.
+pub async fn aeris_account(pool: &SqlitePool) -> Result<Option<AerisAccountRow>, ConfigDbError> {
+    let row = sqlx::query(
+        "SELECT enabled, client_id, client_secret, api_endpoint, refresh_interval_seconds \
+         FROM aeris_account WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|source| ConfigDbError::Query {
+        what: "the Aeris account row",
+        source,
+    })?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some(AerisAccountRow {
+        enabled: flag(&row, "enabled")?,
+        client_id: row.get("client_id"),
+        // Into `secrecy` at the point it leaves SQLite, which is what makes **D-33** a
+        // property of the type rather than of every call site: there is no `String` holding
+        // this value anywhere above this line.
+        client_secret: row
+            .get::<Option<String>, _>("client_secret")
+            .map(SecretString::from),
+        api_endpoint: row.get("api_endpoint"),
+        refresh_interval_seconds: row.get("refresh_interval_seconds"),
+    }))
+}
+
 /// A `0`/`1` column as a `bool`, refusing anything else.
 ///
 /// The column's own `CHECK` permits exactly those two, so a third value means this build

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Rate-limited outputs: APRS/CWOP, PWS Weather, Weather Underground, and one Uploader body."
+description = "Third-party HTTPS integrations: the rate-limited outputs, and the Aeris fetchers."
 
 [lints]
 workspace = true
@@ -47,6 +47,15 @@ metrics.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true
+
+# The Aeris payloads. `serde` reads the vendor's eighteen forecast fields and `serde_json`
+# parses the envelope and escapes one JSON string at a time -- `crate::aeris::forecast`
+# writes the stored array out by hand, because `serde_json` renders an integral `f32` as
+# `0.0` where Go's `encoding/json` renders it as `0`, and that text is a frozen response
+# body one storage round trip later (D-39). Both are already in D-32's table; neither is a
+# new dependency for the workspace.
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 # `macros` for `#[tokio::test]`, and `test-util` for `start_paused`: the rate limiter's
