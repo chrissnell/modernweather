@@ -132,15 +132,46 @@ impl Endpoint {
                 host: host.to_string(),
             });
         }
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) => {
-                let port = port.parse::<u16>().map_err(|_| EndpointError::Port {
-                    url: url.to_string(),
-                    port: port.to_string(),
-                })?;
-                (host, port)
+        let default_port = if tls { 443 } else { 80 };
+        // An IPv6 literal is bracketed (RFC 3986 §3.2.2) and is full of colons, so the
+        // port cannot be found by looking for the last one: `https://[::1]/submit` has no
+        // port at all and `rsplit_once(':')` reads `1]` as one. The literal is stored
+        // **unbracketed**, because that is the form `rustls` parses as a `ServerName` and
+        // the form an error message should carry; [`Endpoint::authority`] puts the
+        // brackets back wherever the wire needs them.
+        let (host, port) = match authority.strip_prefix('[') {
+            Some(after_bracket) => {
+                let (literal, rest) =
+                    after_bracket
+                        .split_once(']')
+                        .ok_or_else(|| EndpointError::HostLiteral {
+                            url: url.to_string(),
+                        })?;
+                let port = match rest {
+                    "" => default_port,
+                    rest => {
+                        let digits = rest.strip_prefix(':').ok_or_else(|| EndpointError::Port {
+                            url: url.to_string(),
+                            port: rest.to_string(),
+                        })?;
+                        digits.parse::<u16>().map_err(|_| EndpointError::Port {
+                            url: url.to_string(),
+                            port: digits.to_string(),
+                        })?
+                    }
+                };
+                (literal, port)
             }
-            None => (authority, if tls { 443 } else { 80 }),
+            None => match authority.rsplit_once(':') {
+                Some((host, port)) => {
+                    let port = port.parse::<u16>().map_err(|_| EndpointError::Port {
+                        url: url.to_string(),
+                        port: port.to_string(),
+                    })?;
+                    (host, port)
+                }
+                None => (authority, default_port),
+            },
         };
         if host.is_empty() {
             return Err(EndpointError::NoHost {
@@ -170,11 +201,25 @@ impl Endpoint {
         self.port
     }
 
+    /// The host as it appears on the wire: an IPv6 literal bracketed, anything else as-is.
+    ///
+    /// [`Self::host`] is the bare host, which is what `rustls` wants as a `ServerName` and
+    /// what reads correctly in an error message. The `Host` header, the `connect` address
+    /// and the displayed URL all need the RFC 3986 §3.2.2 form instead, and an unbracketed
+    /// `::1:443` is neither a host nor a port.
+    pub fn authority(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        }
+    }
+
     /// Where it goes, for an error message. Never the query (`crate::error::Target`).
     pub fn target(&self) -> Target {
         Target::new(
             if self.tls { "https" } else { "http" },
-            &self.host,
+            &self.authority(),
             self.port,
             &self.path,
         )
@@ -249,6 +294,16 @@ pub enum EndpointError {
         url: String,
         /// The text after the colon.
         port: String,
+    },
+
+    /// A bracketed host literal with no closing bracket.
+    #[error(
+        "`{url}` opens a bracketed IPv6 literal and never closes it. The form is \
+         `https://[2001:db8::1]:8443/submit`."
+    )]
+    HostLiteral {
+        /// What was configured.
+        url: String,
     },
 
     /// No host.
@@ -329,9 +384,9 @@ pub fn request_bytes(endpoint: &Endpoint, query: &str) -> Vec<u8> {
     // what RFC 9110 §7.2 requires and what a virtual host matches on.
     let default_port = if endpoint.tls { 443 } else { 80 };
     let host = if endpoint.port == default_port {
-        endpoint.host.clone()
+        endpoint.authority()
     } else {
-        format!("{}:{}", endpoint.host, endpoint.port)
+        format!("{}:{}", endpoint.authority(), endpoint.port)
     };
     format!(
         "GET {path} HTTP/1.1\r\n\
@@ -365,17 +420,28 @@ pub enum RetryAfter {
     At(DateTime<Utc>),
 }
 
+/// The longest hold a `Retry-After` can install, in either of its two forms.
+///
+/// A service answering `Retry-After: 31536000` — or, equivalently, a date a year out — is
+/// not a reason to stop uploading for a year. The cap is here rather than at the parse,
+/// because [`RetryAfter::delay`] is the one place both forms become a duration: capping
+/// only the delta-seconds form left the date form uncapped, and an uncapped hold is the
+/// worst of the failure modes available — the component reports healthy, logs nothing
+/// further, and never uploads again.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 3600);
+
 impl RetryAfter {
-    /// How long to wait, measured from `now`.
+    /// How long to wait, measured from `now`, capped at [`MAX_RETRY_AFTER`].
     ///
     /// A date in the past is zero rather than negative: a service whose clock is ahead of
     /// ours should not make us wait a day, and one whose date has already passed is telling
     /// us to go now.
     pub fn delay(self, now: DateTime<Utc>) -> Duration {
-        match self {
+        let delay = match self {
             RetryAfter::Delta(d) => d,
             RetryAfter::At(when) => (when - now).to_std().unwrap_or(Duration::ZERO),
-        }
+        };
+        delay.min(MAX_RETRY_AFTER)
     }
 }
 
@@ -386,6 +452,8 @@ pub fn parse_head(response: &[u8], target: &Target) -> Result<Head, UploadError>
         expected: "HTTP",
         why,
     };
+    // Any 1xx preamble belongs to the exchange and not to the outcome.
+    let response = final_response(response);
     let split = response
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -455,11 +523,11 @@ pub fn parse_head(response: &[u8], target: &Target) -> Result<Head, UploadError>
 /// would have nothing to honour, which is the quiet half of the pushback defect.
 pub fn parse_retry_after(value: &str) -> Option<RetryAfter> {
     if let Ok(seconds) = value.parse::<u64>() {
-        // Capped at a day: a service answering `Retry-After: 31536000` is not a reason to
-        // hold a component's limiter for a year.
-        return Some(RetryAfter::Delta(Duration::from_secs(
-            seconds.min(24 * 3600),
-        )));
+        // Capped here as well as in `delay`, so the parsed value does not claim a hold
+        // longer than the one that will be honoured. `delay` is the enforcement point.
+        return Some(RetryAfter::Delta(
+            Duration::from_secs(seconds).min(MAX_RETRY_AFTER),
+        ));
     }
     // RFC 9110 names three date formats and requires IMF-fixdate be sent; the other two are
     // obsolete and are parsed because a service that sends one is still telling us when.
@@ -530,9 +598,20 @@ async fn read_response(wire: &mut dyn ByteStream, target: &Target) -> Result<Vec
             Ok(read) => read,
             // A close without `close_notify`, after a complete head, is this response
             // ending. Before the head it is a truncated response and still a failure.
+            //
+            // All three abrupt-close kinds, not `UnexpectedEof` alone: a load balancer
+            // that answers and then RSTs the socket surfaces as `ConnectionReset` (or
+            // `ConnectionAborted` on some stacks), and the response already in the buffer
+            // is just as complete as it is after a missing `close_notify`. Tolerating one
+            // kind and retrying the other two turned the same successful `200` into a
+            // `Connect` failure depending on which middlebox was in front of it.
             Err(e)
-                if e.kind() == std::io::ErrorKind::UnexpectedEof
-                    && head_end(&response).is_some() =>
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                ) && head_end(final_response(&response)).is_some() =>
             {
                 break;
             }
@@ -555,6 +634,36 @@ async fn read_response(wire: &mut dyn ByteStream, target: &Target) -> Result<Vec
     Ok(response)
 }
 
+/// The response this uploader reports, with any 1xx interim responses stepped over.
+///
+/// RFC 9110 §15.2: a `100 Continue` or a `103 Early Hints` preamble is a complete head of
+/// its own, with no body, and the final response follows it. Reading the first status line
+/// in the buffer therefore reports `103` as the outcome — which classifies `Fatal`, so a
+/// perfectly successful `200` behind an early-hints preamble becomes a permanently stopped
+/// uploader. A load balancer is exactly the kind of peer that emits them.
+fn final_response(response: &[u8]) -> &[u8] {
+    let mut rest = response;
+    loop {
+        let Some(end) = head_end(rest) else {
+            return rest;
+        };
+        if !matches!(status_of(rest), Some(100..=199)) {
+            return rest;
+        }
+        rest = &rest[end..];
+    }
+}
+
+/// The status code of the head at the front of `response`, if it has one.
+fn status_of(response: &[u8]) -> Option<u16> {
+    let head_end = head_end(response)?;
+    let head = String::from_utf8_lossy(&response[..head_end]);
+    let status_line = head.split("\r\n").next()?;
+    let mut parts = status_line.split(' ');
+    parts.next().filter(|v| v.starts_with("HTTP/1."))?;
+    parts.next()?.parse().ok()
+}
+
 /// Where the head ends, as an offset past the blank line.
 fn head_end(response: &[u8]) -> Option<usize> {
     response
@@ -568,11 +677,20 @@ fn head_end(response: &[u8]) -> Option<usize> {
 /// `false` until the head is complete, then whichever framing the head declared. A `false`
 /// answer for the read-to-close case is what makes the loop continue to end of stream.
 fn complete(response: &[u8]) -> bool {
+    let response = final_response(response);
     let Some(body_at) = head_end(response) else {
         return false;
     };
     let head = String::from_utf8_lossy(&response[..body_at]);
     let body = &response[body_at..];
+    // RFC 9112 §6.1's *status-defined* framing comes first: a `204` or a `304` has no body
+    // whatever its headers say, and `304` carries the cached response's `Content-Length`
+    // routinely. Reading that header as a promise of bytes that never arrive means the
+    // loop runs to the attempt timeout and a successful conditional request is reported as
+    // `Timeout`.
+    if matches!(status_of(response), Some(204 | 304)) {
+        return true;
+    }
     if header(&head, "transfer-encoding").is_some_and(|v| {
         v.split(',')
             .any(|t| t.trim().eq_ignore_ascii_case("chunked"))
@@ -635,7 +753,14 @@ fn dechunk(body: &[u8]) -> Vec<u8> {
             break;
         }
         let data_at = line_end + 2;
-        let end = (data_at + size).min(body.len());
+        // `checked_add`, for the same reason `chunked_end` uses it twenty lines above: a
+        // peer that answers `ffffffffffffffff` as a chunk size overflows the addition,
+        // which panics in a debug build and wraps to a smaller offset in a release one --
+        // and `min` on the wrapped value is no protection at all.
+        let Some(end) = data_at.checked_add(size) else {
+            break;
+        };
+        let end = end.min(body.len());
         out.extend_from_slice(&body[data_at..end]);
         at = end + 2;
         if at >= body.len() {
@@ -647,7 +772,7 @@ fn dechunk(body: &[u8]) -> Vec<u8> {
 
 /// Connect, and wrap in TLS when the endpoint says so.
 async fn connect(endpoint: &Endpoint, target: &Target) -> Result<Box<dyn ByteStream>, UploadError> {
-    let address = format!("{}:{}", endpoint.host, endpoint.port);
+    let address = format!("{}:{}", endpoint.authority(), endpoint.port);
     let connecting = tokio::net::TcpStream::connect(&address);
     let tcp = match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
         Ok(Ok(tcp)) => tcp,
@@ -982,6 +1107,47 @@ mod tests {
         assert_eq!(parse_retry_after(""), None);
     }
 
+    /// **The cap covers both forms, because an uncapped hold is silent.**
+    ///
+    /// The delta-seconds cap was applied at the parse and the date form was not, so
+    /// `Retry-After: Thu, 01 Jan 2032 00:00:00 GMT` installed a hold of years: the
+    /// component reports healthy, logs nothing further, and never uploads again.
+    #[test]
+    fn a_retry_after_date_is_capped_like_a_delta() {
+        let now = at("2026-11-11T06:00:00Z");
+        let far = parse_retry_after("Thu, 01 Jan 2032 00:00:00 GMT").expect("a date");
+        assert_eq!(
+            far.delay(now),
+            MAX_RETRY_AFTER,
+            "a date five years out is a day, as `Retry-After: 157680000` is"
+        );
+        assert_eq!(
+            parse_retry_after("157680000").expect("a delta").delay(now),
+            MAX_RETRY_AFTER
+        );
+        // And the cap is a ceiling, not a floor: anything inside it is itself.
+        assert_eq!(
+            parse_retry_after("Wed, 11 Nov 2026 12:00:00 GMT")
+                .expect("a date")
+                .delay(now),
+            Duration::from_secs(6 * 3600)
+        );
+
+        // It reaches the class, which is what the uploader's hold is built from.
+        let target = endpoint().target();
+        let head = parse_head(
+            b"HTTP/1.1 503 Busy\r\nRetry-After: Thu, 01 Jan 2032 00:00:00 GMT\r\n\r\n",
+            &target,
+        )
+        .expect("parses");
+        let e = classify(&head, &target, now).expect_err("503 with a hint is rate limiting");
+        assert!(
+            matches!(e.class(), Class::Retryable { after: Some(after) } if after == MAX_RETRY_AFTER),
+            "{e} classified as {:?}",
+            e.class()
+        );
+    }
+
     /// The header name is matched case-insensitively, because HTTP field names are.
     #[test]
     fn the_retry_after_header_is_matched_case_insensitively() {
@@ -1060,6 +1226,207 @@ mod tests {
             head.retry_after,
             Some(RetryAfter::Delta(Duration::from_secs(60)))
         );
+    }
+
+    /// **An IPv6 literal is bracketed, and the brackets are not a port separator.**
+    ///
+    /// `https://[::1]/submit` has no port; reading the last colon as one made it
+    /// `EndpointError::Port { port: "1]" }` and a local test receiver unreachable.
+    #[test]
+    fn an_ipv6_literal_is_a_host_and_not_a_port() {
+        let e = Endpoint::parse("https://[::1]/submit").expect("parses");
+        // Stored bare, because that is what `rustls` parses as a `ServerName`...
+        assert_eq!(e.host(), "::1");
+        assert_eq!(e.port(), 443);
+        // ...and bracketed wherever it meets the wire.
+        assert_eq!(e.authority(), "[::1]");
+        assert_eq!(e.to_string(), "https://[::1]/submit");
+        let request = String::from_utf8(request_bytes(&e, "")).expect("utf-8");
+        assert!(
+            request.contains("Host: [::1]\r\n"),
+            "the Host header carries the RFC 3986 form: {request}"
+        );
+
+        // An explicit port is read from after the closing bracket, and reaches the header
+        // because it is not the scheme's default.
+        let explicit = Endpoint::parse("https://[2001:DB8::1]:8443/submit").expect("parses");
+        assert_eq!((explicit.host(), explicit.port()), ("2001:db8::1", 8443));
+        let request = String::from_utf8(request_bytes(&explicit, "")).expect("utf-8");
+        assert!(
+            request.contains("Host: [2001:db8::1]:8443\r\n"),
+            "{request}"
+        );
+
+        // A name is unaffected: the last colon is still the port separator.
+        assert_eq!(
+            Endpoint::parse("http://wx.lan:8080/submit")
+                .expect("parses")
+                .authority(),
+            "wx.lan"
+        );
+        // And the two malformed literals are refused rather than mangled.
+        assert!(matches!(
+            Endpoint::parse("https://[::1/submit"),
+            Err(EndpointError::HostLiteral { .. })
+        ));
+        assert!(matches!(
+            Endpoint::parse("https://[::1]x/submit"),
+            Err(EndpointError::Port { .. })
+        ));
+    }
+
+    /// **A 1xx preamble is part of the exchange and not the outcome.**
+    ///
+    /// `103 Early Hints` in front of a `200` was read as the status, and `103` classifies
+    /// `Fatal` — so a load balancer emitting hints stopped the uploader permanently on a
+    /// successful upload.
+    #[test]
+    fn an_interim_response_is_not_the_outcome() {
+        let target = endpoint().target();
+        let response = b"HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n\
+                         HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nsuccess";
+        let head = parse_head(response, &target).expect("parses");
+        assert_eq!((head.status, head.body.as_str()), (200, "success"));
+        classify(&head, &target, Utc::now()).expect("a 200 behind a 103 is a success");
+        // And the read loop stops at the final response's framing rather than at the
+        // preamble's absence of one.
+        assert!(complete(response));
+
+        // Two preambles, which `100 Continue` plus `103` is, and a `Retry-After` that
+        // belongs to the final response.
+        let head = parse_head(
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\n\
+              HTTP/1.1 429 Slow down\r\nRetry-After: 60\r\nContent-Length: 4\r\n\r\nwait",
+            &target,
+        )
+        .expect("parses");
+        assert_eq!(head.status, 429);
+        assert_eq!(
+            head.retry_after,
+            Some(RetryAfter::Delta(Duration::from_secs(60)))
+        );
+
+        // A preamble that has arrived without its final response is not complete.
+        assert!(!complete(b"HTTP/1.1 103 Early Hints\r\n\r\n"));
+    }
+
+    /// **RFC 9112 §6.1's status-defined framing comes before the headers.**
+    ///
+    /// A `304` carries the cached response's `Content-Length` and no body. Waiting for
+    /// those bytes on a keep-alive connection burned the whole attempt budget and reported
+    /// a successful conditional request as a timeout.
+    #[test]
+    fn a_status_that_defines_no_body_is_complete_at_its_head() {
+        assert!(complete(
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 42\r\n\r\n"
+        ));
+        assert!(complete(
+            b"HTTP/1.1 304 Not Modified\r\nContent-Length: 1024\r\nETag: \"x\"\r\n\r\n"
+        ));
+        // The status is read, not guessed: a 200 with the same header still waits.
+        assert!(!complete(b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n"));
+    }
+
+    /// **A chunk size that overflows an offset must not panic.**
+    ///
+    /// `chunked_end` used `checked_add` and `dechunk` did not, so the same response was
+    /// safe to frame and fatal to decode: `data_at + size` panics in a debug build and
+    /// wraps in a release one, where `min` on the wrapped value reads out of the body.
+    #[test]
+    fn a_chunk_size_that_overflows_an_offset_is_refused() {
+        let target = endpoint().target();
+        let head = parse_head(
+            b"HTTP/1.1 400 Bad\r\nTransfer-Encoding: chunked\r\n\r\n\
+              ffffffffffffffff\r\nInvalid ID\r\n0\r\n\r\n",
+            &target,
+        )
+        .expect("a malicious chunk size is a short body, not a panic");
+        assert_eq!(head.status, 400);
+        assert!(
+            head.body.is_empty(),
+            "nothing is decoded from an unframeable body, got {:?}",
+            head.body
+        );
+        // The honest prefix is still decoded when the overflow comes second.
+        let head = parse_head(
+            b"HTTP/1.1 400 Bad\r\nTransfer-Encoding: chunked\r\n\r\n\
+              a\r\nInvalid ID\r\nfffffffffffffffe\r\nx\r\n0\r\n\r\n",
+            &target,
+        )
+        .expect("parses");
+        assert_eq!(head.body, "Invalid ID");
+    }
+
+    /// **All three abrupt-close kinds end a response whose head is complete.**
+    ///
+    /// A middlebox that answers and then RSTs surfaces as `ConnectionReset`, which was
+    /// retried as a `Connect` failure while the identical `UnexpectedEof` was tolerated.
+    #[tokio::test]
+    async fn an_abrupt_close_after_a_complete_head_is_the_response_ending() {
+        /// Yields its scripted bytes once, then fails with `kind`.
+        struct Scripted {
+            bytes: Option<Vec<u8>>,
+            kind: std::io::ErrorKind,
+        }
+        impl fmt::Debug for Scripted {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "Scripted({:?})", self.kind)
+            }
+        }
+        impl ByteStream for Scripted {
+            fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxFuture<'a, std::io::Result<usize>> {
+                Box::pin(async move {
+                    match self.bytes.take() {
+                        Some(bytes) => {
+                            buf[..bytes.len()].copy_from_slice(&bytes);
+                            Ok(bytes.len())
+                        }
+                        None => Err(std::io::Error::new(self.kind, "scripted")),
+                    }
+                })
+            }
+            fn write_all<'a>(&'a mut self, _: &'a [u8]) -> BoxFuture<'a, std::io::Result<()>> {
+                Box::pin(async move { Ok(()) })
+            }
+        }
+
+        let target = endpoint().target();
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+        ] {
+            let mut wire = Scripted {
+                bytes: Some(b"HTTP/1.1 200 OK\r\n\r\nsuccess".to_vec()),
+                kind,
+            };
+            let response = read_response(&mut wire, &target)
+                .await
+                .unwrap_or_else(|e| panic!("{kind:?} after a complete head is the end: {e}"));
+            let head = parse_head(&response, &target).expect("parses");
+            assert_eq!(
+                (head.status, head.body.as_str()),
+                (200, "success"),
+                "{kind:?}"
+            );
+        }
+
+        // Before the head is complete every one of them is still a failure: a truncated
+        // response is not a response.
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+        ] {
+            let mut wire = Scripted {
+                bytes: Some(b"HTTP/1.1 200 OK\r\nContent-".to_vec()),
+                kind,
+            };
+            let e = read_response(&mut wire, &target)
+                .await
+                .expect_err("a truncated head is a failure");
+            assert!(matches!(e, UploadError::Connect { .. }), "{kind:?}: {e}");
+        }
     }
 
     /// The connect budget is strictly inside the attempt's, or its diagnosis is

@@ -213,19 +213,26 @@ impl WeatherReport {
             out.push('P');
             out.push_str(&three(Some(hundredths(inches))));
         }
-        if let Some(percent) = self.humidity_percent {
+        // The three optional numeric fields filter non-finite values the way `three` and
+        // `temperature` do for the mandatory ones. Without it a NaN survives `round`,
+        // survives `clamp` -- `f64::clamp` returns NaN for a NaN input -- and then `as u32`
+        // saturates it to **zero**, which in these three encodings is not "absent": it is
+        // `h00` (the protocol's 100 % RH), `b00000` (0 hPa, a reading no barometer gives)
+        // and `L000`. A NaN is an absent reading, and an absent reading is an omitted
+        // field.
+        if let Some(percent) = self.humidity_percent.filter(|v| v.is_finite()) {
             out.push('h');
             // `00` is one hundred per cent, which is the protocol's own encoding and the
             // reason this is not `{:02}` of a clamp to 0.
             let whole = percent.round().clamp(1.0, 100.0) as u32;
             out.push_str(&format!("{:02}", whole % 100));
         }
-        if let Some(in_hg) = self.barometer_in_hg {
+        if let Some(in_hg) = self.barometer_in_hg.filter(|v| v.is_finite()) {
             out.push('b');
             let tenths = (in_hg * HPA_PER_INHG * 10.0).round().clamp(0.0, 99_999.0) as u32;
             out.push_str(&format!("{tenths:05}"));
         }
-        if let Some(watts) = self.solar_watts_per_m2 {
+        if let Some(watts) = self.solar_watts_per_m2.filter(|v| v.is_finite()) {
             // `L` below 1000 W/m², `l` above it carrying the value less 1000 — the
             // protocol's own two-letter trick for a field that is three digits wide and a
             // quantity that is not.
@@ -439,6 +446,17 @@ pub fn parse_info(text: &str) -> Result<Parsed, ParseError> {
     let position = parse_position(&header[1..9], &header[10..19])?;
     let symbol = Symbol::new(char::from(header[9]), char::from(header[19]))
         .map_err(|_| ParseError::Symbol)?;
+    // The same precondition [`WeatherReport::encode_info`] enforces, and for a stronger
+    // reason on the way in: in a position report whose symbol code is *not* `_`, the
+    // `ddd/sss` block after the symbol is `CSE/SPD` -- course in degrees and speed in
+    // **knots** (APRS 1.0.1 ch. 6). Reading it as wind direction and wind speed in mph is
+    // a silent unit error on a value that looks entirely plausible, and it is the hazard
+    // the encoder already refuses to create.
+    if symbol.code() != Symbol::WEATHER_CODE {
+        return Err(ParseError::NotAWeatherSymbol {
+            code: char::from(symbol.code()),
+        });
+    }
 
     let rest = &text[HEADER..];
     let mut report = WeatherReport::default();
@@ -574,8 +592,31 @@ fn parse_degrees(
             .parse()
             .map_err(|_| ParseError::Position)
     };
-    let degrees = text(&bytes[..degree_digits])?;
-    let minutes = text(&bytes[degree_digits..bytes.len() - 1])?;
+    // `DD` and `MM.hh` are digits in fixed positions, and `f64::from_str` is far more
+    // permissive than that: it reads `-9`, `+9`, `inf` and `9e9`. Checked by shape before
+    // the parse, so the parse can only fail on something this already refused.
+    let degrees_field = &bytes[..degree_digits];
+    let minutes_field = &bytes[degree_digits..bytes.len() - 1];
+    if !degrees_field.iter().all(u8::is_ascii_digit)
+        || !matches!(
+            minutes_field,
+            [m0, m1, b'.', h0, h1]
+                if m0.is_ascii_digit()
+                    && m1.is_ascii_digit()
+                    && h0.is_ascii_digit()
+                    && h1.is_ascii_digit()
+        )
+    {
+        return Err(ParseError::Position);
+    }
+    let degrees = text(degrees_field)?;
+    let minutes = text(minutes_field)?;
+    // Sixty minutes is the next degree, so a field claiming more is not a position: with
+    // `99.99` accepted, `4599.99N` parsed as 46.67degN -- about 110 km from the latitude
+    // the bytes name, with no refusal anywhere.
+    if minutes >= 60.0 {
+        return Err(ParseError::Position);
+    }
     // `-0.0` for a southern or western field whose value is exactly zero, which is what
     // makes the hemisphere survive a round trip -- see `Position::latitude_text`.
     Ok(sign * (degrees + minutes / 60.0))
@@ -626,6 +667,17 @@ pub enum ParseError {
     /// A symbol byte that is not printable.
     #[error("the symbol table selector or code is not a printable ASCII character")]
     Symbol,
+
+    /// A position report that is not a weather report.
+    #[error(
+        "the symbol code is `{code}` and a weather report's is `_`; in any other symbol \
+         the `ddd/sss` block is course in degrees and speed in knots, not wind direction \
+         and wind speed in mph"
+    )]
+    NotAWeatherSymbol {
+        /// The symbol code that was there.
+        code: char,
+    },
 
     /// A missing mandatory wind field.
     #[error("the mandatory wind {field} field is absent; a complete weather report has `ddd/sss`")]
@@ -934,6 +986,117 @@ mod tests {
         assert_eq!(Symbol::WEATHER_CODE, b'_');
         let overlay = Symbol::new('\\', '_').expect("a valid symbol");
         assert!(report.encode_info(position(), overlay, ".mw", None).is_ok());
+    }
+
+    /// **The parser refuses the symbol the encoder refuses**, and for the stronger reason.
+    ///
+    /// `encode_info` would not *create* a non-weather weather report; `parse_info` happily
+    /// read one, and in a position report under any code but `_` the `ddd/sss` block is
+    /// `CSE/SPD` — course in degrees and speed in **knots**. A car doing 040 knots parsed
+    /// as a 40 mph wind, which is a plausible-looking value and a silent unit error.
+    #[test]
+    fn a_position_report_under_another_symbol_is_not_weather_data() {
+        // The same bytes under the two symbols: `_` is weather, `>` is a car.
+        let weather = "!4507.40N/12227.40W_090/040g000t072";
+        parse_info(weather).expect("a weather symbol parses");
+
+        let car = "!4507.40N/12227.40W>090/040g000t072";
+        let e = parse_info(car).expect_err("a car's course and speed is not wind");
+        assert!(
+            matches!(e, ParseError::NotAWeatherSymbol { code: '>' }),
+            "{e}"
+        );
+        assert!(e.to_string().contains("knots"), "{e}");
+
+        // An overlaid table is still weather: only the code is fixed, on both sides.
+        parse_info("!4507.40N\\12227.40W_090/040g000t072").expect("an overlay is weather");
+    }
+
+    /// **A NaN is an absent reading, in every field and not only the mandatory ones.**
+    ///
+    /// `three` and `temperature` both refuse a non-finite value; the three optional
+    /// numeric encodings did not, and each has a zero that means something: `h00` is the
+    /// protocol's **100 %** RH, `b00000` is 0 hPa and `L000` is full shade. NaN survives
+    /// `round`, survives `clamp` — `f64::clamp` of a NaN is NaN — and `as u32` saturates
+    /// it to zero, so the packet carried three confident wrong readings.
+    #[test]
+    fn a_non_finite_optional_reading_is_omitted_rather_than_zero() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let report = WeatherReport {
+                humidity_percent: Some(bad),
+                barometer_in_hg: Some(bad),
+                solar_watts_per_m2: Some(bad),
+                ..WeatherReport::default()
+            };
+            let info = report
+                .encode_info(
+                    position(),
+                    Symbol::new('/', '_').expect("weather"),
+                    ".mw",
+                    None,
+                )
+                .expect("encodes")
+                .to_string();
+            assert_eq!(
+                info, "!4507.40N/12227.40W_.../...g...t....mw",
+                "{bad} must omit all three fields, not encode 100 % RH and 0 hPa"
+            );
+            for absent in ['h', 'b', 'L', 'l'] {
+                assert!(
+                    !info.contains(absent),
+                    "{bad}: `{absent}` is present in {info}"
+                );
+            }
+        }
+
+        // A real zero is still encoded, because 0 % RH and 0 W/m² are readings.
+        let zeros = WeatherReport {
+            humidity_percent: Some(0.0),
+            solar_watts_per_m2: Some(0.0),
+            ..WeatherReport::default()
+        };
+        let info = zeros
+            .encode_info(
+                position(),
+                Symbol::new('/', '_').expect("weather"),
+                "",
+                None,
+            )
+            .expect("encodes")
+            .to_string();
+        assert!(info.contains("h01") && info.contains("L000"), "{info}");
+    }
+
+    /// **Sixty minutes is the next degree, so a field claiming more is not a position.**
+    ///
+    /// `f64::from_str` is far more permissive than `MM.hh`: `4599.99N` parsed to 46.67°N,
+    /// about 110 km from the latitude the bytes name, and `-9` and `inf` parsed at all.
+    #[test]
+    fn a_minutes_field_that_is_not_minutes_is_refused() {
+        // The boundary, from both sides.
+        parse_info("!4559.99N/12227.40W_090/040g000t072").expect("59.99 minutes is a position");
+        for bad in [
+            "!4560.00N/12227.40W_090/040g000t072",
+            "!4599.99N/12227.40W_090/040g000t072",
+            "!4507.40N/12260.00W_090/040g000t072",
+        ] {
+            assert!(
+                matches!(parse_info(bad), Err(ParseError::Position)),
+                "{bad} was accepted"
+            );
+        }
+        // And the shapes `from_str` reads that the protocol does not write.
+        for bad in [
+            "!45-9.90N/12227.40W_090/040g000t072",
+            "!45+9.90N/12227.40W_090/040g000t072",
+            "!4507.4EN/12227.40W_090/040g000t072",
+            "!-507.40N/12227.40W_090/040g000t072",
+        ] {
+            assert!(
+                matches!(parse_info(bad), Err(ParseError::Position)),
+                "{bad} was accepted"
+            );
+        }
     }
 
     /// The hemisphere survives a value of exactly zero, which is the one boundary a

@@ -55,6 +55,9 @@ const DIGIT0: u8 = 33;
 /// The largest value two base-91 digits hold, which is the telemetry field's ceiling.
 pub const MAX_TELEMETRY: u16 = (RADIX * RADIX - 1) as u16;
 
+/// The largest value four base-91 digits hold: `91⁴ - 1`.
+pub const MAX_BASE91_POSITION: u32 = RADIX * RADIX * RADIX * RADIX - 1;
+
 /// A validated latitude and longitude, in decimal degrees.
 ///
 /// Its own type because a position is **configuration** — `stations.latitude` and
@@ -166,12 +169,20 @@ pub fn precompress_longitude(lon: f64) -> f64 {
 /// reference's worked example (longitude -72.75°, pre-compressing to 20,427,156.75) renders
 /// `<*e7`, which is the truncated value.
 ///
-/// Saturating rather than wrapping on an out-of-range input: the inputs are a validated
-/// [`Position`], so the clamp is unreachable from this crate's own surface, and the
-/// alternative — `as u32` on a negative float, which is zero — would silently encode the
-/// north pole.
+/// **Saturating at what four digits can hold**, which is [`MAX_BASE91_POSITION`] and not
+/// `u32::MAX`: the loop below is four `% 91`s, so a value above `91⁴ - 1` wraps modulo
+/// `91⁴` rather than saturating — a clamp at `u32::MAX` is 62 full wraps wide and lets the
+/// south pole encode as somewhere near the north one.
+///
+/// The floor is `0`, and `0` is a real encoding rather than a refusal: for a latitude it is
+/// 90°N. There is no representable "out of range" in four base-91 digits, so a negative
+/// input saturates to the pole — which is stated here rather than claimed to be prevented.
+/// Both ends are unreachable from this crate's own surface, because every caller
+/// pre-compresses a validated [`Position`].
 pub fn base91_position(precompressed: f64) -> [u8; 4] {
-    let mut value = precompressed.trunc().clamp(0.0, f64::from(u32::MAX)) as u32;
+    let mut value = precompressed
+        .trunc()
+        .clamp(0.0, f64::from(MAX_BASE91_POSITION)) as u32;
     let mut out = [0u8; 4];
     for cell in out.iter_mut().rev() {
         *cell = (value % RADIX) as u8 + DIGIT0;
@@ -322,6 +333,47 @@ mod tests {
             assert_eq!(p.latitude_text().len(), 8, "{p}");
             assert_eq!(p.longitude_text().len(), 9, "{p}");
         }
+    }
+
+    /// **Four base-91 digits saturate at `91⁴ - 1`, not at `u32::MAX`.**
+    ///
+    /// The conversion is four `% 91`s, so clamping at `u32::MAX` left 62 full wraps inside
+    /// the clamp: the south pole's pre-compressed latitude is well under the ceiling, but
+    /// anything above `91⁴ - 1` came out as a position somewhere else entirely rather than
+    /// as the extreme the clamp was supposed to pin it to.
+    #[test]
+    fn a_base91_position_saturates_at_what_four_digits_hold() {
+        assert_eq!(MAX_BASE91_POSITION, 91 * 91 * 91 * 91 - 1);
+        let ceiling = base91_position(f64::from(MAX_BASE91_POSITION));
+        assert_eq!(ceiling, [DIGIT0 + 90; 4], "the all-nines of base 91");
+
+        // One past the ceiling is the ceiling, and so is a value 62 wraps beyond it. Under
+        // the old clamp the second answered `!!!!`, which is zero -- the north pole.
+        assert_eq!(
+            base91_position(f64::from(MAX_BASE91_POSITION) + 1.0),
+            ceiling
+        );
+        assert_eq!(base91_position(f64::from(u32::MAX)), ceiling);
+        assert_eq!(base91_position(f64::MAX), ceiling);
+
+        // The floor is zero, and zero is an encoding rather than a refusal: 90°N.
+        assert_eq!(base91_position(-1.0), [DIGIT0; 4]);
+        assert_eq!(
+            base91_position(precompress_latitude(90.0)),
+            [DIGIT0; 4],
+            "90N pre-compresses to 0, which is what a negative input saturates to"
+        );
+
+        // Both real poles stay inside the range, which is why neither end is reachable
+        // from a validated `Position`.
+        for degrees in [-90.0, 90.0] {
+            assert!(precompress_latitude(degrees) <= f64::from(MAX_BASE91_POSITION));
+        }
+        for degrees in [-180.0, 180.0] {
+            assert!(precompress_longitude(degrees) <= f64::from(MAX_BASE91_POSITION));
+        }
+        // And the protocol reference's worked example still renders as it did.
+        assert_eq!(&base91_position(20_427_156.75), b"<*e7");
     }
 
     /// The rounding carry: 59.9994 minutes renders as `60.00` without it, which is eight

@@ -58,7 +58,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mw_aprs::{Callsign, Passcode, Position, Symbol};
+use mw_aprs::{Callsign, Passcode, Position, Symbol, WeatherReport};
 use mw_component::{
     Builder, Capability, ComponentId, ComponentIdError, ComponentSpec, ConfigDigest, FirstRun,
     Need, Phase, Trigger, WindowedView,
@@ -258,6 +258,15 @@ pub fn register<C: OutputConfig + ?Sized>(
                          this node maintains no windows for it. Re-enable the station, or \
                          remove the `station_service` pairing."
                     );
+                    // **Claimed before the skip, so the arity rule does not depend on
+                    // `stations.enabled`.** Two `station_service` rows on one account are
+                    // W7 D-38's arity violation whether or not one of the stations is
+                    // switched off -- and `seen` is how that is detected. Skipping without
+                    // claiming made the second pairing invisible for as long as its
+                    // station stayed disabled, so re-enabling a station turned a running
+                    // configuration into `Arity`, which refuses the **whole** node's
+                    // output plan. The refusal now arrives when the pairing is written.
+                    claim(&mut seen, &row, &station.to_string())?;
                     continue;
                 }
                 return Err(OutputPlanError::StationNotCollected {
@@ -267,20 +276,44 @@ pub fn register<C: OutputConfig + ?Sized>(
                 });
             }
         }
-        let spec = declare(&row, windows)?;
         let station = row.station_key.clone().unwrap_or_default();
-        if let Some(first) = seen.insert(spec.id.to_string(), station.clone()) {
-            // `uploader.name` is UNIQUE, so two rows with the same name are two
-            // `station_service` pairings on one account -- which is W7 D-38's arity, and
-            // the refusal the `station_service` table's own comment predicts.
-            return Err(OutputPlanError::Arity {
+        claim(&mut seen, &row, &station)?;
+        out.push(declare(&row, windows)?);
+    }
+    Ok(())
+}
+
+/// Record that this row's component id is taken, or refuse the second row that takes it.
+///
+/// `uploader.name` is UNIQUE, so two rows with the same name are two `station_service`
+/// pairings on one account -- which is W7 D-38's arity, and the refusal the
+/// `station_service` table's own comment predicts. The id is derived from `kind` and `name`
+/// rather than read off a built `ComponentSpec`, so a row that is **not** going to be
+/// planned can still claim it.
+fn claim(
+    seen: &mut BTreeMap<String, String>,
+    row: &UploaderRow,
+    station: &str,
+) -> Result<(), OutputPlanError> {
+    let prefix = match row.kind.as_str() {
+        "wunderground" => Kind::Wu.prefix(),
+        "pwsweather" => Kind::Pws.prefix(),
+        "aprs" => "aprs",
+        other => {
+            return Err(OutputPlanError::UnknownKind {
                 name: row.name.clone(),
-                kind: row.kind.clone(),
-                first,
-                second: station,
-            });
+                kind: other.to_string(),
+            })
         }
-        out.push(spec);
+    };
+    let id = component_id(prefix, &row.name)?;
+    if let Some(first) = seen.insert(id.to_string(), station.to_string()) {
+        return Err(OutputPlanError::Arity {
+            name: row.name.clone(),
+            kind: row.kind.clone(),
+            first,
+            second: station.to_string(),
+        });
     }
     Ok(())
 }
@@ -347,9 +380,18 @@ fn http_spec(
     kind: Kind,
 ) -> Result<ComponentSpec, OutputPlanError> {
     let id = component_id(kind.prefix(), &row.name)?;
+    // Blank-filtered like the four sibling credential columns, and for the same reason:
+    // `uploader.api_key = ''` is how a column gets cleared by hand, and it is not a
+    // credential. Accepting it planned a component whose every occurrence was a `401` --
+    // which classifies `Fatal`, so the uploader stopped for good on the next tick instead
+    // of being refused at plan time where an operator reads the reason.
     let api_key = row
         .api_key
         .clone()
+        .filter(|key| {
+            use secrecy::ExposeSecret;
+            !key.expose_secret().trim().is_empty()
+        })
         .ok_or_else(|| OutputPlanError::MissingCredential {
             name: row.name.clone(),
             column: "api_key",
@@ -442,6 +484,17 @@ fn aprs_spec(
     })?;
     let position = position(row, &station)?;
     let symbol = symbol(row)?;
+    // **The packet is rehearsed here, not discovered at the first occurrence.**
+    //
+    // `encode_info` has two preconditions neither `symbol()` nor the schema enforces: the
+    // symbol *code* must be `_` (under any other code `ddd/sss` is a course and a speed in
+    // knots, so the protocol has no weather report there), and the whole information field
+    // must be printable ASCII within `MAX_INFORMATION_BYTES`. `uploader.aprs_comment` is
+    // free text with no `CHECK`, so `Cafe\u{301} Station`, a comment carrying a newline and a
+    // 300-byte comment each planned cleanly and then failed to encode on every tick -- and
+    // an encode failure classifies `Fatal`, which stops the component for the life of the
+    // process. A configuration error belongs in the pure function that exists to catch one.
+    rehearse(row, position, symbol)?;
     let transport_kind = row.aprs_transport.as_deref().unwrap_or("aprs-is");
 
     // The interval, and the asymmetry: APRS-IS is clamped and a radio is refused.
@@ -509,11 +562,13 @@ fn aprs_spec(
                     interval,
                 }
             } else {
-                let (host, port) = peer(row.aprs_kiss_tcp_address.as_deref(), ("", 0), row)
-                    .map_err(|_| OutputPlanError::MissingKiss {
-                        name: row.name.clone(),
-                        column: "aprs_kiss_tcp_address",
-                    })?;
+                // No `map_err`: `peer` already answers `MissingKiss` for the absent
+                // case, because the default host it is given is empty. The mapping could
+                // therefore only ever convert a real `BadPeer` -- so
+                // `aprs_kiss_tcp_address = 'tnc.lan'`, which is a host with no port, was
+                // reported as "no address configured" while the address sat in the column
+                // the message said was empty.
+                let (host, port) = peer(row.aprs_kiss_tcp_address.as_deref(), ("", 0), row)?;
                 FrameSink::KissTcp {
                     host,
                     port,
@@ -808,6 +863,37 @@ fn position(row: &UploaderRow, station: &StationKey) -> Result<Position, OutputP
 }
 
 /// The configured symbol, or the weather-station default.
+/// Encode the widest packet this row can produce, and refuse the row if it cannot.
+///
+/// The **widest**, not a representative one: every field in a weather report is
+/// fixed-width, so all ten present is the longest information field this station can emit
+/// and the only length a comment is worth checking against. A comment that fits beside a
+/// report with no rain gauge and no barometer must also fit beside the widest packet, or
+/// the failure waits for weather.
+fn rehearse(row: &UploaderRow, position: Position, symbol: Symbol) -> Result<(), OutputPlanError> {
+    /// Every optional field present. Only the widths matter, but the values are finite,
+    /// because a non-finite reading is an omitted field rather than a wide one.
+    const WIDEST: WeatherReport = WeatherReport {
+        wind_direction_deg: Some(359.0),
+        wind_speed_mph: Some(999.0),
+        wind_gust_mph: Some(999.0),
+        temperature_f: Some(-99.0),
+        rain_last_hour_in: Some(9.99),
+        rain_last_24h_in: Some(9.99),
+        rain_since_midnight_in: Some(9.99),
+        humidity_percent: Some(99.0),
+        barometer_in_hg: Some(29.92),
+        solar_watts_per_m2: Some(1999.0),
+    };
+    WIDEST
+        .encode_info(position, symbol, AGENT, row.aprs_comment.as_deref())
+        .map(|_| ())
+        .map_err(|source| OutputPlanError::Unencodable {
+            name: row.name.clone(),
+            source,
+        })
+}
+
 fn symbol(row: &UploaderRow) -> Result<Symbol, OutputPlanError> {
     let one = |text: &Option<String>, fallback: char| -> Result<char, OutputPlanError> {
         match text.as_deref().filter(|s| !s.is_empty()) {
@@ -1140,6 +1226,22 @@ pub enum OutputPlanError {
         value: String,
     },
 
+    /// A row whose widest packet does not encode.
+    #[error(
+        "uploader `{name}` cannot produce a valid APRS packet: {source}. The symbol code \
+         and `uploader.aprs_comment` are checked at plan time rather than at the first \
+         occurrence, because an encode failure is Fatal and would stop the component for \
+         the life of the process."
+    )]
+    Unencodable {
+        /// `uploader.name`.
+        name: String,
+        /// What the encoder refused. **Never the comment's bytes** — the encoder's own
+        /// message names the offending character or the byte count.
+        #[source]
+        source: mw_aprs::EncodeError,
+    },
+
     /// A `host:port` that is not one.
     #[error(
         "uploader `{name}` has the peer `{peer}`, which is not `host:port`. Both \
@@ -1282,6 +1384,197 @@ mod tests {
         let mut out = Vec::new();
         register(&cfg, &mut out)?;
         Ok(out)
+    }
+
+    /// **A symbol code that is not `_` is refused at plan time.**
+    ///
+    /// `symbol()` validated printability and not the *code*, so `aprs_symbol_code = 'O'`
+    /// planned cleanly — and then `encode_info` refused every occurrence, which classifies
+    /// `Fatal` and stops the component for the life of the process. The protocol has no
+    /// weather report under another code: `ddd/sss` there is course and speed in knots.
+    #[test]
+    fn a_non_weather_symbol_code_is_refused_at_plan_time() {
+        let e = plan(vec![UploaderRow {
+            aprs_symbol_code: Some("O".to_string()),
+            ..aprs_row()
+        }])
+        .expect_err("refused");
+        assert!(
+            matches!(
+                &e,
+                OutputPlanError::Unencodable { name, source }
+                    if name == "backyard"
+                        && matches!(source, mw_aprs::EncodeError::NotAWeatherSymbol { code: 'O' })
+            ),
+            "{e:?}"
+        );
+        assert!(e.to_string().contains("aprs_symbol_code"), "{e}");
+
+        // An overlaid TABLE is legal and still plans: only the code is fixed.
+        plan(vec![UploaderRow {
+            aprs_symbol_table: Some("\\".to_string()),
+            ..aprs_row()
+        }])
+        .expect("an overlay plans");
+    }
+
+    /// **`uploader.aprs_comment` is free text with no `CHECK`, so it is checked here.**
+    ///
+    /// Each of these planned and then failed to encode on every tick. The length is
+    /// checked against the **widest** packet the station can emit, so a comment does not
+    /// start failing when the rain gauge reports.
+    #[test]
+    fn a_comment_that_cannot_be_encoded_is_refused_at_plan_time() {
+        for (comment, why) in [
+            ("Café Station", "non-ASCII"),
+            ("two\nlines", "a newline injects a second APRS-IS packet"),
+            ("x\ty", "a tab is not printable"),
+        ] {
+            let e = plan(vec![UploaderRow {
+                aprs_comment: Some(comment.to_string()),
+                ..aprs_row()
+            }])
+            .expect_err(why);
+            assert!(
+                matches!(
+                    &e,
+                    OutputPlanError::Unencodable { source, .. }
+                        if matches!(source, mw_aprs::EncodeError::NotPrintable { .. })
+                ),
+                "{why}: {e:?}"
+            );
+        }
+
+        let long = "x".repeat(mw_aprs::MAX_INFORMATION_BYTES);
+        let e = plan(vec![UploaderRow {
+            aprs_comment: Some(long),
+            ..aprs_row()
+        }])
+        .expect_err("a comment longer than a packet");
+        assert!(
+            matches!(
+                &e,
+                OutputPlanError::Unencodable { source, .. }
+                    if matches!(source, mw_aprs::EncodeError::TooLong { .. })
+            ),
+            "{e:?}"
+        );
+
+        // An ordinary comment plans, and so does the absence of one.
+        plan(vec![UploaderRow {
+            aprs_comment: Some("Backyard WX - Portland OR".to_string()),
+            ..aprs_row()
+        }])
+        .expect("plans");
+        plan(vec![aprs_row()]).expect("no comment plans");
+    }
+
+    /// **An empty `api_key` is not a credential**, and was accepted as one.
+    ///
+    /// The four sibling credential columns all blank-filter. This one did not, so
+    /// `UPDATE uploader SET api_key = ''` planned a component whose every upload was a
+    /// `401` — `Fatal`, so it stopped for good rather than being refused where an operator
+    /// reads the reason.
+    #[test]
+    fn a_blank_api_key_is_a_missing_credential() {
+        for blank in ["", "   ", "\t"] {
+            let e = plan(vec![UploaderRow {
+                api_key: Some(SecretString::from(blank)),
+                ..wu_row()
+            }])
+            .expect_err("refused");
+            assert!(
+                matches!(
+                    &e,
+                    OutputPlanError::MissingCredential { name, column }
+                        if name == "backyard" && *column == "api_key"
+                ),
+                "{blank:?}: {e:?}"
+            );
+            // And the refusal does not echo the column's content.
+            assert!(!e.to_string().contains("hunter2"), "{e}");
+        }
+        plan(vec![wu_row()]).expect("a real credential plans");
+    }
+
+    /// **A malformed KISS address is not a missing one.**
+    ///
+    /// The `map_err` could only ever convert a real `BadPeer`, because `peer` answers
+    /// `MissingKiss` for the absent case itself — so `aprs_kiss_tcp_address = 'tnc.lan'`,
+    /// a host with no port, was reported as "no address configured" while the address sat
+    /// in the column the message said was empty.
+    #[test]
+    fn a_kiss_address_that_is_not_host_port_says_so() {
+        let kiss = |address: Option<&str>| UploaderRow {
+            aprs_transport: Some("kiss-tcp".to_string()),
+            aprs_kiss_tcp_address: address.map(str::to_string),
+            ..aprs_row()
+        };
+        for bad in ["tnc.lan", "tnc.lan:", "tnc.lan:0", ":9001", "tnc.lan:http"] {
+            let e = plan(vec![kiss(Some(bad))]).expect_err("refused");
+            assert!(
+                matches!(&e, OutputPlanError::BadPeer { peer, .. } if peer == bad),
+                "{bad}: {e:?}"
+            );
+        }
+        // The absent case is still the one that names the column.
+        for absent in [None, Some(""), Some("  ")] {
+            let e = plan(vec![kiss(absent)]).expect_err("refused");
+            assert!(
+                matches!(
+                    &e,
+                    OutputPlanError::MissingKiss { column, .. }
+                        if *column == "aprs_kiss_tcp_address"
+                ),
+                "{absent:?}: {e:?}"
+            );
+        }
+        plan(vec![kiss(Some("tnc.lan:8001"))]).expect("a real address plans");
+    }
+
+    /// **An arity violation is in the configuration, not in `stations.enabled`.**
+    ///
+    /// Two `station_service` rows on one account are W7 D-38's arity violation whether or
+    /// not one of the stations is switched off. The skip for a disabled station happened
+    /// before the component id was claimed, so the second pairing stayed invisible — and
+    /// re-enabling the station then refused the **whole** node's output plan, with the
+    /// `Arity` message pointing at an edit that had nothing to do with it.
+    #[test]
+    fn a_disabled_station_still_claims_its_component_id() {
+        let pairing = |station: &str| UploaderRow {
+            station_key: Some(station.to_string()),
+            ..wu_row()
+        };
+        let cfg = Cfg {
+            rows: vec![pairing("backyard"), pairing("orchard")],
+            windows: Some(view()),
+            not_collected: Vec::new(),
+            // The second pairing's station is switched off, which is the state the arity
+            // violation used to hide behind.
+            disabled: vec!["orchard".to_string()],
+        };
+        let mut out = Vec::new();
+        let e = register(&cfg, &mut out).expect_err("two pairings on one account");
+        assert!(
+            matches!(
+                &e,
+                OutputPlanError::Arity { name, first, second, .. }
+                    if name == "backyard" && first == "backyard" && second == "orchard"
+            ),
+            "{e:?}"
+        );
+
+        // One pairing with its station disabled is still a skip and not a refusal: that is
+        // the reversible case, and the warning is the whole of the answer.
+        let cfg = Cfg {
+            rows: vec![pairing("orchard")],
+            windows: Some(view()),
+            not_collected: Vec::new(),
+            disabled: vec!["orchard".to_string()],
+        };
+        let mut out = Vec::new();
+        register(&cfg, &mut out).expect("a disabled station is skipped");
+        assert!(out.is_empty(), "nothing is planned for a disabled station");
     }
 
     #[test]
