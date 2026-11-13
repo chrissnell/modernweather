@@ -128,6 +128,16 @@ Columns that are not value comparisons:
 | `go-only` / `rust-only` | coverage. The two databases do not hold the same readings over the window |
 | `unpaired` / `ambiguous` | (b) only. A reading with two candidate partners inside the tolerance is reported, never resolved by taking the nearer — silently choosing would mis-pair a window in which one daemon dropped a frame and then every metric differs for a reason that has nothing to do with either implementation |
 
+An endpoint that compared **no** keys is never green, even when both sides answered `200`: a
+`/span` that returned `[]` on both sides, or seven endpoints all answering `404 station not
+found`, is an agreement about the absence of data and not an agreement about data. The one
+exception is a matching **non-2xx** status — `/snow` 404s for a website with snow disabled, and
+the two sides agreeing on the status and the error body is a real result.
+
+The window is loaded wider than it is compared, by the pairing tolerance. A frame received at
+`17:59:59.999` by one daemon and `18:00:00.002` by the other has to have both halves available
+or it reads as a missing reading at every window edge.
+
 ---
 
 ## Preconditions, and why they are the first thing to check when a run is red
@@ -168,7 +178,7 @@ M5-2:
 | **DEV-4** | `/span` | `period_rain` and `windd` within `n × 2⁻²⁴ × max(\|a\|,\|b\|,1)` — the same model and the same constant `w9.rollup_report` reconciled the migration with |
 | **DEV-7** | `/span` | `solarjoules` on the new side is the Go side's value **times the bucket's reading count** |
 | **DEV-12** | `/span` | at most one extra bucket, at the **leading edge** only |
-| **DEV-11** | `/span`, `/latest` | the Go side emitted a non-finite literal and the new side emitted exactly `0` |
+| **DEV-11** | `/span`, `/latest` | the Go side's **body** is not JSON and carries a non-finite literal while the new side's parsed. A body rule, not a value rule: `encoding/json` refuses a non-finite mid-stream and truncates, so there is no pair of values to compare |
 
 Adding a rule is code **and** data: the `class` is a predicate in `src/expected.rs`, so a new
 one is a function somebody reviews rather than a line somebody adds. The loader refuses an
@@ -192,28 +202,29 @@ Run from an agent runtime against the live Go server and `pitcairn`'s database a
 and the new daemon and M5-1's migrated database as the subject. Both halves ran; neither meets
 its done-criterion yet, and the reasons are inputs rather than arithmetic.
 
-**(b)** 600 readings over 50 minutes of one Campbell station, paired 600/600 through the
-`ser2net` bridge with a largest pairing offset of **7 ms**, 197 numeric columns compared.
+**(b)** 480 readings over 40 minutes of one Campbell station, paired **480/480** through the
+`ser2net` bridge with a largest pairing offset of **1 ms**, 197 numeric columns compared.
 Result: **184 columns differ only as D-26 predicts**, `windchill` and `heatindex` only as
-DEV-9 predicts, nine columns exactly equal — and **two columns differ for reasons no rule
-predicts**, both of them the two deployments' configuration rather than either
-implementation: `winddir` by the −94° vane calibration above, and `potentialsolarwatts` by the
-station's coordinates. M5-2's criterion is a 24-hour run reporting **only** NULL-versus-zero;
-the window here is 50 minutes because that is how long both daemons had been receiving the
-same station, and the criterion cannot be met until the calibration and the coordinates match.
+DEV-9 predicts, nine exactly equal — and **two columns differ for reasons no rule predicts**,
+both of them the two deployments' configuration rather than either implementation: `winddir`
+by the −94° vane calibration below, and `potentialsolarwatts` by the station's coordinates.
+M5-2's criterion is a 24-hour run reporting **only** NULL-versus-zero; the window here is
+short because that is how long both daemons had been receiving the same station, and the
+criterion cannot be met until the calibration and the coordinates match.
 
-**(c)** All four `/span` bands, `/latest`, `/snow` and `/almanac`. DEV-4 fired **149** times
-and DEV-7 **314**, inside their bound and matching their relationship, which is the first
-evidence either deviation behaves as predicted on real data. Beyond the two configuration differences above and the coverage gap
-(the migrated database was ~19 hours behind the source, which the harness reported as
-`go-only` and `uneven` buckets), four things no decision predicts:
+**(c)** All four `/span` bands, `/latest`, `/snow` and `/almanac`. **DEV-4 fired 148 times and
+DEV-7 353**, inside their bound and matching their relationship, which is the first evidence
+either deviation behaves as predicted on real data. Beyond the two configuration differences
+above and the coverage gap (the migrated database was ~19 hours behind the source, which the
+harness reported as `go-only` and `uneven` buckets), five things no decision predicts:
 
 | | |
 |---|---|
 | **`stationtype`** | `"campbell"` on the Go side, `"campbellscientific"` on the new side, on every `/span` element. The device type string in the two configurations |
 | **1-ulp `float32` differences** | on `ohum`, `otemp`, `bar`, `extratemp1`, `solarwatts`, `stationbatteryvoltage` and `windch`, in a small minority of buckets. In every case examined the two sides hold the **identical** `float8` value and it lies **exactly** on a `float32` tie point: e.g. `observations_1h` gives `38947.830963134766 / 720`, which is precisely the midpoint of two adjacent `float32`s; the Go server emits the upper neighbour and the new side rounds half to even and emits the lower. A serialisation tie-break, contract-visible in the last digit, and **not in the deviation ledger**. The conformance suite does not catch it because no fixture happens to sit on a tie |
-| **`/latest`** | `stationname` is `""` and `stationtype` is absent on the new side where the Go side sends `"CSI"` and `"campbell"`; `monthrain` and `yearrain` are `0` where the Go side sends 1.54 and 15.11 inches; `windgust` differs by about 1 mph |
-| **`/almanac`** | `{}` on the new side. The migration carries no `almanac_cache` and nothing has populated it. Two consequences, and the second is a cutover decision rather than a defect: the cache has to be built before the endpoint serves anything, and the Go cache holds records from **2025-08-19** — earlier than the first imported reading of 2025-10-30 — so those all-time extremes are not reproducible from the migrated data and would reset at cutover |
+| **`/span`'s `rainincremental`** | `0` on the Go side against `0.04` on the new side, on nine of twenty-nine daily buckets. The Go daily view carries no value here and the DTO zero-fills it; the new side serves the stored statistic |
+| **`/latest`** | `stationname` is `""` and `stationtype` is absent on the new side where the Go side sends `"CSI"` and `"campbell"`; `monthrain` and `yearrain` are `0` where the Go side sends 1.54 and 15.11 inches |
+| **`/almanac`** | `{}` on the new side — fourteen records against none, so the endpoint compared nothing. The migration carries no `almanac_cache` and nothing has populated it. Two consequences, and the second is a cutover decision rather than a defect: the cache has to be built before the endpoint serves anything, and the Go cache holds records from **2025-08-19** — earlier than the first imported reading of 2025-10-30 — so those all-time extremes are not reproducible from the migrated data and would reset at cutover |
 
 `/snow` is the only endpoint green on both sides, and it is green because both return
 `404 snow data not enabled for this website`. That is a real agreement and the harness says

@@ -96,7 +96,13 @@ pub fn format_utc_ms_exact(ms: i64) -> String {
 /// and conflating them is how `/span/30d` becomes a 400 nobody expected.
 pub fn parse_duration_secs(s: &str) -> Result<i64, String> {
     let s = s.trim();
-    let (num, unit) = s.split_at(s.len().saturating_sub(1));
+    // Split on the last CHARACTER, not the last byte: `s.len() - 1` lands inside a
+    // multi-byte character and `split_at` panics there, so a mistyped unit would abort the
+    // run instead of printing the usage this function exists to print.
+    let (num, unit) = match s.char_indices().next_back() {
+        Some((at, _)) => s.split_at(at),
+        None => return Err("an empty duration: expected <number><s|m|h|d>".to_string()),
+    };
     let n: i64 = num
         .parse()
         .map_err(|_| format!("{s}: expected <number><s|m|h|d>"))?;
@@ -146,5 +152,13 @@ mod tests {
         assert_eq!(parse_duration_secs("24h").unwrap(), 86_400);
         assert_eq!(parse_duration_secs("7d").unwrap(), 604_800);
         assert!(parse_duration_secs("24").is_err());
+    }
+
+    #[test]
+    fn a_mistyped_unit_is_an_error_and_not_a_panic() {
+        // A multi-byte character at the end used to panic inside `split_at`.
+        assert!(parse_duration_secs("24\u{939}").is_err());
+        assert!(parse_duration_secs("").is_err());
+        assert!(parse_duration_secs("\u{939}").is_err());
     }
 }

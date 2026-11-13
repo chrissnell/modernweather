@@ -216,20 +216,26 @@ fn mechanism_b(args: &[String]) -> Result<ExitCode, String> {
 
     let injection = flags.get("inject").map(Injection::parse).transpose()?;
 
+    // Loaded wider than the window by the pairing tolerance, and compared inside it: a frame
+    // whose two receipt stamps straddle an edge must have both halves available or it becomes
+    // an unpaired reading for no reason but the edge.
+    let slack = expected.pair_tolerance_ms;
     let go = readings::load(
         &go_side,
         readings::GO,
+        "go",
         go_station,
-        from_ms,
-        until_ms,
+        from_ms - slack,
+        until_ms + slack,
         &expected,
     )?;
     let rust = readings::load(
         &rust_side,
         readings::RUST,
+        "rust",
         rust_station,
-        from_ms,
-        until_ms,
+        from_ms - slack,
+        until_ms + slack,
         &expected,
     )?;
 
@@ -280,7 +286,7 @@ fn mechanism_b(args: &[String]) -> Result<ExitCode, String> {
         lines.push(("control".to_string(), note));
     }
 
-    let outcome = readings::diff(go, rust, &expected);
+    let outcome = readings::diff(go, rust, &expected, (from_ms, until_ms));
     print!(
         "{}",
         report::readings(&outcome, &Provenance { lines }, flags.on("verbose"))

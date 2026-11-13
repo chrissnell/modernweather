@@ -140,6 +140,22 @@ impl EndpointOutcome {
             && self.go_only == 0
             && self.rust_only == 0
             && self.uneven == 0
+            && self.compared_something()
+    }
+
+    /// Whether this endpoint is evidence of anything.
+    ///
+    /// A `200` that yielded no value comparison is not a pass. Without this, seven endpoints
+    /// all answering `404 station not found`, or `/span` returning `200 []` on both sides,
+    /// report `ok` on every line and `VERDICT (c): PASS` -- and a green run that compared
+    /// nothing is exactly docs/reconciliation.md G-1, a gate reporting green by deferral.
+    /// Mechanism (b) has had this guard from the start as `paired > 0`.
+    ///
+    /// A matching NON-2xx status is the one case where comparing nothing is the right answer:
+    /// `/snow` 404s for a website with snow disabled, and the two sides agreeing on the
+    /// status and the error body is a real agreement about a real response.
+    pub fn compared_something(&self) -> bool {
+        self.keys_compared > 0 || self.go_status >= 300
     }
 
     pub fn verdict(&self) -> &'static str {
@@ -210,11 +226,34 @@ pub fn diff_endpoint(
         ));
     }
 
+    // DEV-11, and the only shape it can ever have. `mw_api_legacy::zf` serialises a stored
+    // NaN or +/-Inf as the contract's 0; Go's `encoding/json` refuses one mid-stream and
+    // truncates the body, so the Go side is not parseable and there is no pair of values to
+    // compare. Named from the rule set rather than from a branch here, so that removing the
+    // rule removes the excuse.
+    let go_nonfinite = g.json.is_none()
+        && r.json.is_some()
+        && ["NaN", "+Inf", "-Inf", "Infinity"]
+            .iter()
+            .any(|lit| g.text.contains(lit));
+
     let (gj, rj) = match (g.json.clone(), r.json.clone()) {
         (Some(a), Some(b)) => (a, b),
         _ => {
             // Four error-body conventions on the Go side and none of them is JSON. Equal
             // text on an equal status is a real agreement and is reported as one.
+            if let (true, Some(rule)) = (go_nonfinite, expected.nonfinite_body_rule(req.scope)) {
+                out.notes.push(format!(
+                    "the Go body is not JSON and carries a non-finite literal, which {rule} \
+                     predicts: the new side serialises a stored NaN or infinity as the \
+                     contract's 0 and answers, where `encoding/json` refuses it and truncates \
+                     the response. Go sent {} bytes of {:?}",
+                    g.text.len(),
+                    g.text.trim().chars().rev().take(40).collect::<String>()
+                ));
+                *out.expected.entry(rule.to_string()).or_default() += 1;
+                return Ok(out);
+            }
             if g.status == r.status && g.text.trim() == r.text.trim() {
                 out.notes.push(format!(
                     "both sides: {} {:?}",
@@ -401,7 +440,11 @@ fn diff_single(
     }
 
     if gf.is_empty() && rf.is_empty() {
-        out.notes.push("both sides returned an empty body".into());
+        out.notes.push(
+            "both sides returned an empty body, so nothing was compared. An agreement about \
+             the absence of data is not an agreement about data"
+                .into(),
+        );
         return;
     }
     out.paired = 1;

@@ -283,34 +283,22 @@ fn dev9_without_the_row_cannot_fire() {
 // ---------------------------------------------------------------- DEV-11, DEV-12
 
 #[test]
-fn dev11_is_the_go_sides_non_finite_literal_against_a_zero() {
+fn dev11_is_a_body_rule_and_not_a_value_rule() {
+    let e = expected();
+    // It applies where the ledger says the deviation is observable, and nowhere else.
+    assert_eq!(e.nonfinite_body_rule(Scope::Span), Some("DEV-11"));
+    assert_eq!(e.nonfinite_body_rule(Scope::Latest), Some("DEV-11"));
+    assert_eq!(e.nonfinite_body_rule(Scope::Almanac), None);
+    assert_eq!(e.nonfinite_body_rule(Scope::Readings), None);
+    // And it excuses no VALUE: a non-finite on one side against anything on the other is
+    // still unexpected, which is what stops the rule from covering a metric that went NaN
+    // inside a body that happened to parse.
     assert_eq!(
         classify(
             Scope::Span,
             "otemp",
             &Val::NonFinite("NaN".into()),
             &num(0.0),
-            Some(60)
-        ),
-        Verdict::Expected("DEV-11".into())
-    );
-    // Not the reverse, and not a non-finite against a number.
-    assert_eq!(
-        classify(
-            Scope::Span,
-            "otemp",
-            &Val::NonFinite("NaN".into()),
-            &num(47.0),
-            Some(60)
-        ),
-        Verdict::Unexpected
-    );
-    assert_eq!(
-        classify(
-            Scope::Span,
-            "otemp",
-            &num(0.0),
-            &Val::NonFinite("NaN".into()),
             Some(60)
         ),
         Verdict::Unexpected
@@ -461,4 +449,178 @@ fn an_injection_names_its_side_in_the_report() {
         .unwrap()
         .describe()
         .contains("Rust side"));
+}
+
+// ---------------------------------------------------------------- the guards the review found
+
+#[test]
+fn an_endpoint_that_compared_nothing_is_not_green() {
+    use mw_diff::responses::EndpointOutcome;
+    // A 200 that yielded no value comparison is not a pass: seven endpoints all answering
+    // `404 station not found`, or `/span` returning `200 []` on both sides, would otherwise
+    // report `ok` on every line and PASS. A green run that compared nothing is
+    // docs/reconciliation.md G-1.
+    let nothing = EndpointOutcome {
+        go_status: 200,
+        rust_status: 200,
+        ..Default::default()
+    };
+    assert!(!nothing.is_green());
+    let one = EndpointOutcome {
+        go_status: 200,
+        rust_status: 200,
+        keys_compared: 1,
+        ..Default::default()
+    };
+    assert!(one.is_green());
+    // A matching non-2xx is the one case where comparing nothing is the right answer: /snow
+    // 404s for a website with snow disabled, and both sides agreeing is a real agreement.
+    let refused = EndpointOutcome {
+        go_status: 404,
+        rust_status: 404,
+        ..Default::default()
+    };
+    assert!(refused.is_green());
+}
+
+#[test]
+fn a_recorded_dump_does_not_compare_the_identity_columns() {
+    use mw_diff::readings;
+    use mw_diff::source::RowSide;
+    // The documented way to record a dump is to run the harness's own query, so a dump
+    // carries `stationname` -- and comparing it against `station_id` would report the one
+    // thing held constant as a difference in every reading.
+    let dir = std::env::temp_dir().join("mw-diff-control");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("identity.tsv");
+    std::fs::write(
+        &path,
+        "time_us\tstationname\touttemp\tnote\n\
+         1794594603380589\tCSI\t47.8\tsunny\n\
+         1794594608380589\tCSI\t47.9\tsunny\n",
+    )
+    .unwrap();
+    let side = RowSide::parse(&format!("tsv:{}", path.display())).unwrap();
+    let loaded = readings::load(
+        &side,
+        readings::GO,
+        "go",
+        "CSI",
+        1_794_594_000_000,
+        1_794_595_000_000,
+        &expected(),
+    )
+    .unwrap();
+    assert_eq!(
+        loaded.columns,
+        vec!["outtemp".to_string()],
+        "{:?}",
+        loaded.columns
+    );
+    // And a column that is not an identity column but carries no number is reported rather
+    // than compared, which is what the psql side's type filter does.
+    assert_eq!(loaded.non_numeric.len(), 1, "{:?}", loaded.non_numeric);
+    assert!(
+        loaded.non_numeric[0].starts_with("note"),
+        "{:?}",
+        loaded.non_numeric
+    );
+    assert_eq!(loaded.rows.len(), 2);
+}
+
+#[test]
+fn a_frame_that_straddles_the_window_edge_still_pairs() {
+    use mw_diff::readings::{diff, Reading, Side};
+    // One frame, received by the Go daemon at 17:59:59.999 and by the new one at
+    // 18:00:00.002. Both halves are inside the LOADING window, which the caller widens by
+    // the pairing tolerance, and the comparison window starts at 18:00:00. Without the
+    // widening this is one unpaired reading on each side and the run is red for a
+    // non-difference; with it, nothing is reported.
+    let columns = vec!["outtemp".to_string()];
+    let value = |x: f64| Val::Num {
+        text: format!("{x}"),
+        f: x,
+    };
+    let go = Side {
+        columns: columns.clone(),
+        rows: vec![Reading {
+            ts_us: 1_794_592_799_999_000,
+            vals: vec![value(47.8)],
+        }],
+        non_numeric: vec![],
+        provenance: "test".into(),
+    };
+    let rust = Side {
+        columns,
+        rows: vec![Reading {
+            ts_us: 1_794_592_800_002_000,
+            vals: vec![value(47.8)],
+        }],
+        non_numeric: vec![],
+        provenance: "test".into(),
+    };
+    // The window begins at the instant between the two stamps.
+    let outcome = diff(
+        go,
+        rust,
+        &expected(),
+        (1_794_592_800_000, 1_794_592_900_000),
+    );
+    assert_eq!(
+        outcome.paired, 0,
+        "the Go reading is outside the comparison window"
+    );
+    assert_eq!(
+        outcome.unpaired_go, 0,
+        "and so it is not counted as unpaired either"
+    );
+    assert_eq!(
+        outcome.unpaired_rust, 0,
+        "nor is its partner, which is inside the window but has a Go candidate outside it"
+    );
+    assert!(
+        !outcome.is_green(),
+        "nothing paired, so there is nothing to pass"
+    );
+}
+
+#[test]
+fn a_reading_inside_the_window_pairs_with_a_partner_outside_it() {
+    use mw_diff::readings::{diff, Reading, Side};
+    // The mirror of the case above and the one that matters more: the Go reading is inside
+    // the window and its partner is 3 ms past the end. The partner is a candidate because
+    // the caller loaded it, and the pair is compared.
+    let columns = vec!["outtemp".to_string()];
+    let value = |x: f64| Val::Num {
+        text: format!("{x}"),
+        f: x,
+    };
+    let go = Side {
+        columns: columns.clone(),
+        rows: vec![Reading {
+            ts_us: 1_794_592_899_999_000,
+            vals: vec![value(47.8)],
+        }],
+        non_numeric: vec![],
+        provenance: "test".into(),
+    };
+    let rust = Side {
+        columns,
+        rows: vec![Reading {
+            ts_us: 1_794_592_900_002_000,
+            vals: vec![value(47.8)],
+        }],
+        non_numeric: vec![],
+        provenance: "test".into(),
+    };
+    let outcome = diff(
+        go,
+        rust,
+        &expected(),
+        (1_794_592_800_000, 1_794_592_900_000),
+    );
+    assert_eq!(outcome.paired, 1);
+    assert_eq!(outcome.unpaired_go, 0);
+    assert_eq!(outcome.unpaired_rust, 0);
+    assert!(outcome.is_green());
 }

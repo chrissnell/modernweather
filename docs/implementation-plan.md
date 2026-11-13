@@ -1163,25 +1163,26 @@ exactly the deviations `expected.toml` predicts, so the control is attributable 
 that drifted from its own prediction turns the gate red.
 
 **Neither done-criterion is met yet, and in both cases the obstacle is an input.** (b) paired
-**600 of 600** readings of the Campbell station over the `ser2net` bridge with a largest
-pairing offset of 7 ms, and reported 184 of 197 columns differing only as **D-26** predicts,
+**480 of 480** readings of the Campbell station over the `ser2net` bridge with a largest
+pairing offset of 1 ms, and reported 184 of 197 columns differing only as **D-26** predicts,
 `windchill`/`heatindex` only as **DEV-9** predicts, nine exactly equal — and two columns
 differing because the two deployments are not configured alike: a `wind_dir_correction` of
 −94° on the Go side and absent on the new one, and the station's coordinates, which move
-`potentialsolarwatts`. The criterion asks for 24 hours; the window was 50 minutes because that
+`potentialsolarwatts`. The criterion asks for 24 hours; the window was 40 minutes because that
 is how long both daemons had been receiving the same station.
 
-(c) ran all four `/span` bands, `/latest`, `/snow` and `/almanac`. **DEV-4 fired 149 times and
-DEV-7 314, inside their bound and matching their relationship** — the first evidence on real
+(c) ran all four `/span` bands, `/latest`, `/snow` and `/almanac`. **DEV-4 fired 148 times and
+DEV-7 353, inside their bound and matching their relationship** — the first evidence on real
 data that either deviation behaves as predicted, and DEV-7's own ledger entry says the
-conformance suite cannot establish it. Four findings no decision predicts, all recorded in
+conformance suite cannot establish it. Five findings no decision predicts, all recorded in
 `ci/diff/README.md` with evidence: `stationtype` is `"campbell"` against
 `"campbellscientific"`; **a `float32` tie-break difference** where both sides hold the
 identical `float8` value and it lies exactly on a `float32` midpoint, the Go server emitting
 the upper neighbour and this one rounding half to even — contract-visible in the last digit,
 on a minority of buckets, and the conformance suite misses it because no fixture sits on a
-tie; `/latest` serving `stationname` as `""` with `stationtype` absent and `monthrain` /
-`yearrain` as `0`; and `/almanac` serving `{}`, because the migration carries no
+tie; `/span`'s `rainincremental` serving `0.04` against the Go side's zero-filled `0` on nine
+of twenty-nine daily buckets; `/latest` serving `stationname` as `""` with `stationtype` absent
+and `monthrain` / `yearrain` as `0`; and `/almanac` serving `{}`, because the migration carries no
 `almanac_cache` and the Go cache holds records from **2025-08-19**, earlier than the first
 imported reading, so those all-time extremes are not reproducible from the migrated data and
 would reset at cutover.

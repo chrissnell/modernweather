@@ -51,8 +51,8 @@ pub fn readings(out: &ReadingsOutcome, prov: &Provenance, verbose: bool) -> Stri
     s.push('\n');
     s.push_str(&format!(
         "  readings   go {}   rust {}   paired {}   unpaired go {}   unpaired rust {}   ambiguous {}\n",
-        out.go.rows.len(),
-        out.rust.rows.len(),
+        out.go_in_window,
+        out.rust_in_window,
         out.paired,
         out.unpaired_go,
         out.unpaired_rust,

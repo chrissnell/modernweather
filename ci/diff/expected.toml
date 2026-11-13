@@ -179,15 +179,20 @@ the Rust side, or two extra leading buckets are all still unexpected."""
 
 [[responses.rule]]
 id = "DEV-11"
-class = "nonfinite_as_zero"
+class = "nonfinite_body"
 endpoints = ["span", "latest"]
-keys = ["*"]
 because = """
-A metric whose stored value is NaN or +/-Inf serialises as the contract's 0 rather than
-failing the response (`mw_api_legacy::zf`). The Go server emits the JSON literals `NaN` and
-`+Inf`, which are not JSON and which `encoding/json` refuses mid-stream, truncating the body.
+A metric whose stored value is NaN or +/-Inf serialises as the contract's 0 rather than failing
+the response (`mw_api_legacy::zf`). The Go server does fail: `encoding/json` refuses a
+non-finite mid-stream and truncates the body it has already started writing.
 
-The predicate is "the Go side is a non-finite literal and the Rust side is exactly 0", which
-cannot fire on well-formed data at all -- a run in which it never fires is the normal case and
-the rule costs nothing. It is here because a truncated Go body is otherwise a transport error
-with no explanation, and the harness should name the deviation instead."""
+So this is a BODY rule and not a value rule, which is the second draft of it. The first said
+"the Go side is a non-finite literal and the new side is exactly 0" -- a predicate that cannot
+fire, because the Go body never parses and there is no pair of values to compare. What the
+harness actually sees is one side's response being unusable, and the rule says that: the Go
+body is not JSON, it contains one of the non-finite literals, and the new side's body parsed.
+
+Without it a truncated Go body is a transport failure with no explanation, on an endpoint
+whose own deviation ledger predicted it. With it the line names the deviation and the run
+stays green -- and removing the rule removes the excuse, because the branch that reports it
+asks the rule set rather than deciding for itself."""

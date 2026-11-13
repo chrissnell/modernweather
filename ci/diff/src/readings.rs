@@ -131,6 +131,10 @@ impl MetricStat {
 pub struct Outcome {
     pub go: Side,
     pub rust: Side,
+    /// Readings each side had inside the comparison window, which is what the report prints:
+    /// the loaded counts include the pairing tolerance's slack and would not add up.
+    pub go_in_window: u64,
+    pub rust_in_window: u64,
     pub compared_columns: Vec<String>,
     pub go_only_columns: Vec<String>,
     pub rust_only_columns: Vec<String>,
@@ -177,9 +181,15 @@ fn is_numeric(data_type: &str) -> bool {
 }
 
 /// Load one side.
+///
+/// `from_ms`/`until_ms` are the LOADING window and are wider than the comparison window by
+/// the pairing tolerance: a frame whose two receipt stamps straddle the edge has to have both
+/// halves available, or it becomes an unpaired reading and the run goes red for a
+/// non-difference. [`diff`] is given the real window and restricts to it.
 pub fn load(
     side: &RowSide,
     shape: Shape,
+    side_label: &str,
     station: &str,
     from_ms: i64,
     until_ms: i64,
@@ -201,7 +211,22 @@ pub fn load(
                     path.display()
                 ));
             }
-            let columns: Vec<String> = cols[1..].to_vec();
+            // The same two filters the psql branch applies, because the documented way to
+            // record a dump is to run the harness's own query -- so a dump carries the
+            // identity columns too, and comparing `stationname` against `station_id` would
+            // report the one thing held constant as a difference in every reading. The type
+            // filter cannot be read from a TSV, so it is inferred below from the values.
+            let columns: Vec<String> = cols[1..]
+                .iter()
+                .filter(|c| !expected.not_metrics.contains(*c))
+                .cloned()
+                .collect();
+            let keep: Vec<usize> = cols[1..]
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !expected.not_metrics.contains(*c))
+                .map(|(i, _)| i + 1)
+                .collect();
             let mut rows = Vec::new();
             for (i, line) in lines.enumerate() {
                 let f: Vec<&str> = line.split('\t').collect();
@@ -227,19 +252,53 @@ pub fn load(
                 }
                 rows.push(Reading {
                     ts_us,
-                    vals: f[1..].iter().map(|v| Val::from_psql_field(v)).collect(),
+                    vals: keep.iter().map(|i| Val::from_psql_field(f[*i])).collect(),
                 });
             }
             rows.sort_by_key(|r| r.ts_us);
+            // A column whose every non-NULL value fails to parse as a number is not a metric.
+            // Inferred rather than declared, because a TSV carries no types -- and reported
+            // rather than dropped silently, which is what the psql branch does with the same
+            // class of column.
+            let mut numeric = Vec::new();
+            let mut non_numeric = Vec::new();
+            for (i, col) in columns.iter().enumerate() {
+                let mut saw_value = false;
+                let mut saw_number = false;
+                for row in &rows {
+                    match &row.vals[i] {
+                        Val::Null => {}
+                        Val::Num { .. } => {
+                            saw_value = true;
+                            saw_number = true;
+                        }
+                        _ => saw_value = true,
+                    }
+                }
+                if saw_value && !saw_number {
+                    non_numeric.push(format!("{col} (no numeric value in the window)"));
+                } else {
+                    numeric.push(i);
+                }
+            }
+            if !non_numeric.is_empty() {
+                for row in rows.iter_mut() {
+                    row.vals = numeric.iter().map(|i| row.vals[*i].clone()).collect();
+                }
+            }
+            let columns: Vec<String> = numeric.iter().map(|i| columns[*i].clone()).collect();
             Ok(Side {
                 columns,
                 rows,
-                non_numeric: Vec::new(),
+                non_numeric,
                 provenance: format!("tsv:{}", path.display()),
             })
         }
         RowSide::Psql { command } => {
-            let psql = Psql::new(shape.table, command)?;
+            // The label is which SIDE this is, not which table: an error that reads
+            // "weather: no such table in the public schema of weather" names the same thing
+            // twice and never says which of the two databases failed.
+            let psql = Psql::new(&format!("{side_label} ({})", shape.table), command)?;
             let name = quote_station(station)?;
             let catalog = psql.rows(&format!(
                 "SELECT column_name, data_type FROM information_schema.columns \
@@ -305,9 +364,17 @@ pub fn load(
     }
 }
 
-/// Diff two already-loaded sides.
-pub fn diff(go: Side, rust: Side, expected: &Expected) -> Outcome {
+/// Diff two already-loaded sides over `window`, in epoch milliseconds.
+///
+/// The sides are loaded wider than the window by the pairing tolerance and the window is
+/// applied here: a Go reading inside it is in scope, and a Rust reading outside it is a
+/// candidate partner but is never counted as unpaired. Without that, every run reported one
+/// or two unpaired readings at each edge -- a frame received at 17:59:59.999 by one daemon and
+/// at 18:00:00.002 by the other -- and `is_green` turned a non-difference red.
+pub fn diff(go: Side, rust: Side, expected: &Expected, window: (i64, i64)) -> Outcome {
     let tolerance_us = expected.pair_tolerance_ms * 1_000;
+    let (from_us, until_us) = (window.0 * 1_000, window.1 * 1_000);
+    let in_window = |ts_us: i64| ts_us >= from_us && ts_us < until_us;
 
     let go_set: Vec<&String> = go.columns.iter().collect();
     let rust_set: Vec<&String> = rust.columns.iter().collect();
@@ -347,6 +414,9 @@ pub fn diff(go: Side, rust: Side, expected: &Expected) -> Outcome {
     let (mut paired, mut unpaired_go, mut ambiguous, mut max_offset_us) = (0u64, 0u64, 0u64, 0i64);
 
     for g in &go.rows {
+        if !in_window(g.ts_us) {
+            continue;
+        }
         let lo = rust_times.partition_point(|t| *t < g.ts_us - tolerance_us);
         let hi = rust_times.partition_point(|t| *t <= g.ts_us + tolerance_us);
         match hi - lo {
@@ -424,10 +494,29 @@ pub fn diff(go: Side, rust: Side, expected: &Expected) -> Outcome {
         }
     }
 
-    let unpaired_rust = claimed.iter().filter(|c| !**c).count() as u64;
+    // A Rust reading counts as unpaired only if the Go side has no candidate for it at all.
+    // One whose partner exists but fell outside the comparison window is the straddling
+    // frame again, seen from the other side: the pair is not compared, and reporting it as a
+    // missing reading would be the same false red the loading slack exists to remove.
+    let go_times: Vec<i64> = go.rows.iter().map(|r| r.ts_us).collect();
+    let has_go_candidate = |ts_us: i64| {
+        let lo = go_times.partition_point(|t| *t < ts_us - tolerance_us);
+        let hi = go_times.partition_point(|t| *t <= ts_us + tolerance_us);
+        hi > lo
+    };
+    let unpaired_rust = rust
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(j, r)| !claimed[*j] && in_window(r.ts_us) && !has_go_candidate(r.ts_us))
+        .count() as u64;
+    let go_in_window = go.rows.iter().filter(|r| in_window(r.ts_us)).count() as u64;
+    let rust_in_window = rust.rows.iter().filter(|r| in_window(r.ts_us)).count() as u64;
     Outcome {
         go,
         rust,
+        go_in_window,
+        rust_in_window,
         compared_columns: compared,
         go_only_columns: go_only,
         rust_only_columns: rust_only,

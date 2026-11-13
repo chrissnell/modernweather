@@ -29,8 +29,8 @@ cd "$HERE"
 # A filter that matches no tests exits zero, and a gate that reports green while running
 # nothing is docs/reconciliation.md G-1. Same rule, and the same mechanism, as
 # `cargo xtask emulator-tests` and `cargo xtask db-tests`: the declared number is the gate.
-UNIT_TESTS=8
-CONTROL_TESTS=26
+UNIT_TESTS=11
+CONTROL_TESTS=30
 
 BIN="$HERE/target/debug/mw-diff"
 GO_ROWS="tsv:recorded/readings-go.tsv"

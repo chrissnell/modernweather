@@ -38,19 +38,16 @@ impl Psql {
 
     /// The command as it would be typed, for the report's provenance line.
     ///
-    /// Anything that looks like a password assignment is replaced: the harness prints its own
-    /// inputs so a reader can tell which two systems a verdict is about, and a report that is
-    /// only publishable after somebody remembers to redact it will be published unredacted
-    /// once.
+    /// The harness prints its own inputs so that a reader can tell which two systems a
+    /// verdict is about, and a report that is only publishable after somebody remembers to
+    /// redact it will be published unredacted once. So both places a password can be in a
+    /// `psql` invocation are rewritten: a `PGPASSWORD=`-style assignment, and the userinfo of
+    /// a connection URI -- which is the form `ci/conformance/go-target.sh` and
+    /// `ci/db/migrate-from-go/lab/run-in-pod.sh` both build, so it is the likely one.
     pub fn redacted(&self) -> String {
         self.argv
             .iter()
-            .map(|a| match a.split_once('=') {
-                Some((k, _)) if k.to_ascii_uppercase().contains("PASSWORD") => {
-                    format!("{k}=<redacted>")
-                }
-                _ => a.clone(),
-            })
+            .map(|a| redact_arg(a))
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -96,6 +93,35 @@ impl Psql {
     }
 }
 
+/// One argv element with any password in it replaced.
+fn redact_arg(arg: &str) -> String {
+    // `scheme://userinfo@rest`: everything between `://` and the LAST `@` before the next
+    // `/` is credentials. The last, because a password may itself contain an `@`.
+    if let Some(scheme_end) = arg.find("://") {
+        let (scheme, rest) = arg.split_at(scheme_end + 3);
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        if let Some(at) = rest[..authority_end].rfind('@') {
+            let userinfo = &rest[..at];
+            let user = userinfo.split_once(':').map_or(userinfo, |(u, _)| u);
+            let had_password = userinfo.contains(':');
+            return format!(
+                "{scheme}{user}{}@{}",
+                if had_password { ":<redacted>" } else { "" },
+                &rest[at + 1..]
+            );
+        }
+        return arg.to_string();
+    }
+    match arg.split_once('=') {
+        Some((k, v)) if k.to_ascii_uppercase().contains("PASSWORD") => {
+            // A `=` inside a value is still part of the value: only the first one splits.
+            let _ = v;
+            format!("{k}=<redacted>")
+        }
+        _ => arg.to_string(),
+    }
+}
+
 /// A station name, quoted for SQL.
 ///
 /// Doubling the quote would be enough, and the allowlist is here anyway: these names come
@@ -116,4 +142,37 @@ pub fn quote_station(name: &str) -> Result<String, String> {
         ));
     }
     Ok(format!("'{name}'"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_arg;
+
+    #[test]
+    fn a_uri_password_does_not_reach_the_report() {
+        assert_eq!(
+            redact_arg("postgresql://weather:s3cr3t@box:5432/weather_v2_0_0"),
+            "postgresql://weather:<redacted>@box:5432/weather_v2_0_0"
+        );
+        // An `@` inside the password still leaves the host intact.
+        assert_eq!(
+            redact_arg("postgresql://u:p@ss@box/db"),
+            "postgresql://u:<redacted>@box/db"
+        );
+        // No password, no change -- and the user is kept, because which role read the data
+        // is part of what the provenance line is for.
+        assert_eq!(
+            redact_arg("postgresql://weather@box/db"),
+            "postgresql://weather@box/db"
+        );
+        assert_eq!(redact_arg("postgresql://box/db"), "postgresql://box/db");
+    }
+
+    #[test]
+    fn an_assignment_password_does_not_reach_the_report() {
+        assert_eq!(redact_arg("PGPASSWORD=s3cr3t"), "PGPASSWORD=<redacted>");
+        assert_eq!(redact_arg("PGPASSWORD=a=b"), "PGPASSWORD=<redacted>");
+        assert_eq!(redact_arg("PGHOST=box"), "PGHOST=box");
+        assert_eq!(redact_arg("psql"), "psql");
+    }
 }

@@ -172,8 +172,15 @@ enum Class {
     Float4Accumulated,
     /// The new side is the Go side times the bucket's reading count (DEV-7).
     MeanToTotal,
-    /// The Go side emitted a non-finite literal and the new side emitted 0 (DEV-11).
-    NonFiniteAsZero,
+    /// The Go side's body is not JSON because it carries a non-finite literal, and the new
+    /// side's parsed (DEV-11). A body-level rule, decided in `responses`.
+    ///
+    /// This is NOT a per-value predicate and the first draft of it was: "the Go side emitted
+    /// `NaN` and the new side emitted 0" cannot fire, because `encoding/json` refuses a
+    /// non-finite mid-stream and truncates the response -- so the Go body never parses and
+    /// there is no pair of values to compare. The deviation is real and only mechanism (c)
+    /// can ever see it; what it looks like is one side's body being unusable.
+    NonFiniteBody,
     /// A coverage rule, decided in `responses`, not per value (DEV-12).
     ExtraLeadingBucket,
 }
@@ -257,6 +264,15 @@ impl Expected {
         })
     }
 
+    /// The rule that predicts an unparseable Go body carrying a non-finite literal, if the
+    /// set declares one for this scope.
+    pub fn nonfinite_body_rule(&self, scope: Scope) -> Option<&str> {
+        self.rules
+            .iter()
+            .find(|r| r.class == Class::NonFiniteBody && r.scopes.contains(&scope))
+            .map(|r| r.id.as_str())
+    }
+
     /// How many leading buckets may be present on the Rust side alone, per DEV-12.
     pub fn allowed_extra_leading_buckets(&self) -> (u32, Option<&str>) {
         for r in &self.rules {
@@ -283,6 +299,9 @@ impl Expected {
                         return Verdict::Expected(rule.id.clone());
                     }
                 }
+                // Not a value predicate: `responses` consults `nonfinite_body_rule` when a
+                // body fails to parse, which is before there are any values.
+                Class::NonFiniteBody => {}
                 Class::NullVsGoColumn => {
                     // The whole predicate: the new side is absent AND the Go side stored the
                     // named column's value here. A Go side that stored anything else does not
@@ -295,11 +314,6 @@ impl Expected {
                                 }
                             }
                         }
-                    }
-                }
-                Class::NonFiniteAsZero => {
-                    if matches!(c.go, Val::NonFinite(_)) && c.rust.is_zero() {
-                        return Verdict::Expected(rule.id.clone());
                     }
                 }
                 Class::Float4Accumulated => match (c.go.num(), c.rust.num(), c.n_readings) {
@@ -371,7 +385,7 @@ fn compile(raw: &RawRule, default_scope: Scope) -> Result<Rule, String> {
         }
         "float4_accumulated" => Class::Float4Accumulated,
         "mean_to_total" => Class::MeanToTotal,
-        "nonfinite_as_zero" => Class::NonFiniteAsZero,
+        "nonfinite_body" => Class::NonFiniteBody,
         "extra_leading_bucket" => Class::ExtraLeadingBucket,
         other => {
             return Err(format!(
@@ -423,7 +437,7 @@ fn compile(raw: &RawRule, default_scope: Scope) -> Result<Rule, String> {
         }
         None
     } else if named.is_empty() {
-        if class == Class::ExtraLeadingBucket {
+        if matches!(class, Class::ExtraLeadingBucket | Class::NonFiniteBody) {
             None
         } else {
             return Err(format!(
