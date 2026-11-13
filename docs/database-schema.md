@@ -1284,6 +1284,38 @@ The migration for decision 1 drops and recreates `observations_1m`, whose defini
 
 *Recommendation:* **(a), as a W2 follow-up.** It is the smaller change and it matches what the two values actually are — wire metadata, not measurements. The saving is two text values per row on the uncompressed window, so the priority is low; the reason to do it is that two sources of a station's name is the kind of thing that diverges silently. **Not done here:** the registry change is W2's and the prompt's own `Do not` section says so.
 
+**Done as (a)** — the role is N-14 (implementation-plan.md M1-2) and the move is **M5-5**, after
+M5-1's migration had proved the snapshot path reads display metadata from `config.stations`
+(assumption 24 below). `observations` carries **214** generator-owned columns rather than 216, and
+the registry still has **216 allocated identifiers**: a `metadata` dimension keeps its protobuf
+field number forever, exactly as a deprecated metric does, and `cargo xtask budget` prints the two
+numbers separately for that reason.
+
+Three things the option as written did not say, and each is load-bearing:
+
+* **No `DROP COLUMN` is emitted, and that is deliberate.** A dropped column keeps its attribute
+  number forever and is charged twice against the 1600-column ceiling once the hypertable is
+  compressed (H-4, D-19). So the two columns stay where they are, unwritten, and the migration says
+  so in a comment rather than reclaiming a slot that a full table rewrite is the only way to get
+  back. `crates/mw-store/tests/db.rs` asserts both halves: the columns are in the catalogue, and
+  nothing writes them.
+* **`stationname` and `stationtype` do not end up in the same place**, because the frozen contract
+  does not treat them the same way. The display name is configuration: `/latest` and `/span` both
+  resolve it from `config.stations.name`, which is the string `?station=` matches and the one the Go
+  writer projected onto the column. `/latest` gets it on `SnapshotSource`, resolved from the
+  published registry on each fold rather than captured when the renderer was built, so a rename is
+  visible on the next reading — assumption 24 below is where that belongs. The type is the
+  **device's own claim** — `/latest`'s `stationtype` is `campbell` where the configured type is
+  `campbellscientific`, and `docs/legacy-api-contract.md` §3.1 forbids unifying the two
+  vocabularies — so it cannot come from configuration at all. It goes to `stations.reported_type`, a
+  second column beside `stations.type`, which is this section's own answer applied one level down:
+  one value per station instead of one per row, and two columns rather than one so that a reader
+  cannot get the wrong vocabulary by accident.
+* **The migrated history is read once, in that migration.** Nothing writes
+  `observations.stationtype` again, so a station that is not currently reporting would otherwise
+  lose a type it has been sending for a decade; the migration takes the newest non-NULL value per
+  station before the writer stops producing them.
+
 **OQ-W4-3. Should the registry gain a `jsonb` SQL type so `extra` can be a registry entry?**
 
 `observations.extra` is created by the W4 migration and is not in `metrics/registry.toml`, because `SqlType` has no `jsonb` variant and because an escape hatch for unmodelled fields has no business having a protobuf field number. The consequence is a column on a generated table that `generated/sql/020_observations.sql` does not mention — defensible, since migrations are the applied artefact and the generated files are reference, but it is a seam.
@@ -1356,7 +1388,7 @@ Decision 13 puts a requirement on the read path without saying where in it. The 
 21. The writer stores NULL for an unreported metric (§2.5), which is what makes decision 8 necessary rather than theoretical.
 22. §2.3's cancel-safe replay uses `ON CONFLICT (station_id, time) DO UPDATE` (assumption 22) against the unique index decision 11 creates, and the prefix it replays is seconds old, so it lands in the uncompressed window. A replay reaching a compressed chunk works but costs 5.5× as much (281 ms against 51 ms for 30 rows) and is a TimescaleDB 2.31 property rather than a general one.
 23. `snow:*` writes `snow_totals_cache` in inches (the `/snow` unit), not the millimetres `snowdepth` carries on `/latest` (Q-4). The column comment says so; the conversion is W3's.
-24. `snapshot:latest` reads `stations` for display name, type, latitude, longitude and timezone rather than reading `stationname`/`stationtype` off a reading — which is what makes OQ-W4-2's eventual column drop contained.
+24. `snapshot:latest` reads `stations` for display name, type, latitude, longitude and timezone rather than reading `stationname`/`stationtype` off a reading — which is what makes OQ-W4-2's eventual column drop contained. **Discharged by M5-1 and acted on by M5-5**, with one correction the assumption did not anticipate: the *type* on `/latest` is the device's self-reported one and therefore is not configuration, so it is read from `stations.reported_type` rather than from `stations.type`. The containment holds; the source is a different column of the same projection.
 25. Aggregate refresh duration is observable for §5.10's `mw_aggregate_refresh_seconds` (assumption 24): `timescaledb_information.job_stats` carries per-job run duration, which is what §6.2's 28–53 ms came from.
 26. `ReadingStore` queries the levels at the four band boundaries §8.2 names, and the per-level `(station_id, bucket DESC)` indexes in decision 21 are built for that predicate.
 

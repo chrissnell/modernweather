@@ -734,6 +734,11 @@ fn served(station: &Station, at: DateTime<Utc>) -> (String, String) {
             altitude_m: Some(1800.0),
             snow_base_distance_mm: None,
         },
+        // The configured device name, which is where `/latest`'s `stationname` comes from
+        // since M5-5. The rig's stations are named after their keys, as a configuration
+        // migrated from Go would be -- which is also what `latest_fixtures()` below relies
+        // on when it takes each fixture's station from its own response body.
+        display_name: Some(station.key.clone()),
         // No window declarations: `/span`'s rolling values are zero-filled and none of them
         // is a sun time.
         windows: Resolved::new(at, []),

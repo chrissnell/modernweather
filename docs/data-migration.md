@@ -88,7 +88,8 @@ inherited rather than discovered:
   at 0.09 B/row compressed — essentially zero, because `station_id` is the `compress_segmentby` key —
   and declined it. So the transform resolves `stationname` to a *text* `station_id`, and
   `stationname`/`stationtype` **stay** on the row as `role = "attribute"` dimensions. They leave
-  later, under OQ-W4-2, and that is a W2 follow-up.
+  later, under OQ-W4-2, and that is a W2 follow-up. **They left in M5-5**, after this migration
+  ran: see assumption 5 below for what that changed here and what it did not.
 - **Four levels, not three.** W4 added `observations_5m`. The rollup archive therefore has two
   destinations that matter and two that cannot reach it; §3.4.
 - **Retention on the lower levels.** 7 days on `observations_1m`, 14 on `_5m`, 90 on `_1h`. This is
@@ -765,6 +766,16 @@ INSERT INTO observations (station_id, <the 215 columns, by name>)
 SELECT <station_id resolved from stationname>, <the same 215 columns>
   FROM weather;
 ```
+
+**215 as of M5-1; 213 since M5-5**, which retired `stationname` and `stationtype` to
+`role = "metadata"`. The list is derived from the registry, so it shrank on its own — but the two
+columns are still in the *source*, which makes them `unknown_in_source` in `w9.gap_report` and
+`w9.assert_no_unknown_source_columns()` would refuse the import over them. That is the assertion
+working: an unrouted source column is data with no destination. The resolution is the one the
+staging schema was built for — `w9.record_retired_dimensions()`, generated from the registry, records
+both in `w9.dropped_source_column` with the reason, for the columns the source actually declares.
+`w9.populate_stations()` still writes the display name into `stations.name`, so nothing is lost:
+the import stopped copying a per-row duplicate, not a value.
 
 **The risk is not the mapping, it is the width.** The Go source declares 215 columns and production
 carries about 143 (W0 OQ-6), and nothing in the repository knows which 143. A baked column list would
@@ -1580,6 +1591,13 @@ rather than changed.
    dimensions. The import copies them. When OQ-W4-2 drops them, the import's column list shrinks
    automatically because it is derived from the registry — but `w9.station_map` becomes the only
    source of a station's name, which is what OQ-W4-2 intends.
+   **Discharged by M5-5 and the prediction held**, with one thing it did not foresee: the columns
+   stay in the *source*, so omitting them from `w9.expected_column` makes them
+   `unknown_in_source` and `w9.assert_no_unknown_source_columns()` refuses the import until the
+   decision is on the record. `w9.record_retired_dimensions()` is that record, generated from the
+   registry's `metadata` dimensions and joined to `w9.source_column` so it only ever claims a
+   column the source really has. `migrate-from-go.sh`'s `gap` step calls it immediately before the
+   assertion.
 6. `station_metrics` is keyed by the registry's stable `key` and not by the column name (W4 §2.2).
    `w9.metric_key` is generated from the registry for this.
 7. Every metric column in `observations` is nullable (W4 §3.4), so a column production does not have
@@ -1624,7 +1642,13 @@ rather than changed.
     read-side projection a response renders; the match never reads it.
 17. `snapshot:latest` reads `stations` for display name and type rather than reading
     `stationname`/`stationtype` off a reading (W4 assumption 24). The migration populates `stations`
-    before any reading for this reason.
+    before any reading for this reason. **M5-5 acted on this**, and split it: the display name is
+    configuration and is read from `config.stations` (through `SnapshotSource::display_name`, so a
+    rename does not wait for a restart), while `/latest`'s *type* is the device's own claim (§3.1 of
+    the legacy contract keeps `campbell` and `campbellscientific` distinct) and is read from
+    `stations.reported_type`. A re-run of this migration populates `stations.type` from the source's
+    `stationtype` as it always did; `reported_type` is backfilled once, from the raw column, by
+    `migrations/20261113230000`.
 18. `ReadingStore::span` reads `observations_1d` and not `observations_1d_with_legacy` (Decision 6).
     If W3 or a later work item points it at the union view, §3.1's 37% is the cost and the 365-row
     result is the benefit.

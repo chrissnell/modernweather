@@ -86,6 +86,7 @@ fn an_unconfigured_key_is_absent_and_unwritable() {
                 website: website(9, "ghost", "backyard"),
                 reading: Reading::default(),
                 meta: mw_component::StationMeta::EMPTY,
+                display_name: None,
                 windows: Resolved::new(at("2026-11-07T18:00:00Z"), []),
             },
             Staleness::Fresh,

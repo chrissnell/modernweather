@@ -12,9 +12,9 @@ export interface Reading {
   time: string;
   /** Station (`station_id`) */
   station_id: string;
-  /** Station name (`stationname`) */
+  /** Station name (wire metadata, not a column) */
   station_name: string | null;
-  /** Station type (`stationtype`) */
+  /** Station type (wire metadata, not a column) */
   station_type: string | null;
 
   /** Pressure — inHg (`barometer`) */

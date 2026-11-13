@@ -364,15 +364,18 @@ async fn readings_land_in_observations_and_an_unreported_metric_is_null() {
     assert_eq!(rows[0].get::<Option<f32>, _>("outtemp"), Some(41.5));
     assert_eq!(rows[0].get::<Option<f32>, _>("outhumidity"), Some(62.0));
     assert_eq!(rows[0].get::<Option<f32>, _>("windspeed"), Some(7.25));
+    // **M5-5: the two retired columns are never written, and the reading carried both.**
+    // `station_name` and `station_type` are `role = "metadata"` now, so they reach the
+    // daemon on the wire, feed the `stations` projection below, and are not bound by the
+    // `INSERT`. The columns themselves are still there because the migration emits no
+    // `DROP COLUMN` (H-4, D-19), which is exactly why this is worth asserting: a writer
+    // that still bound them would pass every other test in this file.
     assert_eq!(
-        rows[0].get::<Option<String>, _>("stationname").as_deref(),
-        Some("the back yard"),
-        "the two attribute dimensions are columns too"
+        rows[0].get::<Option<String>, _>("stationname"),
+        None,
+        "the reading reported a station name and the raw table is not where it goes"
     );
-    assert_eq!(
-        rows[0].get::<Option<String>, _>("stationtype").as_deref(),
-        Some("weatherlink-live")
-    );
+    assert_eq!(rows[0].get::<Option<String>, _>("stationtype"), None);
 
     // One column of each of the five `sql_type`s the registry declares, all unreported.
     for row in &rows {
@@ -390,11 +393,19 @@ async fn readings_land_in_observations_and_an_unreported_metric_is_null() {
             );
         }
     }
-    // The second reading reported only a temperature, so every other column of it is null
-    // — including the two dimensions, which the first reading did fill.
+    // The second reading reported only a temperature, so every other column of it is null.
     assert_eq!(rows[1].get::<Option<f32>, _>("outtemp"), Some(41.0));
     assert_eq!(rows[1].get::<Option<f32>, _>("outhumidity"), None);
-    assert_eq!(rows[1].get::<Option<String>, _>("stationname"), None);
+    // The wire metadata still reached the projection, which is the half of M5-5 that is a
+    // move rather than a removal: the display name is read from `config.stations` first
+    // and from the reading only as a fallback, and `row()` configures this station, so the
+    // configured name is what is there.
+    let name: String = sqlx::query_scalar("SELECT name FROM stations WHERE station_id = $1")
+        .bind(station)
+        .fetch_one(&pool)
+        .await
+        .expect("the projection row exists");
+    assert_eq!(name, format!("{station} (configured)"));
     touched(
         &pool,
         "readings_land_in_observations_and_an_unreported_metric_is_null",
@@ -414,10 +425,23 @@ async fn readings_land_in_observations_and_an_unreported_metric_is_null() {
 /// forgotten — which is the direction `cargo xtask migrate` cannot catch either, because
 /// it emits from the registry and has nothing to compare the database against.
 ///
-/// `extra` is the one expected extra: W4 §4's escape hatch for unmodelled vendor fields,
-/// deliberately outside `metrics/registry.toml` because the registry is the source of
-/// truth for *modelled* metrics (OQ-W4-3). It is named here rather than filtered silently,
-/// so a *second* unregistered column is a failure.
+/// Three columns are expected extras, each for a stated reason, and they are named here
+/// rather than filtered silently so that a *fourth* unregistered column is a failure.
+///
+/// `extra` is W4 §4's escape hatch for unmodelled vendor fields, deliberately outside
+/// `metrics/registry.toml` because the registry is the source of truth for *modelled*
+/// metrics (OQ-W4-3).
+///
+/// `stationname` and `stationtype` are **M5-5's retired dimensions**, and their presence
+/// here is the migration behaving as designed rather than a gap in it: a `metadata`
+/// dimension leaves the generated DDL and no `DROP COLUMN` is emitted, because a dropped
+/// attribute number is never released and is charged twice against the 1600-column ceiling
+/// once the hypertable is compressed (H-4, D-19). So the columns stay where they are,
+/// unwritten, and `metrics/snapshot.toml` keeps both identifiers allocated. The assertion
+/// this test makes about them is therefore the opposite of the one it makes about the
+/// metrics: these two must be in the catalogue and must NOT be in the registry's stored
+/// set, and `readings_land_in_observations_and_an_unreported_metric_is_null` is what
+/// asserts nothing writes them.
 #[tokio::test]
 #[ignore = "needs a real TimescaleDB; run `cargo xtask db-tests`"]
 async fn the_observations_columns_are_exactly_what_the_registry_declares() {
@@ -454,6 +478,24 @@ async fn the_observations_columns_are_exactly_what_the_registry_declares() {
         )
         .collect();
     declared.insert(("extra".to_string(), "jsonb".to_string()));
+    // See the three-extras note above. Asserted as a *difference* between the catalogue and
+    // the registry rather than inserted blindly: if a later migration does drop them, this
+    // fails and names the line to delete, instead of quietly sanctioning a column that is
+    // no longer there.
+    for retired in ["stationname", "stationtype"] {
+        assert!(
+            actual.contains(&(retired.to_string(), "text".to_string())),
+            "`{retired}` is M5-5's retired dimension and the migration emits no DROP \
+             COLUMN, so it is still a column of `observations`. If it has been dropped by \
+             hand, remove it from this list."
+        );
+        assert!(
+            !DIMENSIONS.iter().any(|d| d.stored && d.column == retired),
+            "`{retired}` is back in the registry's stored set, which is a column the \
+             writer binds -- not a retired one"
+        );
+        declared.insert((retired.to_string(), "text".to_string()));
+    }
 
     let only_declared: Vec<_> = declared.difference(&actual).collect();
     let only_actual: Vec<_> = actual.difference(&declared).collect();
@@ -792,6 +834,10 @@ async fn the_projections_reflect_what_has_been_written() {
             Reading {
                 out_temp: Some(44.0),
                 barometer: Some(29.92),
+                // The DEVICE's claim about itself, which `row()` configures as
+                // `weatherlink-live` -- two different strings on purpose, so the two
+                // columns below cannot both pass by coincidence.
+                station_type: Some("davis-vantage-pro".into()),
                 ..Reading::default()
             },
         ),
@@ -811,7 +857,7 @@ async fn the_projections_reflect_what_has_been_written() {
     // `stations`: the configured name, type, zone and coordinates, with the altitude
     // converted from the configuration's metres to the projection's feet.
     let row = sqlx::query(
-        "SELECT name, type, timezone, latitude, longitude, altitude_ft, \
+        "SELECT name, type, reported_type, timezone, latitude, longitude, altitude_ft, \
                 snow_base_distance_mm, first_seen, last_seen \
            FROM stations WHERE station_id = $1",
     )
@@ -825,6 +871,17 @@ async fn the_projections_reflect_what_has_been_written() {
         "the configuration is authoritative for the name, not the reading"
     );
     assert_eq!(row.get::<String, _>("type"), "weatherlink-live");
+    // **M5-5: the two station types are two columns and neither is the other's fallback.**
+    // `type` is `config.stations.type`, the vocabulary `/stationinfo` returns; `reported_type`
+    // is the driver's self-reported name, which is what `/latest`'s `stationtype` must be
+    // (docs/legacy-api-contract.md §3.1). The configuration wins the first and does not
+    // touch the second, which is the assertion -- a writer that coalesced them would pass
+    // every other check here.
+    assert_eq!(
+        row.get::<Option<String>, _>("reported_type").as_deref(),
+        Some("davis-vantage-pro"),
+        "the device's own claim, not the configured type"
+    );
     assert_eq!(row.get::<String, _>("timezone"), "America/Denver");
     assert_eq!(row.get::<Option<f64>, _>("latitude"), Some(39.7392));
     let feet = row
@@ -986,18 +1043,26 @@ async fn a_station_the_registry_does_not_know_is_still_stored() {
     .await
     .expect("an unknown station's reading is stored");
 
-    let row =
-        sqlx::query("SELECT name, type, timezone, latitude FROM stations WHERE station_id = $1")
-            .bind(station)
-            .fetch_one(&pool)
-            .await
-            .expect("the projection row exists");
+    let row = sqlx::query(
+        "SELECT name, type, reported_type, timezone, latitude FROM stations \
+           WHERE station_id = $1",
+    )
+    .bind(station)
+    .fetch_one(&pool)
+    .await
+    .expect("the projection row exists");
     assert_eq!(
         row.get::<String, _>("name"),
         "a satellite's station",
         "the reading's own name is the fallback"
     );
     assert_eq!(row.get::<String, _>("type"), "davis");
+    assert_eq!(
+        row.get::<Option<String>, _>("reported_type").as_deref(),
+        Some("davis"),
+        "with no configuration row the two type columns agree, because there is only one \
+         answer -- which is why the test above uses two different strings"
+    );
     assert_eq!(
         row.get::<String, _>("timezone"),
         "UTC",
@@ -1684,7 +1749,7 @@ async fn an_hourly_rain_series_is_read_in_order_with_dry_hours_absent() {
 
 /// **The one half `crates/mw-pipeline/src/snapshot/tests.rs` cannot assert.** Those tests
 /// drive `snapshot:warm` over a fake store, so they check what the component does with a
-/// `Reading`; this one checks that a `Reading` comes back out of 216 real columns in the
+/// `Reading`; this one checks that a `Reading` comes back out of 214 real columns in the
 /// types the columns hold.
 ///
 /// Three properties, and each has its own way of failing silently:
@@ -1701,6 +1766,12 @@ async fn an_hourly_rain_series_is_read_in_order_with_dry_hours_absent() {
 ///    row outside the window is not returned at all, which is what makes `/latest`'s
 ///    documented 404 a property of the query rather than of a filter a caller might
 ///    forget.
+/// 4. **`station_type` comes back and `station_name` does not** — M5-5. Neither is a column
+///    of `observations` any more, and they take different routes on purpose:
+///    `/latest`'s `stationtype` is the driver's self-reported name and is read from
+///    `stations.reported_type`, while `stationname` is configuration and is resolved by
+///    `mw_api_legacy::Renderer` rather than here. This is the only test that can see
+///    either, because the statement is what both facts are properties of.
 #[tokio::test]
 #[ignore = "needs a real TimescaleDB; run `cargo xtask db-tests`"]
 async fn the_newest_reading_in_the_window_is_read_back_whole() {
@@ -1750,6 +1821,10 @@ async fn the_newest_reading_in_the_window_is_read_back_whole() {
                 extra_text1: Some("a note from the station".into()),
                 // timestamptz
                 storm_start: Some(reported),
+                // Wire metadata, and the driver's own vocabulary rather than the
+                // configured one (`row()` configures `weatherlink-live`).
+                station_type: Some("campbell".into()),
+                station_name: Some("what the device calls itself".into()),
                 ..Reading::default()
             },
         ),
@@ -1777,6 +1852,20 @@ async fn the_newest_reading_in_the_window_is_read_back_whole() {
         "text -- which a float8 cast would have turned into NULL"
     );
     assert_eq!(got.storm_start, Some(reported), "timestamptz, likewise");
+    // 4. The device's claim survives a restart. The reading carried it on the wire, no
+    // column of `observations` holds it, and `snapshot:warm` reads it back through this
+    // query -- which is the whole reason `stations.reported_type` exists.
+    assert_eq!(
+        got.station_type.as_deref(),
+        Some("campbell"),
+        "`/latest`'s `stationtype` is the driver's self-reported name, read back from the \
+         projection now that no raw column carries it"
+    );
+    assert_eq!(
+        got.station_name, None,
+        "and `stationname` is NOT reconstructed here: it is configuration, and \
+         `mw_api_legacy::Renderer` reads it from `config.stations` (M5-5 criterion 2)"
+    );
     assert_eq!(
         got.out_temp, None,
         "the previous row reported an outdoor temperature and this one did not, so the \

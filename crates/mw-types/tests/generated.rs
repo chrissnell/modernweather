@@ -8,7 +8,7 @@
 //! nothing anywhere naming it.
 //!
 //! `Reading::set` is implementation-plan.md **M4-1**'s addition and is what forced the
-//! question. `ReadingStore::latest` decodes 216 columns and places each one through it, so
+//! question. `ReadingStore::latest` decodes 214 columns and places each one through it, so
 //! it is `value`'s inverse over the same generated list — and an inverse pair is exactly the
 //! kind of thing that is worth asserting *as a pair*, metric by metric, rather than hoping
 //! that one generator loop cannot disagree with the one above it.
