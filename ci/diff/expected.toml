@@ -37,6 +37,11 @@ pair_tolerance_ms = 1000
 
 # Columns that are not metrics and are compared separately or not at all. `time` is the
 # pairing key; the two identity columns are the station, which is the thing held constant.
+#
+# `stationname` and `stationtype` are here for the GO side, which still has them: M5-5 retired
+# both to `role = "metadata"` so the new side's `observations` does not, and the filter is
+# applied to whatever columns a side actually declares. Removing them would make the Go side's
+# `stationname` a compared "metric" against nothing on the new side.
 not_metrics = ["time", "stationname", "station_id", "stationtype"]
 
 [[readings.rule]]

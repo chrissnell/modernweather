@@ -1284,7 +1284,7 @@ recorded here rather than assumed, and the three cases where deletion *does* cha
 are in **DEV-17** with their measurements and their directions. Whether to correct the formula is a
 separate decision, deliberately not taken here.
 
-### M5-5 — drop `stationname` and `stationtype` from the raw table
+### M5-5 — drop `stationname` and `stationtype` from the raw table — ✅ **DONE 2026-11-13**
 **Depends on:** M1-2, M5-1. Now safe: the `metadata` role exists, and the migration has proved
 `snapshot:latest` reads display metadata from `config.stations` rather than off a reading (W4
 assumption 24). The import's column list shrinks automatically, because it is derived from the
@@ -1292,6 +1292,83 @@ registry.
 **Done when:** `observations` carries **214** generator-owned columns (216 today, minus two) plus the
 hand-authored `extra jsonb`; nothing reads `stationname` from a reading; the diff harness still
 reports only its expected set.
+
+**Landed.** Two `role = "attribute"` edits to `role = "metadata"` in `metrics/registry.toml`, a
+regeneration, and `cargo xtask migrate --allow-breaking`. `cargo xtask budget` prints
+`allocated identifiers 216` against `live columns 214`, which is criterion 1 and is also the whole
+point of printing two numbers: a `metadata` dimension keeps its protobuf field number forever, so the
+identifier count does not move. `generated/sql/020_observations.sql` loses two lines, the protobuf
+and both reading types keep the fields, and all four aggregates are byte-identical — they never
+grouped by either column. The migration emits **no `DROP COLUMN`** and says why: a dropped attribute
+number is never released and is charged twice against the 1600-column ceiling once the hypertable is
+compressed (H-4, D-19), so the columns stay where they are, unwritten.
+
+**The two values do not go to the same place, and that is the part the plan did not say.**
+
+The display name is **configuration**. `SnapshotSource` grows a `display_name`, resolved per fold
+from the published station registry, and `mw_api_legacy::Renderer` serves `/latest`'s `stationname`
+from it — `config.stations.name`, the string `?station=` matches and the one the Go writer projected
+onto the column — with the frame's claim as a fallback and the station key as the last resort, which
+is the precedence `mw_store`'s `stations` projection already documents. `/span` already read it from
+configuration. **Per fold and not at construction**, which the code review caught: the first version
+handed the renderer a map built in `boot.rs`, and `shared_fingerprint` deliberately excludes a
+station's `name` so that a rename does not restart every component — so a rename would have left
+`/latest` serving the old name until the next plan restart, silently. Resolving it on the fold makes
+it visible on the next reading, which is what `/span` already does, and W4 assumption 24 had named
+the snapshot source as the place for it all along.
+
+`/latest`'s **`stationtype` is the device's own claim** and therefore cannot come from configuration
+at all: `docs/legacy-api-contract.md` §3.1 is explicit that `campbell` and `campbellscientific` are
+not the same set and must not be unified. So it goes to a new `stations.reported_type` — a second
+column beside the configured `stations.type`, on a per-station projection instead of on every row —
+written by `writer:timescale` from the envelope and read back by `ReadingStore::latest`, as a scalar
+subquery on the station parameter rather than a join so that the statement's index-seek argument
+still holds word for word. That is what lets `snapshot:warm` reconstruct the same body after a
+restart. The migration backfills it once from the retired raw column, one seek per station, which is
+the only chance to keep a decade of a non-reporting station's type. Serving it from `stations.type`
+instead would have been one column fewer and would have unified exactly the two vocabularies §3.1
+forbids unifying.
+
+**The import needed a decision, not just an omission.** Dropping the two from `w9.expected_column`
+left them in the *source* with no destination, which is what
+`w9.assert_no_unknown_source_columns()` refuses an import over — correctly. The staging schema
+already had the resolution: `w9.record_retired_dimensions()`, generated from the registry's
+`metadata` dimensions and joined to `w9.source_column`, records both in `w9.dropped_source_column`
+with the reason, and only for a column the source really declares.
+`migrate-from-go.sh`'s `gap` step calls it immediately before the assertion.
+
+**Verified**, all of it locally because GitHub CI is disabled until December:
+
+| | |
+|---|---|
+| `cargo xtask budget` | `allocated identifiers 216`, `live columns 214` — criterion 1 |
+| `validate`, `codegen --check`, `legacy-import --check`, `mgmt-schema --check`, `gate-layout` | clean |
+| `cargo test --workspace --all-targets --locked` | green, 67 test binaries |
+| `cargo fmt --check`, `cargo clippy --workspace --all-targets` | clean |
+| `cargo xtask db-tests` | **16/16 against a real TimescaleDB** — where criterion 1 is checked against the catalogue rather than against the generator, and where "nothing writes the retired columns" is asserted |
+| `ci/db/migrate-twice.sh` | both paths agree and a second application is a no-op; path B applied nine migrations over seeded tables and then these two, so the `ADD COLUMN` and the backfill ran as a real upgrade and the result matched a fresh install |
+| `cargo xtask conformance` | **green: 61 passed, 9 failed, all nine the declared `retired` set, `PENDING` empty, every `/latest` fixture passing** |
+| `ci/diff/self-test.sh` | **PASSED** — green on the recorded pair, red on every injection. Criterion 3, as far as it runs without two live daemons |
+
+The conformance run is the one that matters here: `stationname` is a key with no `omitempty`, and
+`/latest` in that replay is served **entirely** by `snapshot:warm` — there is no live station — so it
+exercises exactly the read path this item changed, end to end through the daemon.
+
+**Verified able to fail.** The catalogue test fails if a later migration does drop the two columns,
+and names the line to delete rather than going quiet. The renderer test's reading claims a name of
+its own and the response does not use it — the half that was invisible while the column existed and
+the two strings were routinely equal. The projection test configures `weatherlink-live` and has the
+device claim `davis-vantage-pro`, so a writer that coalesced the two type columns would pass every
+other assertion in the file and fail that one. The backfill was checked by hand against the CI
+instance inside a rolled-back transaction: the newest non-NULL value wins, a newer NULL does not
+displace it, a station with no rows stays NULL, and an already-known value is left alone.
+
+**One hand-off for the next live diff run.** `ci/diff/README.md` records, from M5-2's first run,
+`/latest` serving `stationname` as `""` with `stationtype` absent on the new side where the Go side
+sent `"CSI"` and `"campbell"`. Both were the migrated rows carrying NULL in the two columns, and both
+are addressed by the routing above rather than by anything in the harness — so that line should come
+off the findings list when (c) next runs against a daemon built from this branch. Nothing here
+touches the other four findings.
 
 **Milestone 5 done when:** the Rust implementation has been diffed against the Go implementation by
 value, on real data, with every difference predicted in advance from a decision. **The Go version is

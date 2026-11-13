@@ -504,6 +504,14 @@ step_stage() {
 
 step_gap() {
   say "gap — the column inventory, old against the registry (W0 OQ-6)"
+  # The registry's `metadata` dimensions, recorded as consciously dropped before the
+  # assertion below runs. They are columns of the old table and of no new one (N-14;
+  # M5-5's stationname and stationtype), so they are `unknown_in_source` by construction
+  # and the assertion would refuse the import without the decision on the record. The
+  # procedure is generated from the registry and only records a column the source actually
+  # declares -- see generated/00-staging.sql.
+  tgt -c "CALL w9.record_retired_dimensions()"
+  tgt -c "SELECT column_name, reason FROM w9.dropped_source_column ORDER BY column_name"
   tgt -c "SELECT verdict, count(*) FROM w9.gap_report GROUP BY 1 ORDER BY 1"
   tgt -c "SELECT column_name, expected_type, source_type, verdict
             FROM w9.gap_report WHERE verdict <> 'ok' ORDER BY verdict, column_name"

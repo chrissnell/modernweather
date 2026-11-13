@@ -7,10 +7,10 @@
 //! is 303 rows per multi-row `INSERT`; 256 is the power of two below it". That is correct
 //! arithmetic for a `VALUES` list, and it is a ceiling this code does not need to live
 //! under. `INSERT ... SELECT * FROM unnest($1::timestamptz[], $2::text[], …)` binds **one
-//! array per column** — 216 parameters for any batch size — so the parameter limit stops
+//! array per column** — 214 parameters for any batch size — so the parameter limit stops
 //! being a function of the batch at all. 256 stays the batch size because it is also the
 //! single-round-trip figure, but the writer is no longer the thing that constrains it, and
-//! a 217th column is no longer three rows off the ceiling.
+//! a 215th column is no longer three rows off the ceiling.
 //!
 //! # The column list is the registry's, not a literal
 //!
@@ -18,7 +18,7 @@
 //! every value from `Reading::value`. A metric added to `metrics/registry.toml` is written
 //! by this code with no edit, which is the property the Go implementation's 591 lines of
 //! hand-written mapping did not have. The one thing that *is* asserted rather than derived
-//! is the dimension set: four stored dimensions, named, because a fifth would otherwise be
+//! is the dimension set: two stored dimensions, named, because a third would otherwise be
 //! a column this writer silently never fills — see [`DIMENSION_COLUMNS`].
 //!
 //! # D-56, and the one place this item departs from it
@@ -64,7 +64,7 @@ use tracing::warn;
 /// The raw hypertable.
 const OBSERVATIONS: &str = "observations";
 
-/// The four stored dimension columns, in the order `observations` declares them.
+/// The two stored dimension columns, in the order `observations` declares them.
 ///
 /// Asserted against `mw_types::DIMENSIONS` by [`TimescaleWriter::new`] rather than derived
 /// from it, and the difference matters. The *metrics* are derived, so a new one is written
@@ -73,7 +73,11 @@ const OBSERVATIONS: &str = "observations";
 /// so deriving the list would produce an `INSERT` that binds a column it has no value for.
 /// Asserting it turns that into a refusal to build, with the column named, instead of a
 /// silently unfilled column nobody notices until a query returns NULL.
-const DIMENSION_COLUMNS: [&str; 4] = ["time", "station_id", "stationname", "stationtype"];
+///
+/// It was four until M5-5. `station_name` and `station_type` are now `role = "metadata"`:
+/// they still arrive on the wire and still feed the `stations` projection below, and they
+/// are no longer a column repeated on every row of a hundred-million-row table.
+const DIMENSION_COLUMNS: [&str; 2] = ["time", "station_id"];
 
 /// Feet per metre. `config.stations.altitude_m` holds metres and the weather schema's
 /// `stations.altitude_ft` projection holds feet — two columns, two units, both with the
@@ -85,7 +89,7 @@ const FEET_PER_METRE: f64 = 1.0 / 0.3048;
 pub struct TimescaleWriter {
     pool: PgPool,
     registry: Arc<dyn StationRegistry>,
-    /// Built once, because it is 216 column names and a 214-assignment `DO UPDATE` list.
+    /// Built once, because it is 214 column names and a 212-assignment `DO UPDATE` list.
     observations: String,
 }
 
@@ -194,16 +198,17 @@ impl TimescaleWriter {
         sqlx::query(
             "WITH incoming (station_id, name, type, timezone, latitude, longitude, \
                              altitude_ft, snow_base_distance_mm, first_seen, last_seen, \
-                             configured) AS ( \
+                             configured, reported_type) AS ( \
                  SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], \
                                       $5::float8[], $6::float8[], $7::float8[], \
                                       $8::float8[], $9::timestamptz[], $10::timestamptz[], \
-                                      $11::bool[]) \
+                                      $11::bool[], $12::text[]) \
              ) \
              INSERT INTO stations (station_id, name, type, timezone, latitude, longitude, \
-                                   altitude_ft, snow_base_distance_mm, first_seen, last_seen) \
+                                   altitude_ft, snow_base_distance_mm, first_seen, last_seen, \
+                                   reported_type) \
              SELECT station_id, name, type, timezone, latitude, longitude, altitude_ft, \
-                    snow_base_distance_mm, first_seen, last_seen \
+                    snow_base_distance_mm, first_seen, last_seen, reported_type \
                FROM incoming \
              ON CONFLICT (station_id) DO UPDATE SET \
                  name = CASE WHEN (SELECT configured FROM incoming i \
@@ -221,7 +226,8 @@ impl TimescaleWriter {
                  snow_base_distance_mm = coalesce(EXCLUDED.snow_base_distance_mm, \
                                                   stations.snow_base_distance_mm), \
                  first_seen = least(stations.first_seen, EXCLUDED.first_seen), \
-                 last_seen = greatest(stations.last_seen, EXCLUDED.last_seen)",
+                 last_seen = greatest(stations.last_seen, EXCLUDED.last_seen), \
+                 reported_type = coalesce(EXCLUDED.reported_type, stations.reported_type)",
         )
         .bind(&p.ids)
         .bind(&p.names)
@@ -234,6 +240,7 @@ impl TimescaleWriter {
         .bind(&p.first_seen)
         .bind(&p.last_seen)
         .bind(&p.configured)
+        .bind(&p.reported_types)
         .execute(&mut **tx)
         .await
         .map_err(classify)?;
@@ -247,9 +254,7 @@ impl TimescaleWriter {
     ) -> Result<u64, StoreError> {
         let mut q = sqlx::query(&self.observations)
             .bind(&rows.time)
-            .bind(&rows.station_id)
-            .bind(&rows.station_name)
-            .bind(&rows.station_type);
+            .bind(&rows.station_id);
         for column in &rows.metrics {
             q = match column {
                 Column::Float(v) => q.bind(v),
@@ -330,8 +335,6 @@ struct Reported {
 struct Rows {
     time: Vec<DateTime<Utc>>,
     station_id: Vec<String>,
-    station_name: Vec<Option<String>>,
-    station_type: Vec<Option<String>>,
     metrics: Vec<Column>,
     /// The distinct stations in the batch, with the span of observation instants for each.
     stations: BTreeMap<String, Span>,
@@ -469,8 +472,6 @@ impl Rows {
         let mut rows = Rows {
             time: Vec::with_capacity(n),
             station_id: Vec::with_capacity(n),
-            station_name: Vec::with_capacity(n),
-            station_type: Vec::with_capacity(n),
             metrics: METRICS
                 .iter()
                 .map(|m| Column::empty(m.sql_type, n))
@@ -483,8 +484,10 @@ impl Rows {
         let mut mismatches = 0usize;
         for (&(station, observed_at), members) in &groups {
             // The last observation in the group that said anything about this field. The
-            // same rule as the metric columns below, applied to the two dimensions that
-            // are not metrics.
+            // same rule as the metric columns below, applied to the two `metadata`
+            // dimensions, which are not columns and are not metrics either. They reach
+            // only `rows.reported` — the `stations` projection's fallback — because since
+            // M5-5 that is the one thing in the database they feed.
             let latest = |pick: fn(&mw_types::Reading) -> Option<String>| -> Option<String> {
                 members.iter().rev().find_map(|&i| pick(&batch[i].reading))
             };
@@ -493,8 +496,6 @@ impl Rows {
 
             rows.time.push(observed_at);
             rows.station_id.push(station.to_string());
-            rows.station_name.push(name.clone());
-            rows.station_type.push(kind.clone());
             for (column, meta) in rows.metrics.iter_mut().zip(METRICS.iter()) {
                 let value = members
                     .iter()
@@ -565,6 +566,20 @@ struct ProjectionColumns {
     /// row has been deleted or re-keyed rewrites the projection's display name to the
     /// station key -- which is what `/span` then joins to.
     configured: Vec<bool>,
+    /// What the DEVICE said it is -- `/latest`'s `stationtype`, `campbell` where the
+    /// configured type is `campbellscientific`.
+    ///
+    /// **Not `kinds`, and the configuration deliberately does not win here.** `kinds` is
+    /// `stations.type`, the configured vocabulary `/stationinfo` returns; this is the
+    /// driver's self-reported one, and `docs/legacy-api-contract.md` §3.1 requires the two
+    /// sets to stay apart. So the precedence rule the other columns follow is absent on
+    /// purpose: this is the reading's claim or it is `None`.
+    ///
+    /// Here at all because M5-5 took `observations.stationtype` away, and `/latest` has to
+    /// keep serving the key across a restart -- `snapshot:warm` reconstructs its reading
+    /// from the database, so a value that lives only in the process is a key that
+    /// disappears until the station next reports.
+    reported_types: Vec<Option<String>>,
 }
 
 /// Build `stations`' columns for every station the batch carried.
@@ -644,11 +659,12 @@ fn projection_columns(rows: &Rows, registry: &dyn StationRegistry) -> Projection
         p.first_seen.push(span.first);
         p.last_seen.push(span.last);
         p.configured.push(was_configured);
+        p.reported_types.push(fallback.and_then(|r| r.kind.clone()));
     }
     p
 }
 
-/// The 216-column `INSERT`, built once.
+/// The 214-column `INSERT`, built once.
 fn observations_statement() -> String {
     let dimensions: Vec<&DimensionMeta> = DIMENSIONS.iter().filter(|d| d.stored).collect();
     let columns: Vec<&str> = dimensions
@@ -663,17 +679,23 @@ fn observations_statement() -> String {
         .enumerate()
         .map(|(i, ddl)| format!("${}::{ddl}[]", i + 1))
         .collect();
-    // `observations` has one more column than this list: `extra jsonb`, W4 §4's escape
-    // hatch for unmodelled vendor fields, which is deliberately outside
-    // `metrics/registry.toml` (the registry is the source of truth for *modelled* metrics,
-    // OQ-W4-3). Absent from the column list means two things and both are wanted: nothing
-    // here writes it, and the `DO UPDATE` below cannot clobber it on a replay. A driver
-    // that fills it does so through a path this writer does not have yet.
+    // An `observations` built from `migrations/` has three columns this list does not name,
+    // and all three are deliberate -- on a migrated database and on a fresh one alike, which
+    // is why this says `migrations/` and not "production".
+    // `extra jsonb` is W4 §4's escape hatch for unmodelled vendor fields,
+    // outside `metrics/registry.toml` because the registry is the source of truth for
+    // *modelled* metrics (OQ-W4-3). `stationname` and `stationtype` are M5-5's: the
+    // migration emits no `DROP COLUMN`, because a dropped attribute number is never
+    // released and is charged twice against the 1600-column ceiling once the hypertable is
+    // compressed (H-4, D-19), so they stay where they are, unwritten. Absent from the
+    // column list means two things for each of them and both are wanted: nothing here
+    // writes it, and the `DO UPDATE` below cannot clobber it on a replay.
     //
-    // Every column that IS listed, including the dimensions: an envelope replayed from the spool carries
-    // the same `stationname` it carried the first time, so assigning it again is the same
-    // value, and a *corrected* reading for the same instant should correct every column it
-    // names. `station_id` and `time` are the conflict target and cannot be assigned.
+    // Every column that IS listed is assigned, except the conflict target. A *corrected*
+    // reading for the same instant should correct every column it names, and an envelope
+    // replayed from the spool carries the same values it carried the first time, so
+    // assigning them again is assigning what is already there. `station_id` and `time` are
+    // the conflict target and cannot be assigned.
     let updates: Vec<String> = columns
         .iter()
         .filter(|c| **c != "station_id" && **c != "time")
@@ -747,7 +769,7 @@ mod tests {
 
     /// The statement is derived, so what is worth asserting is the shape the derivation
     /// has to have: one placeholder per column, the conflict target excluded from the
-    /// assignment list, and no literal column name in this file beyond the four dimensions.
+    /// assignment list, and no literal column name in this file beyond the two dimensions.
     #[test]
     fn the_statement_binds_one_array_per_column_and_assigns_every_one_but_the_key() {
         let sql = observations_statement();
@@ -780,7 +802,7 @@ mod tests {
     }
 
     /// The parameter count is what W3 §2.4 sized the batch against. An array-per-column
-    /// statement is 216 parameters for a batch of 1 and for a batch of 10,000, which is
+    /// statement is 214 parameters for a batch of 1 and for a batch of 10,000, which is
     /// the claim the module doc makes.
     #[test]
     fn the_parameter_count_does_not_depend_on_the_batch_size() {
@@ -796,7 +818,7 @@ mod tests {
     #[test]
     fn the_dimension_assertion_names_the_column_it_cannot_place() {
         let e = UnplaceableDimensions {
-            declared: "time, station_id, stationname, stationtype, elevation".into(),
+            declared: "time, station_id, elevation".into(),
             known: DIMENSION_COLUMNS.join(", "),
         };
         assert!(e.to_string().contains("elevation"), "{e}");

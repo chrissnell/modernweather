@@ -67,7 +67,7 @@ deprecated = false
 introduced_in = "0.1.0"
 
 [[allocated]]
-kind = "dimension"
+kind = "metadata_dimension"
 key = "station_name"
 column = "stationname"
 sql_type = "text"
@@ -79,7 +79,7 @@ deprecated = false
 introduced_in = "0.1.0"
 
 [[allocated]]
-kind = "dimension"
+kind = "metadata_dimension"
 key = "station_type"
 column = "stationtype"
 sql_type = "text"

@@ -512,8 +512,8 @@ pub struct DimensionMeta {
 pub static DIMENSIONS: [DimensionMeta; 4] = [
     DimensionMeta { name: "time", column: "time", sql_type: SqlType::Timestamptz, stored: true, optional: false },
     DimensionMeta { name: "station_id", column: "station_id", sql_type: SqlType::Text, stored: true, optional: false },
-    DimensionMeta { name: "station_name", column: "stationname", sql_type: SqlType::Text, stored: true, optional: true },
-    DimensionMeta { name: "station_type", column: "stationtype", sql_type: SqlType::Text, stored: true, optional: true },
+    DimensionMeta { name: "station_name", column: "", sql_type: SqlType::Text, stored: false, optional: true },
+    DimensionMeta { name: "station_type", column: "", sql_type: SqlType::Text, stored: false, optional: true },
 ];
 
 // The unit vocabulary (N-7). `MetricMeta::unit` is a key into this table and

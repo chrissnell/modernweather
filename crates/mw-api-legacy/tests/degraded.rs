@@ -377,6 +377,7 @@ fn handlers_with(outage: Outage) -> Arc<Handlers> {
             altitude_m: Some(1800.0),
             snow_base_distance_mm: None,
         },
+        display_name: Some("davis-full".into()),
         // **Degraded**, which is the state a database outage leaves the windows in: the
         // provider's last answer, or none at all.
         windows: mw_component::Resolved::new(chrono::Utc::now(), []),

@@ -658,6 +658,15 @@ impl Folder {
     ) -> Result<usize, ComponentError> {
         let (windows, staleness) = self.resolve(station, now);
         let meta = self.registry.metadata(station);
+        // The configured display name, once per station rather than once per key, and read
+        // from the registry **here** rather than captured when this `Folder` was built.
+        // M5-5: `/latest`'s `stationname` comes from configuration now, and the registry is
+        // published into rather than rebuilt -- so resolving it per fold is what makes a
+        // rename visible on the next reading instead of at the next plan restart.
+        // `projection()` rather than `metadata()` because the display name is a `String`
+        // and `StationMeta` is deliberately `Copy` for `Ingress::admit`'s sake; this is off
+        // that path and the fold already clones a 216-field `Reading` per website.
+        let display_name = self.registry.projection(station).map(|p| p.name);
         let mut written = 0usize;
         for website in self.state.websites() {
             let source = SnapshotSource {
@@ -665,6 +674,7 @@ impl Folder {
                 website: website.clone(),
                 reading: reading.clone(),
                 meta,
+                display_name: display_name.clone(),
                 windows: windows.clone(),
             };
             // **A render failure is a per-key, counted non-event — not a tick failure.**
