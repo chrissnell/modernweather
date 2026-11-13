@@ -1433,11 +1433,45 @@ Adding each is additive under §4.4 and needs no version bump. `mw_api_mgmt::fre
 yet wired into the runtime resource: a freshness sentence needs the instant its capability was last
 written, which no `ComponentStatus` carries.
 
+**Constraint from M5-2, at the owner's instruction (2026-11-13): the station form must expose
+`wind_dir_correction_degrees`, `latitude`, `longitude` and `altitude_m`.** The store and the
+management API already carry all four — `StationInput` takes the correction and validates
+`-360..=360`, `StationView` returns it, and
+`mw_store::config_admin::tests::a_wind_direction_correction_survives_a_write_and_a_read` is the
+round trip — so this is the one remaining place a vane calibration cannot be set. It is not a
+cosmetic field: M5-2 measured the Go configuration's **−94°** against this side's `0` and it
+made `winddir` differ on 100% of readings and `windd` on 100% of `/span` buckets, with nothing
+downstream able to tell. The coordinates are the same class of value: they feed the clear-sky
+model (DEV-9) and `/latest`'s `sunrise`/`sunset`, and a wrong longitude is a wrong answer that
+still looks like weather.
+
 ### M7-4 — the configuration migration *(N-5 / G-2)*
 **Depends on:** M2-2, M7-1, M5-1. Move the owner's existing configuration onto the new schema:
 stations with their calibration, websites with hostnames, titles and about-text HTML, certificate
 paths, per-service settings into `station_service`, and `remote_stations` →
 `peers`/`peer_origins`/`config.stations` with the **four plaintext secret columns dropped** (**D-67**).
+
+**"Stations with their calibration" is load-bearing, and M5-2 measured what the preview is
+missing.** The owner's instruction, 2026-11-13: *"obviously we want to correct the station
+location so calculations are correct. Remoteweather/Go has the right configuration."* So the Go
+configuration is the authority and this item is where it arrives. What M5-2 established about
+the Campbell station, so that it is not re-derived:
+
+| | Go, which is right | the preview node's seed |
+|---|---|---|
+| `latitude` | **40.47571** | `40.0` |
+| `longitude` | **−111.84543** | `−105.0` |
+| `wind_dir_correction_degrees` | **−94** (equivalently 266) | `0` |
+| `altitude_m` | not exposed by any unauthenticated Go endpoint — **read it from the Go configuration** | `1800.0`, which is the conformance seed's placeholder |
+| `timezone` | `America/Denver` | `America/Denver`, already right |
+
+The coordinates come from the live Go server's `/stationinfo`, which serves the website's
+primary device's own `latitude` and `longitude`. The correction is measured rather than read:
+the `ser2net` bridge's raw `wind_d` is what this side stores and the Go side stores raw − 94,
+over nine consecutive readings, which is also the first independent confirmation that
+`mw_codec::WindDirCorrection` applies the Go arithmetic. **A placeholder carried forward is the
+failure mode here** — every one of these values fails quietly, which is why M5-2 found them and
+no gate did.
 Allocate a UUIDv7 `NodeId` per existing node, **not** reusing the `station_id` UUIDs in
 `remote_stations`, which are station identities (W7 assumption 35).
 **Done when:** the Rust daemon starts from the migrated configuration and plans the same component set

@@ -1336,3 +1336,118 @@ pub async fn restore(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A scratch directory per test, removed on drop. The same twenty lines as
+    /// `config_db`'s, for the reason its own comment gives: not needing `tempfile` is
+    /// better than being permitted it.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "mw-config-admin-{}-{tag}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).expect("scratch directory");
+            Self(dir)
+        }
+
+        fn db(&self) -> PathBuf {
+            self.0.join("config.db")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn a_station(correction: i64) -> StationWrite {
+        StationWrite {
+            station_key: "csi".into(),
+            name: "CSI".into(),
+            kind: "campbellscientific".into(),
+            enabled: true,
+            owning_node_id: Some(vec![7u8; 16]),
+            identity_kind: "fixed".into(),
+            // The schema's CHECK ties the two: a station that is not identified by its own
+            // registration has to name a transport. `tcp_out` with a host and a port is the
+            // Campbell station's own shape, over the ser2net bridge M5-1a measured.
+            transport_kind: Some("tcp_out".into()),
+            transport_host: Some("127.0.0.1".into()),
+            transport_port: Some(7001),
+            wind_dir_correction_degrees: correction,
+            ..Default::default()
+        }
+    }
+
+    /// The correction a round trip reports for `csi`.
+    fn stored_correction(changes: &[Change]) -> i64 {
+        changes
+            .iter()
+            .find_map(|c| match c {
+                Change::PutStation(s) if s.station_key == "csi" => {
+                    Some(s.wind_dir_correction_degrees)
+                }
+                _ => None,
+            })
+            .expect("the station this test wrote")
+    }
+
+    /// A non-zero wind-direction correction survives a write and a read.
+    ///
+    /// Every other test of this column uses **zero**, which is the value a dropped binding
+    /// also produces -- so an `UPDATE` that stopped naming the column, or a `SELECT` that
+    /// stopped reading it, would pass all of them. The calibration is not cosmetic: the
+    /// vane is bolted to a mast that is not aligned to north, so a station with the wrong
+    /// correction reports a wind direction that is wrong by a constant and no downstream
+    /// check can tell. Measured on the Campbell station on 2026-11-13, where the Go
+    /// configuration's `-94` against this side's `0` made `winddir` differ on 100% of
+    /// readings and `windd` on 100% of `/span` buckets.
+    #[tokio::test]
+    async fn a_wind_direction_correction_survives_a_write_and_a_read() {
+        let scratch = Scratch::new("wind-dir-correction");
+        let pool = crate::config_db::open_and_migrate(&scratch.db())
+            .await
+            .expect("the configuration schema applies");
+        let mut conn = pool.acquire().await.expect("a connection");
+
+        apply(&mut conn, &Change::PutStation(a_station(-94)))
+            .await
+            .expect("a station with a correction is accepted");
+        assert_eq!(
+            stored_correction(&snapshot(&mut conn).await.expect("snapshot")),
+            -94
+        );
+
+        // An edit changes it, rather than the insert being the only path that writes it:
+        // 266 is the same rotation the other way round, and the column's CHECK admits both.
+        apply(&mut conn, &Change::PutStation(a_station(266)))
+            .await
+            .expect("an edit is accepted");
+        assert_eq!(
+            stored_correction(&snapshot(&mut conn).await.expect("snapshot")),
+            266
+        );
+
+        // And clearing it clears it. `0` is the column's default, so this is the one case an
+        // update that silently did nothing would be indistinguishable from -- which is why it
+        // is asserted after a non-zero value rather than from a fresh row.
+        apply(&mut conn, &Change::PutStation(a_station(0)))
+            .await
+            .expect("clearing is accepted");
+        assert_eq!(
+            stored_correction(&snapshot(&mut conn).await.expect("snapshot")),
+            0
+        );
+    }
+}
