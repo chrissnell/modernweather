@@ -146,11 +146,13 @@ pub enum VersionError {
         found: Version,
     },
 
-    #[error("the weather database at {redacted} could not be reached to check its version")]
+    #[error("the weather database at {url} could not be reached to check its version")]
     Unreachable {
-        /// The URL with its password removed: this one is logged, and the configured URL
-        /// carries a password (**D-33**).
-        redacted: String,
+        /// Where the connection was attempted, with every credential it carried removed.
+        /// A [`RedactedUrl`] and not a `String`, because this message is logged on the
+        /// most ordinary failure there is and the configured URL carries a password
+        /// (**D-33**) -- so the redaction is the type's, not the caller's.
+        url: RedactedUrl,
         #[source]
         source: sqlx::Error,
     },
@@ -254,7 +256,7 @@ pub async fn probe(url: &str) -> Result<Observed, VersionError> {
         PgConnection::connect(url)
             .await
             .map_err(|source| VersionError::Unreachable {
-                redacted: redact(url),
+                url: RedactedUrl::new(url),
                 source,
             })?;
     let answered = observe(&mut conn).await;
@@ -308,46 +310,143 @@ pub async fn observe(conn: &mut PgConnection) -> Result<Observed, VersionError> 
 /// A connection URL with every credential it can carry removed.
 ///
 /// The configured URL is a secret from the moment it is read (**D-33**), and this is the
-/// only form of it that may reach a log line -- which the `Unreachable` message does, on
-/// the most ordinary failure there is. So this has to be right for every URL shape the
-/// driver accepts, not just the obvious one:
+/// only form of it that may reach a log line -- which [`VersionError::Unreachable`]'s
+/// message does, on the most ordinary failure there is.
 ///
-/// - **userinfo**: `postgres://mw:hunter2@host/db`. The authority ends at the first `/`,
-///   `?` or `#` (RFC 3986) and userinfo ends at the **last** `@` inside it, so an `@` in
-///   the path or the query is not mistaken for a credential separator -- which also keeps
-///   `?application_name=mw@node1` readable instead of garbled.
-/// - **the query string**: `postgres://host/db?password=hunter2`. `sqlx` reads `password`
-///   from there (`sqlx-postgres`'s own URL parser does, and so does libpq), and the
-///   schema's `CHECK (url GLOB 'postgres://?*')` permits it -- so a URL written that way
-///   was previously returned *verbatim*, password and all, because there was no `@` to
-///   split on.
-///
-/// Textual rather than parsed, still: a URL crate for one error message is the trade the
-/// original comment refused, and the two rules above are the whole of it.
-pub fn redact(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return "<not a url>".to_string();
-    };
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(end);
-    let authority = match authority.rsplit_once('@') {
-        Some((userinfo, host)) => {
-            let user = userinfo.split_once(':').map_or(userinfo, |(u, _)| u);
-            format!("{user}:{REDACTED}@{host}")
-        }
-        None => authority.to_string(),
-    };
-    format!("{scheme}://{authority}{}", redact_query(tail))
+/// **A newtype rather than a `String` each call site remembers to pass through a
+/// function.** [`RedactedUrl::new`] is the only constructor, so a variant that names where
+/// a connection went cannot be built holding the configured URL -- the same discipline
+/// `mw_output::error::Target` has for the upload endpoints, and for the same reason: the
+/// guard must not depend on every future call site repeating it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactedUrl(String);
+
+impl RedactedUrl {
+    /// Strip every credential a PostgreSQL URL can carry.
+    ///
+    /// Three shapes carry one, and this has to be right for all three, because `sqlx` and
+    /// libpq accept all three:
+    ///
+    /// - **userinfo**: `postgres://mw:hunter2@host/db`.
+    /// - **the query string**: `postgres://host/db?password=hunter2`. `sqlx-postgres`'s own
+    ///   URL parser reads `password` from there, so does libpq, and the configuration
+    ///   schema's `CHECK (url GLOB 'postgres://?*')` permits it.
+    /// - **either of those with a password that is not URL-safe**, which is the shape that
+    ///   bit. The owner's generated password contains a `/`, and the authority used to be
+    ///   ended at the first `/`, `?` or `#` the way RFC 3986 says. That made
+    ///   `postgres://mw:ab/cd@host/db` an authority of `mw:ab` with no `@` in it to split
+    ///   on, so the URL came back **verbatim** -- password and all -- in a `WARN` that
+    ///   `vector` ships to OpenSearch. The ordering in [`redact`] exists to make that
+    ///   impossible: the userinfo separator is found *before* the authority's end.
+    ///
+    /// Textual rather than parsed, still: a URL crate for one error message is the trade
+    /// the original comment refused. What is new is that the parse is **validated** rather
+    /// than trusted ([`is_host_and_port`]), so a shape this does not understand says
+    /// nothing about the URL instead of guessing at it.
+    pub fn new(url: &str) -> Self {
+        Self(redact(url))
+    }
+}
+
+impl fmt::Display for RedactedUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// What replaces a secret.
 const REDACTED: &str = "***";
+
+/// What replaces a URL whose shape this module could not establish.
+///
+/// The fail-safe answer, and the reason the parse is validated. A password may carry a `?`
+/// or a `#` as readily as a `/`, which puts the `@` the userinfo search needs outside the
+/// region it may look in and leaves a credential sitting where a host should be. There is
+/// no useful guess to make about that shape, and *which* database could not be reached is
+/// worth less than the credential, so nothing but the scheme is reported.
+const UNPARSED: &str = "<redacted>";
 
 /// Every parameter name that carries a credential in a PostgreSQL URL.
 ///
 /// `sslpassword` is here as well as `password` because it is the passphrase for the client
 /// key, which is no less a secret for being about TLS.
 const SECRET_PARAMS: [&str; 2] = ["password", "sslpassword"];
+
+/// [`RedactedUrl::new`]'s body, separate so the tests can read the string directly.
+fn redact(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "<not a url>".to_string();
+    };
+    // **The userinfo separator first, the authority's end second** -- the whole of the
+    // fix. A `?` or a `#` ends the region an `@` may be found in, so a legitimate
+    // `?application_name=mw@node1` is not mistaken for a credential separator; and the
+    // LAST `@` in that region is the separator, so an `@` inside the password stays part
+    // of the password.
+    let before_query = &rest[..rest.find(['?', '#']).unwrap_or(rest.len())];
+    let (userinfo, after_userinfo) = match before_query.rsplit_once('@') {
+        Some((userinfo, _)) => (Some(userinfo), &rest[userinfo.len() + 1..]),
+        None => (None, rest),
+    };
+    let end = after_userinfo
+        .find(['/', '?', '#'])
+        .unwrap_or(after_userinfo.len());
+    let (authority, tail) = after_userinfo.split_at(end);
+    // An empty authority is legitimate and carries no credential -- `postgres:///db?host=`
+    // puts the host in the query -- so it is not the suspect shape. An authority that is
+    // not a host and a port means the split above landed inside something else, and the
+    // only safe thing left to say is the scheme.
+    if !authority.is_empty() && !is_host_and_port(authority) {
+        return format!("{scheme}://{UNPARSED}");
+    }
+    let authority = match userinfo {
+        Some(info) => {
+            let user = info.split_once(':').map_or(info, |(u, _)| u);
+            format!("{user}:{REDACTED}@{authority}")
+        }
+        None => authority.to_string(),
+    };
+    format!("{scheme}://{authority}{}", redact_query(tail))
+}
+
+/// Whether a string is a host and an optional port -- and therefore whether the split that
+/// produced it landed where a host really is.
+///
+/// This is the whole of the fail safe, so it is deliberately narrow about what a host may
+/// contain and strict about the port, which is the field a misplaced split lands a password
+/// fragment in. The two shapes it must still admit are an IPv6 literal, whose colons are
+/// inside brackets, and libpq's comma-separated multi-host list.
+fn is_host_and_port(authority: &str) -> bool {
+    let (host, port) = match authority.strip_prefix('[') {
+        // An IPv6 literal: everything up to the `]` is the address, and what follows is
+        // either nothing or `:port`.
+        Some(after) => match after.split_once(']') {
+            Some((inner, "")) => (inner, None),
+            Some((inner, rest)) => match rest.strip_prefix(':') {
+                Some(port) => (inner, Some(port)),
+                None => return false,
+            },
+            None => return false,
+        },
+        None => match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        },
+    };
+    if host.is_empty() {
+        return false;
+    }
+    // `%` admits a percent-encoded Unix socket directory, which is how libpq takes one in
+    // a URL; `,` admits the multi-host list; `:` admits the rest of an unbracketed IPv6
+    // address, which libpq rejects but which costs nothing to tolerate here.
+    let host_ok = host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '%' | ',' | ':'));
+    let port_ok = match port {
+        Some(port) => !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()),
+        None => true,
+    };
+    host_ok && port_ok
+}
 
 /// Replace the value of any secret-bearing query parameter.
 fn redact_query(tail: &str) -> String {
@@ -569,6 +668,41 @@ mod tests {
                 "postgres://mw%40corp:p@db/weather",
                 "postgres://mw%40corp:***@db/weather",
             ),
+            // **A `/` in the password**, which is the shape that leaked. `openssl rand
+            // -base64` emits `/`, so this is the ordinary generated credential and not a
+            // corner: the authority used to end at that `/`, leaving `postgres://mw:hunter`
+            // with no `@` to split on and the whole URL returned verbatim.
+            (
+                "postgres://mw:hunter2/x@db.internal:5432/weather",
+                "postgres://mw:***@db.internal:5432/weather",
+            ),
+            // Several of them, and one in the user as well, which is what a 48-character
+            // base64 password looks like.
+            (
+                "postgresql://postgres:hunter2/a/b/c@modernweather-db-rw.modernweather.svc.cluster.local:5432/modernweather",
+                "postgresql://postgres:***@modernweather-db-rw.modernweather.svc.cluster.local:5432/modernweather",
+            ),
+            // An `@` inside the password: the LAST one in the authority is the separator.
+            (
+                "postgres://mw:hunter2@x@db/weather",
+                "postgres://mw:***@db/weather",
+            ),
+            // An IPv6 literal, whose colons must not be read as a port.
+            (
+                "postgres://mw:hunter2/x@[fd00::1]:5432/weather",
+                "postgres://mw:***@[fd00::1]:5432/weather",
+            ),
+            // libpq's multi-host list.
+            (
+                "postgres://mw:hunter2@a.db:5432,b.db:5432/weather",
+                "postgres://mw:***@a.db:5432,b.db:5432/weather",
+            ),
+            // **The fail safe.** A `?` in the password puts the `@` outside the region the
+            // userinfo search may look in, so the split lands inside the credential. There
+            // is nothing useful to guess here, so the scheme is all that is reported --
+            // which is worth less to a reader and costs nothing to a password.
+            ("postgres://mw:hunter2?x@db/weather", "postgres://<redacted>"),
+            ("postgres://mw:hunter2#x@db/weather", "postgres://<redacted>"),
         ] {
             assert_eq!(redact(url), expected, "redacting {url}");
             assert!(
@@ -578,5 +712,49 @@ mod tests {
             );
         }
         assert_eq!(redact("nonsense"), "<not a url>");
+    }
+
+    /// The whole of [`probe`] against a server that is not there, which is the failure
+    /// that produced the leak and the only one that needs no database to reproduce.
+    ///
+    /// The assertion is over [`mw_types::DisplayChain`] rather than over `to_string()`,
+    /// because that is what the two `warn!` call sites interpolate: the message **and**
+    /// every link of its cause chain. A `sqlx` variant that decided to echo the URL it was
+    /// handed would fail here, which a test of `redact` alone would not catch.
+    #[tokio::test]
+    async fn a_probe_that_cannot_connect_names_the_host_and_not_the_password() {
+        const PASSWORD: &str = "Kj4/mZ8tBw9vFq2Dxsy1";
+        let url = format!("postgresql://postgres:{PASSWORD}@127.0.0.1:1/modernweather");
+        let e = probe(&url).await.expect_err("nothing listens on port 1");
+        let rendered = mw_types::DisplayChain(&e).to_string();
+        assert!(
+            !rendered.contains(PASSWORD),
+            "the password survived into the rendered error: {rendered}"
+        );
+        assert!(
+            rendered.contains("127.0.0.1:1"),
+            "the error still names which database could not be reached: {rendered}"
+        );
+    }
+
+    /// The fail safe has to be a fail safe and not a blanket refusal, so the shapes that
+    /// are genuinely a host keep reporting one.
+    #[test]
+    fn a_url_this_module_understands_still_names_the_database() {
+        for url in [
+            "postgres://db.internal/weather",
+            "postgres://db.internal:5432/weather",
+            "postgres://[fd00::1]/weather",
+            "postgres://[fd00::1]:5432/weather",
+            "postgres://a.db:5432,b.db:5432/weather",
+            // The host in the query, which libpq accepts and which has an empty authority.
+            "postgres:///weather?host=%2Fvar%2Frun%2Fpostgresql",
+        ] {
+            let redacted = redact(url);
+            assert!(
+                !redacted.contains(UNPARSED),
+                "{url} is a shape this module understands, but it reported {redacted}"
+            );
+        }
     }
 }

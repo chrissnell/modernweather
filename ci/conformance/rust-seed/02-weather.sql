@@ -16,6 +16,17 @@
 --     `/span` lose the key. It carries the DRIVER's self-reported type (`campbell`), which
 --     is **not** the configured type `/stationinfo` returns (`campbellscientific`):
 --     `docs/legacy-api-contract.md` §3.1 is explicit that the two sets must not be unified.
+--     Non-NULL here because that is what the migrated history has; the rewrite's own ingest
+--     path does not stamp it yet, which is a known deviation recorded against M7-4 rather
+--     than something this rig may decide.
+--   * **`stationname` is deliberately NULL on every row below, and that is the point.**
+--     It used to be seeded, which is how this suite reported green for `/latest` while the
+--     preview served `{"stationname":""}`: the renderer read the column, and the column is
+--     `NULL` for every row the rewrite's ingest path writes -- no codec stamps it (see
+--     `mw_codec::wll`) -- while the rig wrote it by hand. The rig now reproduces what
+--     production actually holds for a station this daemon ingested, and the fixtures pass
+--     because `/latest` takes the name from `config.stations` (W4 assumption 24), the way
+--     `/span` and `/snow` already did. Seeding it again would re-open the hole.
 --   * `extratext1`..`extratext10` are `omitempty` and stay **NULL**, because all six
 --     `/latest` fixtures recorded 78 keys and not 88.
 --   * a reading inside the last ten minutes is what makes `/latest` a 200 (W1 Decision 15),
@@ -72,7 +83,7 @@ INSERT INTO observations (
     extrafloat1, extrafloat2, extrafloat3,
     windchill, heatindex)
 SELECT
-    t, 'davis-full', 'davis-full', 'davis',
+    t, 'davis-full', NULL, 'davis',
     (55 + 12 * sin(extract(epoch FROM t) / 43200.0))::float4,
     (47 + 20 * cos(extract(epoch FROM t) / 43200.0))::float4,
     (29.981 + 0.2 * sin(extract(epoch FROM t) / 86400.0))::float4,
@@ -106,7 +117,7 @@ FROM generate_series(now() - interval '31 days', now(), interval '5 minutes') AS
 INSERT INTO observations (time, station_id, stationname, stationtype,
                           outtemp, outhumidity, barometer, windspeed, winddir,
                           rainincremental, solarwatts, intemp, inhumidity)
-SELECT t, 'davis-full', 'davis-full', 'davis',
+SELECT t, 'davis-full', NULL, 'davis',
        (55 + 12 * sin(extract(epoch FROM t) / 43200.0))::float4,
        (47 + 20 * cos(extract(epoch FROM t) / 43200.0))::float4,
        29.981::float4,
@@ -132,7 +143,7 @@ ON CONFLICT (station_id, time) DO NOTHING;
 INSERT INTO observations (time, station_id, stationname, stationtype,
                           outtemp, outhumidity, barometer, windspeed, winddir,
                           rainincremental, solarwatts, solarjoules, radiation)
-SELECT t, 'csi-minimal', 'csi-minimal', 'campbell',
+SELECT t, 'csi-minimal', NULL, 'campbell',
        (48 + 9 * sin(extract(epoch FROM t) / 43200.0))::float4,
        (55 + 15 * cos(extract(epoch FROM t) / 43200.0))::float4,
        (29.7 + 0.15 * sin(extract(epoch FROM t) / 86400.0))::float4,
@@ -149,7 +160,7 @@ FROM generate_series(now() - interval '31 days', now(), interval '5 minutes') AS
 INSERT INTO observations (time, station_id, stationname, stationtype,
                           outtemp, outhumidity, barometer, windspeed, winddir,
                           rainincremental, solarwatts)
-SELECT t, 'csi-minimal', 'csi-minimal', 'campbell',
+SELECT t, 'csi-minimal', NULL, 'campbell',
        (48 + 9 * sin(extract(epoch FROM t) / 43200.0))::float4,
        (55 + 15 * cos(extract(epoch FROM t) / 43200.0))::float4,
        29.7::float4,
@@ -169,7 +180,7 @@ ON CONFLICT (station_id, time) DO NOTHING;
 -- unconverted and `/span` and `/snow` convert to inches (Q-4).
 INSERT INTO observations (time, station_id, stationname, stationtype,
                           outtemp, outhumidity, snowdistance, snowdepth, extrafloat1)
-SELECT t, 'snowgauge', 'snowgauge', 'snowgauge',
+SELECT t, 'snowgauge', NULL, 'snowgauge',
        (30 + 8 * sin(extract(epoch FROM t) / 43200.0))::float4,
        (78 + 10 * cos(extract(epoch FROM t) / 43200.0))::float4,
        (1500 - 119.38 - 20 * sin(extract(epoch FROM t) / 86400.0))::float4,
@@ -187,7 +198,7 @@ WHERE NOT (t BETWEEN now() - interval '36 hours' AND now() - interval '30 hours'
 INSERT INTO observations (time, station_id, stationname, stationtype,
                           outtemp, outhumidity, pm25, pm25_in_aqin, pm10_in_aqin, co2,
                           pm_in_temp_aqin, pm_in_humidity_aqin)
-SELECT t, 'aqmon', 'aqmon', 'airgradient',
+SELECT t, 'aqmon', NULL, 'airgradient',
        (52 + 4 * sin(extract(epoch FROM t) / 43200.0))::float4,
        (44 + 8 * cos(extract(epoch FROM t) / 43200.0))::float4,
        (6.2 + 3 * abs(sin(extract(epoch FROM t) / 1800.0)))::float4,
@@ -202,7 +213,7 @@ FROM generate_series(now() - interval '2 hours', now(), interval '2 minutes') AS
 -- `latest-snow-device-offline` record.
 INSERT INTO observations (time, station_id, stationname, stationtype,
                           outtemp, snowdistance, snowdepth)
-SELECT t, 'snowgauge-stale', 'snowgauge-stale', 'snowgauge',
+SELECT t, 'snowgauge-stale', NULL, 'snowgauge',
        28::float4, (1500 - 71.12)::float4, 71.12::float4
 FROM generate_series(now() - interval '10 days', now() - interval '3 days', interval '1 hour') AS t;
 

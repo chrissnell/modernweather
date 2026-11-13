@@ -338,7 +338,7 @@ impl Pool {
             Ok(pool) => pool,
             Err(e) => {
                 let failed = version::VersionError::Unreachable {
-                    redacted: version::redact(self.url.expose_secret()),
+                    url: version::RedactedUrl::new(self.url.expose_secret()),
                     source: e,
                 };
                 // Logged here, not left to the supervisor: it logs a state transition at
@@ -377,7 +377,7 @@ impl Pool {
             // An acquire failure here is the connection and not the statement, which is
             // the distinction `VersionError`'s `Classify` reads.
             VersionError::Unreachable {
-                redacted: version::redact(self.url.expose_secret()),
+                url: version::RedactedUrl::new(self.url.expose_secret()),
                 source,
             }
         })?;

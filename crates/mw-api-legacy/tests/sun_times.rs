@@ -706,7 +706,9 @@ fn served(station: &Station, at: DateTime<Utc>) -> (String, String) {
     );
     let mut positions = BTreeMap::new();
     positions.insert(key.clone(), (station.latitude, station.longitude));
-    let renderer = Renderer::new(zones, positions);
+    // No names: this rig's assertion is over the sun times, and its reading carries its
+    // own `stationname` -- which is the fallback path `Renderer::names` documents.
+    let renderer = Renderer::new(zones, positions, BTreeMap::new());
 
     let source = SnapshotSource {
         key: SnapshotKey::new(WebsiteId::new(1), key.clone()),

@@ -632,7 +632,22 @@ fn attach_registry(cfg: &mut Config) -> anyhow::Result<()> {
             ))
         })
         .collect();
-    let renderer = Arc::new(mw_api_legacy::Renderer::new(zones, positions));
+    // The device names, which is what `/latest`'s `stationname` is (W4 assumption 24).
+    // `/span` and `/snow` already read it from the configuration; this is what the third
+    // endpoint that emits the key needs in order to agree with them, and the reason it has
+    // to come from here is that `observations.stationname` is `NULL` for every row the
+    // ingest path writes -- see `mw_api_legacy::Renderer::names`.
+    let names: std::collections::BTreeMap<mw_types::StationKey, String> = cfg
+        .stations
+        .iter()
+        .map(|row| {
+            (
+                mw_types::StationKey::new(row.station_key.as_str()),
+                row.name.clone(),
+            )
+        })
+        .collect();
+    let renderer = Arc::new(mw_api_legacy::Renderer::new(zones, positions, names));
     info!(
         zones = renderer.zones(),
         "the frozen DTO's serialiser is built, so the snapshot components are planned"
@@ -984,11 +999,9 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     };
     match probed {
         Ok(Ok(_)) => {}
-        Ok(Err(e)) if matches!(e.class(), mw_types::Class::Retryable { .. }) => warn!(
-            err = %mw_types::DisplayChain(&e),
-            class = mw_types::Class::RETRYABLE.as_str(),
-            "the database version could not be asserted; starting anyway (D-27)"
-        ),
+        Ok(Err(e)) if matches!(e.class(), mw_types::Class::Retryable { .. }) => {
+            warn_version_not_asserted(&e)
+        }
         Ok(Err(e)) => return Err(e).context("asserting the database version (D-62)"),
         // The deadline is the same decision as the `Retryable` branch, reached a different
         // way: a refused connection answers in microseconds, but a blackholed address --
@@ -1122,6 +1135,22 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
         "shutdown complete"
     );
     Ok(report)
+}
+
+/// The **D-27** warning, as a function so that the one property it must have is testable.
+///
+/// What it emits is a `VersionError` rendered through [`mw_types::DisplayChain`] -- the
+/// message and every link of its cause chain -- and for `Unreachable` that message names
+/// the server. The configured URL carries a password (**D-33**) and `vector` ships this
+/// line to OpenSearch, so "the password is not in it" is a property of the emitted event
+/// and not of a `Display` impl somebody reads. `mw_store::version::RedactedUrl` is what
+/// makes it true; the test beside this is what makes it checked.
+fn warn_version_not_asserted(e: &VersionError) {
+    warn!(
+        err = %mw_types::DisplayChain(e),
+        class = mw_types::Class::RETRYABLE.as_str(),
+        "the database version could not be asserted; starting anyway (D-27)"
+    );
 }
 
 /// **D-62**: assert the database version, after the pool opens and before `plan()` runs.
@@ -1282,6 +1311,102 @@ mod tests {
             rx.recv().expect("the probe was called"),
             "postgres://mw:hunter2@db.internal/weather",
             "the probe gets the secret, which is why nothing else does"
+        );
+    }
+
+    /// A `tracing::Subscriber` that keeps the text of every field of every event.
+    ///
+    /// Hand-written over `tracing` alone, because `ci/layers.toml` keeps
+    /// `tracing_subscriber` in `mw-obs` and a capture does not need it: this asserts over
+    /// what a **sink** receives, which is the only level at which "the password is not in
+    /// the log" is a claim about the daemon rather than about one `Display` impl.
+    struct Capture(std::sync::Arc<std::sync::Mutex<String>>);
+
+    struct Text<'a>(&'a mut String);
+
+    impl tracing::field::Visit for Text<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            // Infallible into a `String`; a formatting error here would be the test's own
+            // bug and not the subject's.
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+            // Nothing under test opens a span, and a subscriber must still answer with a
+            // non-zero id if anything does.
+            tracing::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut buffer = self.0.lock().expect("the capture mutex is not poisoned");
+            event.record(&mut Text(&mut buffer));
+        }
+
+        fn enter(&self, _: &tracing::Id) {}
+
+        fn exit(&self, _: &tracing::Id) {}
+    }
+
+    /// **The configured password does not reach the D-27 warning.**
+    ///
+    /// The subject is the production path and not a reconstruction of it: the real
+    /// `version::probe`, against an address nothing listens on, and the real `warn!` the
+    /// `Retryable` branch takes. `127.0.0.1:1` makes the failure a genuine refused
+    /// connection, which is the condition an operator hits on every reboot and the one
+    /// that put this URL in OpenSearch.
+    ///
+    /// The password has a `/` in it because `openssl rand -base64` emits one and the
+    /// credential this was found on has one. That single character is the whole defect:
+    /// the authority used to end at the first `/`, so there was no `@` left in it to split
+    /// the userinfo off, and the URL was logged verbatim.
+    #[tokio::test]
+    async fn the_d27_warning_does_not_carry_the_database_password() {
+        const PASSWORD: &str = "Kj4/mZ8tBw9vFq2Dxsy1";
+        let mut cfg = config(true);
+        cfg.weather_database = Some(WeatherDatabase {
+            url: SecretString::from(format!(
+                "postgresql://postgres:{PASSWORD}@127.0.0.1:1/modernweather"
+            )),
+        });
+        let error = assert_database_version(&cfg, |url| async move { version::probe(&url).await })
+            .await
+            .expect_err("nothing listens on port 1");
+        assert!(
+            matches!(error.class(), mw_types::Class::Retryable { .. }),
+            "{error:?} has to be the class that warns and starts anyway, or this test is \
+             asserting over a line the daemon never emits"
+        );
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        tracing::subscriber::with_default(Capture(std::sync::Arc::clone(&captured)), || {
+            warn_version_not_asserted(&error);
+        });
+        let line = captured
+            .lock()
+            .expect("the capture mutex is not poisoned")
+            .clone();
+        assert!(
+            !line.contains(PASSWORD),
+            "the password reached the log sink: {line}"
+        );
+        assert!(
+            line.contains("127.0.0.1:1"),
+            "the line still names the database that could not be reached: {line}"
+        );
+        assert!(
+            line.contains("***"),
+            "and says a credential was removed rather than dropping it silently: {line}"
         );
     }
 

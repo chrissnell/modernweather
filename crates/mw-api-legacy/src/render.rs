@@ -51,7 +51,11 @@ use crate::sun;
 /// change invalidates a cached response. **Bump it in the same commit as any change to the
 /// emitted bytes** -- a new key, a changed unit, a different `omitempty` -- because an
 /// `ETag` that did not move across a payload change is a `304` serving the old body.
-const REVISION: u64 = 1;
+///
+/// `2`: `stationname` is read from the configuration rather than off the reading, which
+/// changes the bytes for every station whose rows were written by this daemon's own ingest
+/// path -- that column is `NULL` there, so the key used to be served as `""`.
+const REVISION: u64 = 2;
 
 /// The ten minutes W1 Decision 15 freezes: a reading older than this makes `/latest` a
 /// `404` rather than a stale `200`.
@@ -83,15 +87,37 @@ pub struct Renderer {
     /// the renderer needs a position it was not handed, which is why this map exists
     /// alongside [`Renderer::zones`] rather than being read off the snapshot.
     positions: BTreeMap<StationKey, (f64, f64)>,
+    /// Each station's **device name**, which is what `stationname` is.
+    ///
+    /// `config.stations.name`, the string `?station=` names and the one the writer projects
+    /// onto the column -- W4 assumption 24's "display metadata comes from
+    /// `config.stations`", which this is the `/latest` half of. `/span` and `/snow` already
+    /// read the name from the configuration (`crate::span`, `crate::snow`); this is what
+    /// makes the third endpoint that emits the key agree with them.
+    ///
+    /// **Not read off the reading, which is where the empty `stationname` came from.** The
+    /// `observations.stationname` column is populated for migrated history and `NULL` for
+    /// every row this daemon's own ingest path writes -- the codecs deliberately do not
+    /// stamp it (`mw_codec::wll`'s note on `Reject::EmptyReading`) and nothing downstream
+    /// of them does either, so `/latest` served `""` against a station whose configured
+    /// name was right there. Taking it from the configuration also makes the key correct
+    /// for a live reading that has never been through the database at all, which no fix to
+    /// the column could.
+    names: BTreeMap<StationKey, String>,
 }
 
 impl Renderer {
-    /// The renderer over the station zones and positions the configuration declares.
+    /// The renderer over the station zones, positions and names the configuration declares.
     pub fn new(
         zones: BTreeMap<StationKey, Zone>,
         positions: BTreeMap<StationKey, (f64, f64)>,
+        names: BTreeMap<StationKey, String>,
     ) -> Self {
-        Self { zones, positions }
+        Self {
+            zones,
+            positions,
+            names,
+        }
     }
 
     /// How many stations have a configured zone, for the binary's boot log line.
@@ -129,7 +155,21 @@ impl Renderer {
             .map(|z| z.tz());
 
         let mut dto = LegacyWeatherReading {
-            station_name: r.station_name.clone().unwrap_or_default(),
+            // The configuration first, then the reading. The fallback is not dead code:
+            // a station the configuration does not have is a peer's claim (the writer's
+            // `upsert_stations` makes the same ordering for the projection row), and the
+            // reading's own `stationname` is the only name there is for one.
+            station_name: self
+                .names
+                .get(&source.key.station)
+                .cloned()
+                .or_else(|| r.station_name.clone())
+                .unwrap_or_default(),
+            // **Not from the configuration.** `docs/legacy-api-contract.md` §3.1 is
+            // explicit that `/latest`'s `stationtype` is the DRIVER's self-reported name
+            // (`campbell`) while `config.stations.type` is the configured vocabulary
+            // (`campbellscientific`), and that the two sets must not be unified. So this
+            // stays the reading's, and `omitempty` drops it when there is none.
             station_type: r.station_type.clone().unwrap_or_default(),
             // Q-3: milliseconds since the epoch, as a bare JSON integer.
             reading_timestamp: r.time.timestamp_millis(),
@@ -515,7 +555,7 @@ mod tests {
         let mut positions = BTreeMap::new();
         positions.insert(StationKey::new("davis-full"), (39.900, -105.500));
         positions.insert(StationKey::new("csi-minimal"), (39.800, -105.400));
-        let renderer = Renderer::new(BTreeMap::new(), positions);
+        let renderer = Renderer::new(BTreeMap::new(), positions, BTreeMap::new());
 
         // The request names `csi-minimal`; the website's primary is `davis-full`.
         let mut src = source(
@@ -557,6 +597,68 @@ mod tests {
             Utc::now(),
             mw_pipeline::snapshot::WINDOWS.map(|d| (d, Some(1.5))),
         )
+    }
+
+    /// **`stationname` comes from the configuration, not from the reading.**
+    ///
+    /// The reading here is the one the live ingest path produces: `station_name` is `None`,
+    /// because no codec stamps it (`mw_codec::wll` records why) and the
+    /// `observations.stationname` column it would have been read back from is `NULL` for
+    /// every row this daemon wrote. Before this, `/latest` served `{"stationname":"", ...}`
+    /// against a station the configuration named `CSI` -- with every other value correct,
+    /// which is what made it survive a conformance suite whose rig seeds the column by
+    /// hand.
+    #[test]
+    fn the_station_name_is_the_configured_device_name_and_not_the_readings() {
+        let configured = Renderer::new(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::from([(StationKey::new("davis-full"), "CSI".to_string())]),
+        );
+        let live = Reading {
+            station_name: None,
+            station_type: None,
+            out_temp: Some(45.08),
+            ..Reading::default()
+        };
+        let dto = configured.reading(&source(live.clone(), resolved()));
+        assert_eq!(
+            dto.station_name, "CSI",
+            "the configured name, for a reading that carries none"
+        );
+        assert!(
+            dto.station_type.is_empty(),
+            "`stationtype` is the driver's vocabulary and not the configured one \
+             (legacy-api-contract.md 3.1), so an unstamped reading has none: {}",
+            dto.station_type
+        );
+
+        // The configuration wins over a reading that disagrees: the column is whatever the
+        // writer last projected onto it, and a station renamed in the configuration has to
+        // serve the new name without a rewrite of history.
+        let migrated = Reading {
+            station_name: Some("the column's value".into()),
+            ..live.clone()
+        };
+        assert_eq!(
+            configured
+                .reading(&source(migrated, resolved()))
+                .station_name,
+            "CSI"
+        );
+
+        // And a station the configuration does not have -- a peer's claim -- keeps the
+        // reading's own name, which is the only one there is for it.
+        let peer = Reading {
+            station_name: Some("a peer's station".into()),
+            ..live
+        };
+        assert_eq!(
+            Renderer::default()
+                .reading(&source(peer, resolved()))
+                .station_name,
+            "a peer's station"
+        );
     }
 
     /// **The invariant that keeps this module and the provider in step.** Every window this
