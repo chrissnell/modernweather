@@ -297,7 +297,13 @@ running nothing is docs/reconciliation.md G-1.
 
 ci/diff/README.md has how to run the two mechanisms, how to read the summary, and the two
 preconditions no test here can confirm -- that the two daemons are configured equivalently and
-that both databases hold the same readings over the window."""
+that both databases hold the same readings over the window.
+
+THIS GATE IS CUTOVER-SCOPED AND IS MEANT TO BE DELETED. The owner's scoping, 2026-11-13: the
+two implementations have to be checked against each other once, as suncrestweather.com moves
+to the new service, and then the Go daemon is gone. When it is, this entry goes with
+ci/diff/ -- a gate whose subject no longer exists reports green forever and guards nothing.
+ci/diff/README.md's "Lifetime" section is the removal list."""
 
 [[gate]]
 id = "coverage-ratchet"

@@ -13,6 +13,29 @@ status, headers, key set, value types, numeric formatting — against either bin
 deliberately **value-blind** (W1 D-3), because values change every two seconds. That
 blindness is exactly what these two cover: (a) cannot catch a wrong *number*.
 
+## Lifetime: this is cutover apparatus, and it is meant to be deleted
+
+**Owner's scoping, 2026-11-13:** *"checking that they match is really only something we have
+to do once as we transition suncrestweather.com to the new service. once we do that,
+remoteweather goes into the dustbin of time."* That is recorded here rather than left on an
+issue because this directory is the kind of thing that gets inherited by default.
+
+So: the two mechanisms exist to be run **once per station**, immediately before cutover, and
+then never again. Nothing in the daemon depends on this crate, no gate but its own runs it, and
+when the Go daemon is decommissioned the correct action is `git rm -r ci/diff` together with
+the `diff-harness` entry in `ci/gates.toml`, its job in `.github/workflows/pr.yml` and its row
+in `docs/release.md` §1. A gate whose subject no longer exists reports green forever and
+guards nothing, which is the same failure as a gate that reports green by deferral
+(`docs/reconciliation.md` G-1) wearing the opposite costume.
+
+**What must not be deleted with it** is anything the harness only *found*. A defect in the new
+service that this directory happens to be the first thing to notice belongs in a work item, in
+the deviation ledger, or in a test next to the code — not in a README that is scheduled for
+removal. The findings from the first run are at the bottom of this file for that reason: they
+are a hand-off list, not a record to keep.
+
+---
+
 **The expected-diff set is `expected.toml`, and it is data.** Every difference the harness
 finds is matched against a rule there; a difference that matches no rule is **unexpected** and
 the run is red. There is no threshold to argue about after the fact and no "ignore" — the

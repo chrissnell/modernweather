@@ -1187,6 +1187,14 @@ and `monthrain` / `yearrain` as `0`; and `/almanac` serving `{}`, because the mi
 imported reading, so those all-time extremes are not reproducible from the migrated data and
 would reset at cutover.
 
+**The harness is cutover apparatus and the owner scoped it as such on 2026-11-13:** the two
+implementations have to be checked against each other once, as `suncrestweather.com` moves to
+the new service, and then the Go daemon is decommissioned. `ci/diff/README.md`'s "Lifetime"
+section is the removal list -- the crate, the `diff-harness` gate, its CI job and its row in
+`docs/release.md` -- and the one thing that must not be removed with it is any defect the
+harness merely *found*, which belongs in a work item rather than in a README scheduled for
+deletion.
+
 **§5.0's "nothing else" for (c) is incomplete against its own deviation ledger,** which is
 recorded here rather than worked around: **DEV-7** changes `/span`'s `solarjoules` from the
 bucket mean to the bucket total — by roughly the bucket's reading count, so up to four orders
