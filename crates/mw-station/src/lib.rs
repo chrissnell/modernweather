@@ -74,6 +74,7 @@ pub use identity::{IdentityError, StationIdentity};
 pub use lines::Lines;
 pub use plan::{
     ambient_mount, check_snowgauge, fixed_receivers, register, FixedReceiver, StationPlanError,
+    MAX_KEY_LEN,
 };
 pub use session::{ByteStream, NoSession, Session, SessionError, MAX_FRAME_BYTES};
 pub use stream::{OpenError, SerialPort, TcpByteStream};

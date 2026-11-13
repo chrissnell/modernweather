@@ -479,16 +479,39 @@ fn staging(reg: &Registry, go: &GoViews) -> String {
          \x20   END IF;\n\
          END $fn$;\n\n\
          -- ------------------------------------------------------------------\n\
-         -- 3. stationname -> station_id. The one mapping a human has to supply.\n\
+         -- 3. stationname -> station_id, and why it cannot be the name.\n\
          -- ------------------------------------------------------------------\n\
          --\n\
          -- The old table keys readings by station *name* and the new one by `station_id`\n\
-         -- (W4 2.1). `/span?station=<device name>` is frozen and matches the name, so the\n\
-         -- safe default is station_id = stationname: it keeps every historical row\n\
-         -- addressable by the parameter both shipped clients already send. Choosing\n\
-         -- something else is allowed and means the history is reachable only under the new\n\
-         -- id, which is why this table is populated by hand and asserted non-empty rather\n\
-         -- than defaulted silently.\n\n\
+         -- (W4 2.1), and `station_id` is not free text. A station's key becomes a\n\
+         -- component id -- `station:campbell:<key>`, crates/mw-station/src/campbell.rs --\n\
+         -- and crates/mw-component/src/id.rs permits only lower-case ASCII, digits, `-`,\n\
+         -- `_`, `.` and `:`, with no empty `:`-delimited segment, inside 128 bytes. A key\n\
+         -- outside that set is StationPlanError::Key at startup, so the station never\n\
+         -- runs and its history is addressable by nothing.\n\
+         --\n\
+         -- `station_id = stationname` is therefore NOT a usable default, and M5-1b is\n\
+         -- what that cost: a Go `stationname` is a display name, and two of the three in\n\
+         -- production -- `CSI` and `Suncrest Air Quality` -- are refused by that type. The\n\
+         -- default is the DERIVED key `w9.station_key(stationname)`, and\n\
+         -- `w9.assert_station_map_usable()` refuses a map -- derived or hand-written --\n\
+         -- whose ids could not be configured afterwards.\n\
+         --\n\
+         -- The frozen contract is unaffected, and that is why `stationname` was the\n\
+         -- default to begin with: `/span?station=<device name>` matches a station's NAME\n\
+         -- and selects data by its KEY (`station_by_name`, crates/mw-api-legacy/src/span.rs),\n\
+         -- so a derived key changes nothing a shipped client already sends.\n\
+         --\n\
+         -- But be exact about where that name comes from, because getting it wrong is how\n\
+         -- `station_id = stationname` looked safe. It is the CONFIGURATION STORE's\n\
+         -- `stations.name`, not this database's: `w9.populate_stations()` writes\n\
+         -- `stationname` into `stations.name` for the read-side projection, which is what\n\
+         -- renders a station's name in the response, and the match itself never reads it.\n\
+         -- So the frozen parameter keeps working only if the configuration store's\n\
+         -- `station_key` equals the id written here. This migration cannot check that --\n\
+         -- that store is SQLite and M7-4 is what populates it -- and it is the one part of\n\
+         -- M5-1b these refusals do not close. Overriding a row here is still allowed and\n\
+         -- still means the history is reachable only under the id written in it.\n\n\
          CREATE TABLE w9.station_map (\n\
          \x20   stationname           text PRIMARY KEY,\n\
          \x20   station_id            text NOT NULL UNIQUE,\n\
@@ -514,6 +537,72 @@ fn staging(reg: &Registry, go: &GoViews) -> String {
          \x20                     FROM weather GROUP BY stationname ORDER BY stationname)\n\
          \x20             TO STDOUT (FORMAT csv)$q$\n\
          $fn$;\n\n\
+         -- A Go display name, lowered into something the component id type accepts.\n\
+         --\n\
+         -- A function and not three typed-in values, because the property that matters is\n\
+         -- that the NEXT run of this migration produces the same station ids as this one:\n\
+         -- a key is a component id, a metric label and a partition key, and a re-import\n\
+         -- that renamed them would make the history of a live station unreachable a\n\
+         -- second time.\n\
+         --\n\
+         -- Runs of anything outside the permitted set collapse to one `-`, and a leading\n\
+         -- or trailing `-` is trimmed. `:` is accepted by the component id type but is\n\
+         -- never produced here: it is that type's segment separator, so a key carrying\n\
+         -- one adds a segment to `station:<driver>:<key>` rather than naming a station.\n\
+         -- `COLLATE \"C\"` and not the database default, because the determinism above is\n\
+         -- the whole point and `lower()` follows the locale: in a Turkish one, `lower('CSI')`\n\
+         -- is `csı` and this would derive `cs`. It also keeps the pattern operators off a\n\
+         -- nondeterministic ICU collation, which they refuse to run against at all.\n\
+         CREATE FUNCTION w9.station_key(stationname text) RETURNS text\n\
+         LANGUAGE sql IMMUTABLE STRICT AS $fn$\n\
+         \x20   SELECT trim(both '-' from\n\
+         \x20               regexp_replace(\n\
+         \x20                   regexp_replace(lower($1 COLLATE \"C\"), '[^a-z0-9._-]+', '-', 'g'),\n\
+         \x20                   '-{2,}', '-', 'g'))\n\
+         $fn$;\n\n\
+         -- Why a station id is not usable as a station key, or NULL if it is. The\n\
+         -- character set, the empty-segment rule and the length limit of\n\
+         -- crates/mw-component/src/id.rs, restated here because this database is reached\n\
+         -- by psql and not only by the daemon, and in the same order so the message a\n\
+         -- reader gets is the message the daemon would have given.\n\
+         --\n\
+         -- 108 bytes and not 128: ComponentId::MAX_LEN is 128 and the longest wrapper any\n\
+         -- driver puts around a key is `station:airgradient:` at 20\n\
+         -- (crates/mw-station/src/airgradient.rs; `station:wll:<key>:rearm` is 18).\n\
+         -- mw_station::MAX_KEY_LEN carries the same number and\n\
+         -- crates/mw-station/tests/station_key_width.rs pins it from the Rust side.\n\
+         CREATE FUNCTION w9.station_key_problem(station_id text) RETURNS text\n\
+         LANGUAGE sql IMMUTABLE AS $fn$\n\
+         \x20   SELECT CASE\n\
+         \x20       WHEN $1 IS NULL OR $1 = '' THEN 'it is empty'\n\
+         \x20       WHEN octet_length($1) > 108\n\
+         \x20           THEN format('it is %s bytes; the limit is 108', octet_length($1))\n\
+         \x20       WHEN $1 ~ '[^a-z0-9._:-]'\n\
+         \x20           THEN format('it contains %L, which is not permitted '\n\
+         \x20                       '(lower-case ASCII, digits, -, _, . and :)',\n\
+         \x20                       (regexp_match($1, '[^a-z0-9._:-]'))[1])\n\
+         \x20       WHEN $1 ~ '(^:|:$|::)' THEN 'it has an empty :-delimited segment'\n\
+         \x20   END\n\
+         $fn$;\n\n\
+         CREATE FUNCTION w9.assert_station_map_usable() RETURNS void\n\
+         LANGUAGE plpgsql AS $fn$\n\
+         DECLARE bad text;\n\
+         BEGIN\n\
+         \x20   SELECT string_agg(format('%L -> %L: %s', stationname, station_id, problem),\n\
+         \x20                     '; ' ORDER BY stationname) INTO bad\n\
+         \x20     FROM (SELECT m.stationname, m.station_id,\n\
+         \x20                  w9.station_key_problem(m.station_id) AS problem\n\
+         \x20             FROM w9.station_map m) q\n\
+         \x20    WHERE problem IS NOT NULL;\n\
+         \x20   IF bad IS NOT NULL THEN\n\
+         \x20       RAISE EXCEPTION 'w9.station_map has station ids that cannot be station keys: %', bad\n\
+         \x20           USING HINT = 'a station_id becomes a component id (station:<driver>:<station_id>), '\n\
+         \x20                        'so the daemon would refuse the station at plan time; '\n\
+         \x20                        'w9.station_key(stationname) derives an id that is accepted, '\n\
+         \x20                        'except for the length -- that one needs a shorter id by hand, '\n\
+         \x20                        'because truncating would silently change which station an id names';\n\
+         \x20   END IF;\n\
+         END $fn$;\n\n\
          CREATE FUNCTION w9.assert_station_map_complete() RETURNS void\n\
          LANGUAGE plpgsql AS $fn$\n\
          DECLARE bad text;\n\
@@ -524,14 +613,58 @@ fn staging(reg: &Registry, go: &GoViews) -> String {
          \x20    WHERE m.stationname IS NULL;\n\
          \x20   IF bad IS NOT NULL THEN\n\
          \x20       RAISE EXCEPTION 'w9.station_map has no entry for: %', bad\n\
-         \x20           USING HINT = 'INSERT INTO w9.station_map (stationname, station_id, stationtype) '\n\
-         \x20                        'SELECT stationname, stationname, stationtype FROM w9.source_station '\n\
-         \x20                        'adopts the frozen-contract-preserving default';\n\
+         \x20           USING HINT = 'CALL w9.seed_station_map() adopts the derived default for '\n\
+         \x20                        'every name the source has';\n\
          \x20   END IF;\n\
          \x20   IF NOT EXISTS (SELECT 1 FROM w9.source_station) THEN\n\
          \x20       RAISE EXCEPTION 'w9.source_station is empty; load it before asserting'\n\
          \x20           USING HINT = 'migrate-from-go.sh inventory';\n\
          \x20   END IF;\n\
+         END $fn$;\n\n\
+         -- The default map, committed rather than typed at a prompt: every name the source\n\
+         -- has, keyed by its derived station id, leaving any row somebody has already\n\
+         -- written alone.\n\
+         CREATE PROCEDURE w9.seed_station_map() LANGUAGE plpgsql AS $fn$\n\
+         DECLARE bad text;\n\
+         BEGIN\n\
+         \x20   IF NOT EXISTS (SELECT 1 FROM w9.source_station) THEN\n\
+         \x20       RAISE EXCEPTION 'w9.source_station is empty; load it before seeding the map'\n\
+         \x20           USING HINT = 'migrate-from-go.sh stage';\n\
+         \x20   END IF;\n\
+         \x20   -- Two names that derive one id, or a derived id some other row already holds,\n\
+         \x20   -- would otherwise arrive as a unique violation naming a constraint instead of\n\
+         \x20   -- the two stations that collided. Nothing in production collides; a fourth\n\
+         \x20   -- station called `Suncrest air quality` would.\n\
+         \x20   SELECT string_agg(detail, '; ' ORDER BY detail) INTO bad FROM (\n\
+         \x20       SELECT format('%L would be derived from %s', g.station_id, g.names) AS detail\n\
+         \x20         FROM (SELECT w9.station_key(s.stationname) AS station_id,\n\
+         \x20                      string_agg(quote_literal(s.stationname), ' and '\n\
+         \x20                                 ORDER BY s.stationname) AS names,\n\
+         \x20                      count(*) AS n\n\
+         \x20                 FROM w9.source_station s\n\
+         \x20                WHERE NOT EXISTS (SELECT 1 FROM w9.station_map m\n\
+         \x20                                   WHERE m.stationname = s.stationname)\n\
+         \x20                GROUP BY 1) g\n\
+         \x20        WHERE g.n > 1\n\
+         \x20       UNION ALL\n\
+         \x20       SELECT format('%L would be derived from %L and already belongs to %L',\n\
+         \x20                     m.station_id, s.stationname, m.stationname) AS detail\n\
+         \x20         FROM w9.source_station s\n\
+         \x20         JOIN w9.station_map m ON m.station_id = w9.station_key(s.stationname)\n\
+         \x20                              AND m.stationname <> s.stationname\n\
+         \x20        WHERE NOT EXISTS (SELECT 1 FROM w9.station_map m2\n\
+         \x20                           WHERE m2.stationname = s.stationname)\n\
+         \x20   ) d;\n\
+         \x20   IF bad IS NOT NULL THEN\n\
+         \x20       RAISE EXCEPTION 'the derived station ids are not unique: %', bad\n\
+         \x20           USING HINT = 'INSERT a w9.station_map row for each colliding name first; '\n\
+         \x20                        'this procedure leaves an existing row alone';\n\
+         \x20   END IF;\n\
+         \x20   INSERT INTO w9.station_map (stationname, station_id, stationtype)\n\
+         \x20   SELECT s.stationname, w9.station_key(s.stationname), s.stationtype\n\
+         \x20     FROM w9.source_station s\n\
+         \x20   ON CONFLICT (stationname) DO NOTHING;\n\
+         \x20   PERFORM w9.assert_station_map_usable();\n\
          END $fn$;\n\n",
     );
 
@@ -700,10 +833,15 @@ fn import_raw(reg: &Registry) -> String {
          -- `stations` first. W4 2.1 makes it the reading-side projection every /span join\n\
          -- goes through, and the low-volume tables carry a foreign key to it, so a reading\n\
          -- whose station has no row is addressable by nothing.\n\
+         --\n\
+         -- Both assertions run here and not at the end, because this is the last point\n\
+         -- before 19 GB moves: a map that is incomplete, or whose ids could not be\n\
+         -- configured as station keys afterwards (M5-1b), costs an import either way.\n\
          -- ------------------------------------------------------------------\n\n\
          CREATE PROCEDURE w9.populate_stations() LANGUAGE plpgsql AS $fn$\n\
          BEGIN\n\
          \x20   PERFORM w9.assert_station_map_complete();\n\
+         \x20   PERFORM w9.assert_station_map_usable();\n\
          \x20   INSERT INTO stations (station_id, name, type, timezone, latitude, longitude,\n\
          \x20                         altitude_ft, snow_base_distance_mm, first_seen, last_seen)\n\
          \x20   SELECT m.station_id,\n\
@@ -1614,6 +1752,35 @@ mod tests {
         }
         // Column order is load-bearing for the matched COPY pair.
         assert!(staging.contains("ord         int  NOT NULL UNIQUE"));
+    }
+
+    #[test]
+    fn the_station_map_derives_its_keys_and_refuses_one_it_could_not_configure() {
+        // M5-1b. The first production run took station_id = stationname, and two of the
+        // three names it imported cannot be a component id, so the live station could not
+        // be configured against its own history. The default is derived now, and the
+        // derivation is in the committed SQL rather than in whoever runs it next.
+        let (reg, go) = inputs();
+        let files = all(&reg, &go);
+        let staging = files.get(&format!("{OUT_DIR}/00-staging.sql")).unwrap();
+        assert!(staging.contains("CREATE FUNCTION w9.station_key(stationname text)"));
+        assert!(staging.contains("CREATE PROCEDURE w9.seed_station_map()"));
+        // The derivation emits only characters mw_component::ComponentId permits, and `:`
+        // -- which it does permit -- is excluded because it is the segment separator.
+        assert!(staging.contains("'[^a-z0-9._-]+', '-', 'g'"));
+        // The refusal, and the limit mw_station::MAX_KEY_LEN carries.
+        assert!(staging.contains("CREATE FUNCTION w9.station_key_problem(station_id text)"));
+        assert!(staging.contains("octet_length($1) > 108"));
+        assert!(staging.contains("w9.assert_station_map_usable()"));
+        // And it gates the import: `stations` is the step before 19 GB moves.
+        let raw = files.get(&format!("{OUT_DIR}/10-import-raw.sql")).unwrap();
+        assert!(raw.contains("PERFORM w9.assert_station_map_usable();"));
+        // No station of the owner's is named in the emitted SQL as a mapping: the three
+        // keys production gets are derived, and a hard-coded scheme would survive here.
+        assert!(
+            !staging.contains("'suncrest-air-quality'"),
+            "the production keys must be derived, not listed"
+        );
     }
 
     #[test]

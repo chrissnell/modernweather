@@ -118,11 +118,16 @@ $fn$;
 -- `stations` first. W4 2.1 makes it the reading-side projection every /span join
 -- goes through, and the low-volume tables carry a foreign key to it, so a reading
 -- whose station has no row is addressable by nothing.
+--
+-- Both assertions run here and not at the end, because this is the last point
+-- before 19 GB moves: a map that is incomplete, or whose ids could not be
+-- configured as station keys afterwards (M5-1b), costs an import either way.
 -- ------------------------------------------------------------------
 
 CREATE PROCEDURE w9.populate_stations() LANGUAGE plpgsql AS $fn$
 BEGIN
     PERFORM w9.assert_station_map_complete();
+    PERFORM w9.assert_station_map_usable();
     INSERT INTO stations (station_id, name, type, timezone, latitude, longitude,
                           altitude_ft, snow_base_distance_mm, first_seen, last_seen)
     SELECT m.station_id,
