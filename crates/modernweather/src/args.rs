@@ -32,11 +32,33 @@ pub struct Args {
     pub directive: Option<String>,
 }
 
+/// A `--migrate-config-from` command line.
+///
+/// Its own variant rather than two more fields on [`Args`], because it is a different thing
+/// to do: nothing binds, nothing is planned and the process exits when the migration is
+/// written. [`MigrateArgs::args`] is the part the two share -- where the configuration
+/// database is, and how to log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrateArgs {
+    /// `--config <path>` (the destination), `--log-format` and `--log-level`.
+    pub args: Args,
+    /// `--migrate-config-from <path>`: the Go daemon's own configuration database. **Read
+    /// only**, and never written to.
+    pub from: PathBuf,
+    /// `--migrate-config-dry-run`: apply everything inside a transaction, print the report,
+    /// and roll back. The same code path as a real migration, differing only in whether the
+    /// transaction commits -- which is how `POST /api/v1/config/preview` and a save already
+    /// relate (W5 §2.4).
+    pub dry_run: bool,
+}
+
 /// What a parse produced.
 #[derive(Debug)]
 pub enum Parsed {
     /// Run the daemon.
     Run(Args),
+    /// Translate a Go configuration database into the `--config` one, and exit.
+    MigrateConfig(MigrateArgs),
     /// `--help` or `--version` was asked for and has been printed.
     Printed,
 }
@@ -58,6 +80,11 @@ pub enum ArgsError {
         /// The accepted spellings.
         expected: &'static str,
     },
+    #[error(
+        "--migrate-config-dry-run only means something with --migrate-config-from <path>, \
+         and without it this would have started the daemon"
+    )]
+    DryRunWithoutSource,
     #[error("unrecognised argument `{arg}`")]
     Unknown {
         /// What was given.
@@ -78,6 +105,19 @@ Options:
                            RUST_LOG. Adjustable at run time through the management API.
   -h, --help               Print this and exit.
   -V, --version            Print the version and exit.
+
+Migrating from RemoteWeather (the Go daemon):
+  --migrate-config-from <path>
+                           Translate that daemon's own SQLite configuration database into
+                           the one --config names, then exit without serving. The source is
+                           read only. --config must not already hold configuration, and the
+                           spool is placed beside it. Every value that was changed, that has
+                           no successor here, or that you have to enter yourself is reported
+                           one line at a time.
+  --migrate-config-dry-run
+                           Do all of that inside a transaction and roll it back, so the
+                           report is produced and nothing is kept. Only with
+                           --migrate-config-from.
 ";
 
 /// Parse the arguments, with `--help` and `--version` handled here.
@@ -90,6 +130,8 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, ArgsEr
     let mut config = None;
     let mut format = None;
     let mut directive = None;
+    let mut migrate_from: Option<PathBuf> = None;
+    let mut dry_run = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         // `--flag=value` and `--flag value` both, because the systemd unit writes the
@@ -122,6 +164,9 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, ArgsEr
                 })?);
             }
             "--log-level" => directive = Some(value()?.to_string_lossy().into_owned()),
+            // A path, like `--config`, so it is kept as bytes for the same reason.
+            "--migrate-config-from" => migrate_from = Some(PathBuf::from(value()?)),
+            "--migrate-config-dry-run" => dry_run = true,
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return Ok(Parsed::Printed);
@@ -137,11 +182,23 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, ArgsEr
             }
         }
     }
-    Ok(Parsed::Run(Args {
+    let args = Args {
         config: config.ok_or(ArgsError::NoConfig)?,
         format,
         directive,
-    }))
+    };
+    match (migrate_from, dry_run) {
+        (Some(from), dry_run) => Ok(Parsed::MigrateConfig(MigrateArgs {
+            args,
+            from,
+            dry_run,
+        })),
+        // A dry run of nothing is a command line that asks for a migration and does not say
+        // from where, and the daemon would otherwise start and serve -- which is the one
+        // outcome somebody typing this flag did not want.
+        (None, true) => Err(ArgsError::DryRunWithoutSource),
+        (None, false) => Ok(Parsed::Run(args)),
+    }
 }
 
 /// Report a failure that happened before -- or instead of -- the subscriber.
@@ -308,5 +365,72 @@ mod tests {
                 "{flag} should print and stop"
             );
         }
+    }
+
+    /// The two flags M7-4 adds, in both spellings, and the one combination that is a
+    /// rejection rather than a default.
+    #[test]
+    fn a_configuration_migration_is_its_own_command_line() {
+        let m = match parse(
+            [
+                "--config",
+                "/var/lib/modernweather/config.db",
+                "--migrate-config-from",
+                "/etc/remoteweather/config.db",
+            ]
+            .iter()
+            .map(OsString::from),
+        ) {
+            Ok(Parsed::MigrateConfig(m)) => m,
+            other => panic!("expected a migration command line, got {other:?}"),
+        };
+        assert_eq!(
+            m.args.config,
+            PathBuf::from("/var/lib/modernweather/config.db")
+        );
+        assert_eq!(m.from, PathBuf::from("/etc/remoteweather/config.db"));
+        assert!(!m.dry_run);
+
+        // `--flag=value`, which a Dockerfile `CMD` array often writes.
+        let m = match parse(
+            [
+                "--config=/d/config.db",
+                "--migrate-config-from=/s/go.db",
+                "--migrate-config-dry-run",
+            ]
+            .iter()
+            .map(OsString::from),
+        ) {
+            Ok(Parsed::MigrateConfig(m)) => m,
+            other => panic!("expected a migration command line, got {other:?}"),
+        };
+        assert_eq!(m.from, PathBuf::from("/s/go.db"));
+        assert!(m.dry_run);
+
+        // Without the source this would have STARTED THE DAEMON, which is the one outcome
+        // somebody typing a dry-run flag did not want.
+        let e = match parse(
+            ["--config", "/d/config.db", "--migrate-config-dry-run"]
+                .iter()
+                .map(OsString::from),
+        ) {
+            Err(e) => e,
+            other => panic!("expected a rejection, got {other:?}"),
+        };
+        assert_eq!(e, ArgsError::DryRunWithoutSource);
+
+        // And the ordinary command line is untouched.
+        assert!(matches!(
+            parse(["--config", "/d/config.db"].iter().map(OsString::from)),
+            Ok(Parsed::Run(_))
+        ));
+    }
+
+    /// The usage text names both flags, because an operator at cutover reads `--help` and
+    /// not this file.
+    #[test]
+    fn the_usage_names_the_migration() {
+        assert!(USAGE.contains("--migrate-config-from"));
+        assert!(USAGE.contains("--migrate-config-dry-run"));
     }
 }

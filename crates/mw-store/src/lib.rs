@@ -17,6 +17,8 @@
 pub mod config_admin;
 /// The configuration store and its migrations (D-8, A-W6-2).
 pub mod config_db;
+/// The **Go** configuration database, and its translation onto this schema (M7-4).
+pub mod config_go;
 /// `ForecastStore` and `SnowCache`: the frozen REST surface's own two reads.
 pub mod frozen;
 /// `db:postgres`: the weather pool, its version assertion and its publish/revoke loop.

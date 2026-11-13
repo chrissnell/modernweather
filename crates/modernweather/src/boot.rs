@@ -2813,4 +2813,147 @@ mod tests {
         .expect("a node with no weather database is a legitimate node (D-44)");
         assert_eq!(asserted, None);
     }
+
+    /// **M7-4's "done when": the daemon starts from the migrated configuration and plans
+    /// the component set the Go daemon was running.**
+    ///
+    /// Nothing is typed by hand here. The source is the owner's own deployment as his public
+    /// endpoints describe it, through the Go schema
+    /// `ci/db/migrate-config-from-go/extract-go-schema.sh` extracted; the destination is
+    /// written by the real migration through the real `ConfigAdmin`; and what is asserted is
+    /// `plan()` over `Config::load` of the result, with the real registrar list. So this test
+    /// fails if the migration writes a row the schema accepts and the planner does not --
+    /// which is the whole class of mistake a configuration migration makes.
+    ///
+    /// The component set is the assertion rather than the row contents, because that is what
+    /// the work item says: `crates/mw-store/src/config_go.rs`'s own tests assert the columns.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_owners_migrated_configuration_plans_what_the_go_daemon_was_running() {
+        use mw_store::config_go::testing as go;
+
+        let scratch = Scratch::new("migrated");
+        let source = scratch.0.join("go-config.db");
+        go::go_db(
+            &source,
+            &[
+                go::OWNER_DEVICES,
+                go::OWNER_WEBSITE,
+                go::OWNER_STORAGE,
+                go::OWNER_CONTROLLERS,
+            ],
+        )
+        .await;
+
+        let migrated = crate::migrate::migrate(&crate::args::MigrateArgs {
+            args: Args {
+                config: scratch.db(),
+                format: None,
+                directive: None,
+            },
+            from: source,
+            dry_run: false,
+        })
+        .await
+        .expect("the owner's configuration migrates");
+        assert_eq!(
+            migrated.station_keys(),
+            vec!["csi", "suncrest-air-quality", "snow"],
+            "the keys the data migration wrote the history under"
+        );
+
+        // From here on this is the boot sequence, in the order W3 §3.1 writes it, against a
+        // configuration database this process did not seed.
+        let pool = config_db::open_and_migrate(&scratch.db())
+            .await
+            .expect("the migrated database opens");
+        let mut cfg = Config::load(&mut pool.acquire().await.expect("a connection"))
+            .await
+            .expect("the migrated configuration reads");
+        let node = cfg
+            .node
+            .clone()
+            .expect("the migration wrote a node identity");
+        assert_eq!(node.timezone, "America/Denver");
+        let fanout = spool::open(&node).expect("the spool opens where the migration put it");
+        let mut slots = Slots::new();
+        let _registry = attach_registry(&mut cfg, &mut slots).expect("the registry publishes");
+        attach_ingress(&mut cfg, &fanout).expect("the pipeline assembles");
+        attach_listener(&mut cfg, Arc::new(String::new), &mut slots, None)
+            .expect("the route tables mount");
+
+        let roots = Roots {
+            schedule: Arc::new(SqliteScheduleStore::new(pool.clone())),
+            stream: Some(Arc::clone(&fanout.stream) as Arc<dyn mw_component::ReadingStream>),
+            log: Arc::new(mw_supervisor::testing::MemoryLogControl::new("info")),
+        };
+        let ctx = PlanContext::new(Generation::ZERO).with_roots(roots.capabilities());
+        let planned = plan(&cfg, REGISTRARS, &ctx)
+            .expect("the migrated configuration plans; a refusal here is a migration defect");
+        let mut ids: Vec<&str> = planned
+            .ids()
+            .map(mw_component::ComponentId::as_str)
+            .collect();
+        ids.sort_unstable();
+        // **The component set, against what the Go daemon runs for this configuration.**
+        //
+        // | Go | here |
+        // |---|---|
+        // | `campbell.NewStation` for `CSI` | `station:campbell:csi` |
+        // | `airgradient.NewStation` for `Suncrest Air Quality` | `station:airgradient:suncrest-air-quality` |
+        // | `snowgauge.NewStation` for `snow` | `station:snowgauge:snow` |
+        // | the `timescaledb` storage backend | `db:postgres` + `writer:timescale` |
+        // | the `rest` controller | `api:legacy`, `web:site:1`, `web:static`, `http:listener` |
+        // | the `aerisweather` controller | two forecast periods, the alert fetch and its sweep |
+        // | the `snowcache` controller | `snow:depth`, `snow:events`, `snow:smoothing`, `snow:season:snow` |
+        // | *nothing*: Go truncates the day in the database session's zone | one `rain:rollover:<station>` each |
+        // | *nothing*: Go reads the database on every request | `snapshot:latest`, `snapshot:warm`, `window:rollup` |
+        //
+        // The last two rows are the only differences, and neither is a migration artefact:
+        // they are W2a **D-11**'s per-station `Calendar` replacing a `date_trunc` in the
+        // server's zone, and **D-27**'s snapshot replacing a read-through. Every row above
+        // them is one-for-one, and the three station ids carry the keys the data migration
+        // wrote the history under.
+        assert_eq!(
+            ids,
+            vec![
+                "aeris:alerts:csi",
+                "aeris:alerts:gc",
+                "aeris:forecast:csi:24",
+                "aeris:forecast:csi:240",
+                "api:legacy",
+                "db:postgres",
+                "http:listener",
+                "rain:rollover:csi",
+                "rain:rollover:snow",
+                "rain:rollover:suncrest-air-quality",
+                "snapshot:latest",
+                "snapshot:warm",
+                "snow:depth",
+                "snow:events",
+                "snow:season:snow",
+                "snow:smoothing",
+                "station:airgradient:suncrest-air-quality",
+                "station:campbell:csi",
+                "station:snowgauge:snow",
+                "web:site:1",
+                "web:static",
+                "window:rollup",
+                "writer:timescale",
+            ],
+            "the migrated configuration plans the Go daemon's component set"
+        );
+
+        // The one thing the component ids cannot show, and the reason this work item also
+        // fixes something the owner has already noticed: the station the frozen read path
+        // resolves `?station=CSI` to is keyed `csi`, which is the id the migrated history is
+        // stored under. One key, derived from his device name, instead of two.
+        let station = cfg
+            .stations
+            .iter()
+            .find(|s| s.name == "CSI")
+            .expect("`?station=CSI` still resolves by name");
+        assert_eq!(station.station_key, "csi");
+        assert_eq!(station.id, 1, "the integer three frozen fields carry");
+        pool.close().await;
+    }
 }

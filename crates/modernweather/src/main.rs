@@ -26,6 +26,7 @@ mod boot;
 mod config;
 mod hostinfo;
 mod logctl;
+mod migrate;
 mod notify;
 mod signals;
 mod spool;
@@ -39,6 +40,18 @@ async fn main() -> ExitCode {
     // valid Unicode, and `--config` is a path.
     let args = match args::parse(std::env::args_os().skip(1)) {
         Ok(args::Parsed::Run(args)) => args,
+        // M7-4's configuration migration. It is the same binary and the same schema
+        // migrations, and it does not serve: the process exits when the configuration is
+        // written, which is what makes it runnable before the daemon is enabled.
+        Ok(args::Parsed::MigrateConfig(m)) => {
+            return match migrate::run(&m).await {
+                Ok(_notes) => ExitCode::SUCCESS,
+                Err(e) => {
+                    report(e);
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Ok(args::Parsed::Printed) => return ExitCode::SUCCESS,
         Err(e) => {
             args::fatal(&e.to_string());
@@ -49,18 +62,26 @@ async fn main() -> ExitCode {
     match boot::run(&args).await {
         Ok(_report) => ExitCode::SUCCESS,
         Err(e) => {
-            // Whichever channel exists, and not both. Every failure after step 2 has a
-            // subscriber, so the chain goes through `tracing` and reaches the journal in
-            // the configured format; step 2 *itself* failing is the one case with no
-            // subscriber, and a daemon that exits 1 silently is what `Type=notify` was
-            // adopted to stop. `has_been_set` is the question that distinguishes them.
-            let chain = mw_types::DisplayChain(e.as_ref());
-            if tracing::dispatcher::has_been_set() {
-                tracing::error!(err = %chain, "modernweather stopped");
-            } else {
-                args::fatal(&chain.to_string());
-            }
+            report(e);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Report a failure through whichever channel exists, and not both.
+///
+/// Every failure after step 2 has a subscriber, so the chain goes through `tracing` and
+/// reaches the journal in the configured format; step 2 *itself* failing is the one case
+/// with no subscriber, and a daemon that exits 1 silently is what `Type=notify` was adopted
+/// to stop. `has_been_set` is the question that distinguishes them.
+///
+/// Shared with the configuration migration, which has the same two cases for the same
+/// reason: it installs the subscriber first and everything after that is logged.
+fn report(e: anyhow::Error) {
+    let chain = mw_types::DisplayChain(e.as_ref());
+    if tracing::dispatcher::has_been_set() {
+        tracing::error!(err = %chain, "modernweather stopped");
+    } else {
+        args::fatal(&chain.to_string());
     }
 }
