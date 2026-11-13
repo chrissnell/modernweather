@@ -233,12 +233,167 @@ separate, explicitly named step rather than part of `all`.
 > `.chunks` column it reads exists at 2.17.2 — and the §2 archive statements execute. `SRC_IMAGE` in
 > `lab/run-in-pod.sh` reproduces it.
 >
-> **Bounded claim:** this exercised the DDL and catalogue paths on an unseeded database, not a full
-> data run. The seeded end-to-end lab cannot be repeated at 2.17.2, because the target schema asserts
-> pg17/2.31 and refuses to build — which is correct, and is why the two halves are now separately
-> parameterised. Note also that `lab/10-seed.sh` manufactures the ~294 days of rollup-only history
-> on purpose; W6 §8 established production never had any, so the legacy-rollup path remains tested
-> only against a state that did not exist (D-71 keeps it anyway).
+> **Bounded claim, now discharged.** That run exercised the DDL and catalogue paths on an unseeded
+> database, not a full data run, and this note used to say the seeded end-to-end lab "cannot be
+> repeated at 2.17.2, because the target schema asserts pg17/2.31 and refuses to build". That was a
+> property of the *harness*, not of the procedure: both databases lived in one pod, so one image had
+> to serve both. `SRC_IMAGE` was declared and documented but never referenced. Wiring it to a second
+> pod removes the limitation — see the 2026-11-12 run below. `lab/10-seed.sh` still manufactures the
+> rollup-only history on purpose; W6 §8 established production never had any, so the legacy-rollup
+> path remains tested only against a state that did not exist (D-71 keeps it anyway).
+
+## 2a. The production run, 2026-11-13
+
+**The migration ran.** `pitcairn` as source over a read-only credential, M0-1's Kubernetes instance
+as target with `migrations/` at HEAD. This section is the record; the lab note below is the rehearsal
+that preceded it, kept because it is what made the run short.
+
+| | |
+|---|---|
+| source | PostgreSQL **16.6** / TimescaleDB **2.17.2**, re-confirmed. `weather` 215 columns, re-confirmed. 3 stations: `CSI` (campbell), `Suncrest Air Quality` (airgradient), `snow` (snowgauge) |
+| imported | **17,162,826** readings, 2025-10-30 .. 2026-11-12 23:17:49 UTC, in 55 slices of 7 days, each slice's count equal to the source's |
+| target after | `observations` **1,356 MB** compressed, 53 of 55 chunks, against the source's **20 GB** uncompressed for the same rows — production never had compression enabled (W6 O-3) |
+
+**Rows per station per year, at import time.** The one record of what moved.
+
+| station | year | rows | first | last |
+|---|---|---|---|---|
+| CSI | 2025 | 1,083,003 | 2025-10-30 00:00:03.929611+00 | 2025-12-31 23:59:57.036742+00 |
+| CSI | 2026 | 5,352,342 | 2026-01-01 00:00:02.037793+00 | 2026-11-12 23:17:48.460205+00 |
+| Suncrest Air Quality | 2025 | 1,620,854 | 2025-10-30 00:00:00.272627+00 | 2025-12-31 23:59:59.31424+00 |
+| Suncrest Air Quality | 2026 | 8,969,086 | 2026-01-01 00:00:02.387283+00 | 2026-11-12 23:17:49.853116+00 |
+| snow | 2025 | 45,600 | 2025-11-01 06:00:49.207257+00 | 2025-12-31 23:59:23.350755+00 |
+| snow | 2026 | 91,941 | 2026-01-01 00:00:18.368164+00 | 2026-10-02 19:29:31.68999+00 |
+
+The year key is UTC — see §6.1. **`snow` stops on 2026-10-02**, which is the station's own silence and
+not the migration's: the source agrees to the microsecond.
+
+**Derived, at import time and not stable.** `observations_1m` 1,193,224, `observations_5m` 240,122,
+`observations_1h` 20,661, `observations_1d` 991, `station_metrics` 636 pairs (3 stations x 212
+metrics), `stations` 3, `observations_1d_legacy` and `_1h_legacy` **0**. The first three figures are
+a snapshot: retention on the levels is 7 days, 14 days and 90 days, so a count taken the next
+morning is legitimately smaller. Raw has no retention and does not move.
+
+**The gates.**
+
+| | |
+|---|---|
+| **1. reconciliation, zero tolerance** | **1,182 of 1,182** (station, year, metric) digests `ok`, zero mismatches, `w9.assert_reconciled()` silent |
+| **2. the two bounded statistics** | `rain_incremental` total worst **5.77e-7** absolute against a 1.03e-3 bound; `wind_dir` circular mean worst **1.65e-3** degrees against a 1.69e-1 bound. The other twelve statistics **exact** — zero difference — over 964 daily buckets |
+| **3. `assert_no_unknown_source_columns()`** | raises nothing. 215 of 215 `ok`, nothing else |
+| **4. row counts per year** | the table above |
+| spot checks | **42 of 42** `ok` — every extreme and the timestamp that produced it, identical on both sides |
+| the §6.3 control | scalar and vector wind-direction means disagree in **378** buckets, so the circular-mean check is not passing for the wrong reason |
+| contract-visible | the two bounded statistics round to a different float32 in **39** and **337** of 964 buckets. Expected, recorded in §7, and the new value is the accurate one |
+
+**Negative controls, on the target that holds the data.** An empty `w9.recon` raises `w9.recon is
+empty: nothing was reconciled`. One digest row reduced by 101 readings raises
+`reconciliation found 1 mismatching (station, year, metric) rows: CSI/2026/outtemp: row_count`. Both
+inside a transaction that rolled back, and the verdict afterwards is 1,182 `ok` — the data-level
+version of the second control was run in the lab (§6.4) rather than against the only compressed copy
+of readings `pitcairn` has since dropped.
+
+**Nothing was written to `pitcairn`.** `archive` found the 2026-10-31 tables and left them alone.
+`pause-source-retention` found no enabled retention job on `weather` at the time it ran and therefore
+issued no `alter_job` — zero statements. Every other statement sent to the source was a `SELECT` or a
+`COPY ... TO STDOUT`.
+
+**What this run cost, because the numbers are not obvious.** `raw` 13 minutes for 17.2M rows.
+`populate_station_metrics` **62 minutes** — it is one `INSERT ... SELECT` per metric, so 212
+sequential single-threaded passes over the raw hypertable, and it is the slowest step in the
+procedure by an order of magnitude. `aggregates` 24 minutes, almost all of it `observations_1m`
+phase 1. Each digest 25-30 minutes. Each spot-check query ~1m50s on the source. The whole procedure
+is a few hours and none of it is interactive.
+
+**Three defects only a production run could find.** §2b.
+
+## 2b. What the production run found
+
+Each of these passed in the lab and failed here, and the reason is the same in all three: the lab's
+source and target were equivalent in a way that two real servers are not.
+
+**1. The legacy boundary compared a bucket's start against a reading's timestamp.**
+`w9.set_legacy_boundary()` records the first raw *reading*; `import_legacy_1d()` took every archived
+bucket whose *start* was below it. Production's first reading is **3.9 seconds** after midnight, so
+the daily bucket containing it starts before the cutover and was imported as legacy while
+`observations_1d` also held it, computed from the same raw. `w9.assert_legacy_disjoint()` caught it at
+exactly **3 buckets, one per station**, and `rollup` exited 1. The comparison is now against the
+bucket's **end**, per level. The lab could not reproduce it: its seeded raw starts exactly on a bucket
+boundary, so no bucket straddles.
+
+**2. The digest's year key was the server's local year.** `extract(year from <timestamptz>)` is
+evaluated in the session's `TimeZone`. Production is **US/Mountain**, the new instance **Etc/UTC**, so
+the seven hours after local New Year land in 2025 on one side and 2026 on the other. The first
+reconciliation reported **all 1,182 rows** as `row_count` mismatches with no data missing — the
+per-metric min and max agreed exactly, and `snow`, which had stopped reporting and so gained nothing
+new, showed **+458 in 2025 against -458 in 2026**: offsetting to zero, which is what a bucketing
+error looks like and what loss does not. Now extracted `AT TIME ZONE 'UTC'` on both sides, in the
+digest and in the spot checks. A lab with both databases in one pod shares one `TimeZone` and cannot
+see this.
+
+**3. The reconciliation window ran past what was imported.** `hi` was the *source's* current maximum,
+and the source is live and stays live — it is the rollback (D-2). By the time the digests ran it held
+readings that arrived after `raw` finished: **1,255** and **2,085** extra old-side rows on the two
+live stations. `hi` is now bounded by the target's maximum as well, and the step prints how many
+source rows the window excludes, so the exclusion is stated rather than inferred.
+
+**And one false positive the run exposed in the rollup check.** The old daily view is
+`materialized_only = false`, so `archive` captures a real-time tail bucket — a part-day. The new
+hierarchy computes that day from complete raw, so the two disagree by construction: every single
+disagreement in the first clean run was the **2026-10-31** bucket, `out_temp` max off by 8.9 degrees
+and `wind_speed` mean by 24% relative, while all 966 other buckets were exact or inside bound.
+`40-rollup-check.sql` now excludes each station's newest archived bucket and says why. A check that
+fails the same way on every run is a check that gets ignored.
+
+**Two steps could not be run alone**, which matters when a digest takes half an hour: `spot` and
+`rollup-check` were reachable only through `reconcile`. Both are now subcommands, and both are
+read-only and leave `w9.recon` alone, so a passing digest run does not have to be repeated to
+re-check them.
+
+> **Seeded end to end across the real version pair, 2026-11-12 (M5-1).** Source
+> `timescale/timescaledb-ha:pg16.6-ts2.17.2` in its own pod, target
+> `timescale/timescaledb-ha:pg17` with `migrations/` at HEAD — nine migrations, including the two
+> M6-3 added on 2026-11-12. Every step ran in order: `preflight`, the interlock refusal, `archive`,
+> `pause-source-retention`, `stage`, `gap`, `stations`, `raw`, `aggregates`, `rollup`, `reconcile`,
+> `policies`.
+>
+> | | result |
+> |---|---|
+> | source shape | 397,440 raw readings over 61 days, 3 stations at a 40 s cadence; `weather_1d` and `weather_1h` reach back 174 days, so **113 / 113 / 110 days per station are rollup-only** (P-4b) |
+> | the dangerous query | P-3b returns **2** invalidations reaching below raw on each of `weather_1d` and `weather_1h` — the A-W9-1 condition reproduced at 2.17.2, which is what makes the archive urgent rather than theoretical |
+> | column gap | 215 of 215 `ok`, nothing else; `w9.assert_no_unknown_source_columns()` raises nothing |
+> | `archive` | 520 daily and 12,480 hourly buckets, each verified equal to the view it came from |
+> | `pause-source-retention` | paused the one enabled retention job on `weather` and left both aggregate retention jobs enabled, as documented |
+> | `raw` | 9 slices, 397,440 rows, every slice's count equal to the source's |
+> | `rollup` | 336 legacy daily and 8,064 legacy hourly buckets, `assert_legacy_disjoint()` clean on both levels |
+> | `reconcile` | **591 of 591** (station, year, metric) digests `ok`, zero mismatches, `assert_reconciled()` raises nothing; 21 of 21 spot checks exact including the timestamp that produced each extreme |
+> | the two bounded statistics | `rain_incremental` total worst relative 3.13e-6 and `wind_dir` circular mean 1.73e-7, both against the 1.29e-4 derived bound; the other twelve statistics exact over 184 buckets |
+> | the §6.3 control | a scalar mean of the wind direction disagrees with the vector mean in **184 of 184** buckets, so the circular-mean check is not passing for the wrong reason |
+> | legacy re-read | 336 of 336 rows exact on mean, angle, extrema and total |
+>
+> **Reproducing it.** `SRC_IMAGE=timescale/timescaledb-ha:pg16.6-ts2.17.2 … run-in-pod.sh up`,
+> then `FROM=2025-01-01 TO=2025-06-25 CADENCE=40 RETAIN='60 days' 10-seed.sh`, then `run-in-pod.sh
+> migrate <step>`. That reproduces the shape — about 61 days of raw under 174 days of rollup; the
+> exact raw row count depends on which 7-day chunk boundary the retention cut lands on.
+>
+> **Two harness constraints the lab's clock imposes, worth knowing before reading any lab output.**
+> The lab's data sits in the past while `now()` does not, and two things follow.
+>
+> First, a *real* retention policy on the lab source deletes everything:
+> `add_retention_policy('weather', '60 days')` is due the moment it is created, because the whole
+> seeded range is older than 60 days *ago*. That is why `10-seed.sh` produces the retention window
+> with an explicit `drop_chunks` and no policy, and why the five policies it does create — so that
+> `pause-source-retention` has the one it pauses and the four it must not touch — take a `drop_after`
+> derived to reach past the oldest row in **any** of the five relations. Deriving it from raw alone
+> is not sufficient and was measured: a `drop_after` of raw's age + 30 days leaves the `weather_1d`
+> policy free to delete the rollup-only buckets, since the whole point of the seed is that
+> `weather_1d` reaches further back than `weather` does. In a lab seeded to a 98-day window it
+> removed 56 of those days within minutes of the policy being created — the A-W9-1 mechanism again,
+> this time with the lab's own clock supplying the invalidation.
+>
+> Second, `rebuild-aggregates.sh` phase 1 — "the widest `/span` band above each level", bounded by
+> `now() - 366 days` — matches no rows in the lab and the whole hierarchy is built by phase 2. On
+> production, where `max(time)` is minutes old, phase 1 is the part that matters.
 
 **Through the view, not through `pg_dump -t`.** The prompt asserts that `pg_dump -t weather_1d`
 captures only a view definition. Verified:
@@ -878,6 +1033,20 @@ scalar mean sneaking into the hierarchy would also be within 1e-9 of itself.
 | a source column with no registry entry | migration **stopped** before any data moved (§4.1) |
 | an interrupted import slice re-run | debris removed, slice re-imported to the full count (§5.4) |
 
+**Three of the five re-run at HEAD on 2026-11-12**, against the pg16.6/2.17.2 source and the
+nine-migration target, because a control that passed once against an older schema is a claim about
+that schema:
+
+| control | result, 2026-11-12 |
+|---|---|
+| `TRUNCATE w9.recon`, then `assert_reconciled()` | **raises** `w9.recon is empty: nothing was reconciled`, HINT *a reconciliation that ran against no rows is not a pass*. Rolled back; the 1,182 digest rows survive |
+| 101 readings deleted from one station on the new side | **197** `row_count` mismatches, `assert_reconciled()` raises naming them, the `reconcile` step exits **1** |
+| that slice marked unfinished and re-imported | `reset_slice` removed the debris, the slice came back to its full count, `observations` back to 397,440, and `reconcile` returned to **591 of 591 `ok`** and exit 0 |
+
+The other two are unchanged by anything since: `pause-source-retention`'s interlock was re-checked in
+the same run (it refused with both archives missing, exit 1, and paused nothing), and the
+unknown-source-column stop is the `gap` step, which ran clean at 215 of 215 above.
+
 ---
 
 ## 7. Validate by running both
@@ -918,11 +1087,21 @@ job uses, so a result here is a result there.
   retyped — a "faithful copy" that was retyped is a measurement of the retyping;
 - the new schema is built from `migrations/`, so it is the schema that ships;
 - the rollup-only window is produced by the mechanism production used: materialise all four levels
-  over the full range, then let retention drop the raw chunks underneath;
+  over the full range, then let retention drop the raw chunks underneath. Its width is
+  `(TO - FROM) - RETAIN`, and `RETAIN` defaults to production's 365 days — so a shortened span needs
+  it lowered too. **`10-seed.sh` measures the window it produced and fails when it is zero**, because
+  a seed with no such window reports success and then `rollup` imports nothing,
+  `assert_legacy_disjoint()` passes over an empty table, and the reconciliation downstream is green
+  on a lab that never exercised the legacy path at all;
 - the cadence is **40 seconds, not 60**, which puts 1 or 2 readings in each 1-minute bucket rather
   than exactly one. That is D-12's uneven-bucket condition — the condition under which a mean of
   means is wrong and a sum-and-count hierarchy is not. A 60-second cadence would make §6.3 pass for
-  the wrong reason.
+  the wrong reason;
+- **one pod or two.** By default both databases share a pod, which is the cheap case and what every
+  run before 2026-11-12 used. Set `SRC_IMAGE` to a different image and the source gets its own pod
+  at that version, which is the only way to seed and migrate across the real version pair — the
+  target's migrations assert pg17/2.31 and will not build on 16.6. `SRC_POD` names it; `10-seed.sh`
+  reads the same variable.
 
 **Load-independent, quote freely:** the column mapping and its gaps (215/215, 451/627, 43/396 and the
 four semantic ones); every structural result in §3.4 and §1.2; the bytes-per-row figures for the old

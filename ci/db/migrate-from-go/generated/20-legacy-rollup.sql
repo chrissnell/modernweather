@@ -1311,17 +1311,27 @@ COMMENT ON TABLE observations_1h_legacy IS
      the old 365-day retention policy before the migration. Not derived from
      observations and not rebuildable from anything. Never truncate this.';
 
--- The boundary. One row per station: the first bucket for which real raw exists.
--- Imports filter strictly below it and the assertion below proves the two sides do
--- not overlap, so the union views cannot double-count a bucket.
+-- The boundary. One row per station: the first raw READING, which is a timestamp
+-- and not a bucket. The imports below compare a bucket's END against it, so a
+-- bucket is legacy only when it finishes before any raw exists.
+--
+-- Comparing a bucket's START against this timestamp is the bug that cost M5-1 a
+-- run: production's first reading is 3.9 seconds after midnight, so the daily
+-- bucket containing it starts before the cutover and was imported as legacy while
+-- the level also held it, computed from the same raw. assert_legacy_disjoint()
+-- caught it at exactly 3 buckets, one per station. A lab whose raw happens to
+-- start on a bucket boundary cannot reproduce it.
+--
+-- The comparison is per level and not stored pre-aligned because one scalar cannot
+-- be aligned to both a day and an hour at once.
 CREATE TABLE w9.legacy_boundary (
     station_id text PRIMARY KEY,
     cutover    timestamptz NOT NULL
 );
 
 COMMENT ON TABLE w9.legacy_boundary IS
-    'Per station, the first bucket that has raw readings behind it. Set from the
-     imported raw extent, not from the archive.';
+    'Per station, the first raw reading. A bucket is legacy when it ENDS at or
+     before this instant. Set from the imported raw extent, not from the archive.';
 
 CREATE PROCEDURE w9.set_legacy_boundary() LANGUAGE sql AS $fn$
     INSERT INTO w9.legacy_boundary (station_id, cutover)
@@ -2247,7 +2257,11 @@ BEGIN
     FROM w9.weather_1d_archive a
     JOIN w9.station_map m ON m.stationname = a.stationname
     LEFT JOIN w9.legacy_boundary b ON b.station_id = m.station_id
-   WHERE b.cutover IS NULL OR a.bucket < b.cutover
+    -- The bucket's END, not its start: a bucket that CONTAINS the first raw
+    -- reading is in the level already, computed from that raw. See
+    -- w9.legacy_boundary's comment for the run this got wrong.
+   WHERE b.cutover IS NULL
+      OR date_trunc('day', a.bucket) + INTERVAL '1 day' <= b.cutover
    ON CONFLICT (station_id, bucket) DO NOTHING;
 END $fn$;
 
@@ -3169,7 +3183,11 @@ BEGIN
     FROM w9.weather_1h_archive a
     JOIN w9.station_map m ON m.stationname = a.stationname
     LEFT JOIN w9.legacy_boundary b ON b.station_id = m.station_id
-   WHERE b.cutover IS NULL OR a.bucket < b.cutover
+    -- The bucket's END, not its start: a bucket that CONTAINS the first raw
+    -- reading is in the level already, computed from that raw. See
+    -- w9.legacy_boundary's comment for the run this got wrong.
+   WHERE b.cutover IS NULL
+      OR date_trunc('hour', a.bucket) + INTERVAL '1 hour' <= b.cutover
    ON CONFLICT (station_id, bucket) DO NOTHING;
 END $fn$;
 

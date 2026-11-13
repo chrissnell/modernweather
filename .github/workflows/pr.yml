@@ -287,6 +287,7 @@ jobs:
             ci/db/migrate-from-go/migrate-from-go.sh \
             ci/db/migrate-from-go/extract-go-views.sh \
             ci/db/migrate-from-go/lab/run-in-pod.sh \
+            ci/db/migrate-from-go/lab/lab-env.sh \
             ci/db/migrate-from-go/lab/emit-old-schema.sh \
             ci/db/migrate-from-go/lab/10-seed.sh \
             ci/conformance/go-target.sh

@@ -34,6 +34,9 @@
 #   aggregates  create the four levels and materialise them bottom-up, recent-first.
 #   rollup      import the archived daily/hourly buckets into observations_*_legacy.
 #   reconcile   both digests, the rollup comparison and the spot checks.
+#   spot        the spot checks alone, against the same window `reconcile` would use.
+#   rollup-check
+#               the new hierarchy against the old daily view, alone.
 #   policies    refresh policies, compression and retention — last, deliberately.
 #
 # Each step is idempotent and each can be run alone. `all` runs stage..reconcile.
@@ -288,11 +291,39 @@ step_rollup() {
   done
 }
 
+# The comparison window, shared by `reconcile` and `spot` so the two cannot disagree
+# about what range they are checking. Sets RECON_LO and RECON_HI.
+recon_window() {
+  RECON_LO="$(srcq "SELECT min(time) FROM weather")"
+  # The TARGET's maximum, not the source's. The source is live and stays live — it is the
+  # rollback (W9 D-2) — so by the time this runs it holds readings that arrived after
+  # `raw` finished, and a window bounded by the source's max would compare a range the
+  # import never covered and report the difference as missing rows. M5-1 measured 1,255
+  # and 2,085 extra old-side rows on its two live stations from exactly that.
+  #
+  # Bounded by the lesser of the two maxima: on a quiesced source they are equal, and on a
+  # live one this is the imported extent. A source that is somehow BEHIND the target still
+  # bounds the comparison correctly.
+  #
+  # `lo` stays the SOURCE's minimum on purpose. Bounding it by the target too would hide
+  # the one failure worth catching at that end — an import that missed the earliest rows
+  # would simply fall outside the window and reconcile clean.
+  RECON_HI="$(tgtq "SELECT least(
+                (SELECT max(time) FROM observations),
+                '$(srcq "SELECT max(time) FROM weather")'::timestamptz)
+              + INTERVAL '1 microsecond'")"
+  echo "  window: $RECON_LO .. $RECON_HI"
+  # What the window leaves out, said out loud rather than left to be inferred: readings
+  # that arrived in the source after the import. Zero on a quiesced source.
+  echo "  source rows above the window (arrived after the import): \
+$(srcq "SELECT count(*) FROM weather WHERE time >= '$RECON_HI'")"
+}
+
 step_reconcile() {
   say "reconcile — the old database stays read-only until this passes"
   local lo hi
-  lo="$(srcq "SELECT min(time) FROM weather")"
-  hi="$(srcq "SELECT max(time) + INTERVAL '1 microsecond' FROM weather")"
+  recon_window
+  lo="$RECON_LO"; hi="$RECON_HI"
   tgt -c "TRUNCATE w9.recon" > /dev/null
   echo "  old-side digest"
   src -c "COPY ($(tgtq "SELECT w9.digest_body('old', '$lo'::timestamptz, '$hi'::timestamptz)")) TO STDOUT (FORMAT csv)" \
@@ -356,6 +387,11 @@ case "${1:-help}" in
   aggregates) shift; step_aggregates "$@" ;;
   rollup)     step_rollup ;;
   reconcile)  step_reconcile ;;
+  # The two tails of `reconcile`, runnable alone. Both are read-only and neither touches
+  # w9.recon, so a digest run that passed does not have to be repeated to re-check these
+  # — which on a production-sized source is the difference between minutes and an hour.
+  spot)       recon_window; step_spot "$RECON_LO" "$RECON_HI" ;;
+  rollup-check) step_rollup_check ;;
   policies)   step_policies ;;
   all)        step_stage; step_stations; step_raw; step_aggregates; step_rollup; step_reconcile ;;
   *) sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2 ;;

@@ -1063,6 +1063,37 @@ the Go source definition, so `w9.expected_column INTERSECT w9.source_column` wil
 `w9.assert_no_unknown_source_columns()` should raise nothing — and if it does, something has changed
 since 2026-10-31 and that is worth stopping for.
 
+**DONE 2026-11-13. The migration ran, and all four criteria are met.**
+`docs/data-migration.md` §2a is the record and §2b is what the run found. In short: **17,162,826**
+readings for three stations over 2025-10-30 .. 2026-11-12, reconciled at **1,182 of 1,182** (station,
+year, metric) digests with zero tolerance and zero mismatches; the two bounded statistics at 5.77e-7
+and 1.65e-3 against bounds of 1.03e-3 and 1.69e-1, with the other twelve **exact** over 964 buckets;
+`w9.assert_no_unknown_source_columns()` silent at 215 of 215; 42 of 42 spot checks exact including
+each extreme's timestamp; per-year counts in §2a. `pitcairn` was not written to at all — `archive`
+found the 2026-10-31 tables and left them, and `pause-source-retention` found nothing enabled and
+issued no statement.
+
+**Three defects only this run could find**, all three green in the lab, all three fixed and
+re-verified here: the legacy boundary compared a bucket's *start* against a reading's timestamp and
+double-counted one bucket per station; the digest's year key was the server's **local** year, and
+US/Mountain against Etc/UTC reported all 1,182 rows as mismatches with nothing missing; and the
+reconciliation window ran past the imported extent because the source is live. §2b has the evidence
+for each, including the control that distinguished the second from real loss.
+
+**Two things for whoever plans the cutover.**
+
+- **The pause O-2 took is not durable.** Retention on `weather` was job 1004, paused 2026-10-31. It
+  is now job **1022**, `drop_after = 365 days`, **enabled** — a new job id with identical config,
+  which is what the Go provisioner creating policies at start-up looks like. It has already dropped
+  raw below **2025-11-12**, so the new database is the only copy of 2025-10-30 .. 2025-11-12. Those
+  14 days *were* reconciled against production before it dropped them. Not re-paused here: it no
+  longer protects data the new database lacks, and unbounded raw growth on `pitcairn` is the owner's
+  disk. One statement reverses it, and a restart will undo that too.
+- **The parallel database was two migrations behind** and nothing would have caught up on its own —
+  the daemon applies `migrations/config` at start-up, not `migrations/`. Fixed, with the
+  `_sqlx_migrations` rows `sqlx` itself would have written; all nine checksums are the SHA-384 of the
+  files on `main`.
+
 ### M5-1a — a serial multiplexer, so two daemons can read one station *(GRA-787)*
 **Depends on:** nothing — both ends already support it. **Blocks:** M5-2's mechanism (b) on a serial
 station, and nothing else.
