@@ -1012,6 +1012,9 @@ so **both daemons can receive the same packets at the same time** with no reconf
 side and no risk to it. Each writes to its own database. A diff harness then compares, per timestamp:
 every stored metric column, and the derived values **R1** stores at ingest (wind chill, heat index,
 AQI, solar, snow depth).
+**The Campbell station is not free in the same way.** A serial line has exactly one reader, so for
+that station (b) does not exist until a multiplexer sits in front of the port — **M5-1a**, which is
+why that item is where it is.
 *Expected diffs, and they are predicted rather than discovered:* NULL where Go writes `0.0` for an
 unreported metric (D-26 — the intended change), and nothing else. **Any other diff is a defect in the
 Rust implementation**, which is what makes this harness useful: its expected output is "one known
@@ -1091,10 +1094,56 @@ for each, including the control that distinguished the second from real loss.
   `_sqlx_migrations` rows `sqlx` itself would have written; all nine checksums are the SHA-384 of the
   files on `main`.
 
+### M5-1a — a serial multiplexer, so two daemons can read one station *(GRA-787)*
+**Depends on:** nothing — both ends already support it. **Blocks:** M5-2's mechanism (b) on a serial
+station, and nothing else.
+
+**Not in the original plan.** Proposed on 2026-11-12 and recorded here rather than left on an issue,
+because it is the only thing that makes (b) available on a serial station and because deploying it
+touches a live machine. It is **N-20**'s production path arriving a milestone early: `ser2net` owns
+the character device, and both daemons read it over TCP. The Go side is a configuration change and
+not a code change (`campbell/station.go:254` takes the serial path only when `serial_device` is
+non-empty); the Rust side already maps Campbell as `Serial | TcpOut`.
+
+**The deliverable is the proof before it is the bridge.** The question that decides whether any of
+this is worth doing is whether the multiplexer *broadcasts* every byte to every connected client or
+hands bytes to whichever client reads first. If it is the second, the two daemons split the stream
+and **both** produce gap-ridden data that still parses — nothing downstream could tell it from
+weather, which makes it the worst available outcome and strictly worse than having no (b) for that
+station at all. `ser2net`'s documentation says `max-connections` broadcasts; the documentation is
+not the measurement.
+
+**Done when:** `ci/serial-bridge/prove.sh` is green — two clients connected at once receive the
+identical byte stream, asserted byte for byte over a known sequence pushed through a `socat` pty, so
+the whole proof runs with no hardware and without touching a live station; the bridge runs as a unit
+that survives a reboot; the Go daemon reads it over TCP with its site serving current readings,
+checked by a timestamp and not by a process being up; and `modernweather`'s Campbell driver reads
+the same stream at the same time.
+
+**Test strategy:** the assertion plus **two** negative controls, because an identity assertion that
+cannot be made to fail proves nothing (W1 **D-10**): the same apparatus with `max-connections: 1`,
+where the refused client's stream must differ; and the same apparatus with the bridge removed and
+one character device read twice, which is the real failure mode. The second control is also
+load-bearing for the runbook — `remoteweather`'s serial library takes no exclusive lock, so a bridge
+started while the daemon still holds the port opens it successfully and the two then split the line
+with no error anywhere. That is why `packaging/serial-bridge/README.md`'s cutover order is a
+measured requirement rather than caution.
+
+**What this item introduces, stated rather than discovered:** the port is writable. `ser2net`
+forwards what a client sends to the datalogger. Neither daemon writes to a Campbell line — checked
+in both trees — but before this change the only thing that *could* was a descriptor the daemon held.
+That is the one new hazard and it is in the README beside the mitigation.
+
+**Nothing in this repository records a particular installation.** The device path, the line rate and
+the listen address are site-specific, and each of them fails *quietly* when guessed wrong, so
+`packaging/serial-bridge/ser2net.yaml.example` leaves them as placeholders that are deliberately not
+valid rather than shipping a plausible default. An operator's actual values belong wherever that
+machine's configuration is kept, which is not here.
+
 ### M5-2 — the diff harness
-**Depends on:** M5-1, M3-1. Build (b) and (c) above as a runnable harness in `ci/diff/`, with its
-expected-diff set encoded as data rather than prose so an unexpected diff is a failure rather than a
-judgement call.
+**Depends on:** M5-1, M3-1, and **M5-1a** for the Campbell half of (b). Build (b) and (c) above as a
+runnable harness in `ci/diff/`, with its expected-diff set encoded as data rather than prose so an
+unexpected diff is a failure rather than a judgement call.
 **Done when:** (b) reports only NULL-versus-zero differences across a 24-hour run; (c) reports only
 `period_rain` and `windd` differences, within DEV-4's measured bound, across all four `/span` bands
 and `/latest`, `/snow` and `/almanac`.

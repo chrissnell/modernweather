@@ -1,0 +1,67 @@
+# EXAMPLE. Copy, edit, and install as /etc/ser2net/<station>.yaml.
+#
+# A serial fan-out for a stream station, so that more than one reader can have the same
+# datalogger at the same time. A serial line has exactly one reader; this gives it several.
+#
+# Two reasons to want it:
+#
+#   - running `modernweather` and an older daemon side by side against one physical station,
+#     which is how a migration gets diffed by value rather than by shape;
+#   - a station whose cable is on one machine and whose daemon is on another -- the bridge
+#     owns the line and the daemon speaks TCP (`transport: tcp_out`).
+#
+# `campbell-serial-bridge.service` runs this. `README.md` has what each option was measured
+# to do, the cutover order and why it is not negotiable, and the rollback.
+#
+# ---------------------------------------------------------------------------------------
+# THE PLACEHOLDERS BELOW ARE DELIBERATELY NOT VALID. Both of them fail QUIETLY if guessed
+# wrong, so neither has a default worth shipping:
+#
+#   <DEVICE>  the character device. For a built-in port this is a /dev/ttyS* node; for a
+#             USB adapter use the /dev/serial/by-id/… symlink and NOT /dev/ttyUSB*, whose
+#             numbering is not stable across a replug. gensio accepts a symlink -- that was
+#             checked.
+#
+#   <BAUD>    the line rate, with `n81` or whatever framing the datalogger uses. A wrong
+#             rate does NOT produce silence: the bytes arrive framed wrong, every line
+#             fails to parse, and the station looks connected and mute. Take it from the
+#             station's existing configuration rather than from memory.
+#
+#   <ADDRESS> what the listener binds. Left as 127.0.0.1 below, which is correct when every
+#             reader is on this machine and is the only choice that needs no further
+#             thought about who may reach the port. See "the port is writable" in README.md
+#             before widening it.
+# ---------------------------------------------------------------------------------------
+
+%YAML 1.1
+---
+
+connection: &campbell
+  # The accepter is `tcp` and not `telnet`, deliberately: no RFC 2217 negotiation, so a
+  # client cannot change the line rate out from under the other readers.
+  accepter: tcp,127.0.0.1,7001
+
+  # `local` because a direct cable has no modem control lines to wait for.
+  #
+  # The uucp lock is left ON (no `nouucplock`), which is deliberate and has a consequence: a
+  # ser2net killed with SIGKILL leaves `/run/lock/LCK..*` behind -- one keyed by the device
+  # path and one by its major.minor -- and the next start then answers its clients
+  # `Device open failure: Object was already in use` while otherwise looking healthy. The
+  # unit therefore stops with SIGTERM, and README.md says where to look if it happens.
+  connector: serialdev,<DEVICE>,<BAUD>n81,local
+
+  options:
+    # Two daemons, plus room for someone with `nc` to watch the line without displacing
+    # either of them.
+    #
+    # Measured against ser2net 4.6.4 and 4.6.8 by
+    # `crates/mw-station/tests/serial_bridge.rs`: every connected client receives every
+    # byte, identical byte for byte; a client beyond this limit is answered
+    # `Port already in use` and the clients already reading do not notice; and a client that
+    # stops reading entirely does not cost the others a byte over several hours' worth of
+    # records.
+    max-connections: 4
+
+    # Not set, and named here so that a later reader does not add it: `kickolduser` would
+    # make a careless extra connection displace a daemon that is reading. Refusing the
+    # newcomer is the behaviour a station wants.
