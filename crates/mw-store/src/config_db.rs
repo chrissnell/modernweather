@@ -18,13 +18,26 @@
 //! - It does not create a table. The only writes [`apply_migrations`] performs are the
 //!   migration files' own, and the only file it creates is the database file itself, which
 //!   has no schema in it.
+//!
+//! # Why every read is generic over the executor rather than taking the pool
+//!
+//! Because the management API's save preview has to read **uncommitted** rows. W5 §2.4
+//! requires `POST /api/v1/config/preview` to run the supervisor's `plan()` against the
+//! proposed configuration, and implementation-plan.md **M7-1** makes "a save's preview names
+//! exactly the components that then restart" its done-criterion. The only arrangement in
+//! which that is structurally true rather than asserted is one where the preview and the
+//! save are the *same* code path and differ only in `COMMIT` versus `ROLLBACK` -- so the
+//! reads below have to be runnable inside a transaction, which `&SqlitePool` cannot do:
+//! every call on a pool takes its own connection and would see the pre-change rows.
+//!
+//! `&SqlitePool` still satisfies the bound, so the boot sequence's reads are unchanged.
 
 use secrecy::SecretString;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
-use sqlx::Row;
+use sqlx::{Executor, Row, Sqlite};
 use std::path::Path;
 use std::time::Duration;
 
@@ -1388,13 +1401,26 @@ pub struct Listener {
     pub management_listen_addr: String,
     /// The management API's port.
     pub management_port: u16,
+    /// The management API's certificate, when one is configured.
+    ///
+    /// Read here because M7-1 binds that socket: the schema has carried the column since
+    /// its first migration and nothing read it, which is the half of W5 §1.4's narrowing
+    /// that needed a consumer -- the port, the address and the certificate move to
+    /// `System → Advanced`, and the `auth_token` beside them does not exist under §3.
+    pub management_tls_cert_path: Option<String>,
+    /// Its key. The table's `CHECK` makes this `Some` exactly when the certificate is.
+    pub management_tls_key_path: Option<String>,
 }
 
 /// Read the listener row.
-pub async fn listener(pool: &SqlitePool) -> Result<Listener, ConfigDbError> {
+pub async fn listener<'e, E>(pool: E) -> Result<Listener, ConfigDbError>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let row = sqlx::query(
         "SELECT listen_addr, http_port, https_port, grpc_port, \
-                management_listen_addr, management_port \
+                management_listen_addr, management_port, \
+                management_tls_cert_path, management_tls_key_path \
          FROM listener WHERE id = 1",
     )
     .fetch_one(pool)
@@ -1410,6 +1436,8 @@ pub async fn listener(pool: &SqlitePool) -> Result<Listener, ConfigDbError> {
         grpc_port: port(&row, "grpc_port")?,
         management_listen_addr: row.get("management_listen_addr"),
         management_port: port(&row, "management_port")?,
+        management_tls_cert_path: row.get("management_tls_cert_path"),
+        management_tls_key_path: row.get("management_tls_key_path"),
     })
 }
 
@@ -1427,7 +1455,10 @@ pub struct WeatherDatabase {
 /// `modernweather --config <path>` on an empty configuration a legitimate start rather
 /// than a misconfiguration -- there is no database to assert a version against, and
 /// **D-62** has nothing to do.
-pub async fn weather_database(pool: &SqlitePool) -> Result<Option<WeatherDatabase>, ConfigDbError> {
+pub async fn weather_database<'e, E>(pool: E) -> Result<Option<WeatherDatabase>, ConfigDbError>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let row = sqlx::query("SELECT url FROM weather_database WHERE id = 1")
         .fetch_optional(pool)
         .await
@@ -1491,6 +1522,13 @@ pub struct StationRow {
     pub wind_dir_correction_degrees: i64,
     /// `presented_key` -- the identifier a non-`fixed` station presents.
     pub presented_key: Option<String>,
+    /// `aprs_callsign` -- public identity, printed on every packet, which is why it is on
+    /// the station row rather than beside the passcode (W7 §6.2).
+    ///
+    /// Read here as well as by [`uploaders`]' join because the **management API** returns it
+    /// (M7-1): a station form that could not prefill it would write `NULL` back on the next
+    /// save, and `mw_output::plan` then refuses the whole configuration while APRS is paired.
+    pub aprs_callsign: Option<String>,
     /// `ingest_secret_hash` -- the protocol secret's hash, where the protocol has one.
     pub ingest_secret_hash: Option<String>,
     /// `transport_kind`. `None` for a station received from a peer.
@@ -1545,9 +1583,13 @@ pub struct StationRow {
 /// nothing tying them together, so a station renamed in the management UI without its key
 /// changing reordered a frozen array. `station_key` stays as the tiebreak, because `name`
 /// has no uniqueness constraint and the digest has to be stable.
-pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbError> {
+pub async fn stations<'e, E>(pool: E) -> Result<Vec<StationRow>, ConfigDbError>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let rows = sqlx::query(
         "SELECT id, station_key, name, type, enabled, identity_kind, presented_key, \
+                aprs_callsign, \
                 ingest_secret_hash, latitude, longitude, altitude_m, timezone, \
                 snow_base_distance_mm, wind_dir_correction_degrees, \
                 transport_kind, transport_dev, transport_baud, \
@@ -1573,6 +1615,7 @@ pub async fn stations(pool: &SqlitePool) -> Result<Vec<StationRow>, ConfigDbErro
                 enabled: flag(&r, "enabled")?,
                 identity_kind: r.get("identity_kind"),
                 presented_key: r.get("presented_key"),
+                aprs_callsign: r.get("aprs_callsign"),
                 ingest_secret_hash: r.get("ingest_secret_hash"),
                 latitude: r.get("latitude"),
                 longitude: r.get("longitude"),
@@ -1672,7 +1715,10 @@ pub struct WebsiteRow {
 ///
 /// **Every row, including a portal.** Which of them produce components is the consumer's to
 /// decide; a `WHERE` here would put that decision in two places.
-pub async fn websites(pool: &SqlitePool) -> Result<Vec<WebsiteRow>, ConfigDbError> {
+pub async fn websites<'e, E>(pool: E) -> Result<Vec<WebsiteRow>, ConfigDbError>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let rows = sqlx::query(
         "SELECT id, name, primary_station_key, snow_enabled, snow_station_key, hostname, \
                 page_title, about_station_html, air_quality_enabled, \
@@ -1722,7 +1768,10 @@ pub async fn websites(pool: &SqlitePool) -> Result<Vec<WebsiteRow>, ConfigDbErro
 ///
 /// Ordered for [`stations`]'s reason: the order reaches the plan through the website
 /// components' `ConfigDigest`.
-pub async fn aeris_stations(pool: &SqlitePool) -> Result<Vec<String>, ConfigDbError> {
+pub async fn aeris_stations<'e, E>(pool: E) -> Result<Vec<String>, ConfigDbError>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let rows = sqlx::query(
         "SELECT station_key FROM station_service WHERE service = 'aeris' ORDER BY station_key",
     )
@@ -1761,7 +1810,10 @@ pub struct AerisAccountRow {
 /// registrar's, not this function's: a disabled account with a credential in it is a state
 /// an operator can see in the management API, and collapsing it to `None` here would make it
 /// invisible.
-pub async fn aeris_account(pool: &SqlitePool) -> Result<Option<AerisAccountRow>, ConfigDbError> {
+pub async fn aeris_account<'e, E>(pool: E) -> Result<Option<AerisAccountRow>, ConfigDbError>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let row = sqlx::query(
         "SELECT enabled, client_id, client_secret, api_endpoint, refresh_interval_seconds \
          FROM aeris_account WHERE id = 1",
@@ -1869,7 +1921,10 @@ pub struct IngestRow {
 /// Ordered for the digest's sake rather than for a reader's: `listen` is the primary key, so
 /// the order is total and stable, and a `ConfigDigest` over the rows is then a function of
 /// the table's contents rather than of the order SQLite happened to return them in.
-pub async fn ingest(pool: &SqlitePool) -> Result<Vec<IngestRow>, ConfigDbError> {
+pub async fn ingest<'e, E>(pool: E) -> Result<Vec<IngestRow>, ConfigDbError>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let rows = sqlx::query(
         "SELECT listen, peer_auth, ca_path, allow_insecure FROM ingest ORDER BY listen",
     )
@@ -1901,7 +1956,10 @@ pub async fn ingest(pool: &SqlitePool) -> Result<Vec<IngestRow>, ConfigDbError> 
 /// the row it writes also needs a `spool_path`, which has no default in the schema and no
 /// value in any design document -- so inventing one here would be this work item deciding
 /// something implementation-plan.md M6-4 owns.
-pub async fn node(pool: &SqlitePool) -> Result<Option<Node>, ConfigDbError> {
+pub async fn node<'e, E>(pool: E) -> Result<Option<Node>, ConfigDbError>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let row = sqlx::query(
         "SELECT node_id, node_name, timezone, spool_path, \
                 spool_ceiling_bytes, spool_max_lag_seconds \
@@ -1978,6 +2036,13 @@ fn optional_port(
 pub struct UploaderRow {
     /// `uploader.kind` -- `wunderground`, `pwsweather` or `aprs`.
     pub kind: String,
+    /// `uploader.enabled` -- W5 §1.4's "Stop sharing with Weather Underground".
+    ///
+    /// Always `true` for a registrar, which reads only the enabled rows. The **management
+    /// API** reads both (M7-1), because a service the operator has just switched off still
+    /// has a page: without this the toggle is write-only, the page 404s the moment it is
+    /// used, and turning the service back on means re-entering a form nothing can prefill.
+    pub enabled: bool,
     /// `uploader.name`, the component id's stable suffix.
     pub name: String,
     /// `uploader.interval_seconds`. `None` is the kind's default.
@@ -2048,9 +2113,34 @@ pub struct UploaderRow {
 /// `enabled = 0` rows are not returned at all, which is what makes W5 §1.4's "Stop sharing
 /// with Weather Underground" a plan that no longer contains the component (W2a §2.5) rather
 /// than `RemoveController` deleting a map entry and logging "will stop on next app restart".
-pub async fn uploaders(pool: &SqlitePool) -> Result<Vec<UploaderRow>, ConfigDbError> {
+pub async fn uploaders<'e, E>(pool: E) -> Result<Vec<UploaderRow>, ConfigDbError>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    read_uploaders(pool, true).await
+}
+
+/// Every `uploader` row, enabled or not, joined the same way.
+///
+/// For the management API alone. The registrar's read filters, because a disabled uploader
+/// is not a component; a **page** for a disabled service is still a page, which is what
+/// makes the enable toggle readable rather than write-only.
+pub async fn all_uploaders<'e, E>(pool: E) -> Result<Vec<UploaderRow>, ConfigDbError>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    read_uploaders(pool, false).await
+}
+
+async fn read_uploaders<'e, E>(
+    pool: E,
+    enabled_only: bool,
+) -> Result<Vec<UploaderRow>, ConfigDbError>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let rows = sqlx::query(
-        "SELECT u.kind, u.name, u.interval_seconds, u.api_endpoint, u.api_key, \
+        "SELECT u.kind, u.name, u.enabled, u.interval_seconds, u.api_endpoint, u.api_key, \
                 u.aprs_passcode, u.aprs_symbol_table, u.aprs_symbol_code, u.aprs_comment, \
                 u.aprs_server, u.aprs_transport, u.aprs_kiss_serial_device, \
                 u.aprs_kiss_serial_baud, u.aprs_kiss_tcp_address, u.aprs_kiss_path, \
@@ -2065,9 +2155,10 @@ pub async fn uploaders(pool: &SqlitePool) -> Result<Vec<UploaderRow>, ConfigDbEr
          LEFT JOIN station_service ss \
                 ON ss.uploader_id = u.id AND ss.service = u.kind \
          LEFT JOIN stations s ON s.station_key = ss.station_key \
-         WHERE u.enabled = 1 \
+         WHERE u.enabled = 1 OR ? = 0 \
          ORDER BY u.kind, u.name, ss.station_key",
     )
+    .bind(enabled_only)
     .fetch_all(pool)
     .await
     .map_err(|source| ConfigDbError::Query {
@@ -2078,6 +2169,7 @@ pub async fn uploaders(pool: &SqlitePool) -> Result<Vec<UploaderRow>, ConfigDbEr
         .map(|r| {
             Ok(UploaderRow {
                 kind: r.get("kind"),
+                enabled: r.get("enabled"),
                 name: r.get("name"),
                 interval_seconds: r.get("interval_seconds"),
                 api_endpoint: r.get("api_endpoint"),

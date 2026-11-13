@@ -83,10 +83,13 @@ impl Drop for Scratch {
 /// Racy in principle, and the alternative is a fixed pair, which is racy in practice: two
 /// of these tests and a developer's own daemon would collide on 8080 and 50051.
 ///
-/// **Two, because the daemon binds N sockets** (§6.1, **A-W3-4**): the main port and the
-/// legacy gRPC port, which keeps its own socket so that no peer's endpoint changes at
-/// upgrade (**D-92**). A test that left `grpc_port` at the seeded 50051 would pass until two
-/// of them ran at once.
+/// **Three, because the daemon binds N sockets** (§6.1, **A-W3-4**): the main port, the
+/// legacy gRPC port -- which keeps its own socket so that no peer's endpoint changes at
+/// upgrade (**D-92**) -- and, since implementation-plan.md **M7-1**, the management port. A
+/// test that left any of them at its seeded default would pass until two of them ran at
+/// once, which is exactly how the management port announced itself: every test in this file
+/// bound the schema's default 8081 and the whole file failed under `cargo test` while each
+/// test passed alone.
 ///
 /// Through `mw_http::bind` rather than `std::net`, and not to dodge a lint:
 /// `ci/layers.toml`'s `only-mw-http-binds-a-socket` rule scans `tests/` as well as `src/`,
@@ -94,20 +97,34 @@ impl Drop for Scratch {
 /// is that there is exactly one place a listener can exist -- so when a test needs the
 /// kernel to choose a port, it asks through the crate that owns binding. The sockets close
 /// when `Bound` drops.
-async fn free_ports() -> (u16, u16) {
-    let probe = mw_http::bind(
+async fn free_ports() -> (u16, u16, u16) {
+    let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let probe = mw_http::bind_all(
         &mw_http::Listen {
-            addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            addr: loopback,
             http_port: 0,
             https_port: None,
             grpc_port: 0,
         },
         axum::Router::new(),
         None,
+        std::sync::Arc::new(mw_http::HostTable::default()),
+        Some(mw_http::Management {
+            addr: std::net::SocketAddr::new(loopback, 0),
+            router: axum::Router::new(),
+            tls: None,
+        }),
     )
     .await
-    .expect("two loopback ports are available");
-    (probe.local_addr().port(), probe.grpc_addr().port())
+    .expect("three loopback ports are available");
+    (
+        probe.local_addr().port(),
+        probe.grpc_addr().port(),
+        probe
+            .management_addr()
+            .expect("the management socket was asked for")
+            .port(),
+    )
 }
 
 /// Create the configuration database and point the listener at free loopback ports.
@@ -116,16 +133,17 @@ async fn free_ports() -> (u16, u16) {
 /// write the row first -- and `listener.http_port` has a `CHECK (http_port BETWEEN 1 AND
 /// 65535)`, so "bind port 0 and tell me what you got" is not available through
 /// configuration.
-async fn configure(path: &Path, port: u16, grpc_port: u16) {
+async fn configure(path: &Path, port: u16, grpc_port: u16, management_port: u16) {
     let pool = mw_store::config_db::open_and_migrate(path)
         .await
         .expect("the configuration schema applies from empty");
     sqlx::query(
-        "UPDATE listener SET listen_addr = '127.0.0.1', http_port = ?1, grpc_port = ?2 \
-         WHERE id = 1",
+        "UPDATE listener SET listen_addr = '127.0.0.1', http_port = ?1, grpc_port = ?2, \
+         management_port = ?3 WHERE id = 1",
     )
     .bind(i64::from(port))
     .bind(i64::from(grpc_port))
+    .bind(i64::from(management_port))
     .execute(&pool)
     .await
     .expect("the seeded listener row is updatable");
@@ -215,8 +233,8 @@ async fn an_empty_configuration_starts_converges_notifies_serves_and_stops() {
     let scratch = Scratch::new("done-when");
     let config = scratch.path("config.db");
     let notify = scratch.path("notify.sock");
-    let (port, grpc_port) = free_ports().await;
-    configure(&config, port, grpc_port).await;
+    let (port, grpc_port, management_port) = free_ports().await;
+    configure(&config, port, grpc_port, management_port).await;
     let socket = notify_socket(&notify);
 
     let mut child = spawn(&config, &notify);
@@ -329,8 +347,8 @@ async fn a_second_start_against_the_same_database_applies_no_migrations_and_stil
     let scratch = Scratch::new("restart");
     let config = scratch.path("config.db");
     let notify = scratch.path("notify.sock");
-    let (port, grpc_port) = free_ports().await;
-    configure(&config, port, grpc_port).await;
+    let (port, grpc_port, management_port) = free_ports().await;
+    configure(&config, port, grpc_port, management_port).await;
     let socket = notify_socket(&notify);
 
     for run in 1..=2 {
@@ -353,8 +371,8 @@ async fn an_unreachable_weather_database_does_not_stop_the_daemon_starting() {
     let scratch = Scratch::new("db-down");
     let config = scratch.path("config.db");
     let notify = scratch.path("notify.sock");
-    let (port, grpc_port) = free_ports().await;
-    configure(&config, port, grpc_port).await;
+    let (port, grpc_port, management_port) = free_ports().await;
+    configure(&config, port, grpc_port, management_port).await;
 
     // Port 1 on loopback: nothing listens there, and a connection is refused rather than
     // timing out. The URL still has to satisfy the schema's scheme CHECK. The slow shape
@@ -408,8 +426,8 @@ async fn a_blackholed_weather_database_does_not_hold_the_boot_open() {
     let scratch = Scratch::new("db-blackhole");
     let config = scratch.path("config.db");
     let notify = scratch.path("notify.sock");
-    let (port, grpc_port) = free_ports().await;
-    configure(&config, port, grpc_port).await;
+    let (port, grpc_port, management_port) = free_ports().await;
+    configure(&config, port, grpc_port, management_port).await;
     configure_weather_database(&config, BLACKHOLE_URL).await;
 
     let socket = notify_socket(&notify);
@@ -442,8 +460,8 @@ async fn sigterm_during_startup_is_an_ordered_exit() {
     let scratch = Scratch::new("stop-during-start");
     let config = scratch.path("config.db");
     let notify = scratch.path("notify.sock");
-    let (port, grpc_port) = free_ports().await;
-    configure(&config, port, grpc_port).await;
+    let (port, grpc_port, management_port) = free_ports().await;
+    configure(&config, port, grpc_port, management_port).await;
     configure_weather_database(&config, BLACKHOLE_URL).await;
 
     let socket = notify_socket(&notify);
@@ -555,8 +573,8 @@ async fn a_configured_node_opens_its_spool_and_stops_cleanly() {
     let config = scratch.path("config.db");
     let notify = scratch.path("notify.sock");
     let spool = scratch.path("spool");
-    let (port, grpc_port) = free_ports().await;
-    configure(&config, port, grpc_port).await;
+    let (port, grpc_port, management_port) = free_ports().await;
+    configure(&config, port, grpc_port, management_port).await;
     configure_node(&config, &spool).await;
 
     let socket = notify_socket(&notify);
@@ -615,8 +633,8 @@ async fn a_spool_path_that_cannot_be_created_fails_the_start() {
     let blocker = scratch.path("not-a-directory");
     std::fs::write(&blocker, b"this is a file").expect("writable");
     let spool = blocker.join("spool");
-    let (port, grpc_port) = free_ports().await;
-    configure(&config, port, grpc_port).await;
+    let (port, grpc_port, management_port) = free_ports().await;
+    configure(&config, port, grpc_port, management_port).await;
     configure_node(&config, &spool).await;
 
     let mut child = spawn(&config, &notify);

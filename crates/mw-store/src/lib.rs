@@ -13,6 +13,8 @@
 //! zeros are produced one layer later, at the DTO in `mw-api-legacy`; the two facts live
 //! in two crates and cannot be confused (§1.7).
 
+/// `ConfigAdmin`'s write half: one statement set per thing an operator can change (M7-1).
+pub mod config_admin;
 /// The configuration store and its migrations (D-8, A-W6-2).
 pub mod config_db;
 /// `ForecastStore` and `SnowCache`: the frozen REST surface's own two reads.
@@ -35,6 +37,10 @@ pub mod version;
 /// `writer:timescale`'s batch `INSERT` and **D-56**'s read-side projections.
 pub mod writer;
 
+pub use crate::config_admin::{
+    restore, snapshot, AerisWrite, Change, ConfigAdminError, ListenerWrite, Pairing, ServiceWrite,
+    StationWrite, WebsiteWrite,
+};
 pub use crate::frozen::FrozenReads;
 pub use crate::reader::TimescaleReader;
 pub use crate::registry::{

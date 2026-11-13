@@ -374,6 +374,28 @@ jobs:
             exit 1
           fi
 
+  mgmt-schema-drift:
+    name: management schema drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask gate mgmt-schema-drift
+      # The same R-2 assertion as the two drift gates above, which this gate's own note in
+      # ci/gates.toml asks for by name: a check that writes its own fix into the tree always
+      # passes. Separate from codegen-drift on purpose (D-57) -- its input is the Rust
+      # handler set in crates/mw-api-mgmt rather than the metric registry.
+      - name: Assert the check left the tree clean
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::the management-schema drift check modified the working tree"
+            git status --porcelain
+            exit 1
+          fi
+
   conformance:
     name: frozen contract conformance (Rust target)
     runs-on: ubuntu-latest
@@ -947,6 +969,7 @@ jobs:
       - layout
       - codegen-drift
       - legacy-import-drift
+      - mgmt-schema-drift
       - conformance
       - conformance-fixtures
       - driver-emulators
