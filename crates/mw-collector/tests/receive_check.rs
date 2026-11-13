@@ -29,6 +29,12 @@
 //!
 //! Both halves are asserted here, from the outside, because the claim being tested is
 //! "every malformed path is rejected" and that is a claim about the two together.
+//!
+//! **One clause is asserted as unreachable rather than as firing.** Clause 4's loop guard
+//! cannot be reached through a decoded envelope, because `sealed` already refuses a
+//! repeated hop — so what this file shows is that no accepted path contains this node
+//! twice, and not that the guard inside `receive_check` is what stops it. See
+//! [`no_accepted_path_has_this_node_as_an_interior_hop`].
 
 use mw_component::Reject;
 use mw_proto::wire::collector::v1 as pb;
@@ -310,9 +316,18 @@ fn forwarding_to_a_node_already_on_the_path_is_unrepresentable() {
 /// **Property 2: an envelope this node has already handled cannot come back.**
 ///
 /// Over the same enumeration, from the receiver's side: a path that passes every clause of
-/// the receive check never has this node as an interior hop. The two guards are independent
-/// — one is a property of a type with no public constructor, the other is this check — and
-/// this is the second one stated as a property rather than as a case.
+/// the receive check never has this node as an interior hop.
+///
+/// **Which clause this rests on, stated precisely**, because an earlier version of this
+/// comment claimed the loop guard and did not test it. The enumeration is filtered through
+/// `Provenance::sealed`, and `PathSet::try_from_hops` refuses any repeated hop — so for
+/// every path that reaches `receive_check` here, "this node is not an interior hop" already
+/// follows from distinctness (clause 6) plus the positional clauses 3 and 5. Deleting
+/// `receive_check`'s own `Reject::Loop` arm leaves this file green; that was checked.
+///
+/// Clause 4 is therefore unreachable today and `clause_4_a_path_that_names_this_node_twice_/// is_refused_before_the_positional_check` is the test that says so from the other side.
+/// It is a guard against a future encoder, not dead code, and the honest statement is that
+/// nothing demonstrates it firing.
 #[test]
 fn no_accepted_path_has_this_node_as_an_interior_hop() {
     let mut accepted = 0usize;

@@ -107,6 +107,10 @@ impl Degradation {
 /// a per-peer series needs the peer set and this function has no configuration. The
 /// components zero their own on start — `crate::uplink` on `build`, `crate::service` when
 /// it mounts — which is also when the label value is known to be a configured one.
+///
+/// The node-wide ones are `ingest_handshake_refused_total` and `ingest_enrolments_total`,
+/// and both are here. An earlier version zeroed only the first, so this paragraph claimed
+/// a set larger than the code's.
 pub fn register() {
     metrics::describe_gauge!(
         "mw_uplink_state",
@@ -198,6 +202,12 @@ pub fn register() {
         "1, labelled with the software version each peer last reported (W7 OQ-W7-6)"
     );
     metrics::counter!("mw_ingest_handshake_refused_total").absolute(0);
+    // Node-wide and a closed label set, so it is zeroed here rather than per peer: an
+    // enrolment surface nobody has used and one whose metrics are broken would otherwise
+    // read the same.
+    for outcome in ENROLMENT_OUTCOMES {
+        metrics::counter!("mw_ingest_enrolments_total", "outcome" => outcome).absolute(0);
+    }
 }
 
 /// Zero every series an uplink owns, at `build`, so a peer that has sent nothing is
@@ -231,7 +241,13 @@ pub fn arm_uplink(peer: &PeerName) {
 }
 
 /// Zero every series a peer owns on a collector, when the ingest service mounts.
-pub fn arm_peer(peer: &PeerName) {
+///
+/// `origins` is the peer's own node plus whatever it may relay for (§5.5's grant), because
+/// `ingest_envelopes_total` and `ingest_duplicates_total` are labelled by origin and a
+/// collector that has received nothing from a configured peer must be distinguishable from
+/// one whose ingest path is broken — which is the whole point of arming. Bounded by
+/// configuration: the grant is a `peers` row, not something a connection claims.
+pub fn arm_peer(peer: &PeerName, origins: &[mw_types::OriginId]) {
     let peer = peer.as_str().to_string();
     for reason in Reject::ALL {
         metrics::counter!(
@@ -241,6 +257,18 @@ pub fn arm_peer(peer: &PeerName) {
         )
         .absolute(0);
     }
+    for origin in origins {
+        // `to_string`, which is what `count_by_origin` labels with -- a different rendering
+        // here would arm a series nothing ever increments.
+        let origin = origin.to_string();
+        metrics::counter!(
+            "mw_ingest_envelopes_total",
+            "peer" => peer.clone(),
+            "origin" => origin.clone(),
+        )
+        .absolute(0);
+        metrics::counter!("mw_ingest_duplicates_total", "origin" => origin).absolute(0);
+    }
 }
 
 /// §4.3's state machine, as a number.
@@ -248,7 +276,12 @@ pub fn uplink_state(peer: &PeerName, state: UplinkState) {
     metrics::gauge!("mw_uplink_state", "peer" => peer.as_str().to_string()).set(state.as_f64());
 }
 
-/// **The headline number**: now − the instant this uplink's cursor last advanced.
+/// **The headline number**: now − the instant this uplink's cursor last advanced
+/// (`Uplink::acked_at`, which is where the arithmetic lives).
+///
+/// Reported on every `readings` call, successful or not, because the quantity is the age of
+/// the last advance: a link that has been down for six hours must read six hours, and a
+/// gauge written only on success stays at its last good value for ever instead.
 pub fn ack_lag(peer: &PeerName, seconds: f64) {
     metrics::gauge!("mw_uplink_ack_lag_seconds", "peer" => peer.as_str().to_string()).set(seconds);
 }
@@ -381,6 +414,22 @@ pub fn handshake_refused() {
     metrics::counter!("mw_ingest_handshake_refused_total").increment(1);
 }
 
+/// Every value the `outcome` label can take, so that [`register`] can zero them.
+///
+/// A closed set named in one place: the alternative is a label whose series appears only
+/// once the thing it counts has happened, which is what `register` exists against. The
+/// assertion in this module's tests is what keeps it the same set the call sites use.
+pub const ENROLMENT_OUTCOMES: [&str; 8] = [
+    "accepted",
+    "rate_limited",
+    "closed",
+    "no_material",
+    "too_many_stations",
+    "name_taken",
+    "cannot_issue",
+    "error",
+];
+
 /// How an enrolment attempt ended. Every attempt is counted, successful or not (§5.3).
 pub fn enrolment(outcome: &'static str) {
     metrics::counter!("mw_ingest_enrolments_total", "outcome" => outcome).increment(1);
@@ -390,7 +439,16 @@ pub fn enrolment(outcome: &'static str) {
 ///
 /// The collector's own authoritative view, as against the peer-reported depth beside it.
 pub fn peer_seen(peer: &PeerName) {
-    metrics::gauge!("mw_peer_last_seen_seconds", "peer" => peer.as_str().to_string()).set(0.0);
+    peer_last_seen(peer, 0.0);
+}
+
+/// How long ago a peer was last heard from.
+///
+/// Written by [`peer_seen`] with zero when a batch arrives, and recomputed for every known
+/// peer by `Handlers::sweep_last_seen` on the scrape path -- which is the half that makes
+/// the gauge able to show silence at all.
+pub fn peer_last_seen(peer: &PeerName, seconds: f64) {
+    metrics::gauge!("mw_peer_last_seen_seconds", "peer" => peer.as_str().to_string()).set(seconds);
 }
 
 /// `IngestBatch.sender_depth`. **Peer-reported** — W5 must label it as such.
@@ -415,8 +473,55 @@ pub fn peer_depth(peer: &PeerName, envelopes: u64) {
 /// correct for the same reason: nothing has yet shown that it speaks the new protocol.
 pub const SOFTWARE_UNKNOWN: &str = "unknown";
 
+/// The longest a reported version may be as a label.
+const MAX_SOFTWARE_LABEL: usize = 32;
+
+/// What a version that is not one collapses to.
+pub const SOFTWARE_INVALID: &str = "invalid";
+
+/// The label a reported version is rendered as.
+///
+/// **`Hello.software` is peer-controlled**, which makes it the one value in this module
+/// that is not a configured name, an origin or a closed enum — and §5.10's cardinality rule
+/// is about exactly that. `Hello` carries no rate limit (unlike `Enroll`), so without a
+/// bound an enrolled-but-misbehaving satellite could mint a fresh series per call by
+/// sending a random string. So: at most [`MAX_SOFTWARE_LABEL`] bytes, and only the
+/// characters a version number has. Anything else is [`SOFTWARE_INVALID`] — a label an
+/// operator can alert on, rather than a refusal, because what a peer calls itself is not
+/// worth closing a stream over.
+pub fn software_label(version: &str) -> &str {
+    let version = version.trim();
+    if version.is_empty() {
+        return SOFTWARE_UNKNOWN;
+    }
+    let legal = version.len() <= MAX_SOFTWARE_LABEL
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '+' | '-'));
+    if legal {
+        version
+    } else {
+        SOFTWARE_INVALID
+    }
+}
+
 /// Which peers are still Go-era (§9), which is what W7 OQ-W7-6 gates the shim's removal on.
-pub fn peer_software(peer: &PeerName, version: &str) {
+///
+/// The label goes through [`software_label`]. `previous` is the label this peer last
+/// carried, if any: its series is zeroed, because an info gauge that is only ever set to 1
+/// leaves every version a peer has ever reported reading as current — and OQ-W7-6's removal
+/// condition is "no series carries `unknown`", which a stale 1 makes permanently
+/// unsatisfiable.
+pub fn peer_software(peer: &PeerName, version: &str, previous: Option<&str>) {
+    let version = software_label(version);
+    if let Some(previous) = previous.filter(|p| *p != version) {
+        metrics::gauge!(
+            "mw_peer_software_info",
+            "peer" => peer.as_str().to_string(),
+            "version" => previous.to_string(),
+        )
+        .set(0.0);
+    }
     metrics::gauge!(
         "mw_peer_software_info",
         "peer" => peer.as_str().to_string(),
@@ -444,6 +549,86 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), before, "two states share a name");
+    }
+
+    /// **The one peer-controlled label in this module** (§5.10), so the bound is asserted
+    /// rather than assumed: `Hello.software` is a string a satellite chooses and `Hello`
+    /// carries no rate limit, so an unbounded label here is a cardinality explosion one
+    /// enrolled peer can cause on its own.
+    #[test]
+    fn a_peer_cannot_choose_an_unbounded_software_label() {
+        assert_eq!(software_label("modernweather 0.1.0"), "modernweather 0.1.0");
+        assert_eq!(
+            software_label("  modernweather 0.1.0  "),
+            "modernweather 0.1.0"
+        );
+        // Empty is the Go-era signal, not an invalid value (§9, OQ-W7-6).
+        assert_eq!(software_label(""), SOFTWARE_UNKNOWN);
+        assert_eq!(software_label("   "), SOFTWARE_UNKNOWN);
+        // Too long, and a random string of legal characters is the cheap attack.
+        assert_eq!(
+            software_label(&"a".repeat(MAX_SOFTWARE_LABEL + 1)),
+            SOFTWARE_INVALID
+        );
+        assert_eq!(software_label(&"a".repeat(MAX_SOFTWARE_LABEL)).len(), 32);
+        // A label that would break the exposition format, or carry a newline into it.
+        assert_eq!(software_label("go\n1.21"), SOFTWARE_INVALID);
+        assert_eq!(software_label("a\"b"), SOFTWARE_INVALID);
+        assert_eq!(software_label("{peer=\"x\"}"), SOFTWARE_INVALID);
+        // Every value collapses to one of a bounded set, which is the property.
+        for version in ["\u{1}", "ünïcödé", "；", "go\u{7}1.21"] {
+            assert_eq!(software_label(version), SOFTWARE_INVALID, "{version:?}");
+        }
+        // Whitespace alone is trimmed away and reads as a peer that reported nothing,
+        // which is `unknown` rather than `invalid`.
+        assert_eq!(software_label("\t"), SOFTWARE_UNKNOWN);
+    }
+
+    /// **`ENROLMENT_OUTCOMES` has to be the set the call sites use**, or `register` zeroes
+    /// a series nothing writes and leaves a written one absent — which is the failure
+    /// `register` exists to prevent, reintroduced by a label added in one place.
+    ///
+    /// Read out of the source rather than asserted by hand, because a hand-kept list is the
+    /// thing being checked. The two forms a call site takes are `m::enrolment("literal")`
+    /// and the `match` in `Handlers::enrol` that resolves a `PeerWriteError` to one of
+    /// these strings.
+    #[test]
+    fn every_enrolment_outcome_the_service_records_is_armed() {
+        let source = include_str!("service.rs");
+        let mut used: Vec<&str> = Vec::new();
+        for (marker, close) in [("m::enrolment(\"", '"'), ("=> \"", '"')] {
+            for rest in source.split(marker).skip(1) {
+                if let Some(value) = rest.split(close).next() {
+                    // The `=> "..."` form catches every string-valued match arm in the
+                    // file, so it is filtered to the ones that look like an outcome: lower
+                    // snake case, which every value in the list is.
+                    if !value.is_empty()
+                        && value.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                        && (marker.starts_with("m::") || ENROLMENT_OUTCOMES.contains(&value))
+                    {
+                        used.push(value);
+                    }
+                }
+            }
+        }
+        used.sort_unstable();
+        used.dedup();
+        assert!(
+            !used.is_empty(),
+            "the scan found no call sites, so it proves nothing"
+        );
+        for outcome in &used {
+            assert!(
+                ENROLMENT_OUTCOMES.contains(outcome),
+                "`{outcome}` is recorded by the service and not armed by `register`"
+            );
+        }
+        for outcome in ENROLMENT_OUTCOMES {
+            assert!(
+                used.contains(&outcome),
+                "`{outcome}` is armed and nothing records it"
+            );
+        }
     }
 
     #[test]

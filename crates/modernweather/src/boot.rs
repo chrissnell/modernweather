@@ -859,6 +859,9 @@ fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<
     cfg.set_web_states(states);
 
     let snapshot = cfg.snapshot.clone();
+    // The collector's own sweep, for the same reason and on the same path: see
+    // `mw_collector::service::Handlers::sweep_last_seen`.
+    let ingest = cfg.ingest_service.clone();
     let mut tables = vec![mw_http::metrics_table(mw_http::MetricsRoute::new(
         Arc::new(move || {
             // **M4-1's constraint 2, on the scrape path.** `mw_snapshot_age_seconds` and
@@ -869,6 +872,12 @@ fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<
             // immediately before the payload is rendered.
             if let Some(state) = &snapshot {
                 mw_pipeline::metrics::sweep_snapshot_ages(state, chrono::Utc::now());
+            }
+            // §7's `peer_last_seen_seconds`: written to zero when a peer arrives, and aged
+            // here. `handlers()` is `None` while the component is not running, which is
+            // when there is nothing to age.
+            if let Some(handlers) = ingest.as_ref().and_then(|state| state.handlers()) {
+                handlers.sweep_last_seen();
             }
             render()
         }),

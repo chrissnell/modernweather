@@ -376,7 +376,7 @@ test_names = [
     "an_unregistered_satellite_is_refused_and_stores_nothing",
     "a_satellite_that_sends_only_a_name_is_resolved_by_it",
     "a_disabled_station_is_refused",
-    "enrolment_answers_unimplemented_and_names_the_work_item",
+    "enrolment_answers_unimplemented_and_names_the_path_that_works",
 ]
 note = """
 The sixth driver, and the one whose emulator checks something no other test in this programme
@@ -412,10 +412,13 @@ for `snowgauge`'s reason.
   a_disabled_station_is_refused
       `enabled` is about collection, and a satellite streaming at a switched-off station is
       told rather than silently stored.
-  enrolment_answers_unimplemented_and_names_the_work_item
-      `RegisterRemoteStation` mints a station key, which needs Write on StationRegistry --
-      M6-4's, with the collector. `Unimplemented` with the work item in the message, where a
-      404 would look like the wrong address."""
+  enrolment_answers_unimplemented_and_names_the_path_that_works
+      `RegisterRemoteStation` mints a station key, which needs Write on StationRegistry.
+      That arrived with the collector (M6-4) and this method did not come with it: its own
+      message carries the four plaintext secrets docs/collector.md §5.2 and **D-67** delete,
+      so decoding it would put them back. `Unimplemented` naming
+      `collector.v1.Collector/Hello` instead, where a 404 would look like the wrong
+      address."""
 
 [emulator.files]
 "remoteweather/protocols/remoteweather/remoteweather.pb.go" = "227f47deb74c11df06e4c35ceeaed0db4168923ec9ec283f01f84a2b3d32b2b0"

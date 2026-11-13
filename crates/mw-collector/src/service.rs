@@ -113,6 +113,18 @@ pub struct Handlers {
     auth: PeerAuthKind,
     /// The last enrolment attempt per source address (§5.3's rate limit).
     enrolments: Mutex<std::collections::HashMap<IpAddr, Instant>>,
+    /// The `version` label each peer's `peer_software_info` series currently carries, so
+    /// that a peer which reports a new version does not leave the old series reading 1.
+    /// Bounded by the `peers` table for `last_seen`'s reason.
+    software: Mutex<std::collections::BTreeMap<PeerName, String>>,
+    /// When each peer was last heard from, for §7's `peer_last_seen_seconds`.
+    ///
+    /// **Bounded by the `peers` table**, not by what connects: a key is written only for a
+    /// peer that layer 2 already resolved against a configured row, so an unenrolled
+    /// caller cannot grow this map. Seeded at mount with every configured peer, so a peer
+    /// that has never connected reads as silent-since-start rather than as an absent
+    /// series.
+    last_seen: Mutex<std::collections::BTreeMap<PeerName, Instant>>,
 }
 
 impl fmt::Debug for Handlers {
@@ -143,6 +155,75 @@ impl Handlers {
             gate,
             auth,
             enrolments: Mutex::new(std::collections::HashMap::new()),
+            last_seen: Mutex::new(std::collections::BTreeMap::new()),
+            software: Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    /// Record what `peer` reports itself to be, replacing the series it carried before.
+    fn note_software(&self, peer: &PeerName, version: &str) {
+        let label = m::software_label(version);
+        let mut held = self
+            .software
+            .lock()
+            .expect("the software map is not held across an await");
+        m::peer_software(peer, version, held.get(peer).map(String::as_str));
+        held.insert(peer.clone(), label.to_string());
+    }
+
+    /// Note that `peer` has just been heard from: the gauge resets and the sweep below has
+    /// an instant to measure from.
+    fn seen(&self, peer: &PeerName) {
+        m::peer_seen(peer);
+        self.last_seen
+            .lock()
+            .expect("the last-seen map is not held across an await")
+            .insert(peer.clone(), Instant::now());
+    }
+
+    /// Recompute `peer_last_seen_seconds` for every peer this collector knows.
+    ///
+    /// **Swept on the scrape path, which is M4-1's decision reused** (see
+    /// `mw_pipeline::metrics::sweep_snapshot_ages`, whose documentation states it): the
+    /// gauge is written when a peer arrives, so a peer that goes quiet freezes it at zero
+    /// and an alert on `peer_last_seen_seconds > 300` never fires for the silence it exists
+    /// to catch. §7 names silence as "the failure mode a stream-based protocol hides", so a
+    /// gauge that cannot show it is the one gauge not worth having.
+    ///
+    /// Sweeping rather than running a timer for the reason M4-1 recorded: a timer is a
+    /// second clock and costs work on a daemon nobody scrapes, while the scrape is the
+    /// moment the number is read. The cost is one iteration over the `peers` table.
+    pub fn sweep_last_seen(&self) {
+        for (peer, age) in self.ages() {
+            m::peer_last_seen(&peer, age.as_secs_f64());
+        }
+    }
+
+    /// What [`Handlers::sweep_last_seen`] is about to report, as a value a test can read.
+    ///
+    /// Separate because a gauge cannot be read back without a recorder, and this workspace
+    /// has no metrics test dependency (**D-32**).
+    fn ages(&self) -> Vec<(PeerName, std::time::Duration)> {
+        let seen = self
+            .last_seen
+            .lock()
+            .expect("the last-seen map is not held across an await");
+        seen.iter()
+            .map(|(peer, at)| (peer.clone(), at.elapsed()))
+            .collect()
+    }
+
+    /// Seed the map so that a configured peer which has never connected is a series rather
+    /// than an absence. Its age then runs from the mount, which is the honest reading: this
+    /// node has not heard from it since it started.
+    fn seed_last_seen(&self, peers: &[PeerEntry]) {
+        let now = Instant::now();
+        let mut seen = self
+            .last_seen
+            .lock()
+            .expect("the last-seen map is not held across an await");
+        for peer in peers {
+            seen.entry(peer.name.clone()).or_insert(now);
         }
     }
 
@@ -298,18 +379,12 @@ impl Handlers {
             .await
             .map_err(|e| peer_write_status(&e, "registering your stations"))?;
 
-        m::peer_seen(&peer.name);
+        self.seen(&peer.name);
         // A `Hello` is the only thing that can replace `unknown` with a version, which is
         // what makes the label mean "this peer speaks the new protocol".
-        let software = identity.software.trim();
-        m::peer_software(
-            &peer.name,
-            if software.is_empty() {
-                m::SOFTWARE_UNKNOWN
-            } else {
-                software
-            },
-        );
+        // `software_label` handles the empty case (a peer that sent no version reads as
+        // `unknown`, which is §9's Go-era signal) and bounds what a peer can put in a label.
+        self.note_software(&peer.name, &identity.software);
         let accepted: Vec<String> = stations
             .iter()
             .filter(|s| self.gate.station_owner(&s.station) == Some(peer.node))
@@ -372,7 +447,7 @@ impl Handlers {
         first: bool,
         acked_through: &mut u64,
     ) -> Result<pb::IngestAck, Status> {
-        m::peer_seen(&peer.name);
+        self.seen(&peer.name);
         m::peer_depth(&peer.name, batch.sender_depth);
         // The count bound before anything is decoded, because decoding is the work a peer
         // can make this node do by asking. The encoded-size bound is `accept`'s, where the
@@ -1297,16 +1372,20 @@ impl Serve for Receiver {
             self.routes
                 .publish(Arc::new(Mounted) as Arc<dyn RouteProvider>);
             let peers = self.peers.peers();
+            self.handlers.seed_last_seen(&peers);
             for peer in &peers {
                 // Zeroed here, where the label value is known to be a configured one.
-                m::arm_peer(&peer.name);
+                m::arm_peer(
+                    &peer.name,
+                    &std::iter::once(peer.node)
+                        .chain(peer.origins.iter().copied())
+                        .collect::<Vec<_>>(),
+                );
                 // Labelled on every peer, including the ones with no recorded version:
                 // `unknown` is what makes W7 OQ-W7-6's removal condition observable rather
                 // than a series that simply is not there (`crate::metrics`).
-                m::peer_software(
-                    &peer.name,
-                    peer.software.as_deref().unwrap_or(m::SOFTWARE_UNKNOWN),
-                );
+                self.handlers
+                    .note_software(&peer.name, peer.software.as_deref().unwrap_or(""));
             }
             if peers.is_empty() {
                 // §8.5: `[[ingest]]` present with no `[[peer]]` rows is **not** an error. A
@@ -1618,6 +1697,79 @@ mod tests {
         }
     }
 
+    /// Handlers over the test doubles, for the two properties below.
+    fn handlers() -> Handlers {
+        let registry = crate::testing::station_registry(&[("satellite-a:backyard", 1)]);
+        Handlers::new(
+            ComponentId::new(crate::INGEST_ID).expect("a legal id"),
+            crate::testing::FakePeers::ca("satellite-a", OriginId::new([1; 16]))
+                as Arc<dyn PeerRegistry>,
+            Arc::new(crate::testing::NullIngress) as Arc<dyn Ingress>,
+            crate::testing::null_spool(),
+            crate::Gate::new(registry, OriginId::new([9; 16])),
+            PeerAuthKind::MtlsCa,
+        )
+    }
+
+    /// **§7's silence gauge has to be able to show silence.**
+    ///
+    /// `peer_last_seen_seconds` is written to zero when a peer arrives, so without the
+    /// sweep a peer that goes quiet leaves it at zero for ever and the one failure mode §7
+    /// names — "silence is the failure mode a stream-based protocol hides" — is the one
+    /// thing the metric cannot report. What is asserted is the number the sweep is about to
+    /// write, because reading a gauge back needs a recorder this workspace does not depend
+    /// on (**D-32**).
+    #[test]
+    fn a_peer_that_goes_quiet_has_a_rising_last_seen_age() {
+        let handlers = handlers();
+        let peer = PeerName::new("satellite-a");
+        handlers.seen(&peer);
+        let first = handlers.ages();
+        assert_eq!(first.len(), 1, "one peer, one series");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = handlers.ages();
+        assert!(
+            second[0].1 > first[0].1,
+            "the age has to rise while the peer is quiet: {:?} then {:?}",
+            first[0].1,
+            second[0].1
+        );
+        // And a batch resets it, which is the other half.
+        handlers.seen(&peer);
+        let third = handlers.ages();
+        assert!(
+            third[0].1 < second[0].1,
+            "a peer that spoke again is not silent: {:?}",
+            third[0].1
+        );
+        // The sweep itself, so the metric call is on a tested path.
+        handlers.sweep_last_seen();
+    }
+
+    /// A configured peer that has **never** connected is a series, not an absence.
+    ///
+    /// An absent series cannot be alerted on without `absent()`, and a collector whose
+    /// satellite has never called since the daemon started is exactly the state an operator
+    /// wants to see. The age runs from the mount.
+    #[test]
+    fn a_peer_that_has_never_connected_is_still_reported() {
+        let handlers = handlers();
+        assert!(handlers.ages().is_empty(), "nothing is seeded yet");
+        let peers = vec![PeerEntry {
+            node: OriginId::new([1; 16]),
+            name: PeerName::new("satellite-a"),
+            auth: mw_component::PeerAuth::MtlsCa,
+            relay: false,
+            origins: std::collections::BTreeSet::new(),
+            revoked_at: None,
+            software: None,
+        }];
+        handlers.seed_last_seen(&peers);
+        let ages = handlers.ages();
+        assert_eq!(ages.len(), 1);
+        assert_eq!(ages[0].0, PeerName::new("satellite-a"));
+    }
+
     /// **D-44**: no flag, no mode. A node with no row plans nothing and that is not an
     /// error.
     #[test]
@@ -1815,6 +1967,8 @@ mod tests {
             ),
             auth: PeerAuthKind::MtlsCa,
             enrolments: Mutex::new(std::collections::HashMap::new()),
+            last_seen: Mutex::new(std::collections::BTreeMap::new()),
+            software: Mutex::new(std::collections::BTreeMap::new()),
         };
         let a: IpAddr = "192.0.2.1".parse().expect("an address");
         let b: IpAddr = "192.0.2.2".parse().expect("an address");

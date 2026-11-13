@@ -17,7 +17,14 @@
 //! | 1 | the first batch is acked, and the collector's spool holds it with **the satellite's** `(origin, seq)` |
 //! | 2 | the collector is taken away mid-flight: `deliver` returns `Err`, so the supervisor would `Backoff` and the cursor does not move |
 //! | 3 | the collector comes back: the same batch is delivered again and acked |
-//! | 4 | a third delivery of the same batch is acked with `duplicates`, and the spool still holds each envelope **once** |
+//! | 4 | a third delivery of the same batch leaves the spool holding each envelope **once** |
+//!
+//! The `IngestAck`'s own `duplicates` count is **not** asserted here — the uplink consumes
+//! the ack inside `deliver` and this test sees only its `Result`. What the ack says is
+//! asserted where the ack is in hand: `mw_collector`'s `tests/ack.rs`
+//! (`a_replayed_batch_is_acked_again_and_spooled_once`) and `tests/rest.rs`
+//! (`a_retried_post_is_acked_again_and_spooled_once`). An earlier version of this table
+//! claimed both halves here.
 //!
 //! # Why this test lives in the binary
 //!

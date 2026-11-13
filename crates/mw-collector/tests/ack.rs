@@ -34,14 +34,27 @@
 //! | Claim | Shown by |
 //! |---|---|
 //! | the bytes left the process before the ack | `SIGKILL` + reopen, here |
-//! | the records were `fsync`ed before the ack | the `commits` counter, asserted here |
+//! | the ack waited for a **group commit** rather than a buffered write | the `commits` counter, asserted here |
+//! | the `fsync` syscall was really made | **nothing here**, and this was checked -- see below |
 //! | the platter has them after a power loss | **nothing here**, and nothing a test on one machine can show |
 //!
-//! The second line is why this file asserts `SpoolStats::commits`: without it, "the bytes
-//! are in the page cache" and "the bytes are durable" would both pass, and the ack promises
-//! the second. The third is the honest limit — `mw_pipeline`'s own spool tests cover the
-//! consequence of losing a commit mid-write (a torn tail is truncated and counted), which is
-//! the other half of the same property approached from the recovery side.
+//! The third line is a correction of an earlier version of this comment, which claimed the
+//! `commits` counter separated "in the page cache" from "on the platter". It does not, and
+//! that was verified the same way as everything else here: with `sync_data` replaced by a
+//! no-op, `SpoolStats::commits` still increments and every test in this file still passes.
+//! A counter sits *after* the syscall on the same path, so it can only show that the path
+//! ran -- which is the coalescing claim (W7 **D-13**), not a durability one. Nothing short
+//! of intercepting the syscall can show the syscall, so what pins `sync_data` is the call
+//! site in `mw_pipeline::spool::flush` and the review that put it there.
+//!
+//! What `commits` does earn: the ack did not return from a buffered write. The append path
+//! has a group-commit boundary and the ack is on the far side of it, so an implementation
+//! that queued the records and acked immediately -- the shape a reader of D-21 would most
+//! plausibly reach for -- fails this assertion.
+//!
+//! The last line is the honest limit. `mw_pipeline`'s own spool tests cover the consequence
+//! of losing a commit mid-write (a torn tail is truncated and counted), which is the other
+//! half of the same property approached from the recovery side.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -75,19 +88,25 @@ const STATION: &str = "satellite-a:backyard";
 /// reason that has nothing to do with the code. The window's own edges are asserted with a
 /// controlled clock in `crate::admit`'s unit tests, where `now` is an argument.
 fn envelope(seq: u64) -> pb::Envelope {
+    envelope_from(1, STATION, seq)
+}
+
+/// [`envelope`] from an arbitrary origin and station, for the tests about **more than one**
+/// satellite.
+fn envelope_from(origin: u8, station: &str, seq: u64) -> pb::Envelope {
     let now = chrono::Utc::now();
     pb::Envelope {
-        origin: prost::bytes::Bytes::copy_from_slice(node(1).as_bytes()),
+        origin: prost::bytes::Bytes::copy_from_slice(node(origin).as_bytes()),
         seq,
         path: vec![
-            prost::bytes::Bytes::copy_from_slice(node(1).as_bytes()),
+            prost::bytes::Bytes::copy_from_slice(node(origin).as_bytes()),
             prost::bytes::Bytes::copy_from_slice(node(9).as_bytes()),
         ],
-        station_key: STATION.to_string(),
+        station_key: station.to_string(),
         observed_at: now.timestamp_millis(),
         received_at: now.timestamp_millis(),
         reading: Some(mw_proto::wire::Reading {
-            station_id: STATION.to_string(),
+            station_id: station.to_string(),
             reading_timestamp: Some(mw_proto::wire::Timestamp {
                 seconds: now.timestamp(),
                 nanos: 0,
@@ -239,9 +258,15 @@ fn an_ack_survives_sigkill() {
     // `fsync` inside the ack put there.
     child.kill().expect("the child can be killed");
     let status = child.wait().expect("the child can be reaped");
-    assert!(
-        !status.success(),
-        "the child was supposed to be killed, not to exit cleanly: {status}"
+    // `signal()` rather than `!success()`: a child that panicked would also exit
+    // unsuccessfully, and a panic runs unwinding -- which is the clean shutdown this test
+    // exists to avoid.
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        // 9 as a literal: `libc` is not in this workspace's dependency set (DESIGN.md
+        // D-32) and `SIGKILL` is 9 on every platform this daemon builds for.
+        Some(9),
+        "the child was supposed to die of SIGKILL, not to exit on its own: {status}"
     );
 
     // Restart: a different process, the same directory.
@@ -304,13 +329,12 @@ async fn nothing_in_this_file_has_a_database() {
     // That is the collector of W7 §8.4 -- a relay with no database of its own -- and it is
     // a legitimate node rather than a degraded one.
     assert_eq!(spool.tail_seq(), Seq::FIRST);
-    // **The other half of what the ack promises, and the half `SIGKILL` cannot show.** A
-    // group commit is `sync_data` on the open segment plus, when the manifest changed, its
-    // own write-fsync-rename-fsyncdir (`mw_pipeline::SpoolStats::commits`). So a non-zero
-    // count here is "the records were fsynced before this function returned", which is what
-    // separates the ack's promise from "the bytes are in the page cache" -- and page cache
-    // is exactly what a killed process leaves behind, so without this assertion the two
-    // would be indistinguishable. See this file's module documentation.
+    // **The ack is on the far side of a group commit.** A commit is `sync_data` on the open
+    // segment plus, when the manifest changed, its own write-fsync-rename-fsyncdir
+    // (`mw_pipeline::SpoolStats::commits`). A non-zero count here says the ack returned
+    // from the commit path and not from a buffered write -- it does NOT say the `fsync`
+    // syscall was made, because the counter is on the same path as the syscall rather than
+    // observing it. This file's module documentation sets out exactly how far that gets.
     let stats = spool.stats();
     assert_eq!(stats.appends, 1, "one batch is one append call (W7 D-14)");
     assert!(
@@ -520,18 +544,83 @@ fn the_zero_status_is_not_a_successful_acknowledgement() {
 ///
 /// Asserted because the alternative is a leak: handing a satellite every origin this node
 /// has ever seen would tell it how far along every other node in the fleet is.
+///
+/// **Two satellites, and that is what makes this test able to fail.** An earlier version
+/// spooled one origin and asserted one entry — which is the same assertion for "scoped to
+/// this peer" and "every origin this collector has", so the leak was outside its reach. Now
+/// satellite 2 delivers three readings of its own first, and satellite 1's `Hello` must
+/// mention neither the origin nor the position. Checked by widening `known_through` to an
+/// origin this peer does not own: this test fails and the rest of the file does not.
+///
+/// One leak shape is still outside it, and deliberately: a `known_through` built from the
+/// whole **peer table** rather than from the spool would pass, because `FakePeers` holds
+/// exactly one peer for the reason its own documentation gives. The two-node test in
+/// `crates/modernweather/tests/collector_two_node.rs` is where a real `PeerStore` with more
+/// than one row answers.
 #[tokio::test]
 async fn known_through_covers_this_peer_s_origins_and_no_others() {
+    const STATION_B: &str = "satellite-b:orchard";
     let dir = mw_collector::testing::scratch("ack-known-through");
-    let (handlers, _spool) = collector(&dir);
+    // The collector knows both stations; the fake peer registry still holds only
+    // satellite-a, which is the peer whose `Hello` is answered below.
+    let spool = mw_collector::testing::spool_for(&dir, node(9));
+    let registry = station_registry(&[(STATION, 1), (STATION_B, 2)]);
+    let ingress: Arc<dyn mw_component::Ingress> = Arc::new(mw_pipeline::SpoolIngress::new(
+        Arc::clone(&spool),
+        Arc::clone(&registry),
+    ));
+    let handlers = Arc::new(Handlers::new(
+        mw_component::ComponentId::new(mw_collector::INGEST_ID).expect("a legal id"),
+        FakePeers::ca("satellite-a", node(1)) as Arc<dyn mw_component::PeerRegistry>,
+        ingress,
+        Arc::clone(&spool),
+        Gate::new(registry, node(9)),
+        PeerAuthKind::MtlsCa,
+    ));
+
     let mut acked_through = 0u64;
     handlers
         .ingest_batch(&peer(), &batch(&[1], 1), true, &mut acked_through)
         .await
         .expect("acknowledged");
 
+    // Satellite 2, three readings deep, so a leak would be visible as a sequence number and
+    // not just as an extra entry.
+    let peer_b = PeerEntry {
+        node: node(2),
+        name: PeerName::new("satellite-b"),
+        origins: [node(2)].into_iter().collect(),
+        ..peer()
+    };
+    let mut acked_b = 0u64;
+    let ack_b = handlers
+        .ingest_batch(
+            &peer_b,
+            &pb::IngestBatch {
+                envelopes: (1..=3)
+                    .map(|seq| envelope_from(2, STATION_B, seq))
+                    .collect(),
+                through: 3,
+                sender_depth: 0,
+            },
+            true,
+            &mut acked_b,
+        )
+        .await
+        .expect("satellite-b is acknowledged too");
+    assert_eq!(
+        ack_b.status,
+        pb::AckStatus::AckOk as i32,
+        "the second satellite's readings have to be in the spool for this test to mean          anything: {ack_b:?}"
+    );
+    assert_eq!(spool.high_water(node(2)).get(), 3);
+
     let peers = FakePeers::ca("satellite-a", node(1));
     let entry = peers.peer(node(1)).expect("the one peer");
+    assert!(
+        !entry.origins.contains(&node(2)),
+        "satellite-a has no relay grant over satellite-b, which is the premise"
+    );
     let ack = handlers
         .hello(
             &entry,
@@ -552,10 +641,18 @@ async fn known_through_covers_this_peer_s_origins_and_no_others() {
     assert_eq!(
         ack.known_through.len(),
         1,
-        "one origin: this peer, which has no relay grant"
+        "one origin: this peer, which has no relay grant -- satellite-b's position is not \
+         satellite-a's business: {:?}",
+        ack.known_through
     );
     assert_eq!(ack.known_through[0].origin, node(1).as_bytes().to_vec());
     assert_eq!(ack.known_through[0].seq, 1);
+    assert!(
+        !ack.known_through
+            .iter()
+            .any(|high| high.origin == node(2).as_bytes().to_vec()),
+        "satellite-b's high water leaked into satellite-a's HelloAck"
+    );
     assert_eq!(ack.collector_node_id, node(9).as_bytes().to_vec());
     assert_eq!(
         ack.max_batch_envelopes, 256,

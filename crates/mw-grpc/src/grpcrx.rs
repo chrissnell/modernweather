@@ -371,16 +371,13 @@ pub fn route_table(state: Arc<ServiceState>) -> Result<mw_http::RouteTable, Comp
         })
     };
     let register = axum::routing::post(|| async move {
-        // Named rather than absent: a satellite that tries to enrol gets a sentence and the
-        // work item, where a 404 would look like the wrong address.
+        // Named rather than absent: a satellite that tries to enrol gets a sentence and
+        // somewhere to go, where a 404 would look like the wrong address.
         unimplemented_status(
             "`RegisterRemoteStation` is not implemented and will not be: its message \
              carries four plaintext secrets that docs/collector.md §5.2 and D-67 delete, \
              so decoding it would carry that exposure forward. Register through \
-             `collector.v1.Collector/Hello`, which carries identity only -- or have an \
-             operator insert the `config.stations` row with \
-             `identity_kind = 'from_registration'` and the key this satellite presents in \
-             `presented_key`.",
+             `collector.v1.Collector/Hello`, which carries identity only.",
         )
     });
     Ok(mw_http::RouteTable::new(

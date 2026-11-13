@@ -723,8 +723,13 @@ async fn concurrent_registrations_never_publish_a_stale_snapshot() {
         // **The snapshot those two calls published**, read straight off the registry --
         // NOT a fresh `republish`. That distinction is the whole test: an extra sequential
         // republish is always correct, so asserting on one would pass with no
-        // serialisation at all. Checked: with the mutex removed this fails on the first
-        // round, and with it the hundred rounds hold.
+        // serialisation at all.
+        //
+        // **Checked, and the honest statement is probabilistic**: with the mutex removed
+        // this fails within the first few dozen rounds -- round 54 on one run and round 28
+        // on another -- and with it the hundred hold. It is a race-window prober, so a
+        // slower or single-core runner could in principle complete the hundred without
+        // hitting the window; the mutex it guards is what makes that not matter.
         let snapshot = registry.peer_snapshot();
         assert_eq!(
             snapshot.owner(&StationKey::new(key_a.as_str())),
@@ -741,6 +746,13 @@ async fn concurrent_registrations_never_publish_a_stale_snapshot() {
 
 /// The total a peer may own is bounded, and the refusal is **whole**: registering some of a
 /// satellite's stations and silently refusing envelopes for the rest is the worse failure.
+///
+/// **One call over the limit is the easy half.** `Handlers::hello` refuses a `Hello`
+/// carrying more than `MAX_PEER_STATIONS` before `record_hello` is reached, so no peer can
+/// deliver `limit + 1` in a single call and a per-call check would pass this part on its
+/// own. What `MAX_OWNED_STATIONS` is for is the attack named in `record_hello`'s own
+/// comment — "a peer inventing a fresh station key per `Hello`" — and that is
+/// [`the_stations_a_peer_accumulates_across_calls_are_bounded`], below.
 #[tokio::test]
 async fn the_stations_one_peer_may_own_are_bounded() {
     let scratch = Scratch::new("station-cap");
@@ -775,4 +787,64 @@ async fn the_stations_one_peer_may_own_are_bounded() {
         .await
         .expect("countable");
     assert_eq!(rows, i64::try_from(limit).expect("a small limit"));
+}
+
+/// **The cap is cumulative, which is the only reading of it that bounds anything.**
+///
+/// `MAX_PEER_STATIONS` bounds one `Hello`; this bounds what a peer accumulates over all of
+/// them. Two calls of 200 keys each are both legal `Hello`s, and the second has to be
+/// refused — otherwise an authenticated peer grows `config.stations` and every resident
+/// `PeerSnapshot` without limit, one legal call at a time.
+///
+/// Checked by replacing the cumulative count with a per-call `stations.len()` check: this
+/// test fails and nothing else in the file does.
+#[tokio::test]
+async fn the_stations_a_peer_accumulates_across_calls_are_bounded() {
+    let scratch = Scratch::new("station-cap-cumulative");
+    let (pool, store, _registry) = store(&scratch).await;
+    peer(&pool, "satellite-a", 1).await;
+
+    let limit = usize::try_from(mw_store::peers::MAX_OWNED_STATIONS).expect("a small limit");
+    let half = limit - 56;
+    let first: Vec<PeerStation> = (0..half)
+        .map(|i| station(&format!("satellite-a:first{i}")))
+        .collect();
+    // Fresh keys, not a replay: this is what inventing a station per `Hello` looks like.
+    let second: Vec<PeerStation> = (0..half)
+        .map(|i| station(&format!("satellite-a:second{i}")))
+        .collect();
+    assert!(
+        half <= usize::try_from(mw_store::peers::MAX_OWNED_STATIONS).expect("small")
+            && half * 2 > limit,
+        "each call has to be legal on its own and the pair has to exceed the cap"
+    );
+
+    store
+        .record_hello(node(1), "modernweather 1.0", &first)
+        .await
+        .expect("a call inside the cap is registered");
+    let e = store
+        .record_hello(node(1), "modernweather 1.0", &second)
+        .await
+        .expect_err("the second call takes this peer over the cap");
+    assert!(matches!(e, PeerWriteError::TooManyStations { .. }), "{e}");
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM stations")
+        .fetch_one(&pool)
+        .await
+        .expect("countable");
+    assert_eq!(
+        rows,
+        i64::try_from(half).expect("a small count"),
+        "the second transaction rolled back whole: the first call's stations are still \
+         there and none of the second's was written"
+    );
+    // And the first call's keys are the ones that survived, not an arbitrary subset.
+    let kept: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM stations WHERE station_key LIKE 'satellite-a:first%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("countable");
+    assert_eq!(kept, i64::try_from(half).expect("a small count"));
 }

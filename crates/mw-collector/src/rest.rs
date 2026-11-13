@@ -258,10 +258,16 @@ mod tests {
         );
     }
 
-    /// §4.5's limits are the gRPC path's limits, read from the same constants rather than
-    /// re-spelled -- which is what "the same contract, not a second tier" means in code.
+    /// The two numbers §4.5 states, pinned so that a change to either is a reviewed line.
+    ///
+    /// **This is not a test of the handler** and does not claim to be: it names no code in
+    /// this module, so it would pass with every check in `ingest` deleted. What exercises
+    /// the limits through the handler is `tests/rest.rs`, which is also where the layer-1
+    /// guard and the dedup behaviour are. An earlier version of this comment claimed this
+    /// test established "the same contract, not a second tier"; it establishes the
+    /// constants' values.
     #[test]
-    fn the_rest_limits_are_the_same_constants_accept_enforces() {
+    fn the_rest_limits_are_the_numbers_section_4_5_states() {
         assert_eq!(mw_pipeline::MAX_BATCH_ENVELOPES, 256);
         assert_eq!(mw_pipeline::MAX_BATCH_BYTES, 1024 * 1024);
     }

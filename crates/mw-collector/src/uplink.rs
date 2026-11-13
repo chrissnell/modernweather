@@ -315,6 +315,18 @@ pub struct Uplink {
     session: Option<Link>,
     /// `known_through` from the most recent `HelloAck`, for the fast-resume skip (§4.2).
     known_through: Vec<(OriginId, Seq)>,
+    /// When this uplink's cursor last advanced, which is what §7's **headline number** is
+    /// measured from: `uplink_ack_lag_seconds` is `now - acked_at`.
+    ///
+    /// Held on the component rather than computed per call, because the question the gauge
+    /// answers is "how far behind is this satellite" and that is a property of the *link*
+    /// over time, not of one delivery. An earlier version reported the elapsed time of the
+    /// failing attempt, which read as a fraction of a second after an outage of hours --
+    /// the one number an operator is told to watch, showing the opposite of the outage.
+    ///
+    /// Initialised at `build` rather than `Option`: a satellite that has never acked
+    /// anything *is* behind by its whole uptime, and that is the honest reading.
+    acked_at: std::time::Instant,
 }
 
 impl fmt::Debug for Uplink {
@@ -452,6 +464,7 @@ impl Uplink {
             cursor,
             session: None,
             known_through: Vec::new(),
+            acked_at: std::time::Instant::now(),
         })
     }
 
@@ -793,7 +806,10 @@ impl Uplink {
         m::sent(&self.peer, sent as u64);
         // Nothing is outstanding, because nothing was ever promised.
         m::unacked(&self.peer, 0);
-        m::ack_lag(&self.peer, 0.0);
+        // **The compat path has no ack**, so a handover is the furthest this link gets and
+        // that is what the advance means here; `mw_uplink_degraded` beside it is what says
+        // the number is weaker on this path (§9.3).
+        self.advance_acked_at();
         Ok(())
     }
 
@@ -876,7 +892,7 @@ impl Uplink {
                     }
                     if ack.through >= through.get() {
                         m::unacked(&self.peer, 0);
-                        m::ack_lag(&self.peer, 0.0);
+                        self.advance_acked_at();
                         return Ok(());
                     }
                     // A cumulative ack below our position: the collector is acknowledging
@@ -966,6 +982,11 @@ impl Uplink {
             .cursor_position(&self.cursor)
             .map_or(tail, |position| position.acked_seq.get());
         tail.saturating_sub(acked)
+    }
+
+    /// The cursor advanced: §7's headline gauge is measured from here.
+    fn advance_acked_at(&mut self) {
+        self.acked_at = std::time::Instant::now();
     }
 
     /// Forget the connection, so the next batch reconnects.
@@ -1069,10 +1090,12 @@ impl OnReading for Uplink {
         _cx: &'a Cx,
     ) -> BoxFuture<'a, Result<(), ComponentError>> {
         Box::pin(async move {
-            let started = std::time::Instant::now();
             let result = self.deliver(&batch).await;
+            // Reported on **both** paths, because the gauge is the age of the last advance
+            // and not a timing of this call: on failure it is the whole outage so far, and
+            // on success it is whatever has elapsed since the ack that just arrived.
+            m::ack_lag(&self.peer, self.acked_at.elapsed().as_secs_f64());
             if let Err(e) = &result {
-                m::ack_lag(&self.peer, started.elapsed().as_secs_f64());
                 warn!(
                     peer = %self.peer,
                     envelopes = batch.len(),
@@ -1489,6 +1512,111 @@ mod tests {
             e.class(),
             Class::Fatal,
             "no retry makes a URL parse, and an operator has to see it"
+        );
+    }
+
+    /// An uplink over the checked-in credentials, pointed at a port nothing is listening
+    /// on. `tests/uplink.rs` has the same arrangement and its header says why; this one is
+    /// here because the two properties below are about **private** state.
+    fn uplink() -> Uplink {
+        let data = |name: &str| crate::testing::data(name).to_string_lossy().into_owned();
+        let mut row = row("suncrest", 9);
+        row.endpoint = "https://127.0.0.1:1".to_string();
+        row.tls_cert_path = Some(data("peer-a-cert.pem"));
+        row.tls_key_path = Some(data("peer-a-key.pem"));
+        row.tls_ca_path = Some(data("ca-cert.pem"));
+        Uplink::build(
+            &row,
+            identity(),
+            crate::testing::spool_for(&crate::testing::scratch("uplink-unit"), node(1)),
+            id("suncrest").expect("a legal id"),
+        )
+        .expect("the checked-in credentials are readable")
+    }
+
+    /// One envelope whose path already holds `hops`.
+    fn envelope(seq: u64, hops: &[u8]) -> Envelope {
+        let now = chrono::Utc::now();
+        let path: Vec<OriginId> = hops.iter().copied().map(node).collect();
+        Envelope {
+            station: mw_types::StationKey::new("satellite-a:backyard"),
+            observed_at: now,
+            received_at: now,
+            provenance: mw_types::Provenance::sealed(path[0], Seq::new(seq), &path)
+                .expect("a path an honest encoder produces"),
+            reading: Arc::new(mw_types::Reading {
+                time: now,
+                station_id: "satellite-a:backyard".to_string(),
+                barometer: Some(29.92),
+                ..mw_types::Reading::default()
+            }),
+        }
+    }
+
+    /// **`path_full` is not `loop_refused`**, which is the distinction `Staged`'s own
+    /// documentation exists for.
+    ///
+    /// `uplink_loop_refused_total` is documented as "non-zero is a bug in this code" (§7,
+    /// **D-41**). An eight-hop topology is **D-8**'s bound working as designed, so counting
+    /// it there would make that alert fire in ordinary operation and mean nothing after. The
+    /// integration test in `tests/uplink.rs` covers the consequence — the cursor advances
+    /// over such a batch — and cannot see which counter moved, because `Staged` is private.
+    ///
+    /// Checked by swapping the two arms in `stage`: this test fails and nothing else does.
+    #[test]
+    fn a_path_at_the_hop_bound_is_counted_as_full_and_not_as_a_loop() {
+        let uplink = uplink();
+        let hops: Vec<u8> = (10..18).collect();
+        assert_eq!(hops.len(), mw_types::PathSet::MAX_HOPS);
+        assert!(!hops.contains(&9), "the peer is not already on the path");
+        let staged = uplink.stage(&[envelope(1, &hops)]);
+        assert_eq!(staged.path_full, 1, "D-8's bound refused the ninth hop");
+        assert_eq!(
+            staged.loop_refused, 0,
+            "a full path is not a cycle, and the cycle counter is an alert"
+        );
+        assert_eq!(staged.filtered, 0, "the peer is not on this path");
+        assert!(staged.envelopes.is_empty());
+    }
+
+    /// **§7's headline gauge is the age of the last advance**, so a failed delivery must not
+    /// reset it and must not report its own duration.
+    ///
+    /// `uplink_ack_lag_seconds` is specified as `now - acked_at` on the cursor. An earlier
+    /// version reported `started.elapsed()` of the failing attempt, so a collector that had
+    /// been unreachable for hours showed a gauge of about 0.3 seconds — a refused connect is
+    /// fast, and the one number an operator is told to watch read as healthy throughout an
+    /// outage.
+    ///
+    /// **What this asserts is the instant, not the gauge.** Reading a gauge back needs a
+    /// recorder, and this workspace has no metrics test dependency (**D-32**); so what is
+    /// pinned here is that `advance_acked_at` is the only thing that moves the instant the
+    /// gauge is computed from.
+    #[tokio::test]
+    async fn a_failed_delivery_does_not_reset_the_ack_lag() {
+        let mut uplink = uplink();
+        let built = uplink.acked_at;
+        let (_tx, rx) = tokio::sync::watch::channel(mw_component::Generation::ZERO);
+        let cx = Cx::new(
+            ComponentId::new("uplink:suncrest").expect("a legal id"),
+            tokio_util::sync::CancellationToken::new(),
+            mw_component::Generation::ZERO,
+            rx,
+        );
+        // Something to send, and nothing listening on port 1.
+        let batch = ReadingBatch::at(vec![envelope(1, &[1])], Seq::new(1));
+        uplink
+            .readings(batch, &cx)
+            .await
+            .expect_err("there is no collector on port 1");
+        assert_eq!(
+            uplink.acked_at, built,
+            "a delivery that failed acknowledged nothing, so the lag still runs from the              last advance"
+        );
+        uplink.advance_acked_at();
+        assert!(
+            uplink.acked_at > built,
+            "and an ack that covers `through` is what moves it"
         );
     }
 
