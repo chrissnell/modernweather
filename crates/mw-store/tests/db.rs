@@ -186,6 +186,7 @@ fn row(key: &str) -> StationRow {
         kind: "weatherlink-live".into(),
         enabled: true,
         identity_kind: "from_payload".into(),
+        aprs_callsign: None,
         presented_key: Some(key.to_ascii_uppercase()),
         ingest_secret_hash: None,
         latitude: Some(39.7392),

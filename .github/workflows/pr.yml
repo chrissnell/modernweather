@@ -287,6 +287,7 @@ jobs:
             ci/db/migrate-from-go/migrate-from-go.sh \
             ci/db/migrate-from-go/extract-go-views.sh \
             ci/db/migrate-from-go/lab/run-in-pod.sh \
+            ci/db/migrate-from-go/lab/lab-env.sh \
             ci/db/migrate-from-go/lab/emit-old-schema.sh \
             ci/db/migrate-from-go/lab/10-seed.sh \
             ci/conformance/go-target.sh
@@ -369,6 +370,28 @@ jobs:
         run: |
           if [ -n "$(git status --porcelain)" ]; then
             echo "::error::the migration-SQL drift check modified the working tree"
+            git status --porcelain
+            exit 1
+          fi
+
+  mgmt-schema-drift:
+    name: management schema drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask gate mgmt-schema-drift
+      # The same R-2 assertion as the two drift gates above, which this gate's own note in
+      # ci/gates.toml asks for by name: a check that writes its own fix into the tree always
+      # passes. Separate from codegen-drift on purpose (D-57) -- its input is the Rust
+      # handler set in crates/mw-api-mgmt rather than the metric registry.
+      - name: Assert the check left the tree clean
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::the management-schema drift check modified the working tree"
             git status --porcelain
             exit 1
           fi
@@ -659,6 +682,30 @@ jobs:
           done
       - run: cargo xtask gate driver-emulators
 
+  serial-bridge:
+    name: a ser2net fan-out broadcasts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      # `ser2net` is the thing under test, not a test dependency that could be stubbed:
+      # GRA-787 exists because `max-connections` is documented to broadcast and the
+      # programme needed that measured rather than read. A hand-written fan-out would prove
+      # only that its author can write one. `socat` provides the pty pair that stands in for
+      # the station, so the whole proof runs with no hardware.
+      #
+      # The runner also reports the version it measured. Debian/Ubuntu and Arch do not ship
+      # the same release, and both were checked by hand (4.6.4 and 4.6.8) -- so a future
+      # divergence should be visible in the log rather than assumed away.
+      - name: Install the bridge under test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ser2net socat
+      - run: cargo xtask gate serial-bridge
+
   database:
     name: migrations and server version
     runs-on: ubuntu-latest
@@ -922,6 +969,7 @@ jobs:
       - layout
       - codegen-drift
       - legacy-import-drift
+      - mgmt-schema-drift
       - conformance
       - conformance-fixtures
       - driver-emulators

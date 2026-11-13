@@ -1012,6 +1012,9 @@ so **both daemons can receive the same packets at the same time** with no reconf
 side and no risk to it. Each writes to its own database. A diff harness then compares, per timestamp:
 every stored metric column, and the derived values **R1** stores at ingest (wind chill, heat index,
 AQI, solar, snow depth).
+**The Campbell station is not free in the same way.** A serial line has exactly one reader, so for
+that station (b) does not exist until a multiplexer sits in front of the port — **M5-1a**, which is
+why that item is where it is.
 *Expected diffs, and they are predicted rather than discovered:* NULL where Go writes `0.0` for an
 unreported metric (D-26 — the intended change), and nothing else. **Any other diff is a defect in the
 Rust implementation**, which is what makes this harness useful: its expected output is "one known
@@ -1060,10 +1063,87 @@ the Go source definition, so `w9.expected_column INTERSECT w9.source_column` wil
 `w9.assert_no_unknown_source_columns()` should raise nothing — and if it does, something has changed
 since 2026-10-31 and that is worth stopping for.
 
+**DONE 2026-11-13. The migration ran, and all four criteria are met.**
+`docs/data-migration.md` §2a is the record and §2b is what the run found. In short: **17,162,826**
+readings for three stations over 2025-10-30 .. 2026-11-12, reconciled at **1,182 of 1,182** (station,
+year, metric) digests with zero tolerance and zero mismatches; the two bounded statistics at 5.77e-7
+and 1.65e-3 against bounds of 1.03e-3 and 1.69e-1, with the other twelve **exact** over 964 buckets;
+`w9.assert_no_unknown_source_columns()` silent at 215 of 215; 42 of 42 spot checks exact including
+each extreme's timestamp; per-year counts in §2a. `pitcairn` was not written to at all — `archive`
+found the 2026-10-31 tables and left them, and `pause-source-retention` found nothing enabled and
+issued no statement.
+
+**Three defects only this run could find**, all three green in the lab, all three fixed and
+re-verified here: the legacy boundary compared a bucket's *start* against a reading's timestamp and
+double-counted one bucket per station; the digest's year key was the server's **local** year, and
+US/Mountain against Etc/UTC reported all 1,182 rows as mismatches with nothing missing; and the
+reconciliation window ran past the imported extent because the source is live. §2b has the evidence
+for each, including the control that distinguished the second from real loss.
+
+**Two things for whoever plans the cutover.**
+
+- **The pause O-2 took is not durable.** Retention on `weather` was job 1004, paused 2026-10-31. It
+  is now job **1022**, `drop_after = 365 days`, **enabled** — a new job id with identical config,
+  which is what the Go provisioner creating policies at start-up looks like. It has already dropped
+  raw below **2025-11-12**, so the new database is the only copy of 2025-10-30 .. 2025-11-12. Those
+  14 days *were* reconciled against production before it dropped them. Not re-paused here: it no
+  longer protects data the new database lacks, and unbounded raw growth on `pitcairn` is the owner's
+  disk. One statement reverses it, and a restart will undo that too.
+- **The parallel database was two migrations behind** and nothing would have caught up on its own —
+  the daemon applies `migrations/config` at start-up, not `migrations/`. Fixed, with the
+  `_sqlx_migrations` rows `sqlx` itself would have written; all nine checksums are the SHA-384 of the
+  files on `main`.
+
+### M5-1a — a serial multiplexer, so two daemons can read one station *(GRA-787)*
+**Depends on:** nothing — both ends already support it. **Blocks:** M5-2's mechanism (b) on a serial
+station, and nothing else.
+
+**Not in the original plan.** Proposed on 2026-11-12 and recorded here rather than left on an issue,
+because it is the only thing that makes (b) available on a serial station and because deploying it
+touches a live machine. It is **N-20**'s production path arriving a milestone early: `ser2net` owns
+the character device, and both daemons read it over TCP. The Go side is a configuration change and
+not a code change (`campbell/station.go:254` takes the serial path only when `serial_device` is
+non-empty); the Rust side already maps Campbell as `Serial | TcpOut`.
+
+**The deliverable is the proof before it is the bridge.** The question that decides whether any of
+this is worth doing is whether the multiplexer *broadcasts* every byte to every connected client or
+hands bytes to whichever client reads first. If it is the second, the two daemons split the stream
+and **both** produce gap-ridden data that still parses — nothing downstream could tell it from
+weather, which makes it the worst available outcome and strictly worse than having no (b) for that
+station at all. `ser2net`'s documentation says `max-connections` broadcasts; the documentation is
+not the measurement.
+
+**Done when:** `ci/serial-bridge/prove.sh` is green — two clients connected at once receive the
+identical byte stream, asserted byte for byte over a known sequence pushed through a `socat` pty, so
+the whole proof runs with no hardware and without touching a live station; the bridge runs as a unit
+that survives a reboot; the Go daemon reads it over TCP with its site serving current readings,
+checked by a timestamp and not by a process being up; and `modernweather`'s Campbell driver reads
+the same stream at the same time.
+
+**Test strategy:** the assertion plus **two** negative controls, because an identity assertion that
+cannot be made to fail proves nothing (W1 **D-10**): the same apparatus with `max-connections: 1`,
+where the refused client's stream must differ; and the same apparatus with the bridge removed and
+one character device read twice, which is the real failure mode. The second control is also
+load-bearing for the runbook — `remoteweather`'s serial library takes no exclusive lock, so a bridge
+started while the daemon still holds the port opens it successfully and the two then split the line
+with no error anywhere. That is why `packaging/serial-bridge/README.md`'s cutover order is a
+measured requirement rather than caution.
+
+**What this item introduces, stated rather than discovered:** the port is writable. `ser2net`
+forwards what a client sends to the datalogger. Neither daemon writes to a Campbell line — checked
+in both trees — but before this change the only thing that *could* was a descriptor the daemon held.
+That is the one new hazard and it is in the README beside the mitigation.
+
+**Nothing in this repository records a particular installation.** The device path, the line rate and
+the listen address are site-specific, and each of them fails *quietly* when guessed wrong, so
+`packaging/serial-bridge/ser2net.yaml.example` leaves them as placeholders that are deliberately not
+valid rather than shipping a plausible default. An operator's actual values belong wherever that
+machine's configuration is kept, which is not here.
+
 ### M5-2 — the diff harness
-**Depends on:** M5-1, M3-1. Build (b) and (c) above as a runnable harness in `ci/diff/`, with its
-expected-diff set encoded as data rather than prose so an unexpected diff is a failure rather than a
-judgement call.
+**Depends on:** M5-1, M3-1, and **M5-1a** for the Campbell half of (b). Build (b) and (c) above as a
+runnable harness in `ci/diff/`, with its expected-diff set encoded as data rather than prose so an
+unexpected diff is a failure rather than a judgement call.
 **Done when:** (b) reports only NULL-versus-zero differences across a 24-hour run; (c) reports only
 `period_rain` and `windd` differences, within DEV-4's measured bound, across all four `/span` bands
 and `/latest`, `/snow` and `/almanac`.
@@ -1234,6 +1314,16 @@ which is what lets §2.4's save preview and §8.7's deletion consequences come f
 that will actually run.
 **Done when:** `mgmt-schema-drift` is armed and green; a save's preview names exactly the components
 that then restart.
+**Three deviations, recorded in `docs/reconciliation.md`** as **A-M7-1-1** (the preview takes a
+change rather than a partial document, so that §8.7's deletion consequences and §2.4's save preview
+really are one code path), **A-M7-1-2** (the TypeScript client is emitted by `cargo xtask` rather
+than by `openapi-typescript`, so the gate needs no `npm`) and **A-M7-1-3** (forecasts and alerts are
+their own resource rather than a `services/` entry).
+**One stated cost.** Adding or removing a station or a website restarts **every** component, because
+the rollup state's and the snapshot table's key sets are fixed at construction and every holder of
+either has to be rebuilt together. Editing a station's settings, a service, the forecast account, the
+storage connection or the ports restarts only what changed. The save preview reports both cases in
+advance, which is what makes it a stated cost rather than a surprise.
 
 ### M7-2 — authentication and first-run
 **Depends on:** M7-1, M2-2. Argon2id at m=64 MiB/t=3/p=4, sessions as hashed 32-byte secrets in an
@@ -1248,6 +1338,14 @@ creates the account.
 **Owner decisions this needs:** **O-10**'s four (loopback-until-claimed, the breached-password list,
 no API tokens in v1, one step of config history). All four have recommendations and none blocks the
 others.
+**Constraint from another work item.** M7-1 ships the management surface with **no authentication**
+and binds it to loopback regardless of `listener.management_listen_addr`, warning when it narrows a
+configured address. This item is what makes that column mean what it says: until an administrator
+account exists there is nothing to authenticate, and the narrowing is the interim answer rather than
+a decision. The three `/api/v1/auth/*` routes and `POST /api/v1/auth/password` are this item's to
+add; the router they attach to exists. The one step of config history O-10 asks about is already
+implemented as `POST /api/v1/config/revert`, scoped to this process rather than to a session,
+because a session-scoped one cannot be written before sessions exist.
 
 ### M7-3 — the UI
 **Depends on:** M7-1, M7-2. SvelteKit 2 + `adapter-static` + Vite 6 in SPA mode on `chonky`, embedded
@@ -1267,6 +1365,21 @@ visible), `spool_time_remaining_seconds`, the `ceiling < max_lag × rate` adviso
 polls — the only client-side timer is the `Backoff` countdown rendering a server-supplied absolute
 timestamp (W5 D-46).
 **Owner decision this needs:** **O-11** — which `chonky` gaps to upstream.
+**Constraints from another work item.** Three route families M7-1 maps are deliberately **not** in
+its surface, and each is this item's or needs work this item depends on:
+- `GET /api/v1/events` — the SSE endpoint of §5, which belongs with the client that consumes its
+  channels. There is no polling to replace until there is a page.
+- `POST /api/v1/checks/*` — all seven. Each is a `check:<name>` component with `Trigger::OnDemand`
+  run through `ComponentControl::run_now` (W2a §4.4), and **no work item creates those components**;
+  the routes are two lines each and the components are not. The seventh, `check:aprs`, is W2a §3.2's
+  observation that the APRS controller's 90-second health monitor is a connectivity check wearing a
+  health hat.
+- `GET /api/v1/discovery/weatherlink/*` — needs M3-1's in-process mDNS probe driven from a request
+  rather than from a station's build, which is a change to `mw-station`'s surface rather than a
+  handler.
+Adding each is additive under §4.4 and needs no version bump. `mw_api_mgmt::freshness` is also not
+yet wired into the runtime resource: a freshness sentence needs the instant its capability was last
+written, which no `ComponentStatus` carries.
 
 ### M7-4 — the configuration migration *(N-5 / G-2)*
 **Depends on:** M2-2, M7-1, M5-1. Move the owner's existing configuration onto the new schema:

@@ -133,9 +133,9 @@ RELATIONS=(
   "almanac_cache|copy|cache, included because excluding it is not worth the thought (7.5)"
   "snow_totals_cache|copy|cache, same reasoning"
   "forecasts|copy|the read side of the frozen forecast endpoint"
-  "alerts|copy|what the aeris:alerts:* components write. A cache of a live upstream feed that refills on its own and is swept by aeris:alerts:gc, so it is included for the reason the other caches are: small enough that excluding it is not worth the thought (7.5)"
-  "snow_depth_estimates|copy|snow:smoothing's output and snow:season's input. NOT regenerable by a refresh: each estimate carries the rate limit forward from the one before it, so it is recursive over its own output and no CREATE MATERIALIZED VIEW can express it. It is also what the numbers /snow serves are computed from"
-  "snow_events|copy|snow:events' changepoint output, which feeds the website's accumulation bands. A different algorithm over the same series, not a second copy of the estimates"
+  "alerts|copy|the rows the aeris:alerts:* components write. Small, updated in place, and a past alert cannot be re-fetched -- the Aeris endpoint serves current ones. Included on almanac_cache's reasoning: excluding it is not worth the thought (7.5)"
+  "snow_depth_estimates|copy|snow:smoothing's output, and snowlast24 is max-min over THIS smoothed series rather than over the raw gauge distance. A hypertable, not a continuous aggregate, so A-W9-2 does not apply and it loads back. Not rebuildable by a refresh either: rate_limit carries each estimate forward into the next, so the series is recursive over its own output and no CREATE MATERIALIZED VIEW can express it"
+  "snow_events|copy|snow:events' output, detected by changepoint detection over a median-filtered series. Same reasoning as the estimates, and the website's accumulation bands read it"
   "observations_1m|skip|aggregate level: disposable (D-15), rebuilt on restore, and A-W9-2 makes loading it impossible anyway"
   "observations_5m|skip|aggregate level, same"
   "observations_1h|skip|aggregate level, same"
@@ -230,35 +230,19 @@ columns_of() {
               WHERE attrelid = 'public.$1'::regclass AND attnum > 0 AND NOT attisdropped"
 }
 
-# `ORDER BY 1,2,...,n` over the whole column list, for a stream whose byte order is
-# reproducible.
-#
-# This used to be `ORDER BY 1`, which is only a total order when the first column is unique.
-# It is not: `station_metrics` is keyed on (station_id, metric_key), and `alerts`,
-# `snow_depth_estimates` and `snow_events` all have composite primary keys too. With a
-# non-unique sort key PostgreSQL may return equal-keyed rows in any order, so the digest
-# recorded at dump time and the digest recomputed at restore time could differ on data that
-# restored perfectly -- a reconciliation that fails for no reason, which is worse than one
-# that does not run, because somebody has to decide whether to trust it.
-#
-# It had not bitten: the tables that carry rows today hold three of them and PostgreSQL
-# happened to return the same order twice. That is luck, and it would have run out at the
-# first table big enough for a parallel or hashed plan.
-#
-# Ordering by every column is a total order up to rows that are identical in all of them,
-# and two identical rows are interchangeable in a digest by definition.
-order_by_all() { # <comma-separated column list>
-  printf '%s' "$1" | awk -F, '{ for (i = 1; i <= NF; i++) printf "%s%d", (i > 1 ? "," : ""), i }'
-}
-
 table_present() { printf '%s\n' "$PRESENT" | grep -qx -- "$1"; }
 
 # The years raw covers. min()/max() rather than DISTINCT extract(year ...), which is a
 # sequential scan of a decade to learn something the two endpoints already say.
+# `AT TIME ZONE 'UTC'` is load-bearing: the slicing below is hard-coded `+00`, and
+# `extract(year from <timestamptz>)` reads it in the **session** zone. On a server whose
+# `TimeZone` is not UTC the two disagree at the year boundary, and the newest rows land in no
+# object at all -- silently, because the rehearsal iterates the manifest and so cannot see a
+# year the manifest never mentioned.
 raw_years() {
   local lo hi
-  lo="$(psqlv_ -c "SELECT coalesce(extract(year from min(time))::int, 0) FROM observations")"
-  hi="$(psqlv_ -c "SELECT coalesce(extract(year from max(time))::int, 0) FROM observations")"
+  lo="$(psqlv_ -c "SELECT coalesce(extract(year from (min(time) AT TIME ZONE 'UTC'))::int, 0) FROM observations")"
+  hi="$(psqlv_ -c "SELECT coalesce(extract(year from (max(time) AT TIME ZONE 'UTC'))::int, 0) FROM observations")"
   [ "${lo:-0}" -gt 0 ] 2>/dev/null || return 0
   seq "$lo" "$hi"
 }
@@ -278,6 +262,13 @@ obj_table()    { printf '%s/tables/%s.copy.gz' "$MW_BACKUP_REMOTE" "$1"; }
 obj_pgdump()   { printf '%s/legacy/%s.pgdump' "$MW_BACKUP_REMOTE" "$1"; }
 obj_configdb() { printf '%s/config/config.db.gz' "$MW_BACKUP_REMOTE"; }
 obj_manifest() { printf '%s/manifest/%s.json' "$MW_BACKUP_REMOTE" "$1"; }
+# Objects are overwritten in place, so a dump that dies half way leaves new objects behind a
+# manifest that describes the old ones -- and `--from-archive` would then report MISMATCH on
+# a restore that was perfectly faithful to what it was given. This marker is written before
+# the first object and rewritten after `latest.json`, so the two disagreeing is the signal
+# that a run was interrupted. A marker rather than a rename because a rename is a copy and a
+# delete, and nothing else in this script needs delete on the bucket.
+obj_state()    { printf '%s/manifest/state.json' "$MW_BACKUP_REMOTE"; }
 
 human() {
   case "${1:-}" in ''|*[!0-9]*) printf '%s' "${1:-?}"; return ;; esac
@@ -432,18 +423,23 @@ cmd_dump() {
   fi
 
   local verify="${MW_BACKUP_VERIFY_HISTORY:-1}"
-  local this_year raw_cols y rows prev_rows prev_dig prev_bytes prev_stored want
+  local this_year raw_cols y rows prev_rows prev_dig prev_bytes prev_stored prev_cols want
   this_year="$(date -u +%Y)"
   raw_cols="$(columns_of observations)"
 
+  printf '{"run": "%s", "status": "in-progress"}' "$STAMP" | rclone_ rcat "$(obj_state)"
+
   note "=== raw, one object per year (the current year, $this_year, is always re-dumped)"
   for y in $(raw_years); do
-    prev_rows=""; prev_dig=""; prev_bytes=""; prev_stored=""
+    prev_rows=""; prev_dig=""; prev_bytes=""; prev_stored=""; prev_cols=""
     if [ -n "$prev" ]; then
       prev_rows="$(man_get "$prev" "(m['objects']['raw'].get('$y') or {}).get('rows')")"
       prev_dig="$(man_get "$prev" "(m['objects']['raw'].get('$y') or {}).get('sha256')")"
       prev_bytes="$(man_get "$prev" "(m['objects']['raw'].get('$y') or {}).get('bytes')")"
       prev_stored="$(man_get "$prev" "(m['objects']['raw'].get('$y') or {}).get('stored_bytes')")"
+      # The column list the stored object was actually dumped with. A carried year's
+      # manifest entry has to describe that object, not today's `observations`.
+      prev_cols="$(man_get "$prev" "','.join((m['objects']['raw'].get('$y') or {}).get('columns') or [])")"
     fi
 
     # Two independent questions, and the order is deliberate.
@@ -480,9 +476,8 @@ cmd_dump() {
         fi
       fi
     fi
-    [ -n "$rows" ] || rows="$(year_rows "$y")"
-
     if [ "$want" = "1" ]; then
+      [ -n "$rows" ] || rows="$(year_rows "$y")"
       begin_meter
       psql_ -c "COPY (SELECT $raw_cols FROM observations
                        WHERE time >= '$y-01-01 00:00:00+00'::timestamptz
@@ -495,7 +490,11 @@ cmd_dump() {
              "$y" "$rows" "$(human "$METER_BYTES")" "$(human "$UPLOADED_BYTES")" "${METER_SHA:0:16}"
       MANIFEST_PARTS+=("raw|$y|$(obj_raw "$y")|$rows|$METER_BYTES|$UPLOADED_BYTES|$METER_SHA|$raw_cols|0")
     else
-      MANIFEST_PARTS+=("raw|$y|$(obj_raw "$y")|$rows|${prev_bytes:--}|${prev_stored:--}|$prev_dig|$raw_cols|1")
+      # Every field here describes the object that is already in the archive. Recording the
+      # live row count beside the stored object's digest would make the manifest describe
+      # something that does not exist -- which the rehearsal would then report as a
+      # MISMATCH against a faithful restore.
+      MANIFEST_PARTS+=("raw|$y|$(obj_raw "$y")|$prev_rows|${prev_bytes:--}|${prev_stored:--}|$prev_dig|${prev_cols:-$raw_cols}|1")
     fi
   done
 
@@ -524,7 +523,17 @@ cmd_dump() {
     else
       cols="$(columns_of "$r")"
       begin_meter
-      psql_ -c "COPY (SELECT $cols FROM public.$r ORDER BY $(order_by_all "$cols")) TO STDOUT" \
+      # Ordered by **every** column, not by the first one, which is only a total order when
+      # the first column is unique. It is not: `station_metrics` is keyed on
+      # (station_id, metric_key), `almanac_cache` and `forecasts` have duplicate first
+      # columns, and all three tables M6-3 added have composite primary keys too. With a
+      # non-unique sort key PostgreSQL may return equal-keyed rows in any order, so the
+      # digest recorded here and the digest recomputed at restore time could differ on data
+      # that restored perfectly -- a reconciliation that fails for no reason, which is worse
+      # than one that does not run, because somebody then has to decide whether to trust it.
+      # Ordering by every column is a total order up to rows identical in all of them, and
+      # two identical rows are interchangeable in a digest by definition.
+      psql_ -c "COPY (SELECT $cols FROM public.$r ORDER BY $cols) TO STDOUT" \
         | meter | gzip -6 | rclone_ rcat "$(obj_table "$r")"
       end_meter
       stored_bytes "$(obj_table "$r")"
@@ -567,6 +576,7 @@ cmd_dump() {
   man="$(build_manifest "$cfg_state" "$cfg_dig" "$cfg_bytes" "$cfg_stored" "$verify")"
   printf '%s' "$man" | rclone_ rcat "$(obj_manifest "$STAMP")"
   printf '%s' "$man" | rclone_ rcat "$(obj_manifest latest)"
+  printf '{"run": "%s", "status": "complete"}' "$STAMP" | rclone_ rcat "$(obj_state)"
   printf '  %s\n  %s\n' "$(obj_manifest "$STAMP")" "$(obj_manifest latest)"
   rm -f "$prev_f"
   prune_manifests
