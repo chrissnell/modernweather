@@ -18,6 +18,7 @@ Two reasons to want it:
 
 | | |
 |---|---|
+| **Set it up** | [`install.sh`](install.sh) — `check`, then `stage`. Derives this machine's values; changes nothing until you say so |
 | Configuration | [`ser2net.yaml.example`](ser2net.yaml.example) → `/etc/ser2net/<station>.yaml` |
 | Unit | [`campbell-serial-bridge.service`](campbell-serial-bridge.service) → `/etc/systemd/system/` |
 | Moving an existing `remoteweather` onto it | [`cutover.sh`](cutover.sh), which writes its own rollback first |
@@ -75,31 +76,45 @@ if the bridge starts while the daemon still holds the device, the bridge's `open
 no error anywhere to notice. This order makes it impossible, because by the time the bridge
 opens the device nothing else has it.
 
-Have the rollback in hand before stopping anything — step 2 writes it.
+Have the rollback in hand before stopping anything — step 3 writes it.
 
 ```sh
-# 1. Install and stage. Nothing is live yet; the daemon still owns the port.
-#    (ser2net is packaged by Debian/Ubuntu and by Arch; both were measured.)
-useradd --system --no-create-home --shell "$(command -v nologin)" ser2net   # if absent
-ls -l "$DEVICE"                        # note the owning group: uucp or dialout,
-                                       # and keep the matching SupplementaryGroups line
-install -d /etc/ser2net
-cp ser2net.yaml.example /etc/ser2net/campbell.yaml
-$EDITOR /etc/ser2net/campbell.yaml     # the placeholders: device, baud, address
-install -m 0644 campbell-serial-bridge.service /etc/systemd/system/
-systemctl daemon-reload
+# 1. See what this machine says about itself. Changes NOTHING.
+sudo ./install.sh check
+```
 
-# 2. Write the rollback, then move the station onto TCP. Still nothing restarted.
+`check` does not guess. It reads the device from the file descriptor the running daemon
+actually has open, and the line rate off the live line with `stty`, and it cross-checks both
+against the daemon's configuration row. **If the two sources disagree it stops** and asks you
+to say which is right, because every way these can be wrong is a quiet way. It also prefers
+the `/dev/serial/by-id/` name over `/dev/ttyUSB*` when the station is on USB, since that
+numbering moves on a replug.
+
+```sh
+# 2. Create the user, render the config, install the unit, and have ser2net itself
+#    validate the result. Starts nothing; opens no device; safe to run twice.
+sudo ./install.sh stage
+
+# 3. Write the rollback, then move the station onto TCP. Still nothing restarted.
 ./cutover.sh plan                      # read this
 ./cutover.sh apply                     # writes ./rollback.sql from the row as it was
 
-# 3. THE GAP STARTS HERE. The daemon lets go of the serial port and starts dialling.
+# 4. THE GAP STARTS HERE. The daemon lets go of the serial port and starts dialling.
 systemctl restart remoteweather
 #    It will log `could not connect to …` and retry every 5 s. Expected.
 
-# 4. THE GAP ENDS HERE.
+# 5. THE GAP ENDS HERE.
 systemctl enable --now campbell-serial-bridge
+
+# 6. Who has the device, who is connected, and whether readings are landing.
+sudo ./install.sh status
 ```
+
+`stage` validates by running the real `ser2net` against the rendered configuration for a few
+seconds with no client connected — which parses the connector string, the line rate and the
+framing token **without opening the device**, because `ser2net` opens it on the first client
+and not at startup. That catches a malformed rate. It cannot catch a rate that is valid but
+wrong, which is what step 1's two independent sources are for.
 
 The gap is bounded by the daemon's own retry — `connectToNetworkStation` loops with a 5 s
 sleep — so it costs a few readings and not a restart. **Do it once**, not repeatedly while
@@ -108,12 +123,14 @@ hardware and no station.
 
 ## Verify, by value and not by liveness
 
+`install.sh status` prints the first two of these. The third is the one that matters.
+
 ```sh
 systemctl status campbell-serial-bridge
 journalctl -u remoteweather -n 20      # expect the TCP connect, and nothing after it
 
-# A reading landed recently. This is the check that matters: a process that is up and a
-# station that is reporting are different claims.
+# A reading landed recently. A process that is up and a station that is reporting are
+# different claims, and only this one distinguishes a working bridge from a mute one.
 psql -c "SELECT max(time), now() - max(time) AS age FROM weather;"
 ```
 
