@@ -227,7 +227,28 @@ line framer exists for.
   a_datalogger_that_hangs_up_ends_the_conversation_retryably
       the emulator is killed mid-stream. The failure is retryable, which is what makes the
       supervisor reconnect (D-27) rather than the driver carrying two nested reconnect loops
-      and a `connecting` mutex."""
+      and a `connecting` mutex.
+
+WHAT THIS EMULATOR IS NOT FAITHFUL ABOUT, measured against a real datalogger 2026-11-12.
+Every field of its packet struct is `omitempty`, so a value that happens to be zero is
+absent from the wire -- which is the premise `emulator_campbell.rs` asserts on with
+`assert_ne!(value, Some(0.0))` for `slr_w`, `slr_mj`, `rain_in` and `wind_d`. A real CRBasic
+program has now been observed emitting those keys EXPLICITLY as zero (`"slr_mj":0.000000`)
+rather than omitting them, with all ten keys present on every record.
+
+So the emulator level cannot exercise the present-but-zero path at all, and its assertion
+describes the emulator rather than the hardware. The path is covered where it can be:
+`mw_codec::campbell`'s `a_key_the_program_does_not_output_is_absent_rather_than_zero` holds
+both halves apart -- an absent key is `None`, an output zero is `Some(0.0)` -- and
+`a_real_datalogger_sends_every_key_including_the_zeros` is the observed shape.
+
+The consequence is larger than this file and is recorded with DEV-16 in
+docs/reconciliation.md: on a station whose program outputs all ten keys, the NULL-versus-zero
+difference M5-2 expects as its only diff class does not arise from these columns, because
+both implementations store the zero the datalogger sent. Nothing here can establish whether
+such a program ever omits a key under other conditions -- two records are evidence, not a
+specification -- so the emulator's shape is not wrong to test, it is merely not the only one
+that occurs."""
 
 # Byte-for-byte from `cmd/campbell-emulator/main.go` at the pinned commit.
 [emulator.files]

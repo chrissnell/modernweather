@@ -224,6 +224,54 @@ mod tests {
         assert_eq!(r.wind_dir, Some(0.0));
     }
 
+    /// **Observed hardware output, 2026-11-12.** A real CRBasic program outputs all ten
+    /// keys on every record and writes the zeros **explicitly** rather than omitting them,
+    /// which is the opposite of the vendored emulator's `omitempty` struct and is therefore
+    /// the shape the emulator level cannot produce.
+    ///
+    /// The values here are shaped rather than captured — what is being characterised is the
+    /// key set and the explicit zeros, not anybody's weather. The consequence for M5-2's
+    /// expected-diff set is recorded with DEV-16 in `docs/reconciliation.md`: on a program
+    /// like this one, both implementations store the zero and the NULL-versus-zero
+    /// difference does not arise in these columns.
+    #[test]
+    fn a_real_datalogger_sends_every_key_including_the_zeros() {
+        let r = decode(
+            &CampbellAscii::default(),
+            r#"{"batt_volt":12.700000,"airtemp_f":47.500000,"rh":46.700000,
+                "baro":30.060000,"baro_temp_f":41.200000,"slr_mj":0.000000,
+                "slr_w":0.000000,"rain_in":0.000000,"wind_s":3.000000,"wind_d":262}"#,
+        );
+        // Not `None`: the program said zero, so zero is a measurement.
+        assert_eq!(
+            r.solar_joules,
+            Some(0.0),
+            "`slr_mj` was output as an explicit zero"
+        );
+        assert_eq!(
+            r.solar_watts,
+            Some(0.0),
+            "`slr_w` was output as an explicit zero"
+        );
+        assert_eq!(
+            r.rain_incremental,
+            Some(0.0),
+            "`rain_in` was output as an explicit zero"
+        );
+        // And the rest of the ten arrived with it.
+        assert_eq!(r.station_battery_voltage, Some(12.7));
+        assert_eq!(r.out_temp, Some(47.5));
+        assert_eq!(r.out_humidity, Some(46.7));
+        assert_eq!(r.barometer, Some(30.06));
+        assert_eq!(r.extra_temp1, Some(41.2));
+        assert_eq!(r.wind_speed, Some(3.0));
+        assert_eq!(r.wind_dir, Some(262.0));
+        // Ten keys in, ten metrics out, and nothing inferred.
+        assert_eq!(r.wind_chill, None);
+        assert_eq!(r.heat_index, None);
+        assert_eq!(r.potential_solar_watts, None);
+    }
+
     /// The second disagreement, as the value that takes the Go station offline.
     #[test]
     fn a_fractional_wind_direction_decodes_rather_than_closing_the_connection() {

@@ -1232,6 +1232,25 @@ hold. **Marked as needing the owner's acknowledgement**, like DEV-2, DEV-3 and D
 is an agent's technical judgement, and whether a chart's numbers may change by three orders of
 magnitude is not.
 
+**DEV-16's Campbell premise is narrower on real hardware than it reads, measured 2026-11-12.** Part
+(a) says a key the device omits stays at its zero value in Go because the response struct is a
+non-pointer `float32`, and that is true of the code. What it assumes is that *absence* is how a zero
+arrives. A real CRBasic program has now been observed outputting **all ten keys on every record, with
+the zeros explicit** — `"slr_mj":0.000000`, `"slr_w":0.000000`, `"rain_in":0.000000`. Where a program
+does that, both implementations store the zero the datalogger sent and **there is no NULL-versus-zero
+difference in those columns at all**.
+
+This matters to implementation-plan.md **M5-2** rather than to the driver, and in the direction that
+costs something: mechanism (b)'s expected-diff set is "NULL where Go writes `0.0`, and nothing else",
+encoded as data so that an unexpected diff is a failure rather than a judgement call. A Campbell
+station that produces *no* such diff is therefore the expected outcome for this station type, not a
+harness fault — and the harness must not read agreement as a missing check. Two qualifiers, because
+the measurement is small: two records are evidence that the case occurs, not a specification that the
+other case never does, so DEV-16(a) stands for a program that *does* omit; and the vendored
+`cmd/campbell-emulator` is `omitempty` on every field, so the emulator level cannot produce an
+explicit zero and `emulator_campbell.rs`'s `assert_ne!(value, Some(0.0))` describes the emulator and
+not the hardware (`tests/emulators/manifest.toml` records that against the entry).
+
 **DEV-8 is a *driver* deviation rather than a read-path one, which is why it reads differently from
 the seven above it.** Nothing about the frozen contract changes: the keys, the types and the formatting
 are identical, and a client sees the same JSON shape it always did. What changes is the **number**
