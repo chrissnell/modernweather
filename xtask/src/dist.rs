@@ -129,8 +129,7 @@ pub fn main(args: &[String]) -> Result<(), String> {
     // (docs/release.md Decision 32), which is what removes the `.exe`/zip branch
     // that used to live here.
     let bin_name = cfg.release.binary.clone();
-    let built = root
-        .join("target")
+    let built = target_root(&root)
         .join(&triple)
         .join(&cfg.release.profile)
         .join(&bin_name);
@@ -157,6 +156,38 @@ pub fn main(args: &[String]) -> Result<(), String> {
 
     println!("{}  {digest}", archive.display());
     Ok(())
+}
+
+/// Where `cargo` will have put the binary.
+///
+/// `$CARGO_TARGET_DIR` and not `<root>/target` unconditionally, because an out-of-tree
+/// target directory is the ordinary case anywhere the checkout is not on fast local disk --
+/// `apps/modernweather/build` in `chrissnell/kube-cluster-helm-values` sets it to an
+/// `emptyDir`, which is the whole reason the in-cluster build does not write several GB of
+/// intermediates into its container filesystem. Before this, that build compiled
+/// successfully and then failed with "expected .../target/... to exist", which is the least
+/// informative possible rendering of "this function looked in the wrong place".
+///
+/// A relative value is relative to the workspace root, which is `cargo`'s own rule and is
+/// also the directory this command runs `cargo` in.
+fn target_root(root: &Path) -> PathBuf {
+    resolve_target_root(root, std::env::var_os("CARGO_TARGET_DIR"))
+}
+
+/// [`target_root`]'s rule, with the environment passed in so it is testable without
+/// mutating a process-wide variable from a test that runs beside others.
+fn resolve_target_root(root: &Path, configured: Option<std::ffi::OsString>) -> PathBuf {
+    match configured {
+        Some(dir) if !dir.is_empty() => {
+            let dir = PathBuf::from(dir);
+            if dir.is_absolute() {
+                dir
+            } else {
+                root.join(dir)
+            }
+        }
+        _ => root.join("target"),
+    }
 }
 
 /// `cross` is used for every target that is not the host, because it carries the ARMv6 and
@@ -229,4 +260,36 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The in-cluster build sets an absolute `CARGO_TARGET_DIR` and this function used to
+    /// ignore it, which is a build that compiles and then cannot find what it compiled.
+    #[test]
+    fn the_target_directory_follows_cargos_own_rule() {
+        let root = Path::new("/src");
+        assert_eq!(
+            resolve_target_root(root, None),
+            Path::new("/src/target"),
+            "unset is the default"
+        );
+        assert_eq!(
+            resolve_target_root(root, Some("".into())),
+            Path::new("/src/target"),
+            "empty is unset, which is how cargo reads it"
+        );
+        assert_eq!(
+            resolve_target_root(root, Some("/ws/target".into())),
+            Path::new("/ws/target"),
+            "an absolute directory is used as it stands"
+        );
+        assert_eq!(
+            resolve_target_root(root, Some("build/out".into())),
+            Path::new("/src/build/out"),
+            "a relative one is relative to the workspace root, which is where cargo runs"
+        );
+    }
 }
