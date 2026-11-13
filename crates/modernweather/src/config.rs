@@ -29,7 +29,6 @@ use std::time::Duration;
 use mw_component::{Generation, Ingress, Zone};
 use mw_store::config_db::{self, ConfigDbError, Listener, Node, WeatherDatabase, WebsiteRow};
 use mw_types::{StationKey, WebsiteId};
-use sqlx::SqlitePool;
 
 /// Everything `plan()` and the boot sequence read from the configuration database.
 pub struct Config {
@@ -209,6 +208,18 @@ pub struct Config {
     /// configured one.
     pub(crate) sni: Option<Arc<mw_http::SniResolver>>,
 
+    /// The management API's socket and router, once `main` has built them (**M7-1**).
+    ///
+    /// A root resource for [`Config::mount`]'s reason and the mirror of it: `mw-http` may
+    /// not name `mw-api-mgmt` (`ci/layers.toml`), and `mw-api-mgmt` may not bind a socket,
+    /// so the binary is where the router and the listener meet (§1.3 rule 1).
+    ///
+    /// `None` is a node whose management API has not been built, which is every
+    /// `crate::boot` test that plans without one. `http:listener` plans either way --
+    /// `/metrics` is on the one listener and every node has a `listener` row -- so the
+    /// absence is a configuration rather than a wiring error.
+    pub(crate) mgmt: Option<mw_http::Management>,
+
     /// Every enabled `uploader` row, joined to its `station_service` pairing, in the shape
     /// `mw-output` plans from.
     ///
@@ -223,6 +234,16 @@ pub struct Config {
     /// nothing in the boot sequence reads an uploader, so a second copy in the store's own
     /// shape would be a field whose only purpose is to be converted.
     pub(crate) declared_uploaders: Vec<mw_output::UploaderRow>,
+
+    /// Every `uploader` row, enabled or not, joined to its pairing.
+    ///
+    /// **A second read of the same table**, and the reason is which question each answers:
+    /// [`Config::declared_uploaders`] is what the registrar plans from and holds only the
+    /// enabled rows, because a disabled uploader is not a component. The management API has
+    /// to show a service the operator has just switched off, or the toggle is write-only and
+    /// the page 404s the moment it is used (M7-1). One `WHERE` apart, so a second query is
+    /// cheaper than a second shape.
+    pub services: Vec<config_db::UploaderRow>,
 
     /// The `aeris_account` row, if this node has one.
     ///
@@ -250,26 +271,33 @@ pub struct Config {
 
 impl Config {
     /// Read the configuration. Step 4 of the boot sequence.
-    pub async fn load(pool: &SqlitePool) -> Result<Self, ConfigDbError> {
-        let stations = config_db::stations(pool).await?;
-        let ingest = config_db::ingest(pool).await?;
-        let websites = config_db::websites(pool).await?;
+    ///
+    /// **A connection rather than the pool**, which is what lets `ConfigAdmin`'s save
+    /// preview read the configuration *it is proposing*: the preview applies its change in a
+    /// transaction, re-reads through this function, runs `plan()` and rolls back, so the
+    /// preview and the save are one code path (implementation-plan.md **M7-1**). Every call
+    /// on a pool takes its own connection and would see the pre-change rows.
+    pub async fn load(conn: &mut sqlx::SqliteConnection) -> Result<Self, ConfigDbError> {
+        let stations = config_db::stations(&mut *conn).await?;
+        let ingest = config_db::ingest(&mut *conn).await?;
+        let websites = config_db::websites(&mut *conn).await?;
         // `aerisWeatherEnabled` is a `station_service` row with `service = 'aeris'` rather
         // than a column -- the `website` table's own comment says so -- and it is folded
         // into the website views below rather than kept, because nothing else reads it.
-        let aeris_stations = config_db::aeris_stations(pool).await?;
-        let uploaders = config_db::uploaders(pool).await?;
+        let aeris_stations = config_db::aeris_stations(&mut *conn).await?;
+        let uploaders = config_db::uploaders(&mut *conn).await?;
         Ok(Config {
             declared_uploaders: uploaders.iter().map(declare_uploader).collect(),
-            aeris_account: config_db::aeris_account(pool).await?,
+            services: config_db::all_uploaders(&mut *conn).await?,
+            aeris_account: config_db::aeris_account(&mut *conn).await?,
             declared_aeris: declare_aeris(&stations, &aeris_stations),
             web_sites: websites
                 .iter()
                 .map(|w| declare_site(w, &stations, &aeris_stations))
                 .collect(),
-            listener: config_db::listener(pool).await?,
-            weather_database: config_db::weather_database(pool).await?,
-            node: config_db::node(pool).await?,
+            listener: config_db::listener(&mut *conn).await?,
+            weather_database: config_db::weather_database(&mut *conn).await?,
+            node: config_db::node(&mut *conn).await?,
             declared_ingest: ingest.iter().map(declare_ingest).collect(),
             ingest,
             declared_stations: stations.iter().map(declare).collect(),
@@ -291,6 +319,7 @@ impl Config {
             web_states: None,
             mount: None,
             sni: None,
+            mgmt: None,
             generation: Generation::ZERO,
         })
     }
@@ -390,6 +419,74 @@ impl Config {
     ) {
         self.mount = Some(mount);
         self.sni = sni;
+    }
+
+    /// Hand the configuration the management API's socket and router (**M7-1**).
+    ///
+    /// Separate from [`Config::set_listener`] rather than folded into it, because the two
+    /// have different preconditions and the order is forced: the management router holds a
+    /// `ConfigAdmin`, which holds the plan sink, which the supervisor produces -- and the
+    /// supervisor is assembled after the route tables are mounted. One call would mean
+    /// mounting the public tables after the supervisor existed, which is the ordering
+    /// `assert_route_tables_match_the_plan` depends on not changing.
+    pub fn set_management(&mut self, mgmt: mw_http::Management) {
+        self.mgmt = Some(mgmt);
+    }
+
+    /// Where the management API binds, from `listener.management_listen_addr` and
+    /// `management_port`.
+    ///
+    /// **Loopback unless the instance has been claimed.** `A-W5-3` makes the column's
+    /// default `127.0.0.1`, and W5 §3.5 keeps the management API on loopback until an
+    /// administrator account exists -- which is implementation-plan.md **M7-2**'s work. This
+    /// item ships the surface without authentication, so the rule is enforced here rather
+    /// than left to the operator: a configured non-loopback address is **refused** and
+    /// narrowed to loopback with a warning naming what was configured, until M7-2 can tell
+    /// a claimed instance from an unclaimed one.
+    ///
+    /// Narrowed rather than refused outright, because the alternative is a daemon that will
+    /// not start on the owner's existing configuration -- and the thing the operator needs
+    /// is the management UI, reachable over an SSH tunnel in the meantime.
+    pub fn management_addr(&self) -> Result<std::net::SocketAddr, AddressError> {
+        let configured = &self.listener.management_listen_addr;
+        let port = self.listener.management_port;
+        let bare = configured
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(configured);
+        let addr: std::net::IpAddr = bare.parse().map_err(|_| AddressError {
+            addr: configured.clone(),
+            port,
+        })?;
+        if addr.is_loopback() {
+            return Ok(std::net::SocketAddr::new(addr, port));
+        }
+        tracing::warn!(
+            configured = %configured,
+            port,
+            "the management API has no authentication until M7-2, so it is bound to \
+             127.0.0.1 rather than the configured address; reach it over an SSH tunnel"
+        );
+        Ok(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port,
+        ))
+    }
+
+    /// The management API's certificate paths, when one is configured.
+    ///
+    /// Keyed by an empty hostname and marked the default, because there is one certificate
+    /// and no SNI to select on: an operator reaches this API by address, not by a name the
+    /// certificate has to match.
+    pub fn management_cert(&self) -> Option<mw_http::CertPaths> {
+        let cert = self.listener.management_tls_cert_path.as_ref()?;
+        let key = self.listener.management_tls_key_path.as_ref()?;
+        Some(mw_http::CertPaths {
+            hostname: String::new(),
+            cert: cert.into(),
+            key: key.into(),
+            is_default: true,
+        })
     }
 
     /// Every website's certificate paths, for the SNI resolver (§6.4).
@@ -830,6 +927,19 @@ impl mw_http::ListenerConfig for Config {
     fn sni_resolver(&self) -> Option<&Arc<mw_http::SniResolver>> {
         self.sni.as_ref()
     }
+
+    /// The management API's socket and router (**M7-1**).
+    ///
+    /// Cloned per call rather than borrowed, because [`mw_http::Management`] owns an
+    /// `axum::Router` that the component's builder closure moves into a task -- and a
+    /// `Backoff` retry builds again, so the router has to survive being taken.
+    fn management(&self) -> Option<mw_http::Management> {
+        self.mgmt.as_ref().map(|m| mw_http::Management {
+            addr: m.addr,
+            router: m.router.clone(),
+            tls: m.tls.clone(),
+        })
+    }
 }
 
 /// One `config.website` row joined to its primary station, as the website renders it.
@@ -1074,6 +1184,7 @@ mod tests {
     fn config(addr: &str, port: u16) -> Config {
         Config {
             declared_uploaders: Vec::new(),
+            services: Vec::new(),
             aeris_account: None,
             declared_aeris: Vec::new(),
             stations: Vec::new(),
@@ -1098,6 +1209,7 @@ mod tests {
             web_states: None,
             mount: None,
             sni: None,
+            mgmt: None,
             listener: Listener {
                 listen_addr: addr.to_string(),
                 http_port: port,
@@ -1105,6 +1217,8 @@ mod tests {
                 grpc_port: 50051,
                 management_listen_addr: "127.0.0.1".into(),
                 management_port: 8081,
+                management_tls_cert_path: None,
+                management_tls_key_path: None,
             },
             weather_database: None,
             node: None,

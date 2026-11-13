@@ -12,6 +12,13 @@ description = "Repository tasks: the metric-registry code generator, the CI gate
 workspace = true
 
 [dependencies]
+# `mgmt-schema` serialises the management OpenAPI document, and `utoipa` is a set of DERIVE
+# macros -- the schema exists only as the output of compiling the handlers. So the emitter
+# links the crate it describes, which is also what makes the bytes it writes and the routes
+# they describe one compilation. `xtask` is `exempt_members` in ci/layers.toml, so this
+# dependency is outside the layer order by declaration rather than by accident.
+mw-api-mgmt = { path = "../crates/mw-api-mgmt" }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = { version = "0.8", default-features = false, features = ["parse"] }

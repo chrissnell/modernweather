@@ -2370,7 +2370,7 @@ A-W2-1 and A-W2-2, W2a's D-30 split, W3's A-W3-1 to A-W3-4, W4's A-W4-1 to A-W4-
 A-W5-3, W7's A-W7-1 to A-W7-4, W8's A-1 to A-4 and W9's A-W9-1 to A-W9-3. All are applied there under
 the protocol; none is edited in place. See `docs/DESIGN.md`'s `## Amendments` section.
 
-This document proposes **one** amendment of its own, which is not to a decision. Eighteen
+This document proposes **one** amendment of its own, which is not to a decision. Twenty-one
 more were appended later by implementation items and are marked as such.
 
 **A-M4-2-1 — a `Soft` capability handle is read when it is used, not once at build.**
@@ -3422,3 +3422,80 @@ location would serve a Gulf of Guinea forecast as that station's on a frozen end
 DEV-17 records the same predicate mismatch for the sun times and notes it is unobservable there; here
 it is observable, so Go's predicate is reproduced — with a refusal naming the station in place of
 Go's silent skip.
+
+---
+
+**A-M7-1-1 — the save preview takes a change, not a partial configuration document.**
+*Proposed by implementation-plan.md **M7-1**, 2026-11-13. Not applied: the protocol above
+reserves that for a work item that owns the ledger.*
+
+*What was found.* W5 §2.4 writes the preview's body as a partial configuration document —
+`POST /api/v1/config/preview { "stations": [ ... ] }` — and W5 §8.7 requires the **deletion**
+consequence list ("this will leave your website with no weather to show") to come from the
+same call. Those two cannot both hold. A document that omits a station is indistinguishable
+from a document that was not asked about one, so "delete Backyard" has no representation in
+the shape §2.4 shows, and §8.7's dialog would have to be driven by a second endpoint whose
+answer could differ from what the delete then did.
+
+*What was chosen.* The preview takes the **same value the mutating route builds from its own
+body** — a discriminated `Change` union with `put_station`, `delete_station`, `put_website`
+and the rest. `ConfigAdmin::apply(change, Commit)` is then one function: it opens a
+transaction, applies the change's statements, reads the configuration back **out of that
+transaction**, runs `plan()` and diffs against the live plan. A preview rolls back; a save
+commits. Nothing else differs.
+
+*Why that is the stronger shape.* M7-1's done-criterion is "a save's preview names exactly
+the components that then restart". Under a partial-document preview that is an agreement two
+code paths have to keep — one that interprets a document and one that interprets a form
+submission — and the first divergence is silent, because a preview that under-reports looks
+exactly like a change that did less. Under one path it is not an agreement at all. The cost
+is that a client assembling a multi-resource edit previews it as several changes rather than
+one document, which no screen in §7.1 does.
+
+---
+
+**A-M7-1-2 — the management API's TypeScript client is emitted by `cargo xtask`, not by
+`openapi-typescript`.**
+*Proposed by implementation-plan.md **M7-1**, 2026-11-13. Not applied: see above.*
+
+*What was found.* W5 §4.2 names `openapi-typescript` as the emitter for
+`generated/ts/mgmt-api.d.ts` and `openapi-fetch` as the client wrapper. The gate that checks
+the result, `mgmt-schema-drift` (**D-57**), is also a developer command — W8's rule is that a
+gate you cannot reproduce locally gets worked around instead of fixed — and `cargo xtask
+mgmt-schema --check` would then need `npm` on every machine and in a CI job whose only other
+requirement is a Rust toolchain.
+
+*What was chosen.* The `.d.ts` is emitted from the OpenAPI document by `xtask/src/mgmt.rs`,
+in `openapi-typescript`'s own shape, so `openapi-fetch` consumes it unchanged and W5 §4.3's
+mechanism 2 (`tsc --noEmit` against the committed `.d.ts`) works exactly as specified. What
+§4.2 actually requires of the file is that it is **types only** — no runtime, no class per
+endpoint, so the client costs about 2 KB against §6.5's budget — and a `.d.ts` is types only
+whoever writes it. The emitter fails loudly on a schema shape it does not know rather than
+falling back to `unknown`, because a silent `unknown` is the one outcome that would make
+mechanism 2 useless.
+
+*What this does not change.* The schema itself is still derived from the handlers by
+`utoipa`, which is §4.1's requirement and the reason the gate is separate from
+`codegen-drift`. M7-3 may replace this emitter with `openapi-typescript` once the UI build
+exists and `npm` is in that job anyway; the committed file is the contract either way.
+
+---
+
+**A-M7-1-3 — forecasts and alerts get their own resource rather than a `services/` entry.**
+*Proposed by implementation-plan.md **M7-1**, 2026-11-13. Not applied: see above.*
+
+*What was found.* W5 §1.4 maps `GET /api/config/controllers/{type}` onto
+`GET /api/v1/services/{service}` for `pwsweather`, `weatherunderground`, `aprs`,
+`aerisweather` and `snowcache`. The first three are `uploader` rows; `aerisweather` is an
+`aeris_account` row, which the schema deliberately separates (its migration's own argument:
+Aeris is four fetching components rather than an egress); and `snowcache` has no
+configuration at all under the new schema — the snow components plan from the station's
+`snow_base_distance_mm`.
+
+*What was chosen.* `/api/v1/services/{service}` covers the three upload accounts, and
+forecasts and alerts are `/api/v1/forecasts`. An upload account's interval, endpoint and APRS
+symbols have no field in common with a client-id pair and a station list, so one union would
+be §4.4's "object with named fields" turned into an object where every field is optional —
+which is the shape §4.4 exists to avoid. There is no `/services/snowcache`, because there is
+nothing to configure. The **page** is one page under "Share my data" either way, which is
+what §1.4's mapping is actually about.

@@ -30,6 +30,7 @@ mod gen;
 mod gogolden;
 mod layout;
 mod legacy;
+mod mgmt;
 mod migrate;
 mod registry;
 mod snapshot;
@@ -60,6 +61,10 @@ fn main() -> ExitCode {
         "codegen" => codegen(&root, flags.contains(&"--check")),
         "migrate" => migrate_cmd(&root, &flags),
         "legacy-import" => legacy_import(&root, &flags),
+        // The `mgmt-schema-drift` gate's command, and the same split as `gate-layout`:
+        // `cargo xtask gate mgmt-schema-drift` consults ci/gates.toml and then runs this.
+        // Its exit codes are `codegen`'s -- 1 means drift -- for C-W2-20's reason.
+        "mgmt-schema" => mgmt::main(&root, flags.contains(&"--check")),
         "budget" => budget(&root),
         "validate" => validate_cmd(&root),
         "gates" => gates::list(&owned).map(|()| ExitCode::SUCCESS),
@@ -137,6 +142,13 @@ fn usage() {
          \x20                        changes. Loud on purpose; read the migration.\n\
          \x20     --dry-run          print what would be written, write nothing\n\
          \x20 validate           check every invariant and exit\n\
+         \n\
+         the management API schema (W5, D-57)\n\
+         \x20 mgmt-schema        regenerate generated/openapi/management.json and\n\
+         \x20                    generated/ts/mgmt-api.d.ts from the Rust handlers in\n\
+         \x20                    crates/mw-api-mgmt\n\
+         \x20     --check            regenerate into memory and diff; never writes into the\n\
+         \x20                        working tree. Exit 1 on drift.\n\
          \n\
          the Go-to-Rust data migration (W9)\n\
          \x20 legacy-import      emit the migration SQL into ci/db/migrate-from-go/generated/\n\
@@ -287,7 +299,7 @@ fn codegen_drift(root: &Path, files: &gen::Files) -> Result<(PathBuf, Vec<String
     let mut orphans = list_files(&root.join(GENERATED), root);
     orphans.sort();
     for path in orphans {
-        if !files.contains_key(&path) {
+        if !files.contains_key(&path) && !foreign(&path) {
             drift.push(format!("  in the tree but not generated: {path}"));
         }
     }
@@ -359,7 +371,7 @@ fn write_generated(root: &Path, dir: &str, files: &gen::Files) -> Result<Vec<Str
 
     let mut pruned: Vec<String> = Vec::new();
     for rel in list_files(&root.join(dir), root) {
-        if files.contains_key(&rel) {
+        if files.contains_key(&rel) || foreign(&rel) {
             continue;
         }
         let full = root.join(&rel);
@@ -369,6 +381,22 @@ fn write_generated(root: &Path, dir: &str, files: &gen::Files) -> Result<Vec<Str
     pruned.sort();
     remove_empty_dirs(&root.join(dir));
     Ok(pruned)
+}
+
+/// Whether this path under `generated/` belongs to a **different** emitter.
+///
+/// `GENERATED` is "wholly owned by the generator, which is what makes pruning it correct"
+/// (N-15), and that was true while there was one generator. There are two: implementation-plan.md
+/// M7-1 adds `cargo xtask mgmt-schema`, whose input is the Rust handler set rather than
+/// `metrics/registry.toml` (D-57). Without this, `codegen` would DELETE the management
+/// schema on every run and `codegen --check` would report it as an orphan -- so the two
+/// emitters have to agree on who owns what, and a list is how they do.
+///
+/// Deliberately a path list rather than a directory or an extension: `generated/openapi/`
+/// and `generated/ts/` each hold files from both emitters, so anything coarser would make
+/// `codegen`'s prune blind to a real orphan beside them.
+fn foreign(path: &str) -> bool {
+    mgmt::OWNED.contains(&path)
 }
 
 /// Every file under `dir`, repo-relative. Listed by path rather than by content, unlike

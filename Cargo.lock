@@ -345,6 +345,7 @@ checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
  "num-traits",
+ "serde",
  "windows-link",
 ]
 
@@ -1472,6 +1473,7 @@ dependencies = [
  "mw-web",
  "sd-notify",
  "secrecy",
+ "serde_json",
  "sqlx",
  "thiserror",
  "tokio",
@@ -1522,6 +1524,8 @@ dependencies = [
  "serde_json",
  "subtle",
  "thiserror",
+ "tokio",
+ "tower",
  "tracing",
  "utoipa",
 ]
@@ -3788,6 +3792,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "mw-api-mgmt",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -23,6 +23,18 @@ serde_json.workspace = true
 argon2.workspace = true
 subtle.workspace = true
 secrecy.workspace = true
-chrono.workspace = true
+# `features = ["serde"]` rather than the bare workspace entry: every timestamp this API
+# emits is a `DateTime<Utc>` (`since`, `last_run`, `radar_registered_at`), and the whole
+# surface is `serde`. Narrowed to the crates that serialise one rather than turned on in
+# `[workspace.dependencies]`, so that `mw-types` -- which may not name `serde` at all, because
+# a rename in the domain type is how legacy naming leaks into the core -- does not acquire a
+# reason to.
+chrono = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# The router is exercised end to end against `oneshot` rather than over a socket: only
+# `mw-http` may bind one (ci/layers.toml), and the thing under test here is the handler set.
+tokio = { workspace = true }
+tower = { workspace = true }

@@ -65,7 +65,7 @@ use tracing::info;
 
 use crate::mount::Mount;
 use crate::sni::SniResolver;
-use crate::socket::{self, Bound, Listen};
+use crate::socket::{self, Bound, Listen, Management};
 
 /// The component's id. A constant because the spec, the log lines and a plan test name it.
 pub const ID: &str = "http:listener";
@@ -80,6 +80,22 @@ pub trait ListenerConfig {
 
     /// The mounted router set, built by `main` as a root resource.
     fn mount(&self) -> Option<&Arc<Mount>>;
+
+    /// The management API's socket and router, when this node serves one.
+    ///
+    /// A provided method returning `None`, which is not laziness: a node that has not been
+    /// given a management router still listens -- `/metrics` is on the one listener and every
+    /// node has a `listener` row -- so "no management API" has to be a configuration this
+    /// component plans, not a wiring error it refuses. `crates/modernweather/src/boot.rs`
+    /// supplies one; `mw-http`'s own tests do not, which is the honest shape for a crate that
+    /// may not name `mw-api-mgmt`.
+    ///
+    /// Built fresh per call rather than borrowed, because [`Management`] owns an
+    /// `axum::Router` -- cheap to clone, and a borrow would put the router's lifetime into
+    /// the builder closure this component moves into a task.
+    fn management(&self) -> Option<Management> {
+        None
+    }
 
     /// The SNI resolver, when `listen().https_port` is set.
     ///
@@ -123,14 +139,23 @@ pub fn register<C: ListenerConfig>(
     let listen = cfg.listen();
     let mount = Arc::clone(cfg.mount().ok_or(ListenerPlanError::NoMount)?);
     let resolver = cfg.sni_resolver().map(Arc::clone);
+    let management = cfg.management();
     // Every configuration value the builder closes over, folded in. The router and the
     // resolver are root resources whose *contents* follow the configuration the components
     // that built them digested, so what is this component's own is the socket set.
+    //
+    // **The management address is part of it**, and that is what makes W5 §1.4's "changing
+    // the port shows an explicit warning and the new URL" true rather than a promise: a
+    // write that moves `management_port` changes this digest, so the plan diff restarts this
+    // component and the socket actually moves. Without it the management port would be the
+    // one configuration value a save could not apply.
     let digest = ConfigDigest::of(&(
         listen.addr.to_string(),
         listen.http_port,
         listen.https_port,
         listen.grpc_port,
+        management.as_ref().map(|m| m.addr.to_string()),
+        management.as_ref().map(|m| m.tls.is_some()),
     ));
 
     out.push(
@@ -141,22 +166,37 @@ pub fn register<C: ListenerConfig>(
                 let listen = listen.clone();
                 let mount = Arc::clone(&mount);
                 let resolver = resolver.clone();
+                // Cloned per build rather than moved, because a `Backoff` retry builds
+                // again: a port another process holds is a lifecycle transition retried
+                // with exponential backoff (W2a Decision 30), and a router moved out on the
+                // first attempt would leave the second with none.
+                let management = management.as_ref().map(|m| Management {
+                    addr: m.addr,
+                    router: m.router.clone(),
+                    tls: m.tls.clone(),
+                });
                 async move {
                     // Additive and soft: the set of providers is observed, never waited
                     // for (W2a Decision 19).
                     let routes = cx.additive::<Arc<dyn RouteProvider>>()?;
-                    let bound =
-                        socket::bind_with_hosts(&listen, mount.router(), resolver, mount.hosts())
-                            .await
-                            .map_err(|source| mw_component::BuildError::Resource {
-                                what: format!("the listener on {}", listen.main()),
-                                source: Box::new(source),
-                            })?;
+                    let bound = socket::bind_all(
+                        &listen,
+                        mount.router(),
+                        resolver,
+                        mount.hosts(),
+                        management,
+                    )
+                    .await
+                    .map_err(|source| mw_component::BuildError::Resource {
+                        what: format!("the listener on {}", listen.main()),
+                        source: Box::new(source),
+                    })?;
                     info!(
                         main = %bound.local_addr(),
                         tls = listen.tls(),
                         grpc = %bound.grpc_addr(),
                         redirect = ?bound.redirect_addr(),
+                        management = ?bound.management_addr(),
                         sites = mount.sites(),
                         providers = routes.load().len(),
                         "the one listener is serving"

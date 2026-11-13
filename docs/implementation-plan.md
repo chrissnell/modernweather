@@ -1314,6 +1314,16 @@ which is what lets §2.4's save preview and §8.7's deletion consequences come f
 that will actually run.
 **Done when:** `mgmt-schema-drift` is armed and green; a save's preview names exactly the components
 that then restart.
+**Three deviations, recorded in `docs/reconciliation.md`** as **A-M7-1-1** (the preview takes a
+change rather than a partial document, so that §8.7's deletion consequences and §2.4's save preview
+really are one code path), **A-M7-1-2** (the TypeScript client is emitted by `cargo xtask` rather
+than by `openapi-typescript`, so the gate needs no `npm`) and **A-M7-1-3** (forecasts and alerts are
+their own resource rather than a `services/` entry).
+**One stated cost.** Adding or removing a station or a website restarts **every** component, because
+the rollup state's and the snapshot table's key sets are fixed at construction and every holder of
+either has to be rebuilt together. Editing a station's settings, a service, the forecast account, the
+storage connection or the ports restarts only what changed. The save preview reports both cases in
+advance, which is what makes it a stated cost rather than a surprise.
 
 ### M7-2 — authentication and first-run
 **Depends on:** M7-1, M2-2. Argon2id at m=64 MiB/t=3/p=4, sessions as hashed 32-byte secrets in an
@@ -1328,6 +1338,14 @@ creates the account.
 **Owner decisions this needs:** **O-10**'s four (loopback-until-claimed, the breached-password list,
 no API tokens in v1, one step of config history). All four have recommendations and none blocks the
 others.
+**Constraint from another work item.** M7-1 ships the management surface with **no authentication**
+and binds it to loopback regardless of `listener.management_listen_addr`, warning when it narrows a
+configured address. This item is what makes that column mean what it says: until an administrator
+account exists there is nothing to authenticate, and the narrowing is the interim answer rather than
+a decision. The three `/api/v1/auth/*` routes and `POST /api/v1/auth/password` are this item's to
+add; the router they attach to exists. The one step of config history O-10 asks about is already
+implemented as `POST /api/v1/config/revert`, scoped to this process rather than to a session,
+because a session-scoped one cannot be written before sessions exist.
 
 ### M7-3 — the UI
 **Depends on:** M7-1, M7-2. SvelteKit 2 + `adapter-static` + Vite 6 in SPA mode on `chonky`, embedded
@@ -1347,6 +1365,21 @@ visible), `spool_time_remaining_seconds`, the `ceiling < max_lag × rate` adviso
 polls — the only client-side timer is the `Backoff` countdown rendering a server-supplied absolute
 timestamp (W5 D-46).
 **Owner decision this needs:** **O-11** — which `chonky` gaps to upstream.
+**Constraints from another work item.** Three route families M7-1 maps are deliberately **not** in
+its surface, and each is this item's or needs work this item depends on:
+- `GET /api/v1/events` — the SSE endpoint of §5, which belongs with the client that consumes its
+  channels. There is no polling to replace until there is a page.
+- `POST /api/v1/checks/*` — all seven. Each is a `check:<name>` component with `Trigger::OnDemand`
+  run through `ComponentControl::run_now` (W2a §4.4), and **no work item creates those components**;
+  the routes are two lines each and the components are not. The seventh, `check:aprs`, is W2a §3.2's
+  observation that the APRS controller's 90-second health monitor is a connectivity check wearing a
+  health hat.
+- `GET /api/v1/discovery/weatherlink/*` — needs M3-1's in-process mDNS probe driven from a request
+  rather than from a station's build, which is a change to `mw-station`'s surface rather than a
+  handler.
+Adding each is additive under §4.4 and needs no version bump. `mw_api_mgmt::freshness` is also not
+yet wired into the runtime resource: a freshness sentence needs the instant its capability was last
+written, which no `ComponentStatus` carries.
 
 ### M7-4 — the configuration migration *(N-5 / G-2)*
 **Depends on:** M2-2, M7-1, M5-1. Move the owner's existing configuration onto the new schema:
