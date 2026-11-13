@@ -1073,6 +1073,35 @@ each extreme's timestamp; per-year counts in §2a. `pitcairn` was not written to
 found the 2026-10-31 tables and left them, and `pause-source-retention` found nothing enabled and
 issued no statement.
 
+**But the station ids it imported could not be station keys, so M5-1b re-ran it.** See below.
+
+### M5-1b — the migrated station keys were not usable as station keys
+**Depends on:** M5-1. **Blocks:** the owner's own side-by-side comparison, which is why it is carved
+out of M7-4 rather than waiting behind it.
+A `station_id` becomes a station key and a station key becomes a `ComponentId`, which permits only
+lower-case ASCII, digits, `-`, `_`, `.` and `:`. M5-1 took the documented default `station_id =
+stationname`, and two of the three Go display names — `CSI` and `Suncrest Air Quality` — are refused
+by that type, so a live station configured against a year of its own history is
+`StationPlanError::Key` at plan time. The preview showed it: it minted a **second** station `csi`
+beside the migrated `CSI`, and `/span?station=CSI` answered one bucket of live data.
+**The fix is a derived default and two refusals, not three corrected values.** Any station with a
+capital letter or a space would have hit this. `w9.station_key(stationname)` derives the id,
+`w9.assert_station_map_usable()` refuses any id — derived or hand-written — that could not be a
+station key, and `w9.seed_station_map()` names two source names that derive one id rather than
+letting a unique violation name a constraint. Done through `w9.station_map`, which is what
+`30-reconcile.sql` also maps through, so the reconciliation still compares the right rows.
+**Two things the re-run needed that did not exist.** `reset-target`, because `stage` creates its
+relations without `IF NOT EXISTS` and a procedure whose second run needs hand-typed SQL cannot be
+repeated; and `carry-out` / `carry-in`, because the source's raw window had receded 14 days since
+M5-1 and 462,495 readings existed only in the target (data-migration.md Decision 3a).
+**DONE 2026-11-13.** `docs/data-migration.md` §2c is the record. **1,182 of 1,182** digests `ok` with
+zero tolerance, the two bounded statistics at 5.7742e-7 and 1.6502e-3 with the other twelve exact
+over 964 buckets, `assert_no_unknown_source_columns()` silent at 215 of 215, 42 of 42 spot checks
+exact, and **every settled per-year row count identical to §2a's** — the only two deltas are the two
+live stations' 7 h 26 m of new readings. Verified against the running preview:
+`/span/8760h?station=CSI` returns **365 daily buckets, 2025-11-13 → 2026-11-13** beside the live
+reading, and `stations` holds one row per device instead of four.
+
 **Three defects only this run could find**, all three green in the lab, all three fixed and
 re-verified here: the legacy boundary compared a bucket's *start* against a reading's timestamp and
 double-counted one bucket per station; the digest's year key was the server's **local** year, and
