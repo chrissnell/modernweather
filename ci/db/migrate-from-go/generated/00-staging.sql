@@ -309,7 +309,8 @@ COMMENT ON TABLE w9.dropped_source_column IS
     'Source columns consciously not carried over. Every row is a decision someone
      made; `reason` is not optional for that reason.';
 
-CREATE PROCEDURE w9.record_retired_dimensions() LANGUAGE sql AS $fn$
+CREATE PROCEDURE w9.record_retired_dimensions() LANGUAGE plpgsql AS $fn$
+BEGIN
     INSERT INTO w9.dropped_source_column (column_name, reason)
     SELECT r.column_name, r.reason
       FROM (VALUES
@@ -318,7 +319,7 @@ CREATE PROCEDURE w9.record_retired_dimensions() LANGUAGE sql AS $fn$
         ) AS r(column_name, reason)
       JOIN w9.source_column s USING (column_name)
     ON CONFLICT (column_name) DO NOTHING;
-$fn$;
+END $fn$;
 
 COMMENT ON PROCEDURE w9.record_retired_dimensions() IS
     'Records the registry''s `metadata` dimensions as consciously dropped, for

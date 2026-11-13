@@ -480,15 +480,33 @@ fn staging(reg: &Registry, go: &GoViews) -> String {
     // records a drop only where there is something to drop. It also means the procedure
     // runs AFTER the source inventory loads -- migrate-from-go.sh's `gap` step calls it
     // there, immediately before the assertion it exists to satisfy.
+    //
+    // **Emitted unconditionally, even by a registry with no `metadata` dimension at all**,
+    // and that is the whole reason it is plpgsql rather than the one-statement `LANGUAGE
+    // sql` it would otherwise be: `migrate-from-go.sh` calls it by name, and a procedure
+    // that exists only when the registry happens to have something to say would make that
+    // call fail with `undefined_function` on the next registry that does not. An INSERT over
+    // an empty VALUES list is not expressible, so the empty case is `NULL` -- a procedure
+    // that runs and records nothing, which is the honest shape of "nothing was retired".
     let retired: Vec<&Dimension> = reg
         .dimensions
         .iter()
         .filter(|d| d.role.retirable())
         .collect();
-    if !retired.is_empty() {
+    s.push_str(
+        "CREATE PROCEDURE w9.record_retired_dimensions() LANGUAGE plpgsql AS $fn$\n\
+         BEGIN\n",
+    );
+    if retired.is_empty() {
         s.push_str(
-            "CREATE PROCEDURE w9.record_retired_dimensions() LANGUAGE sql AS $fn$\n\
-            \x20   INSERT INTO w9.dropped_source_column (column_name, reason)\n\
+            "    -- metrics/registry.toml declares no `metadata` dimension, so there is no\n\
+            \x20   -- decision to record. See xtask/src/legacy.rs for why this is a no-op\n\
+            \x20   -- rather than an absent procedure.\n\
+            \x20   NULL;\n",
+        );
+    } else {
+        s.push_str(
+            "    INSERT INTO w9.dropped_source_column (column_name, reason)\n\
             \x20   SELECT r.column_name, r.reason\n\
             \x20     FROM (VALUES\n",
         );
@@ -506,14 +524,16 @@ fn staging(reg: &Registry, go: &GoViews) -> String {
         s.push_str(
             "        ) AS r(column_name, reason)\n\
             \x20     JOIN w9.source_column s USING (column_name)\n\
-            \x20   ON CONFLICT (column_name) DO NOTHING;\n\
-             $fn$;\n\n\
-             COMMENT ON PROCEDURE w9.record_retired_dimensions() IS\n\
-            \x20   'Records the registry''s `metadata` dimensions as consciously dropped, for\n\
-            \x20    the ones the source actually declares. Call it after w9.source_column is\n\
-            \x20    loaded and before w9.assert_no_unknown_source_columns().';\n\n",
+            \x20   ON CONFLICT (column_name) DO NOTHING;\n",
         );
     }
+    s.push_str(
+        "END $fn$;\n\n\
+         COMMENT ON PROCEDURE w9.record_retired_dimensions() IS\n\
+        \x20   'Records the registry''s `metadata` dimensions as consciously dropped, for\n\
+        \x20    the ones the source actually declares. Call it after w9.source_column is\n\
+        \x20    loaded and before w9.assert_no_unknown_source_columns().';\n\n",
+    );
 
     s.push_str(
         "-- Fails the migration rather than importing into a column nobody chose.\n\
@@ -1511,6 +1531,60 @@ mod tests {
             Registry::load(&root.join(crate::REGISTRY)).expect("registry"),
             GoViews::load(&root.join(GO_VIEWS)).expect("go views"),
         )
+    }
+
+    /// The shipped registry with both `metadata` dimensions put back to `attribute`, which
+    /// is what `main` looked like before M5-5 and is the only way to reach the empty branch
+    /// of the `w9.record_retired_dimensions()` emitter.
+    fn registry_with_no_metadata_dimension() -> Registry {
+        let root = crate::repo_root();
+        let text = std::fs::read_to_string(root.join(crate::REGISTRY))
+            .expect("registry is readable")
+            .replace("role = \"metadata\"", "role = \"attribute\"");
+        let reg: Registry = toml::from_str(&text).expect("fixture parses");
+        assert!(
+            !reg.dimensions.iter().any(|d| d.role.retirable()),
+            "the fixture is supposed to have no `metadata` dimension"
+        );
+        crate::validate::registry_internal(&reg).expect("fixture is a valid registry");
+        reg
+    }
+
+    /// **`w9.record_retired_dimensions()` is emitted whatever the registry says**, because
+    /// `migrate-from-go.sh` calls it by name.
+    ///
+    /// A procedure that existed only when the registry happened to have a `metadata`
+    /// dimension would make that call fail with `undefined_function` on the next registry
+    /// that does not -- in the `gap` step, after the archive has been taken and before the
+    /// import. An `INSERT` over an empty `VALUES` list is not expressible, which is why the
+    /// empty case is a plpgsql `NULL` rather than a shorter `LANGUAGE sql` body.
+    #[test]
+    fn the_retired_dimension_recorder_is_emitted_even_with_nothing_to_record() {
+        let go = inputs().1;
+        let staging = |reg: &Registry| {
+            all(reg, &go)
+                .remove(&format!("{OUT_DIR}/00-staging.sql"))
+                .expect("staging is emitted")
+        };
+
+        let empty = staging(&registry_with_no_metadata_dimension());
+        assert!(
+            empty.contains("CREATE PROCEDURE w9.record_retired_dimensions()"),
+            "the procedure migrate-from-go.sh CALLs is missing: {empty}"
+        );
+        assert!(
+            empty.contains("    NULL;"),
+            "with nothing retired the body is a no-op, not an INSERT over an empty VALUES"
+        );
+        assert!(
+            !empty.contains("INSERT INTO w9.dropped_source_column"),
+            "and it records nothing"
+        );
+
+        // The shipped registry's version, for contrast: same procedure, real body.
+        let populated = staging(&inputs().0);
+        assert!(populated.contains("CREATE PROCEDURE w9.record_retired_dimensions()"));
+        assert!(populated.contains("INSERT INTO w9.dropped_source_column"));
     }
 
     /// A registry with a `metadata` dimension the OLD TABLE NEVER HAD, which the shipped

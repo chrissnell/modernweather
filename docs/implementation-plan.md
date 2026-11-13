@@ -1337,6 +1337,13 @@ already had the resolution: `w9.record_retired_dimensions()`, generated from the
 with the reason, and only for a column the source really declares.
 `migrate-from-go.sh`'s `gap` step calls it immediately before the assertion.
 
+**The procedure is emitted whatever the registry says**, which is the second review finding: it was
+emitted only when there was something to record, and the shell script calls it by name — so the next
+registry with no `metadata` dimension would have failed the `gap` step with `undefined_function`,
+after the archive and before the import. An `INSERT` over an empty `VALUES` list is not expressible,
+so the empty case is a plpgsql `NULL` rather than a shorter `LANGUAGE sql` body, and a generator test
+pins both branches.
+
 **Verified**, all of it locally because GitHub CI is disabled until December:
 
 | | |
@@ -1349,12 +1356,16 @@ with the reason, and only for a column the source really declares.
 | `ci/db/migrate-twice.sh` | both paths agree and a second application is a no-op; path B applied nine migrations over seeded tables and then these two, so the `ADD COLUMN` and the backfill ran as a real upgrade and the result matched a fresh install |
 | `cargo xtask conformance` | **green: 61 passed, 9 failed, all nine the declared `retired` set, `PENDING` empty, every `/latest` fixture passing** |
 | `ci/diff/self-test.sh` | **PASSED** — green on the recorded pair, red on every injection. Criterion 3, as far as it runs without two live daemons |
+| `generated/00-staging.sql` **executed**, not just diffed | against a throwaway database on the CI instance: the whole file applies, and `w9.record_retired_dimensions()` records nothing against an empty inventory, exactly `stationname` and `stationtype` once the source declares them, nothing further on a second call, and the no-op branch applies and records nothing too |
 
 The conformance run is the one that matters here: `stationname` is a key with no `omitempty`, and
 `/latest` in that replay is served **entirely** by `snapshot:warm` — there is no live station — so it
 exercises exactly the read path this item changed, end to end through the daemon.
 
-**Verified able to fail.** The catalogue test fails if a later migration does drop the two columns,
+**Verified able to fail.** `w9.assert_no_unknown_source_columns()` was made to raise and then to
+pass over the same inventory: with a third unrouted column present it raises naming **only** that
+column — so the two retired ones are genuinely routed and the assertion has not been blunted — and it
+passes once that column is recorded too. The catalogue test fails if a later migration does drop the two columns,
 and names the line to delete rather than going quiet. The renderer test's reading claims a name of
 its own and the response does not use it — the half that was invisible while the column existed and
 the two strings were routinely equal. The projection test configures `weatherlink-live` and has the
