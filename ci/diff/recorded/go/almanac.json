@@ -1,0 +1,62 @@
+{
+ "status": 200,
+ "json": {
+  "high_temp": {
+   "value": 95.73979,
+   "timestamp": "2025-08-19T18:00:00-06:00"
+  },
+  "low_temp": {
+   "value": 12.097401,
+   "timestamp": "2026-02-18T17:00:00-07:00"
+  },
+  "high_wind_speed": {
+   "value": 46.014404,
+   "timestamp": "2026-02-16T17:00:00-07:00",
+   "wind_dir": 184.01839
+  },
+  "max_rain_hour": {
+   "value": 0.23000003,
+   "timestamp": "2026-04-28T10:00:00-06:00"
+  },
+  "max_rain_day": {
+   "value": 0.90999943,
+   "timestamp": "2025-10-03T18:00:00-06:00"
+  },
+  "low_barometer": {
+   "value": 29.440966,
+   "timestamp": "2026-02-17T17:00:00-07:00"
+  },
+  "low_humidity": {
+   "value": 6.698,
+   "timestamp": "2025-08-03T18:00:00-06:00"
+  },
+  "high_solar": {
+   "value": 1514.0381,
+   "timestamp": "2026-05-18T13:04:28.657385-06:00"
+  },
+  "high_pm25": {
+   "value": 731.13,
+   "timestamp": "2026-01-19T17:00:00-07:00"
+  },
+  "high_pm10_in": {
+   "value": 655.33,
+   "timestamp": "2026-01-19T17:00:00-07:00"
+  },
+  "high_co2": {
+   "value": 646,
+   "timestamp": "2026-02-27T17:00:00-07:00"
+  },
+  "high_tvoc": {
+   "value": 500,
+   "timestamp": "2025-09-28T18:00:00-06:00"
+  },
+  "high_aqi_pm25": {
+   "value": 500,
+   "timestamp": "2026-01-19T17:00:00-07:00"
+  },
+  "high_aqi_pm10": {
+   "value": 500,
+   "timestamp": "2026-01-19T17:00:00-07:00"
+  }
+ }
+}

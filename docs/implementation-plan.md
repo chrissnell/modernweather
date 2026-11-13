@@ -1151,6 +1151,58 @@ and `/latest`, `/snow` and `/almanac`.
 the harness reports it. **Same principle as W1 D-10: a differ that cannot be made to differ proves
 nothing.**
 
+**BUILT 2026-11-13, and both mechanisms have run against production.** `ci/diff/` is the
+harness — `mw-diff readings` is (b), `mw-diff responses` is (c), `expected.toml` is the
+expected-diff set, and `ci/diff/README.md` is how to run them and how to read the summary.
+`ci/diff/self-test.sh` is the negative control and the new `diff-harness` gate: it drives both
+mechanisms over a recorded pair and asserts a clean run is green, a 1% error injected on
+either side is red and names the metric, an injection that moved **nothing** is refused rather
+than passed, and a run whose bound has no reading count reports `no_census` instead of
+guessing one. The recorded Rust side is derived from a capture of the Go side by applying
+exactly the deviations `expected.toml` predicts, so the control is attributable and a rule
+that drifted from its own prediction turns the gate red.
+
+**Neither done-criterion is met yet, and in both cases the obstacle is an input.** (b) paired
+**480 of 480** readings of the Campbell station over the `ser2net` bridge with a largest
+pairing offset of 1 ms, and reported 184 of 197 columns differing only as **D-26** predicts,
+`windchill`/`heatindex` only as **DEV-9** predicts, nine exactly equal — and two columns
+differing because the two deployments are not configured alike: a `wind_dir_correction` of
+−94° on the Go side and absent on the new one, and the station's coordinates, which move
+`potentialsolarwatts`. The criterion asks for 24 hours; the window was 40 minutes because that
+is how long both daemons had been receiving the same station.
+
+(c) ran all four `/span` bands, `/latest`, `/snow` and `/almanac`. **DEV-4 fired 148 times and
+DEV-7 353, inside their bound and matching their relationship** — the first evidence on real
+data that either deviation behaves as predicted, and DEV-7's own ledger entry says the
+conformance suite cannot establish it. Five findings no decision predicts, all recorded in
+`ci/diff/README.md` with evidence: `stationtype` is `"campbell"` against
+`"campbellscientific"`; **a `float32` tie-break difference** where both sides hold the
+identical `float8` value and it lies exactly on a `float32` midpoint, the Go server emitting
+the upper neighbour and this one rounding half to even — contract-visible in the last digit,
+on a minority of buckets, and the conformance suite misses it because no fixture sits on a
+tie; `/span`'s `rainincremental` serving `0.04` against the Go side's zero-filled `0` on nine
+of twenty-nine daily buckets; `/latest` serving `stationname` as `""` with `stationtype` absent
+and `monthrain` / `yearrain` as `0`; and `/almanac` serving `{}`, because the migration carries no
+`almanac_cache` and the Go cache holds records from **2025-08-19**, earlier than the first
+imported reading, so those all-time extremes are not reproducible from the migrated data and
+would reset at cutover.
+
+**The harness is cutover apparatus and the owner scoped it as such on 2026-11-13:** the two
+implementations have to be checked against each other once, as `suncrestweather.com` moves to
+the new service, and then the Go daemon is decommissioned. `ci/diff/README.md`'s "Lifetime"
+section is the removal list -- the crate, the `diff-harness` gate, its CI job and its row in
+`docs/release.md` -- and the one thing that must not be removed with it is any defect the
+harness merely *found*, which belongs in a work item rather than in a README scheduled for
+deletion.
+
+**§5.0's "nothing else" for (c) is incomplete against its own deviation ledger,** which is
+recorded here rather than worked around: **DEV-7** changes `/span`'s `solarjoules` from the
+bucket mean to the bucket total — by roughly the bucket's reading count, so up to four orders
+of magnitude — and **DEV-12** adds one leading bucket to every response. Both are in
+`expected.toml` as predicates rather than exemptions, each citing its decision. The tie-break
+difference is deliberately **not** there: a rule needs a ledger entry behind it first, and
+`ci/diff/README.md` states the rule that would encode it so that accepting it is one edit.
+
 ### M5-3 — the `sunrise`/`sunset` assertion *(N-10 / C-W2a-27)*
 **Depends on:** M4-1. **Blocks:** M5-4.
 Compare `/latest`'s `sunrise` and `sunset` strings against a fresh Meeus evaluation for the fixture's
@@ -1381,11 +1433,45 @@ Adding each is additive under §4.4 and needs no version bump. `mw_api_mgmt::fre
 yet wired into the runtime resource: a freshness sentence needs the instant its capability was last
 written, which no `ComponentStatus` carries.
 
+**Constraint from M5-2, at the owner's instruction (2026-11-13): the station form must expose
+`wind_dir_correction_degrees`, `latitude`, `longitude` and `altitude_m`.** The store and the
+management API already carry all four — `StationInput` takes the correction and validates
+`-360..=360`, `StationView` returns it, and
+`mw_store::config_admin::tests::a_wind_direction_correction_survives_a_write_and_a_read` is the
+round trip — so this is the one remaining place a vane calibration cannot be set. It is not a
+cosmetic field: M5-2 measured the Go configuration's **−94°** against this side's `0` and it
+made `winddir` differ on 100% of readings and `windd` on 100% of `/span` buckets, with nothing
+downstream able to tell. The coordinates are the same class of value: they feed the clear-sky
+model (DEV-9) and `/latest`'s `sunrise`/`sunset`, and a wrong longitude is a wrong answer that
+still looks like weather.
+
 ### M7-4 — the configuration migration *(N-5 / G-2)*
 **Depends on:** M2-2, M7-1, M5-1. Move the owner's existing configuration onto the new schema:
 stations with their calibration, websites with hostnames, titles and about-text HTML, certificate
 paths, per-service settings into `station_service`, and `remote_stations` →
 `peers`/`peer_origins`/`config.stations` with the **four plaintext secret columns dropped** (**D-67**).
+
+**"Stations with their calibration" is load-bearing, and M5-2 measured what the preview is
+missing.** The owner's instruction, 2026-11-13: *"obviously we want to correct the station
+location so calculations are correct. Remoteweather/Go has the right configuration."* So the Go
+configuration is the authority and this item is where it arrives. What M5-2 established about
+the Campbell station, so that it is not re-derived:
+
+| | Go, which is right | the preview node's seed |
+|---|---|---|
+| `latitude` | **40.47571** | `40.0` |
+| `longitude` | **−111.84543** | `−105.0` |
+| `wind_dir_correction_degrees` | **−94** (equivalently 266) | `0` |
+| `altitude_m` | not exposed by any unauthenticated Go endpoint — **read it from the Go configuration** | `1800.0`, which is the conformance seed's placeholder |
+| `timezone` | `America/Denver` | `America/Denver`, already right |
+
+The coordinates come from the live Go server's `/stationinfo`, which serves the website's
+primary device's own `latitude` and `longitude`. The correction is measured rather than read:
+the `ser2net` bridge's raw `wind_d` is what this side stores and the Go side stores raw − 94,
+over nine consecutive readings, which is also the first independent confirmation that
+`mw_codec::WindDirCorrection` applies the Go arithmetic. **A placeholder carried forward is the
+failure mode here** — every one of these values fails quietly, which is why M5-2 found them and
+no gate did.
 Allocate a UUIDv7 `NodeId` per existing node, **not** reusing the `station_id` UUIDs in
 `remote_stations`, which are station identities (W7 assumption 35).
 **Done when:** the Rust daemon starts from the migrated configuration and plans the same component set

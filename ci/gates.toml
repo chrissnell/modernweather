@@ -265,6 +265,47 @@ packaging/serial-bridge/README.md has what each test establishes, the cutover or
 measurements require, and the two values on the box that no test here can confirm."""
 
 [[gate]]
+id = "diff-harness"
+description = "The M5-2 diff harness is green on a recorded pair and red on every injection"
+owner = "M5-2 (the diff harness); the two mechanisms it controls need two running systems"
+arms_when = "ci/diff/expected.toml"
+cmd = ["ci/diff/self-test.sh"]
+note = """
+M5-2's mechanisms (b) and (c) diff the two implementations by value on real data, which needs
+two running daemons, two databases and a live station -- so neither can be a CI gate. The
+DIFFER can: it needs only inputs, and ci/diff/recorded/ is a pair of them.
+
+This gate is the harness's own negative control. W1 D-10, which M5-2 restates as its test
+strategy: a differ that cannot be made to differ proves nothing. It asserts a clean run over
+the recorded pair is green, that a 1% error injected into one metric on EITHER side is red and
+names the metric, that an injection which moved nothing is refused rather than passed, and
+that a run whose tolerance has no reading count reports no_census instead of guessing one.
+
+The green half and the red half are both load-bearing and neither is a control alone: a
+harness that reported red on everything would pass the injections and be useless, and one
+that reported green on everything would pass the clean run.
+
+The recorded Rust side is DERIVED from the captured Go side by ci/diff/recorded/build.py,
+which applies exactly the deviations ci/diff/expected.toml predicts. So the gate also checks
+that derivation -- a corpus edited by hand would make the control pass for a reason nobody
+chose -- and a rule that drifted from its own prediction turns the gate red, because the
+manufactured difference would stop matching it.
+
+The test counts are declared in self-test.sh for the reason `cargo xtask db-tests` declares
+its names: a filter that matches no tests exits zero, and a gate that reports green while
+running nothing is docs/reconciliation.md G-1.
+
+ci/diff/README.md has how to run the two mechanisms, how to read the summary, and the two
+preconditions no test here can confirm -- that the two daemons are configured equivalently and
+that both databases hold the same readings over the window.
+
+THIS GATE IS CUTOVER-SCOPED AND IS MEANT TO BE DELETED. The owner's scoping, 2026-11-13: the
+two implementations have to be checked against each other once, as suncrestweather.com moves
+to the new service, and then the Go daemon is gone. When it is, this entry goes with
+ci/diff/ -- a gate whose subject no longer exists reports green forever and guards nothing.
+ci/diff/README.md's "Lifetime" section is the removal list."""
+
+[[gate]]
 id = "coverage-ratchet"
 description = "Line coverage has not decreased against the committed floor"
 owner = "W8 (this item); becomes meaningful once there are tests"

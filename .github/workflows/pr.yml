@@ -290,7 +290,8 @@ jobs:
             ci/db/migrate-from-go/lab/lab-env.sh \
             ci/db/migrate-from-go/lab/emit-old-schema.sh \
             ci/db/migrate-from-go/lab/10-seed.sh \
-            ci/conformance/go-target.sh
+            ci/conformance/go-target.sh \
+            ci/diff/self-test.sh
 
   gates:
     name: deferred gates
@@ -706,6 +707,41 @@ jobs:
           sudo apt-get install -y --no-install-recommends ser2net socat
       - run: cargo xtask gate serial-bridge
 
+  diff-harness:
+    name: the diff harness, made to differ on purpose
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          components: rustfmt, clippy
+      # Two workspaces, for the reason the conformance jobs name two: the root one builds
+      # xtask, and ci/diff is standalone on purpose so that mechanism (b) stays runnable
+      # against the Go daemon's database from a machine with no Rust daemon in the tree.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: diff-harness
+          workspaces: |
+            .
+            ci/diff
+      # M5-2's mechanisms need two running daemons, two databases and a live station, so
+      # neither can run here. The DIFFER needs only inputs, and ci/diff/recorded/ is a pair
+      # of them -- a capture of the Go side and a Rust side derived from it by applying
+      # exactly the deviations ci/diff/expected.toml predicts.
+      #
+      # So this job is the harness's own negative control, which is M5-2's declared test
+      # strategy and W1 D-10's principle: a differ that cannot be made to differ proves
+      # nothing. Green on the recorded pair, red on a 1% error injected on either side, red
+      # when an injection moved nothing, red when a bound has no reading count behind it.
+      # ci/diff is its own workspace, so the root `cargo fmt --all --check` and
+      # `cargo clippy --workspace` do not reach it. Checked here rather than left unchecked.
+      - name: Lint the harness, which the root workspace's jobs do not reach
+        run: |
+          cargo fmt --manifest-path ci/diff/Cargo.toml --all --check
+          cargo clippy --manifest-path ci/diff/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo xtask gate diff-harness
+
   database:
     name: migrations and server version
     runs-on: ubuntu-latest
@@ -976,6 +1012,7 @@ jobs:
       - database
       - db-tests
       - db-restore-rehearsal
+      - diff-harness
       - coverage
     if: always()
     runs-on: ubuntu-latest

@@ -58,6 +58,7 @@ The workspace contains one crate, `xtask`. **No application crate was created**,
 | `driver-emulators` | `cargo xtask gate driver-emulators` | W2a arms it |
 | `database` | version assertion + `cargo xtask gate db-migrate-twice` | TimescaleDB service container |
 | `coverage` | `cargo xtask gate coverage-ratchet` | a ratchet, not a threshold |
+| `diff-harness` | `cargo xtask gate diff-harness` | M5-2's differ, green on a recorded pair and red on every injection |
 | `gate` | checks that all of the above succeeded | **the only required check** |
 
 Every one of these is a `cargo xtask` subcommand or a one-line `cargo` invocation on

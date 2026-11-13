@@ -1,0 +1,34 @@
+# Standalone crate, and a standalone workspace, for the reason `contract/conformance` is one
+# (W1 Decision 7): this harness has to be runnable against the GO daemon and the GO database
+# from a machine that has no Rust daemon and no copy of the new schema. It is an operator's
+# tool pointed at two running systems, not a unit of the program under test, so it must not
+# inherit the workspace's lints, its pinned dependency set or its build profile.
+[workspace]
+
+[package]
+name = "mw-diff"
+version = "0.1.0"
+edition = "2021"
+description = "Diffs the Go daemon against the Rust daemon on the same inputs: readings (b) and responses (c), with the expected-diff set read from expected.toml."
+publish = false
+
+[dependencies]
+# `preserve_order` so a reported difference names keys in the order the server emitted them,
+# and `arbitrary_precision` so the literal the server wrote survives into the report: a
+# difference of one in the last digit has to be printable as the two digits, not as two f64s
+# that round to the same thing on the way to the terminal.
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+# Same client the conformance runner uses, for the same reason: blocking, tiny, and with a
+# TLS stack that needs no system library. (c) talks to the live Go server over HTTPS.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# The expected-diff set is data. `parse` only -- nothing here writes TOML.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+serde = { version = "1", features = ["derive"] }
+
+[[bin]]
+name = "mw-diff"
+path = "src/main.rs"
+
+[lib]
+name = "mw_diff"
+path = "src/lib.rs"
