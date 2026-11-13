@@ -1095,19 +1095,22 @@ where the refused client's stream must differ; and the same apparatus with the b
 one character device read twice, which is the real failure mode. The second control is also
 load-bearing for the runbook — `remoteweather`'s serial library takes no exclusive lock, so a bridge
 started while the daemon still holds the port opens it successfully and the two then split the line
-with no error anywhere. That is why `packaging/serial-bridge/README.md`'s cutover order is a
-measured requirement rather than caution.
+with no error anywhere. The durable consequence — an incumbent reader must be moved off the
+device *before* a bridge is started, never after — is recorded on the test that measures it
+rather than in a runbook.
 
 **What this item introduces, stated rather than discovered:** the port is writable. `ser2net`
 forwards what a client sends to the datalogger. Neither daemon writes to a Campbell line — checked
 in both trees — but before this change the only thing that *could* was a descriptor the daemon held.
 That is the one new hazard and it is in the README beside the mitigation.
 
-**Nothing in this repository records a particular installation.** The device path, the line rate and
-the listen address are site-specific, and each of them fails *quietly* when guessed wrong, so
-`packaging/serial-bridge/ser2net.yaml.example` leaves them as placeholders that are deliberately not
-valid rather than shipping a plausible default. An operator's actual values belong wherever that
-machine's configuration is kept, which is not here.
+**Deploying a bridge is not described in this repository, and that is the decision rather than an
+omission.** The device path, the line rate and the listen address belong to one installation; none of
+them is a fact about this software, and each fails *quietly* when guessed wrong, so a plausible
+default would be worse than no default. This item's output in the tree is therefore the **proof and
+its gate** — `crates/mw-station/tests/serial_bridge.rs`, `ci/serial-bridge/prove.sh` — plus the one
+operational fact the proof establishes, which is the ordering constraint above. An operator's values
+and runbook belong wherever that machine is administered.
 
 ### M5-2 — the diff harness
 **Depends on:** M5-1, M3-1, and **M5-1a** for the Campbell half of (b). Build (b) and (c) above as a

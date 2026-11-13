@@ -239,7 +239,7 @@ green while running nothing is docs/reconciliation.md G-1."""
 id = "serial-bridge"
 description = "A `ser2net` fan-out broadcasts every byte to every client, with its controls"
 owner = "GRA-787 (the serial multiplexer); consumed by M5-2 mechanism (b)"
-arms_when = "packaging/serial-bridge/ser2net.yaml.example"
+arms_when = "crates/mw-station/tests/serial_bridge.rs"
 cmd = ["ci/serial-bridge/prove.sh"]
 note = """
 M5-2's mechanism (b) diffs the two implementations by value on real data, which needs both
@@ -255,14 +255,15 @@ thing; this gate is the measurement, byte for byte, with two negative controls (
 misconfigured bridge, one unbridged character device read twice).
 
 `ser2net` and `socat` are hard requirements and the runner says so rather than skipping: the
-binary under test is the one `packaging/serial-bridge/` deploys, and a faked fan-out would
-prove only that its author can write one. The runner asserts the declared number of tests passed, because a
+binary under test is the one a deployment actually runs, and a faked fan-out would prove only
+that its author can write one. The runner asserts the declared number of tests passed, because a
 `--ignored` filter that matches no tests exits zero and a gate that reports green while
 running nothing is docs/reconciliation.md G-1 -- the same rule `cargo xtask emulator-tests`
 applies.
 
-packaging/serial-bridge/README.md has what each test establishes, the cutover order the
-measurements require, and the two values on the box that no test here can confirm."""
+Each test's own documentation has what it establishes. Deploying a bridge is an operator's
+business and is deliberately not described in this tree: the device path, the line rate and
+the listen address belong to one installation and none of them is a fact about this software."""
 
 [[gate]]
 id = "coverage-ratchet"

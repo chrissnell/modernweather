@@ -24,22 +24,29 @@
 //!   with `max-connections: 1`, where the second client is refused and the assertion must
 //!   go red;
 //! - [`two_readers_of_one_character_device_do_not_both_get_the_stream`] — the same
-//!   apparatus with the bridge taken out, which is the *real* failure mode and the reason
-//!   `packaging/serial-bridge/README.md`'s cutover order is what it is.
+//!   apparatus with the bridge taken out, which is the *real* failure mode and the reason a
+//!   bridge must be started only after the incumbent reader has let the device go.
 //!
 //! # What runs these
 //!
 //! `ser2net` and `socat`, as real processes. Neither is a Rust dependency and neither is a
-//! double: the binary under test is the one `packaging/serial-bridge/` deploys. A missing
-//! binary is a **failure** rather than a skip, for the reason `emulator_campbell.rs` gives
-//! for
-//! `socat` — a gate that reports green while running nothing is
-//! `docs/reconciliation.md` G-1. `#[ignore]`d so that `cargo test` on a machine with
-//! neither stays green; `ci/serial-bridge/prove.sh` is what runs them and it asserts the
-//! count.
+//! double: the binary under test is the one a deployment actually runs. A missing binary is
+//! a **failure** rather than a skip, for the reason `emulator_campbell.rs` gives for
+//! `socat` — a gate that reports green while running nothing is `docs/reconciliation.md`
+//! G-1. `#[ignore]`d so that `cargo test` on a machine with neither stays green;
+//! `ci/serial-bridge/prove.sh` is what runs them and it asserts the count.
 //!
 //! The station side of every test is a `socat` pty pair, so all of this is provable with no
-//! hardware and without touching the live station.
+//! hardware and without touching a live station.
+//!
+//! # What is deliberately not here
+//!
+//! **How to deploy a bridge.** The device path, the line rate and the listen address belong
+//! to one installation and none of them is a fact about this software, so none of them is in
+//! this repository. What *is* a fact about it — the ordering constraint these tests measure,
+//! and which is not obvious — is stated on
+//! [`two_readers_of_one_character_device_do_not_both_get_the_stream`], where the test that
+//! measures it is.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -133,9 +140,8 @@ async fn connect(port: u16) -> tokio::net::TcpStream {
 async fn both_clients_receive_the_identical_byte_stream() {
     let bridge = bridge_or_fail("campbell", 4).await;
     // Both clients first: a byte that arrives with nobody connected is dropped, because the
-    // bridge is a fan-out and not a spool. That is a property of the thing, recorded in
-    // `packaging/serial-bridge/README.md`, and it is why the station is fed after this line
-    // rather than before it.
+    // bridge is a fan-out and not a spool. That is a property of the thing, and it is why
+    // the station is fed after this line rather than before it.
     let mut a = connect(bridge.port()).await;
     let mut b = connect(bridge.port()).await;
     delivering(&bridge, &mut [&mut a, &mut b]).await;
@@ -215,10 +221,14 @@ async fn the_control_bites_when_the_bridge_has_only_one_client_slot() {
 ///
 /// `github.com/tarm/goserial` — `remoteweather`'s serial library — sets neither `TIOCEXCL`
 /// nor `O_EXCL` nor a `flock`, so that second `open(2)` **succeeds**: the kernel hands each
-/// byte to whichever reader asks first and there is no error anywhere to notice. This is
-/// the failure the cutover order in `packaging/serial-bridge/README.md` exists to prevent,
-/// and asserting it here is what makes that order a measured requirement rather than
-/// caution.
+/// byte to whichever reader asks first and there is no error anywhere to notice.
+///
+/// **The ordering constraint this measures** is the one durable operational fact this item
+/// produces: an incumbent reader must be moved off the device *before* the bridge is
+/// started, never after. In that order the bridge's `open(2)` is the only one and
+/// [`the_bridge_owns_the_line_exclusively_once_it_has_a_client`] takes over — a stray reader
+/// then gets `EBUSY` and retries loudly. In the other order, this test is what happens, and
+/// nothing reports it.
 #[tokio::test]
 #[ignore = "needs `socat`; `ci/serial-bridge/prove.sh` runs it"]
 async fn two_readers_of_one_character_device_do_not_both_get_the_stream() {
@@ -452,9 +462,9 @@ async fn the_campbell_driver_reads_the_bridge_while_a_second_client_reads_the_sa
 ///
 /// This is the fail-safe half of the asymmetry
 /// [`two_readers_of_one_character_device_do_not_both_get_the_stream`] measures. Started in
-/// the right order, a daemon that is accidentally left pointing at the serial port logs
-/// `failed to open serial port … device or resource busy` and retries — loud, and not a
-/// split stream.
+/// the right order — the bridge last, after the incumbent has let go — a daemon that is
+/// accidentally left pointing at the serial port logs `failed to open serial port … device
+/// or resource busy` and retries. Loud, and not a split stream.
 #[tokio::test]
 #[ignore = "needs `ser2net` and `socat`; `ci/serial-bridge/prove.sh` runs it"]
 async fn the_bridge_owns_the_line_exclusively_once_it_has_a_client() {
@@ -462,8 +472,8 @@ async fn the_bridge_owns_the_line_exclusively_once_it_has_a_client() {
 
     let bridge = bridge_or_fail("campbell-exclusive", 4).await;
     // The device is opened on the first client connection, not at startup, which is also
-    // why `ser2net` starts happily with the cable unplugged
-    // (`packaging/serial-bridge/README.md`). `Ser2netBridge::spawn` connects a throwaway
+    // why `ser2net` starts happily with the cable unplugged and makes a replug a non-event.
+    // `Ser2netBridge::spawn` connects a throwaway
     // client of its own, so by the time a test runs the device is already held -- the
     // *other* half of this property, that an unbridged character device admits a second
     // plain `open(2)`, is what

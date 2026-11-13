@@ -13,12 +13,12 @@
 # rule `cargo xtask emulator-tests` applies to the emulator gate.
 #
 # Requires: a Rust toolchain, `socat`, and `ser2net` 4.x. None of them is optional and none
-# is faked -- the binary under test is the one `packaging/serial-bridge/` deploys, which is
-# the whole point. Set `SER2NET` if it is not on PATH; the Debian package puts it in
+# is faked -- the binary under test is the one a deployment actually runs, which is the whole
+# point. Set `SER2NET` if it is not on PATH; the Debian package puts it in
 # /usr/sbin, which a non-root PATH does not include. Measured against 4.6.4 (Debian trixie)
 # and 4.6.8 (Arch extra), because the two differ and a fan-out is not a thing to assume.
 #
-# Arms itself when packaging/serial-bridge/ser2net.yaml.example exists (see ci/gates.toml).
+# Arms itself when crates/mw-station/tests/serial_bridge.rs exists (see ci/gates.toml).
 
 set -euo pipefail
 

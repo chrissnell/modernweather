@@ -564,10 +564,9 @@ impl Drop for PtyBridge {
 /// # Why the real binary and not a double
 ///
 /// A hand-written fan-out would prove only that the test author can write one. The claim
-/// under test is about **`ser2net` 4.x's `max-connections`**, and `ser2net` is what
-/// `packaging/serial-bridge/` deploys — so the binary is the thing under test and a missing
-/// binary is a failure rather than a skip, the same rule [`PtyBridge`] follows for
-/// `socat`.
+/// under test is about **`ser2net` 4.x's `max-connections`**, and `ser2net` is what a
+/// deployment actually runs — so the binary is the thing under test and a missing binary is
+/// a failure rather than a skip, the same rule [`PtyBridge`] follows for `socat`.
 ///
 /// `SER2NET` overrides the executable, because the Debian package installs it in
 /// `/usr/sbin` and that is not on a non-root `PATH`. `GENSIO_LIBRARY_PATH` is gensio's own
@@ -582,10 +581,10 @@ impl Drop for PtyBridge {
 /// it was handed. A `ser2net` killed with `SIGKILL`, which is what `kill_on_drop` does,
 /// leaves both behind; the next test gets the same `/dev/pts/N`, finds the stale lock, and
 /// answers its client `Device open failure: Object was already in use` while looking
-/// perfectly healthy. The lock is a real safeguard on a real port and stays on in
-/// `packaging/serial-bridge/ser2net.yaml.example` — with the consequence recorded there,
-/// because it
-/// is also why that unit must be stopped with `SIGTERM`.
+/// perfectly healthy. The lock is a real safeguard on a real port and a deployment should
+/// leave it on — with the consequence that such a bridge must be stopped with `SIGTERM`,
+/// because a `SIGKILL` leaves the lock behind and the next start then answers its clients
+/// `Device open failure: Object was already in use` while looking healthy.
 ///
 /// **A guessed port.** A deployment's is fixed and in its configuration; this one is
 /// chosen per bridge so the tests may run beside each other.
