@@ -1060,26 +1060,36 @@ the Go source definition, so `w9.expected_column INTERSECT w9.source_column` wil
 `w9.assert_no_unknown_source_columns()` should raise nothing — and if it does, something has changed
 since 2026-10-31 and that is worth stopping for.
 
-**Status 2026-11-12 — blocked on one credential, and rehearsed while it is.** `pitcairn:5432` accepts
-a connection from an agent runtime and `pg_hba.conf` admits user `weather` on `weather_v2_0_0` from
-the cluster subnet, but it demands a password that is not in the cluster and not in Vault — not at
-`secret/modernweather`, which holds only the R2 backup keys, and not at any other path tried. User
-`postgres` has no `pg_hba` entry at all. O-2 and O-4 cannot be re-checked without it either, since
-both are queries against the source. **This is O-1/O-3/O-4's "credential handoff" arriving as the
-thing that blocks the run** (`docs/reconciliation.md` Group A), and it is the owner's to hand over.
+**DONE 2026-11-13. The migration ran, and all four criteria are met.**
+`docs/data-migration.md` §2a is the record and §2b is what the run found. In short: **17,162,826**
+readings for three stations over 2025-10-30 .. 2026-11-12, reconciled at **1,182 of 1,182** (station,
+year, metric) digests with zero tolerance and zero mismatches; the two bounded statistics at 5.77e-7
+and 1.65e-3 against bounds of 1.03e-3 and 1.69e-1, with the other twelve **exact** over 964 buckets;
+`w9.assert_no_unknown_source_columns()` silent at 215 of 215; 42 of 42 spot checks exact including
+each extreme's timestamp; per-year counts in §2a. `pitcairn` was not written to at all — `archive`
+found the 2026-10-31 tables and left them, and `pause-source-retention` found nothing enabled and
+issued no statement.
 
-Two things were discharged while waiting.
+**Three defects only this run could find**, all three green in the lab, all three fixed and
+re-verified here: the legacy boundary compared a bucket's *start* against a reading's timestamp and
+double-counted one bucket per station; the digest's year key was the server's **local** year, and
+US/Mountain against Etc/UTC reported all 1,182 rows as mismatches with nothing missing; and the
+reconciliation window ran past the imported extent because the source is live. §2b has the evidence
+for each, including the control that distinguished the second from real loss.
 
-- **The target was two migrations behind HEAD** and nothing would have fixed that on its own: the
-  daemon applies `migrations/config` at startup, not `migrations/`. `20261112120000` (`alerts`) and
-  `20261112120100` (the two snow tables) are now applied, with the `_sqlx_migrations` row `sqlx`
-  itself would have written — all nine checksums are the SHA-384 of the files on `main`. Verified
-  against a lab target built from the nine files: 2,779 columns, 14 indexes, 28 constraints and all
-  four continuous-aggregate definitions identical.
-- **The procedure was run end to end across the real version pair** — a 2.17.2 source in its own
-  pod, a HEAD target — with the reconciliation passing at 591 of 591 and three of W9's five negative
-  controls re-run. `docs/data-migration.md` §6.4 and the 2026-11-12 note have the numbers. That is a
-  rehearsal, not the deliverable: items 1–4 of this item's "done when" are about production's rows.
+**Two things for whoever plans the cutover.**
+
+- **The pause O-2 took is not durable.** Retention on `weather` was job 1004, paused 2026-10-31. It
+  is now job **1022**, `drop_after = 365 days`, **enabled** — a new job id with identical config,
+  which is what the Go provisioner creating policies at start-up looks like. It has already dropped
+  raw below **2025-11-12**, so the new database is the only copy of 2025-10-30 .. 2025-11-12. Those
+  14 days *were* reconciled against production before it dropped them. Not re-paused here: it no
+  longer protects data the new database lacks, and unbounded raw growth on `pitcairn` is the owner's
+  disk. One statement reverses it, and a restart will undo that too.
+- **The parallel database was two migrations behind** and nothing would have caught up on its own —
+  the daemon applies `migrations/config` at start-up, not `migrations/`. Fixed, with the
+  `_sqlx_migrations` rows `sqlx` itself would have written; all nine checksums are the SHA-384 of the
+  files on `main`.
 
 ### M5-2 — the diff harness
 **Depends on:** M5-1, M3-1. Build (b) and (c) above as a runnable harness in `ci/diff/`, with its

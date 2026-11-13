@@ -828,16 +828,26 @@ fn legacy_rollup(reg: &Registry, go: &GoViews) -> String {
     }
 
     s.push_str(
-        "-- The boundary. One row per station: the first bucket for which real raw exists.\n\
-         -- Imports filter strictly below it and the assertion below proves the two sides do\n\
-         -- not overlap, so the union views cannot double-count a bucket.\n\
+        "-- The boundary. One row per station: the first raw READING, which is a timestamp\n\
+         -- and not a bucket. The imports below compare a bucket's END against it, so a\n\
+         -- bucket is legacy only when it finishes before any raw exists.\n\
+         --\n\
+         -- Comparing a bucket's START against this timestamp is the bug that cost M5-1 a\n\
+         -- run: production's first reading is 3.9 seconds after midnight, so the daily\n\
+         -- bucket containing it starts before the cutover and was imported as legacy while\n\
+         -- the level also held it, computed from the same raw. assert_legacy_disjoint()\n\
+         -- caught it at exactly 3 buckets, one per station. A lab whose raw happens to\n\
+         -- start on a bucket boundary cannot reproduce it.\n\
+         --\n\
+         -- The comparison is per level and not stored pre-aligned because one scalar cannot\n\
+         -- be aligned to both a day and an hour at once.\n\
          CREATE TABLE w9.legacy_boundary (\n\
          \x20   station_id text PRIMARY KEY,\n\
          \x20   cutover    timestamptz NOT NULL\n\
          );\n\n\
          COMMENT ON TABLE w9.legacy_boundary IS\n\
-         \x20   'Per station, the first bucket that has raw readings behind it. Set from the\n\
-         \x20    imported raw extent, not from the archive.';\n\n\
+         \x20   'Per station, the first raw reading. A bucket is legacy when it ENDS at or\n\
+         \x20    before this instant. Set from the imported raw extent, not from the archive.';\n\n\
          CREATE PROCEDURE w9.set_legacy_boundary() LANGUAGE sql AS $fn$\n\
          \x20   INSERT INTO w9.legacy_boundary (station_id, cutover)\n\
          \x20   SELECT station_id, min(time) FROM observations GROUP BY 1\n\
@@ -886,9 +896,14 @@ fn legacy_rollup(reg: &Registry, go: &GoViews) -> String {
             "    FROM w9.weather_{lvl}_archive a\n\
              \x20   JOIN w9.station_map m ON m.stationname = a.stationname\n\
              \x20   LEFT JOIN w9.legacy_boundary b ON b.station_id = m.station_id\n\
-             \x20  WHERE b.cutover IS NULL OR a.bucket < b.cutover\n\
+             \x20   -- The bucket's END, not its start: a bucket that CONTAINS the first raw\n\
+             \x20   -- reading is in the level already, computed from that raw. See\n\
+             \x20   -- w9.legacy_boundary's comment for the run this got wrong.\n\
+             \x20  WHERE b.cutover IS NULL\n\
+             \x20     OR date_trunc('{trunc}', a.bucket) + INTERVAL '{bucket}' <= b.cutover\n\
              \x20  ON CONFLICT (station_id, bucket) DO NOTHING;\n\
-             END $fn$;\n\n"
+             END $fn$;\n\n",
+            trunc = bucket.split(' ').nth(1).unwrap_or("day")
         );
     }
 
@@ -1027,7 +1042,7 @@ fn reconcile(reg: &Registry, go: &GoViews) -> String {
         );
         let _ = write!(
             s,
-            "--   SELECT '{side}', {key}, extract(year from {time})::int, v.metric, n, v.*\n\
+            "--   SELECT '{side}', {key}, extract(year from {time} AT TIME ZONE 'UTC')::int, v.metric, n, v.*\n\
              --     FROM (SELECT ... count(*) n, count(<col>) , sum(<col>::numeric), min, max ...\n\
              --             FROM {table}{filter} GROUP BY 1,2) z,\n\
              --          LATERAL (VALUES (<one row per metric>)) v(metric, non_null, total, lo, hi)\n\n"
@@ -1084,14 +1099,26 @@ fn reconcile(reg: &Registry, go: &GoViews) -> String {
          \x20   END IF;\n\
          \x20   RETURN format(\n\
          \x20       'SELECT %L, z.k, z.yr, v.metric, z.n, v.non_null, v.total, v.lo, v.hi '\n\
-         \x20       'FROM (SELECT %I AS k, extract(year from {time})::int AS yr, count(*) AS n, %s '\n\
+         \x20       'FROM (SELECT %I AS k, extract(year from {time} AT TIME ZONE ''UTC'')::int AS yr, count(*) AS n, %s '\n\
          \x20       'FROM %I WHERE {time} >= %L AND {time} < %L GROUP BY 1, 2) z, '\n\
          \x20       'LATERAL (VALUES %s) v(metric, non_null, total, lo, hi)',\n\
          \x20       side, key, aggs, tbl, t0, t1, vals);\n\
          END $fn$;\n\n\
          COMMENT ON FUNCTION w9.digest_body(text, timestamptz, timestamptz) IS\n\
          \x20   'One sequential pass per side. The LATERAL unpivots columns a single GROUP BY\n\
-         \x20    already produced, so this does not scan once per metric.';\n\n\
+         \x20    already produced, so this does not scan once per metric. The year key is\n\
+         \x20    extracted AT TIME ZONE UTC on both sides and not in the server''s local\n\
+         \x20    zone: the two databases this compares are different servers and need not\n\
+         \x20    agree on TimeZone.';\n\n\
+         -- WHY THE YEAR IS EXTRACTED IN UTC. `extract(year from <timestamptz>)` is evaluated\n\
+         -- in the session's TimeZone, so the same instant lands in different years on two\n\
+         -- servers configured differently. Production is US/Mountain and the new instance is\n\
+         -- Etc/UTC, which puts the seven hours after local New Year in 2025 on one side and\n\
+         -- 2026 on the other. M5-1's first reconciliation run reported all 1,182 (station,\n\
+         -- year, metric) rows as row_count mismatches for exactly that reason, with no data\n\
+         -- missing: the per-metric min and max agreed exactly, and the one station that had\n\
+         -- stopped reporting showed +458 in 2025 against -458 in 2026 — offsetting to zero,\n\
+         -- which is what a bucketing error looks like and what data loss does not.\n\n\
          -- The old side groups by stationname because that is the only station key the old\n\
          -- table has. migrate-from-go.sh maps it to station_id through w9.station_map on the\n\
          -- way in, so the two sides of this join are in the same namespace.\n\
@@ -1223,11 +1250,11 @@ fn reconcile(reg: &Registry, go: &GoViews) -> String {
          \x20                           t0 timestamptz, t1 timestamptz) RETURNS text\n\
          LANGUAGE sql STABLE AS $fn$\n\
          \x20   SELECT format(\n\
-         \x20       'SELECT %L::text AS side, %I AS station, extract(year from {time})::int AS yr, '\n\
+         \x20       'SELECT %L::text AS side, %I AS station, extract(year from {time} AT TIME ZONE ''UTC'')::int AS yr, '\n\
          \x20       '%L AS metric, %L AS dir, %I::double precision AS value, {time} AS at FROM ('\n\
-         \x20       '  SELECT DISTINCT ON (%I, extract(year from {time})) %I, {time}, %I '\n\
+         \x20       '  SELECT DISTINCT ON (%I, extract(year from {time} AT TIME ZONE ''UTC'')) %I, {time}, %I '\n\
          \x20       '    FROM %I WHERE {time} >= %L AND {time} < %L AND %I IS NOT NULL '\n\
-         \x20       '   ORDER BY %I, extract(year from {time}), %I %s, {time} ASC) q',\n\
+         \x20       '   ORDER BY %I, extract(year from {time} AT TIME ZONE ''UTC''), %I %s, {time} ASC) q',\n\
          \x20       side,\n\
          \x20       CASE WHEN side = 'old' THEN 'stationname' ELSE '{part}' END,\n\
          \x20       col, dir, col,\n\

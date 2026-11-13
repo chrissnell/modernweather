@@ -40,6 +40,22 @@ TRUNCATE w9.rollup_recon;
 
 -- Only the window where both sides have something to say: buckets that have raw behind them
 -- in the imported data AND a row in the old archive.
+--
+-- MINUS EACH STATION'S LAST ARCHIVED BUCKET, which is not comparable and never was. The
+-- old daily view is declared materialized_only = false, so selecting from it unions the
+-- materialised buckets with a real-time one computed from whatever raw existed at that
+-- instant. `archive` copies the view, so the newest bucket it captures is a part-day
+-- snapshot: the day was still in progress. The new hierarchy computes that same day from
+-- the complete raw, so the two disagree by construction and by a lot.
+--
+-- M5-1 measured it. Against an archive taken on 2026-10-31, every single disagreement in
+-- the whole check was the 2026-10-31 bucket: out_temp max off by 8.9 degrees, wind_speed
+-- mean by 24% relative, and the two bounded statistics outside their bound — while all 966
+-- other buckets were exact or inside it. A check that fails the same way on every run is a
+-- check that gets ignored, and this one would have reported nine false failures forever.
+--
+-- The archive's OWN maximum is the bound, not the imported extent: what makes the bucket
+-- incomplete is when the snapshot was taken, which is a property of the archive alone.
 INSERT INTO w9.rollup_recon (station_id, bucket, metric, stat, old_value, new_value,
                              n_readings, tol_model)
 SELECT m.station_id, n.bucket, s.metric, s.stat, s.old_value, s.new_value,
@@ -53,6 +69,11 @@ SELECT m.station_id, n.bucket, s.metric, s.stat, s.old_value, s.new_value,
   JOIN w9.station_map m ON m.station_id = n.station_id
   JOIN w9.weather_1d_archive a
     ON a.stationname = m.stationname AND a.bucket = n.bucket
+  -- See above: the newest bucket each station has in the archive was open when the
+  -- archive was taken, so it holds a part-day and cannot be compared against a full one.
+  JOIN (SELECT stationname, max(bucket) AS open_bucket
+          FROM w9.weather_1d_archive GROUP BY 1) tail
+    ON tail.stationname = a.stationname AND a.bucket < tail.open_bucket
  CROSS JOIN LATERAL (VALUES
     -- A mean, finalised from the new level's sum and count, against the old view's avg().
     ('out_temp',   'mean', a.outtemp::double precision,

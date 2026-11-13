@@ -41,7 +41,7 @@ CREATE TABLE w9.recon (
 -- The metric list is filtered through w9.source_column first, so a column
 -- production does not have cannot make the statement fail to parse.
 -- Emitted shape (side = 'old', table = weather, key = stationname):
---   SELECT 'old', stationname, extract(year from time)::int, v.metric, n, v.*
+--   SELECT 'old', stationname, extract(year from time AT TIME ZONE 'UTC')::int, v.metric, n, v.*
 --     FROM (SELECT ... count(*) n, count(<col>) , sum(<col>::numeric), min, max ...
 --             FROM weather GROUP BY 1,2) z,
 --          LATERAL (VALUES (<one row per metric>)) v(metric, non_null, total, lo, hi)
@@ -52,7 +52,7 @@ CREATE TABLE w9.recon (
 -- `rows` repeats the station-year row count on every metric row on purpose: it
 -- makes each row independently checkable without a join back to a header.
 -- Emitted shape (side = 'new', table = observations, key = station_id):
---   SELECT 'new', station_id, extract(year from time)::int, v.metric, n, v.*
+--   SELECT 'new', station_id, extract(year from time AT TIME ZONE 'UTC')::int, v.metric, n, v.*
 --     FROM (SELECT ... count(*) n, count(<col>) , sum(<col>::numeric), min, max ...
 --             FROM observations GROUP BY 1,2) z,
 --          LATERAL (VALUES (<one row per metric>)) v(metric, non_null, total, lo, hi)
@@ -279,7 +279,7 @@ BEGIN
     END IF;
     RETURN format(
         'SELECT %L, z.k, z.yr, v.metric, z.n, v.non_null, v.total, v.lo, v.hi '
-        'FROM (SELECT %I AS k, extract(year from time)::int AS yr, count(*) AS n, %s '
+        'FROM (SELECT %I AS k, extract(year from time AT TIME ZONE ''UTC'')::int AS yr, count(*) AS n, %s '
         'FROM %I WHERE time >= %L AND time < %L GROUP BY 1, 2) z, '
         'LATERAL (VALUES %s) v(metric, non_null, total, lo, hi)',
         side, key, aggs, tbl, t0, t1, vals);
@@ -287,7 +287,20 @@ END $fn$;
 
 COMMENT ON FUNCTION w9.digest_body(text, timestamptz, timestamptz) IS
     'One sequential pass per side. The LATERAL unpivots columns a single GROUP BY
-     already produced, so this does not scan once per metric.';
+     already produced, so this does not scan once per metric. The year key is
+     extracted AT TIME ZONE UTC on both sides and not in the server''s local
+     zone: the two databases this compares are different servers and need not
+     agree on TimeZone.';
+
+-- WHY THE YEAR IS EXTRACTED IN UTC. `extract(year from <timestamptz>)` is evaluated
+-- in the session's TimeZone, so the same instant lands in different years on two
+-- servers configured differently. Production is US/Mountain and the new instance is
+-- Etc/UTC, which puts the seven hours after local New Year in 2025 on one side and
+-- 2026 on the other. M5-1's first reconciliation run reported all 1,182 (station,
+-- year, metric) rows as row_count mismatches for exactly that reason, with no data
+-- missing: the per-metric min and max agreed exactly, and the one station that had
+-- stopped reporting showed +458 in 2025 against -458 in 2026 — offsetting to zero,
+-- which is what a bucketing error looks like and what data loss does not.
 
 -- The old side groups by stationname because that is the only station key the old
 -- table has. migrate-from-go.sh maps it to station_id through w9.station_map on the
@@ -415,11 +428,11 @@ CREATE FUNCTION w9.extreme_sql(side text, col text, dir text,
                             t0 timestamptz, t1 timestamptz) RETURNS text
 LANGUAGE sql STABLE AS $fn$
     SELECT format(
-        'SELECT %L::text AS side, %I AS station, extract(year from time)::int AS yr, '
+        'SELECT %L::text AS side, %I AS station, extract(year from time AT TIME ZONE ''UTC'')::int AS yr, '
         '%L AS metric, %L AS dir, %I::double precision AS value, time AS at FROM ('
-        '  SELECT DISTINCT ON (%I, extract(year from time)) %I, time, %I '
+        '  SELECT DISTINCT ON (%I, extract(year from time AT TIME ZONE ''UTC'')) %I, time, %I '
         '    FROM %I WHERE time >= %L AND time < %L AND %I IS NOT NULL '
-        '   ORDER BY %I, extract(year from time), %I %s, time ASC) q',
+        '   ORDER BY %I, extract(year from time AT TIME ZONE ''UTC''), %I %s, time ASC) q',
         side,
         CASE WHEN side = 'old' THEN 'stationname' ELSE 'station_id' END,
         col, dir, col,
