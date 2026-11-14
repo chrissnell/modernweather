@@ -100,9 +100,12 @@
   const stale = $derived(isStale(stream.state));
 
   const columns = [
-    { key: 'ts', label: copy.activity.columns.ts, width: '9ch' },
-    { key: 'level', label: copy.activity.columns.level, width: '6ch' },
-    { key: 'where', label: copy.activity.columns.target, width: '22ch' },
+    // Wide enough for a 12-hour locale with seconds and a meridiem -- `9:58:12 AM` is
+    // 11 characters and the narrower column truncated every row to `9:58:…`, which is a
+    // log you cannot correlate anything with.
+    { key: 'ts', label: copy.activity.columns.ts, width: '13ch' },
+    { key: 'level', label: copy.activity.columns.level, width: '7ch' },
+    { key: 'where', label: copy.activity.columns.target, width: '24ch' },
     { key: 'message', label: copy.activity.columns.message }
   ];
 

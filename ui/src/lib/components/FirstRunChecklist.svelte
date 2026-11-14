@@ -21,8 +21,12 @@
 
   let { steps: list, dismissed = false, ondismiss }: Props = $props();
 
-  const here = $derived(current(list));
   const done = $derived(complete(list));
+  // **"You are here" only while there is a here.** §0.7's first-run is over when steps 1-3
+  // are complete; the optional ones stay available and are "not nagged about". Pointing at
+  // one under a heading that says all done is the nagging, and it contradicts itself on
+  // the same screen.
+  const here = $derived(done ? null : current(list));
 </script>
 
 {#if !(done && dismissed)}
@@ -63,7 +67,7 @@
       {/each}
     </ol>
 
-    {#if here && here.optional}
+    {#if here?.optional}
       <a class="btn btn-sm btn-ghost" href={here.href}>{common.skipForNow}</a>
     {/if}
   </Box>
@@ -80,9 +84,14 @@
   .finished {
     display: flex;
     justify-content: space-between;
-    align-items: center;
+    align-items: baseline;
     gap: 1rem;
     flex-wrap: wrap;
+  }
+
+  .finished p {
+    flex: 1 1 24rem;
+    margin: 0;
   }
 
   ol {
