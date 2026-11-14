@@ -1506,7 +1506,19 @@ other session and keeps the current one; the setup code is invalidated in the sa
 creates the account.
 **Owner decisions this needs:** **O-10**'s four (loopback-until-claimed, the breached-password list,
 no API tokens in v1, one step of config history). All four have recommendations and none blocks the
-others.
+others. **Answered 2026-11-13: all four as recommended** — `docs/reconciliation.md`'s "O-10's four
+calls, as implemented" table says where each one landed.
+**Six deviations, recorded in `docs/reconciliation.md`** as **A-M7-2-1** (`sha2` joins D-32's table,
+because the session secret and the setup code need a fast hash and Argon2id would run on every
+request), **A-M7-2-2** (the breached list is the 10,000 most common passwords **of at least twelve
+characters**, because the 10k-most-common list OQ-W5-2 was written against has ten such entries and
+the length minimum refuses the rest), **A-M7-2-3** (the setup code is 52 base32 characters — §3.4's
+sentence says 32 random bytes and its worked example shows 32 characters), **A-M7-2-4** (§3.4's
+optional `MW_INITIAL_ADMIN_*` path is not built, because in a container the console *is* the log and
+`reset-setup-token` covers the rest), **A-M7-2-5** (`mw-http` installs connect information on every
+socket, without which `created_ip` and the claim's audited source IP are permanently `NULL`) and
+**A-M7-2-6** (the CORS allowlist is read at startup and no route edits it, so an added origin takes
+effect at the next start — the page is M7-3's).
 **Constraint from another work item.** M7-1 ships the management surface with **no authentication**
 and binds it to loopback regardless of `listener.management_listen_addr`, warning when it narrows a
 configured address. This item is what makes that column mean what it says: until an administrator

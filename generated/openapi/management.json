@@ -10,6 +10,271 @@
     "version": "0.1.0"
   },
   "paths": {
+    "/api/v1/auth/claim": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Create the administrator account — §3.4's one-time claim.",
+        "operationId": "post_claim",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClaimInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The account exists and you are signed in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignedInView"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already claimed, or there is no outstanding code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The code or the password was refused",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/login": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Sign in.",
+        "operationId": "post_login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Signed in; the session is in a Set-Cookie",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignedInView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The username and password do not match",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The instance has not been claimed yet",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The progressive delay is still holding this off",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/password": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Change the password (§3.3, §3.5).",
+        "description": "**Revokes every other session and keeps this one**, which is implementation-plan.md\n**M7-2**'s done-criterion and what a person expects after \"my laptop was stolen\". The\ncookie is therefore *not* cleared and no new session is minted: the operator stays on\nthe page they were on.",
+        "operationId": "post_password",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Changed; every other session is revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignedInView"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The current password was wrong, or the new one was refused",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The progressive delay is still holding this off",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/session": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Whether this instance is claimed, and whether this request is signed in.",
+        "operationId": "get_auth_state",
+        "responses": {
+          "200": {
+            "description": "The three states of §1.1's table",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthStateView"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Sign out of this browser — W5 §1.1's `POST /logout`, which now actually revokes.",
+        "operationId": "delete_session",
+        "responses": {
+          "204": {
+            "description": "Signed out; the session row is gone"
+          }
+        }
+      }
+    },
+    "/api/v1/auth/sessions": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Every live session (§3.3).",
+        "operationId": "get_sessions",
+        "responses": {
+          "200": {
+            "description": "Every live session, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionsView"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Sign out everywhere (§3.3) — **including** the session making the request.",
+        "operationId": "delete_all_sessions",
+        "responses": {
+          "204": {
+            "description": "Every session is gone, this one included"
+          }
+        }
+      }
+    },
+    "/api/v1/auth/sessions/{id}": {
+      "delete": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Revoke one session (§3.3).",
+        "operationId": "delete_one_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The session's public handle",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked"
+          },
+          "404": {
+            "description": "There is no such session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/config": {
       "get": {
         "tags": [
@@ -1605,6 +1870,47 @@
           }
         }
       },
+      "AuthStateView": {
+        "type": "object",
+        "description": "`GET /api/v1/auth/session` — the one unauthenticated read, and the first request the UI\nmakes.\n\nThree states in one object, which is what §1.1 means by \"also reports whether the\ninstance has been claimed, which drives the first-run redirect\":\n\n| `claimed` | `authenticated` | the client shows |\n|---|---|---|\n| `false` | `false` | §0.7's \"Create your administrator account\" |\n| `true` | `false` | the login screen (§8.8's signed-out state) |\n| `true` | `true` | the application |\n\n`claimed = false, authenticated = true` is unrepresentable in practice and is not\nspecial-cased: the claim creates the credential and the session in one transaction.",
+        "required": [
+          "claimed",
+          "authenticated",
+          "password_policy"
+        ],
+        "properties": {
+          "authenticated": {
+            "type": "boolean",
+            "description": "Whether this request carried a live session."
+          },
+          "claimed": {
+            "type": "boolean",
+            "description": "Whether an administrator account exists."
+          },
+          "password_policy": {
+            "$ref": "#/components/schemas/PasswordPolicyView",
+            "description": "The password rule the forms should state."
+          },
+          "session": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SessionView",
+                "description": "This request's session, when `authenticated`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "username": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who, when `authenticated`."
+          }
+        }
+      },
       "Badge": {
         "type": "object",
         "description": "The badge a state gets, as §0.4's table names it.\n\nNote that the badge is **not** the state's own word: `Failed` is badged **Stopped** and\n`Stopped` is badged **Off**, because the only way an operator deliberately reaches\n`Stopped` is by turning something off — and a red \"Failed\" on something they switched off\nthemselves is the UI lying in the other direction.\n`String` rather than `&'static str`, even though every value is a literal: the badge is\ndeserialised by the generated TypeScript client's Rust-side counterpart in this\nrepository's own tests, and `Deserialize` cannot produce a `&'static str`.",
@@ -1970,6 +2276,34 @@
           }
         ],
         "description": "Everything an operator can change, as one discriminated union.\n\nBoth `POST /api/v1/config/preview` and every mutating route construct one of these, which\nis what makes the preview and the save one code path. The discriminant is `change` so\nthat `openapi-typescript` emits a union the client narrows on rather than an object with\nevery field optional."
+      },
+      "ClaimInput": {
+        "type": "object",
+        "description": "What `POST /api/v1/auth/claim` submits — §3.4's one-time setup claim.",
+        "required": [
+          "setup_code",
+          "username",
+          "password",
+          "password_again"
+        ],
+        "properties": {
+          "password": {
+            "type": "string",
+            "description": "The password to set."
+          },
+          "password_again": {
+            "type": "string",
+            "description": "The same password again (§3.4 step 3: \"a password (twice)\")."
+          },
+          "setup_code": {
+            "type": "string",
+            "description": "The code printed to the console at first start.\n\nSecret for the same reason the password is, and for one more: this is the value\n§3.5's \"nothing secret in logs\" rule makes the single deliberate exception for, and\nthe exception is the **banner**, not a `{:?}`."
+          },
+          "username": {
+            "type": "string",
+            "description": "The username to create."
+          }
+        }
       },
       "ComponentView": {
         "type": "object",
@@ -2693,6 +3027,24 @@
           }
         }
       },
+      "LoginInput": {
+        "type": "object",
+        "description": "What `POST /api/v1/auth/login` submits.",
+        "required": [
+          "username",
+          "password"
+        ],
+        "properties": {
+          "password": {
+            "type": "string",
+            "description": "Their password.\n\nA `SecretString` from the moment it is deserialised (**D-33**, §3.2), so a `{:?}` on\nthis struct anywhere downstream cannot print it. `value_type = String` because that\nis what is on the wire; the schema describes the JSON, not the Rust."
+          },
+          "username": {
+            "type": "string",
+            "description": "The administrator's username."
+          }
+        }
+      },
       "LogsView": {
         "type": "object",
         "description": "What a read of the log rings returns.",
@@ -2821,6 +3173,49 @@
           "station_key": {
             "type": "string",
             "description": "Which station."
+          }
+        }
+      },
+      "PasswordInput": {
+        "type": "object",
+        "description": "What `POST /api/v1/auth/password` submits.",
+        "required": [
+          "current_password",
+          "new_password",
+          "new_password_again"
+        ],
+        "properties": {
+          "current_password": {
+            "type": "string",
+            "description": "The current password. **Required** (§3.5): a session is not sufficient authority to\nreplace the credential, because the session is what a borrowed laptop has."
+          },
+          "new_password": {
+            "type": "string",
+            "description": "The new password."
+          },
+          "new_password_again": {
+            "type": "string",
+            "description": "The new password again."
+          }
+        }
+      },
+      "PasswordPolicyView": {
+        "type": "object",
+        "description": "The password rule, so the form states it rather than restating it.\n\n§0.5's inline-help standard applied to the one rule there is: a client that hardcoded\n\"at least 12 characters\" would be a second copy of [`crate::auth::POLICY_MIN_CHARS`],\nand the two would disagree the first time the policy moved.",
+        "required": [
+          "minimum_characters",
+          "maximum_bytes"
+        ],
+        "properties": {
+          "maximum_bytes": {
+            "type": "integer",
+            "description": "The most bytes accepted.",
+            "minimum": 0
+          },
+          "minimum_characters": {
+            "type": "integer",
+            "description": "The fewest characters accepted.",
+            "minimum": 0
           }
         }
       },
@@ -3337,6 +3732,98 @@
               "$ref": "#/components/schemas/ServiceView"
             },
             "description": "Every upload service that has an account."
+          }
+        }
+      },
+      "SessionView": {
+        "type": "object",
+        "description": "One session, as the session list shows it.",
+        "required": [
+          "id",
+          "created_at",
+          "last_seen_at",
+          "expires_at",
+          "current"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When it was created."
+          },
+          "created_ip": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where it was created from."
+          },
+          "current": {
+            "type": "boolean",
+            "description": "Whether this is the session making the request, so the list can say \"this browser\"\nrather than offering to sign the operator out of the page they are looking at."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When it stops working."
+          },
+          "id": {
+            "type": "string",
+            "description": "The public handle, hex. What `DELETE /api/v1/auth/sessions/{id}` names."
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When it was last used."
+          },
+          "user_agent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The browser that created it, if it said — §3.3's \"which browser is this?\"."
+          }
+        }
+      },
+      "SessionsView": {
+        "type": "object",
+        "description": "`GET /api/v1/auth/sessions`.",
+        "required": [
+          "sessions"
+        ],
+        "properties": {
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionView"
+            },
+            "description": "Every live session, newest first."
+          }
+        }
+      },
+      "SignedInView": {
+        "type": "object",
+        "description": "What a successful login, claim or password change answers with.\n\nOne type for all three because the client does the same thing with all three: it is\nsigned in, as this person, on this session, with these things worth knowing. `warnings`\nis §8.5's non-blocking slot and is where **O-10**'s breached-password notice lands --\nwhich is the whole reason that decision is \"warn\" rather than \"refuse\".",
+        "required": [
+          "username",
+          "session",
+          "warnings"
+        ],
+        "properties": {
+          "session": {
+            "$ref": "#/components/schemas/SessionView",
+            "description": "The session this request is now on."
+          },
+          "username": {
+            "type": "string",
+            "description": "The administrator's username."
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Consequences that do not block."
           }
         }
       },
@@ -4186,6 +4673,10 @@
     }
   },
   "tags": [
+    {
+      "name": "auth",
+      "description": "Signing in, sessions, and the first-run claim"
+    },
     {
       "name": "config",
       "description": "The configuration, the save preview and one step back"

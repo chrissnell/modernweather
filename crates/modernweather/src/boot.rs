@@ -1347,6 +1347,18 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
         return Ok(RunReport::default());
     };
 
+    // Drop the sessions that have expired since the last start. Here rather than as a
+    // component: `admin_session_expires_at` makes it one indexed delete over a table with
+    // one row per browser the operator has ever used, and a `Calendar` entry on the Activity
+    // page for that would be noise (`mw_store::admin_auth::sweep_expired`).
+    match mw_store::admin_auth::sweep_expired(&pool).await {
+        Ok(0) => {}
+        Ok(swept) => info!(swept, "expired administrator sessions were dropped"),
+        // Not fatal: an expired session is refused by `resolve` on every request regardless,
+        // so this is housekeeping rather than enforcement.
+        Err(e) => warn!(err = %mw_types::DisplayChain(&e), "expired sessions were not swept"),
+    }
+
     // Step 4.
     let mut conn = pool
         .acquire()
@@ -1355,9 +1367,25 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     let mut cfg = Config::load(&mut conn)
         .await
         .context("reading the configuration")?;
+    // W5 §3.4's headless opt-out, which is a property of this invocation rather than of the
+    // installation -- so it is set here rather than read from a column, and re-set on every
+    // re-plan from `crate::admin::Shared`.
+    cfg.set_setup_listen(args.setup_listen);
     // Returned to the pool before anything else runs: every read above is done, and SQLite
     // in WAL mode has a bounded connection budget that a held handle spends for nothing.
     drop(conn);
+
+    // Step 4a, which is new with **M7-2**: make sure an unclaimed instance has a setup code
+    // outstanding, and print it to the console.
+    //
+    // **After step 4 rather than before it**, which is what lets the banner state the port
+    // and scheme the operator will actually use: those are `listener` columns, and
+    // `--setup-listen` is this invocation's flag, so the banner is built from the same
+    // `Config` the listener will be. Printing it earlier meant hardcoding `8081` and
+    // `http://`, which are the column's default and not its value.
+    crate::authstore::ensure_setup_code(&pool, &cfg)
+        .await
+        .context("issuing the first-run setup code")?;
     match &cfg.node {
         Some(node) => info!(
             node = %node.node_name,
@@ -1535,17 +1563,53 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
                     .context("the route tables have not been mounted")?,
             ),
             router: std::sync::OnceLock::new(),
+            setup_listen: args.setup_listen,
         },
         slots,
         cfg.sni.clone(),
         mgmt_sni.clone(),
     ));
-    let mgmt_router = mw_api_mgmt::router(Arc::new(mw_api_mgmt::Mgmt::new(
-        Arc::clone(&admin) as Arc<dyn mw_api_mgmt::ConfigAdmin>,
-        Arc::clone(&control),
-        Arc::new(crate::hostinfo::Rings::new(obs.rings())),
-        Arc::new(crate::hostinfo::Host::new()),
-    )));
+
+    // **M7-2**: the gate in front of the forty operations M7-1 shipped without one.
+    //
+    // The CORS allowlist is read **here** and not on every re-plan, because this router is a
+    // root resource built once: `crate::admin::plan_from` puts this same `Router` back into
+    // every plan rather than rebuilding it, so an origin added through the configuration
+    // database takes effect at the next start. There is no route that edits the allowlist --
+    // it is not in M7-1's surface and not in `mw_api_mgmt::Change` -- so "edit the row and
+    // restart" is the whole of the operator's path either way, and `System -> Advanced`
+    // offering it is W5 §3.5's follow-up rather than this item's.
+    let origins = mw_store::admin_auth::cors_origins(&pool)
+        .await
+        .context("reading the management API's CORS allowlist")?;
+    if !origins.is_empty() {
+        info!(
+            origins = origins.len(),
+            "the management API accepts cross-origin requests from an allowlist"
+        );
+    }
+    let auth = Arc::new(crate::authstore::SqliteAuthStore::new(pool.clone()));
+    auth.install_admin(&admin);
+    let guard = Arc::new(mw_api_mgmt::Guard::new(
+        Arc::clone(&auth) as Arc<dyn mw_api_mgmt::AuthStore>,
+        origins,
+        // Whether the session cookie carries `Secure` and the `__Host-` prefix (W5 §3.3).
+        // The management socket either has a certificate or it does not, for the life of
+        // this process's router -- and `http:listener` restarts when that changes, so a
+        // certificate added at run time is reflected in new cookies at the next start.
+        // Deliberately not per-request: `mw-http` terminates TLS, and nothing it hands a
+        // handler says which socket the bytes arrived on.
+        mgmt_sni.is_some(),
+    ));
+    let mgmt_router = mw_api_mgmt::router(
+        Arc::new(mw_api_mgmt::Mgmt::new(
+            Arc::clone(&admin) as Arc<dyn mw_api_mgmt::ConfigAdmin>,
+            Arc::clone(&control),
+            Arc::new(crate::hostinfo::Rings::new(obs.rings())),
+            Arc::new(crate::hostinfo::Host::new()),
+        )),
+        guard,
+    );
     admin.install_router(mgmt_router.clone());
     cfg.set_management(mw_http::Management {
         addr: cfg
@@ -1722,6 +1786,8 @@ mod tests {
                 url: SecretString::from("postgres://mw:hunter2@db.internal/weather".to_string()),
             }),
             node: None,
+            claimed: false,
+            setup_listen: None,
             generation: Generation::ZERO,
         };
         // The three root resources `attach_registry` builds, over this fixture's empty
