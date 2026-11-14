@@ -2822,10 +2822,12 @@ which is non-deterministic between runs and produces a browser interstitial that
 refusal is diagnosable either way.
 
 **A-M6-1-1 — D-32's crate table has no row for a serial line rate, and this build cannot set one.**
-*Proposed by implementation-plan.md **M6-1**, 2026-11-11. Not applied: the protocol above reserves
-that for a work item that owns the ledger. **The implementation carries on under the existing
-decision**, which is what the protocol asks for — `crates/mw-station/src/stream.rs` records the gap
-at its one call site and warns once per connect, naming the station and the configured rate.*
+*Proposed by implementation-plan.md **M6-1**, 2026-11-11. **Accepted and applied 2026-11-14** by
+GRA-788, which is the work item that owns this ledger entry — the owner asked for it directly, on
+the delegation of technical calls of 2026-11-12. From 2026-11-11 to 2026-11-14 the implementation
+carried on under the existing decision, which is what the protocol asks for:
+`crates/mw-station/src/stream.rs` recorded the gap at its one call site and warned once per
+connect, naming the station and the configured rate.*
 
 *What was found.* **D-32** names the default crate for each idiom the daemon needs and **A-W3-1**
 added seven rows for idioms it had not named, on the grounds that *"it should be complete for the
@@ -2867,6 +2869,55 @@ be discovered:
 cannot fully serve, and the failure mode is a station whose readings are all refused — which is the
 shape of defect this programme keeps finding. It is also a *one-line* fix once the row exists: the
 `AsyncFd` path becomes a `tokio_serial::SerialStream` and the `ByteStream` impl is unchanged.
+
+*What was built, 2026-11-14.* `tokio-serial` 5.5 is in `[workspace.dependencies]` with
+`default-features = false` — its `libudev` feature links the C library of that name, for the port
+enumeration nothing here calls, and every Linux target in `ci/release.toml` is a static musl build
+that cannot link it. `ci/layers.toml`'s **`serial-line-rate-only-where-the-line-is-opened`** rule
+confines the crate to `mw-station`, because `mw_station::stream::open` is the one place in the
+workspace that turns a `Transport` into a `ByteStream` and `mw-output`'s KISS-serial TNC reaches it
+from there. `stream.rs`'s `serial` now opens through `tokio_serial`, which is `tcgetattr`,
+`cfmakeraw`, 8N1, no flow control, the rate, `tcsetattr`; the "recorded and not applied" `warn!` is
+deleted, and what replaced it reads the rate back out of the line with `tcgetattr` and logs that,
+because "`tcsetattr` returned" and "the line is at 115200" are not the same claim.
+
+*Four corrections to this entry's own claims, now that they have been measured rather than read.*
+
+- **The fix is not one line.** The *open* is, near enough; the `ByteStream` impl is **not**
+  unchanged. `SerialStream` is `AsyncRead + AsyncWrite`, so `read`/`write_all` go through
+  `AsyncReadExt`/`AsyncWriteExt` rather than `AsyncFd::async_io` over `std::io::Read`.
+- **It deleted the only `unsafe` block in the workspace**, which this entry did not predict and is
+  the better half of the trade. `tokio_serial::SerialStream` is itself an `AsyncFd` over an owned
+  `mio_serial::SerialStream`, so the safety argument that lived at `stream.rs`'s registration call
+  site is now the dependency's. `unsafe_code` is still `warn` and no `unsafe` was added.
+- **`libc` is now in the graph transitively**, through `mio`, `nix` and `serialport`. That was never
+  the property anyone wanted — `unsafe_code = "warn"` was — but this entry's framing ("needs either
+  `libc` or a serial-port crate") reads as though the two were alternatives, and they are not: the
+  crate brings it. What it does not bring is an `unsafe` block in this workspace.
+- **One platform regressed, and it is `serialport`'s own recorded note.** On macOS the rate is set
+  with the `IOSSIOSPEED` ioctl, which refuses a pseudo terminal with `ENOTTY`
+  (`serialport-4.10.1/src/posix/termios.rs:93`), so the pty tests are `cfg`'d off there, where
+  before they ran. macOS is supported so that the crate builds on a developer's machine and is not
+  in `ci/release.toml`; a real `/dev/cu.*` is unaffected. Linux uses `BOTHER` with `TCSETS2` and
+  takes arbitrary rates.
+
+*The test, which is the part worth arguing about.* GRA-788's criterion 3 asked for a test that would
+have caught the old behaviour, and said in as many words that a `socat` pty cannot be it. **That is
+half right, and the half that is wrong is the useful half.** A pty has no line *rate* — no bits are
+clocked at any speed — but it is a real tty with real `termios`, and Linux stores the rate set on it
+and reports it back. Measured, not assumed: a fresh `socat` pty is at **38400**, and `stty -F <link>
+115200` then reads back 115200. So
+`stream::tests::the_configured_line_rate_is_set_on_the_tty` opens a pty at 115200 — the owner's
+Campbell's rate — and asserts `tcgetattr` reports 115200, then drops the port and reopens the **same
+device** at 9600 as a negative control. **Against the previous build the first assertion answers
+38400**, because that build never called `tcsetattr`. That is a test that fails on the defect, which
+is what criterion 3 is for and what **G-1** is about.
+
+What it does not prove is timing, and nothing in this repository does: that the kernel accepted and
+recorded 115200 for this device is not evidence that a UART shifted bits at 115200. The only
+apparatus that could assert that is a Campbell datalogger on a real serial cable, and this change is
+**unproven against hardware** — stated here rather than left for someone to discover, because the
+owner's own station is served over the `ser2net` bridge and will not exercise it.
 
 **A-M6-1-2 — D-87 and §4a.6 are both satisfiable for an Ambient secret, by verifying it once per
 snapshot rather than once per reading.**

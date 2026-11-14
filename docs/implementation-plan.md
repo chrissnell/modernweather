@@ -1413,6 +1413,17 @@ Kubernetes, so Campbell must work over `TcpOut` against a `ser2net` bridge as we
 W2a §4a.5 already maps it as `Serial | TcpOut` and the Go version already dials TCP when
 `SerialDevice` is empty, so this is a test case rather than a new capability — but it is the one
 driver where the TCP path is load-bearing in production rather than a convenience.
+**The serial line rate is set as of 2026-11-14** — see `docs/reconciliation.md`'s **A-M6-1-1**, which
+this item filed as *proposed* on 2026-11-11 and GRA-788 accepted and applied. The `socat` pty pair
+this item builds could never have caught the gap it recorded: `transport_baud` was carried into
+`Transport::Serial { baud }` and never put on the line, so a directly attached Davis or Campbell
+console worked only where a `udev` rule or an `stty` had already configured it, and failed by
+producing frames that all fail CRC rather than by going quiet. D-32's crate table gains
+`tokio-serial`, confined to `mw-station` by `ci/layers.toml`. Two things a reader of this item should
+carry forward: the pty tests here are now **Linux-only** (macOS sets the rate with an ioctl that
+refuses a pseudo terminal), and the change is **unproven against hardware** — the owner's Campbell is
+served over the `ser2net` bridge, which does not exercise it.
+
 **Decision point that lands here, not before:** **OQ-W4-3** — whether the registry gains a `jsonb`
 type so `observations.extra` can be a registry entry. W4's note is explicit that this is "worth
 deciding before W7 writes its first driver that receives an unknown field", and this is that moment.

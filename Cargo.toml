@@ -20,9 +20,9 @@ repository = "https://github.com/chrissnell/modernweather"
 # Pinning versions here keeps one version of each crate across the workspace, which is what
 # makes `cargo xtask codegen --check` and the conformance replay compare like with like.
 #
-# Every third-party entry below is a crate DESIGN.md §6 (D-32) or its amendment A-W3-1 /
-# A-W8-3 names for an idiom this program needs. A substitution is an amendment, not a
-# manifest edit. The five versions the ARMv6 measurement actually linked and ran --
+# Every third-party entry below is a crate DESIGN.md §6 (D-32) or one of its amendments --
+# A-W3-1, A-W8-3, A-M6-1-1 -- names for an idiom this program needs. A substitution is an
+# amendment, not a manifest edit. The five versions the ARMv6 measurement actually linked and ran --
 # `tokio` 1, `sqlx` 0.8, `axum` 0.8, `argon2` 0.5, `zerocopy` 0.8, `rustls` 0.23 with
 # `ring` -- are held at the versions `ci/spike/probe/Cargo.toml` measured, because that
 # probe is the evidence for docs/release.md Appendix A and a newer major would make the
@@ -60,6 +60,25 @@ thiserror = "2"
 # the part `ci/layers.toml` enforces.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "fs", "io-util", "sync", "signal", "process"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+
+# The serial line rate, which a file descriptor alone cannot set. Amendment **A-M6-1-1**,
+# recorded in docs/reconciliation.md and accepted 2026-11-14 on the owner's delegation:
+# D-32's table named neither `libc` nor a serial-port crate, so `transport_baud` was
+# accepted, stored, displayed and then never applied to the line -- a station that looks
+# connected and whose every frame fails its CRC. Setting a rate is `tcsetattr`, and
+# `[workspace.lints.rust]`'s `unsafe_code` makes hand-rolling the `ioctl` a build error, so
+# the choice was a crate or a permanent footnote telling operators to run `stty` first.
+#
+# `tokio-serial` rather than `serialport` directly, because one crate then covers the open,
+# the line rate AND the async read: `tokio_serial::SerialStream` is an `AsyncFd` over
+# `mio_serial::SerialStream`, which is the thing `mw_station::stream` was building by hand.
+#
+# `default-features = false` is load-bearing rather than tidy. The `libudev` feature links
+# the C library of the same name, for port ENUMERATION this crate never calls -- and every
+# Linux target in `ci/release.toml` is a statically linked musl build that cannot link it.
+# Off by default in 5.5, asked for explicitly so that a future default cannot turn four
+# cross builds red.
+tokio-serial = { version = "5.5", default-features = false }
 
 # Sink composition, rate limiting (D-32). The layer order in component-model.md §4b.5 is
 # Retry outside RateLimit outside Timeout, which is why all three features are here.

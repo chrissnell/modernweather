@@ -8,44 +8,61 @@
 //! (**W2a Decision 3**), where a console that stops answering mid-conversation is a session
 //! failure and therefore a restart.
 //!
-//! # The serial port, and the one thing this cannot do
+//! # The serial port, and the line rate it now sets
 //!
-//! **`transport_baud` is recorded and not applied.** A line rate is set with `tcsetattr`,
-//! which needs either `libc` or a serial-port crate, and **D-32**'s table names neither —
-//! a substitution or an addition there is an amendment, not a manifest edit, and
-//! `docs/reconciliation.md`'s *Proposed amendments* carries the one this item files. So what
-//! [`open`] does with a `serial` transport is open the character device and read it: the
-//! line discipline is whatever the device already has.
+//! **`transport_baud` is applied.** [`serial`] opens the character device through
+//! `tokio_serial`, which is `tcgetattr`, `cfmakeraw`, 8N1 with no flow control, the rate,
+//! `tcsetattr` — and then the same `AsyncFd` registration this module used to perform by
+//! hand. It reads the rate back out of the line afterwards and logs it, because "we called
+//! `tcsetattr`" and "the line is at 115200" are not the same claim.
 //!
-//! Three consequences, stated rather than discovered:
+//! That is amendment **A-M6-1-1**, accepted 2026-11-14 (GRA-788) after being recorded as
+//! *proposed* by M6-1 on 2026-11-11. What it replaced was a build that carried `baud` this
+//! far and dropped it: the device was opened with `O_NONBLOCK | O_NOCTTY` and polled, so the
+//! line discipline was whatever the device already had, and a directly attached console
+//! worked if and only if a `udev` rule or an `stty` had already configured it. **The failure
+//! that produced was not silence** — the bytes arrive framed wrong, so every Davis packet
+//! fails its CRC-16 and every Campbell line fails to parse, and
+//! `mw_station_frames_total{outcome="undecodable"}` and `mw_station_resync_bytes_total` count
+//! every one of them while the station looks connected. The reason it was left is in
+//! `docs/reconciliation.md` A-M6-1-1: setting a rate is `tcsetattr`, **D-32**'s crate table
+//! named neither `libc` nor a serial-port crate, and `[workspace.lints.rust]`'s
+//! `unsafe_code` makes hand-rolling the `ioctl` a build error — so the table gained a row
+//! rather than this module gaining an `unsafe`.
 //!
-//! - **A `socat` pty pair works completely**, because a pty has no line rate. That is the
-//!   whole of W3 **D-83**'s Davis and Campbell test level, and it is what
-//!   `tests/emulators/manifest.toml`'s `davis` and `campbell` entries exercise.
-//! - **A `ser2net` bridge works completely**, because the bridge owns the line and this end
-//!   is a TCP socket. That is **N-20**'s production path: the owner's Campbell is on USB
-//!   serial and the daemon is moving into Kubernetes, so the serial line is terminated
-//!   outside the pod.
-//! - **A directly attached console works if and only if the line is already configured** —
-//!   by a `udev` rule, by `stty`, or because the kernel default matches. If it is not, the
-//!   symptom is not silence: the bytes arrive framed wrong, every Davis packet fails its
-//!   CRC-16 and every Campbell line fails to parse, so
-//!   `mw_station_frames_total{outcome="undecodable"}` counts every one of them. [`open`]
-//!   also logs the configured rate and the fact that it was not applied, once per connect,
-//!   naming the station.
+//! It also **deleted the only `unsafe` block in this workspace**, which was not the goal and
+//! is the better half of the trade: `tokio_serial::SerialStream` is an `AsyncFd` over an
+//! owned `mio_serial::SerialStream`, so the safety argument that used to live at the
+//! registration call site is now the dependency's.
 //!
-//! A reader who wants this closed should read the proposed amendment rather than add a
-//! dependency: the point of the amendment protocol is that the next agent does not have to
-//! re-decide it.
+//! What the three transports do, stated rather than discovered:
+//!
+//! - **A directly attached console works**, which is the configuration this change exists
+//!   for. `transport_baud` is the rate the line runs at.
+//! - **A `ser2net` bridge is unaffected**, because the bridge owns the line and this end is
+//!   a TCP socket. That is **N-20**'s production path, and it worked before this change too.
+//! - **A `socat` pty pair works, and now asserts something.** A pty has no line rate — no
+//!   bits are clocked at any speed — but it is a real tty with real `termios`, and Linux
+//!   stores and reports the rate set on it. So
+//!   `the_configured_line_rate_is_set_on_the_tty` is a `tcgetattr` assertion that would have
+//!   failed against the previous build, which is the test criterion 3 of GRA-788 asked for.
+//!   **What it does not prove is timing**, and no test in this repository does: that the
+//!   kernel accepted and recorded 115200 is not evidence that a UART clocked 115200, and
+//!   the only apparatus that could say so is hardware.
+//!
+//! **One platform cost, and it is `serialport`'s own recorded note.** On macOS the rate is
+//! set with the `IOSSIOSPEED` ioctl, which **refuses a pseudo terminal with `ENOTTY`**
+//! (`serialport-4.10.1/src/posix/termios.rs:93`). So the pty tests in this module are
+//! `cfg`'d off there, where before they ran: macOS is supported so that the crate builds on
+//! a developer's machine, and a real `/dev/cu.*` is unaffected. Linux, which is every target
+//! in `ci/release.toml`, uses `BOTHER` with `TCSETS2` and takes arbitrary rates.
 
 use std::fmt;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use mw_component::{BoxFuture, BuildError};
-use tokio::io::unix::AsyncFd;
-use tokio::io::Interest;
+use tokio_serial::{SerialPort as _, SerialPortBuilderExt};
 use tracing::{debug, warn};
 
 use crate::session::ByteStream;
@@ -56,34 +73,6 @@ use crate::transport::Transport;
 /// The Go Davis driver's `net.DialTimeout` value (`davis/station.go:308`), kept so that the two
 /// daemons give a bridge the same chance during the M5-2 comparison.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The flags a character device is opened with.
-///
-/// `O_NONBLOCK` for two reasons, and the second is the stronger one: [`AsyncFd`] polls the
-/// descriptor and then reads it, so without it a read the poll said would succeed can still
-/// block the runtime thread -- and `open(2)` **itself** blocks on a tty until the modem
-/// lines assert carrier, which on an unplugged serial cable is forever. `O_NOCTTY` because
-/// opening a terminal from a daemon with no controlling terminal would otherwise *acquire*
-/// one, and a `SIGHUP` on that terminal would then reach the whole process.
-///
-/// Numeric rather than from `libc`, which is not a dependency (see this module's
-/// documentation). The values are the asm-generic ABI's, which every target in
-/// `ci/release.toml` uses; macOS is here so that the crate builds on a developer's machine,
-/// and any other platform is a `compile_error!` naming what to add rather than a silently
-/// wrong constant.
-#[cfg(target_os = "linux")]
-const OPEN_FLAGS: i32 = 0o4000 | 0o400;
-#[cfg(target_os = "macos")]
-const OPEN_FLAGS: i32 = 0x0004 | 0x2_0000;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!(
-    "crates/mw-station/src/stream.rs opens a character device with numeric O_NONBLOCK and \
-     O_NOCTTY, and this target's values are not recorded. Add them beside the Linux ones."
-);
-
-/// What the serial descriptor is polled for. Both, because the Davis conversation writes
-/// commands as well as reading packets.
-const INTEREST: Interest = Interest::READABLE.add(Interest::WRITABLE);
 
 /// Why a station's transport could not be opened.
 ///
@@ -102,16 +91,16 @@ pub enum OpenError {
         source: std::io::Error,
     },
 
-    /// The character device opened and cannot be polled.
+    /// `transport_dev` names a path that exists and is a regular file.
     ///
-    /// The reachable cause is a `transport_dev` that names a **regular file**: `epoll_ctl`
-    /// refuses one with `EPERM`, which is the kernel saying "this is not a stream". Worth
-    /// its own sentence because the path exists, the open succeeds, and the message
-    /// `epoll_ctl` produces on its own names neither the file nor the reason.
+    /// Worth its own variant because the path exists, so `Device`'s "could not be opened"
+    /// reads like a cable fault. What actually happens is that `tcgetattr` answers `ENOTTY`
+    /// -- there is no line to read the state of -- and `serialport` reports that in its
+    /// catch-all `ErrorKind::Unknown`, which is why [`classify`] decides this from the file
+    /// type rather than from the errno.
     #[error(
-        "the serial device {dev} opened and cannot be polled, which is what a regular file \
-         does: `transport_dev` has to name a character device -- a serial port, or a `socat` \
-         pty"
+        "the serial device {dev} is a regular file: `transport_dev` has to name a character \
+         device -- a serial port, or a `socat` pty"
     )]
     NotAStream {
         /// Which device.
@@ -213,61 +202,108 @@ pub async fn open(transport: &Transport, station: &str) -> Result<Box<dyn ByteSt
     }
 }
 
-/// Open a character device.
+/// Open a character device and set its line rate.
 ///
 /// **Must be called from inside a tokio runtime**, which is not visible in the signature:
-/// `AsyncFd::register_with_interest` panics without a current reactor. Not an `async fn`
-/// because nothing here awaits, so the obligation has to be written down rather than
-/// carried by the type. Every caller reaches this through [`open`], which is `async`.
+/// `SerialStream::open` registers an `AsyncFd` and panics without a current reactor. Not an
+/// `async fn` because nothing here awaits — the open, the `tcsetattr` and the registration
+/// are all synchronous — so the obligation has to be written down rather than carried by the
+/// type. Every caller reaches this through [`open`], which is `async`.
+///
+/// **The two open flags this module used to set by hand are still set, and that is worth
+/// recording rather than trusting.** `serialport` opens with `O_NOCTTY | O_NONBLOCK`
+/// (`posix/tty.rs:127`) and `mio_serial` re-sets `O_NONBLOCK` on the final descriptor after
+/// `serialport` clears it (`mio-serial-5.0.7/src/lib.rs:538`). Both matter and neither is
+/// cosmetic: `open(2)` on a tty blocks until the modem lines assert carrier, which on an
+/// unplugged serial cable is forever, and opening a terminal from a daemon with no
+/// controlling terminal would otherwise *acquire* one, so a `SIGHUP` on it would reach the
+/// whole process.
+///
+/// 8N1 and no flow control are stated rather than left to the crate's defaults, because they
+/// are what both station protocols need and what the Go daemon used: a Davis console is
+/// 8N1 (`davis/station.go`'s `serial.Config`) and so is a Campbell datalogger. They happen to
+/// be `serialport`'s defaults today; saying so means a change to those defaults is not a
+/// change to this program.
 fn serial(dev: &Path, baud: u32, station: &str) -> Result<SerialPort, OpenError> {
-    use std::os::unix::fs::OpenOptionsExt;
+    // `to_string_lossy` because `serialport`'s builder takes a `str` and a device path is an
+    // `OsStr`. A non-UTF-8 `transport_dev` therefore fails to open rather than opening the
+    // wrong thing, and the error names the lossy form, which is the one an operator can see
+    // in the management UI anyway.
+    let port = tokio_serial::new(dev.to_string_lossy(), baud)
+        .data_bits(tokio_serial::DataBits::Eight)
+        .parity(tokio_serial::Parity::None)
+        .stop_bits(tokio_serial::StopBits::One)
+        .flow_control(tokio_serial::FlowControl::None)
+        .open_native_async()
+        .map_err(|e| classify(dev, e))?;
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(OPEN_FLAGS)
-        .open(dev)
-        .map_err(|source| OpenError::Device {
-            dev: dev.to_path_buf(),
-            source,
-        })?;
-    // SAFETY: `file` is an owned `std::fs::File` this function has just opened and is
-    // moving into the `AsyncFd`, so all three of `register_with_interest`'s conditions hold
-    // by construction: the descriptor is open, it stays open and refers to the same file
-    // description until the `AsyncFd` is dropped, and `File::as_raw_fd` returns the same
-    // value every time it is called.
-    //
-    // **This is the only `unsafe` block in the workspace, and it is here because every safe
-    // constructor is deprecated.** `AsyncFd::{new, with_interest, try_new,
-    // try_with_interest}` are all deprecated in `tokio` 1.54 as "unsound due to lack of I/O
-    // safety" (tokio#8587) -- unsound for a BORROWED descriptor somebody else may close,
-    // which is exactly the case this is not. The alternative is `#[allow(deprecated)]`,
-    // which trades an audited safety argument for a call that disappears in a future minor
-    // version, and `unsafe_code` is `warn` in `[workspace.lints]` rather than `forbid`
-    // precisely so that a case like this can be made in writing.
-    #[allow(unsafe_code)]
-    let registered = unsafe { AsyncFd::register_with_interest(file, INTEREST) };
-    let fd = registered.map_err(|source| OpenError::NotAStream {
-        dev: dev.to_path_buf(),
-        // `AsyncFdRegisterError` hands the file back so a caller can try something else;
-        // there is nothing else to try, so only the cause is kept.
-        source: source.into(),
-    })?;
-    // Once per connect, naming the station and the rate, because the alternative is an
-    // operator reading `transport_baud` in the management UI and believing it (see this
-    // module's documentation).
-    warn!(
-        station,
-        device = %dev.display(),
-        configured_baud = baud,
-        "opened a serial device; the configured line rate is NOT applied by this build -- \
-         set it with a udev rule or `stty`, or terminate the line with `ser2net` and use a \
-         `tcp_out` transport. See docs/reconciliation.md's proposed D-32 amendment."
-    );
+    // Read the rate back off the line, once per connect. The point is the gap between the
+    // two claims: `tcsetattr` returning says the kernel accepted the request, and this says
+    // what `tcgetattr` reports afterwards. They agree on every Linux target -- `BOTHER` with
+    // `TCSETS2` takes arbitrary rates -- and a driver that clamps or a platform that refuses
+    // is exactly the case where an operator needs to be told rather than left to infer it
+    // from CRC failures. Not an error: the open succeeded and the station may well work.
+    match port.baud_rate() {
+        Ok(actual) if actual == baud => {
+            debug!(
+                station,
+                device = %dev.display(),
+                baud,
+                "opened a serial device and set the line rate"
+            );
+        }
+        Ok(actual) => {
+            warn!(
+                station,
+                device = %dev.display(),
+                configured_baud = baud,
+                line_baud = actual,
+                "opened a serial device and the line is NOT at the configured rate -- the \
+                 driver or the platform refused it. Frames will arrive framed wrong and be \
+                 counted undecodable."
+            );
+        }
+        Err(e) => {
+            debug!(
+                station,
+                device = %dev.display(),
+                baud,
+                error = %e,
+                "opened a serial device and set the line rate; reading it back was refused"
+            );
+        }
+    }
+
     Ok(SerialPort {
-        fd,
+        port,
         dev: dev.to_path_buf(),
     })
+}
+
+/// Which [`OpenError`] a `tokio_serial` failure is.
+///
+/// **Decided from the file type rather than from the error**, and that is the crate's
+/// limitation rather than a preference. `serialport` translates ten errnos and answers
+/// `ErrorKind::Unknown` for every other one (`posix/error.rs`), and the two this path can
+/// actually produce — `ENOTTY` from the `tcgetattr` that reads the line's current state, and
+/// `EINVAL` from the `tcsetattr` that writes the new one — are both in that catch-all,
+/// alongside errnos meaning the opposite. A `stat` is a direct measurement of the thing
+/// [`OpenError::NotAStream`] is about, so it is used instead of inferring it.
+///
+/// The `stat` follows symlinks on purpose: `socat`'s `link=` is a symlink to a `/dev/pts/N`.
+/// A path that has gone away between the open and here is `Device`, which is what it would
+/// have been anyway.
+fn classify(dev: &Path, e: tokio_serial::Error) -> OpenError {
+    let dev = dev.to_path_buf();
+    let source = std::io::Error::from(e);
+    if std::fs::metadata(&dev)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        OpenError::NotAStream { dev, source }
+    } else {
+        OpenError::Device { dev, source }
+    }
 }
 
 /// Connect to a console or a serial-to-Ethernet bridge.
@@ -301,13 +337,15 @@ async fn tcp(host: &str, port: u16) -> Result<TcpByteStream, OpenError> {
     Ok(TcpByteStream(stream))
 }
 
-/// A character device, polled.
+/// A character device at a configured line rate, polled.
 pub struct SerialPort {
-    fd: AsyncFd<std::fs::File>,
+    port: tokio_serial::SerialStream,
     dev: PathBuf,
 }
 
 impl fmt::Debug for SerialPort {
+    /// By hand rather than derived, so that a `{:?}` in a log line stays one short field.
+    /// `SerialStream`'s own `Debug` prints the descriptor and the `AsyncFd` around it.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SerialPort")
             .field("dev", &self.dev)
@@ -315,43 +353,43 @@ impl fmt::Debug for SerialPort {
     }
 }
 
+impl SerialPort {
+    /// The rate the line is actually at, read with `tcgetattr`.
+    ///
+    /// Not the configured value held in a field: this asks the kernel. That distinction is
+    /// the whole of amendment **A-M6-1-1** — the previous build had the configured value and
+    /// nothing else — so the accessor returns the measurement and there is no field for the
+    /// request to be confused with.
+    pub fn baud_rate(&self) -> Result<u32, std::io::Error> {
+        self.port.baud_rate().map_err(std::io::Error::from)
+    }
+
+    /// Which device this is, for a log line and an error message.
+    pub fn device(&self) -> &Path {
+        &self.dev
+    }
+}
+
 impl ByteStream for SerialPort {
     fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxFuture<'a, std::io::Result<usize>> {
         Box::pin(async move {
-            // `async_io` retries the closure whenever it reports `WouldBlock`, which is the
-            // whole reason the descriptor is opened non-blocking: the poll says readable,
-            // the read is attempted, and a spurious wake-up costs a retry rather than a
-            // blocked runtime thread.
-            self.fd
-                .async_io(Interest::READABLE, |file| (&*file).read(buf))
-                .await
+            use tokio::io::AsyncReadExt;
+            self.port.read(buf).await
         })
     }
 
     fn write_all<'a>(&'a mut self, bytes: &'a [u8]) -> BoxFuture<'a, std::io::Result<()>> {
         Box::pin(async move {
-            let mut written = 0;
-            while written < bytes.len() {
-                let n = self
-                    .fd
-                    .async_io(Interest::WRITABLE, |file| (&*file).write(&bytes[written..]))
-                    .await?;
-                if n == 0 {
-                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
-                }
-                written += n;
-            }
-            // **No flush, and that is not an omission.** The obvious call here is
-            // `sync_data`, and it cannot do anything: `tty_fops` declares no `fsync`, so
-            // `fsync` and `fdatasync` return `EINVAL` on every serial port and on both ends
-            // of every pty -- which is every target in `ci/release.toml` and the whole of
-            // the `socat` test path. A call that is `EINVAL` everywhere it can be reached
-            // is a blocking syscall in an `async fn` that reads as a guarantee it does not
-            // make. Draining a tty's output queue is `tcdrain`, an `ioctl` and therefore a
-            // second `unsafe` block; it is not needed, because the write above returning
-            // means the bytes are in the driver's queue and the console reads them from
-            // there.
-            Ok(())
+            use tokio::io::AsyncWriteExt;
+            self.port.write_all(bytes).await
+            // **No flush, and that is not an omission.** It is now reachable -- `AsyncWrite`
+            // for `SerialStream` forwards `poll_flush` to `tcdrain` -- where before this
+            // module's only option was `sync_data`, which is `EINVAL` on every tty because
+            // `tty_fops` declares no `fsync`. It is still not called, for the reason that
+            // always applied: the write above returning means the bytes are in the driver's
+            // queue and the console reads them from there. `tcdrain` would add a syscall that
+            // blocks until the queue empties -- at 9600 baud, milliseconds of it -- inside an
+            // `async fn`, to guarantee something no caller asked for.
         })
     }
 }
@@ -407,19 +445,16 @@ mod tests {
         assert_eq!(e.class(), Class::RETRYABLE);
     }
 
-    /// The case the path exists for: an open that succeeds and a descriptor that cannot be
-    /// polled.
+    /// The case the path exists for: a `transport_dev` that names a regular file.
     ///
-    /// **Linux only, and that is a property of the assertion rather than of the code under
-    /// test.** `NotAStream` is reported because `epoll_ctl` answers `EPERM` for a regular
-    /// file; `kqueue` registers one happily, so on macOS -- which this module supports so
-    /// that the crate builds on a developer's machine -- the open would succeed and the
-    /// `expect_err` would fail. Refusing a regular file is not a guarantee this module
-    /// makes on every platform, and a test that claimed otherwise would be asserting
-    /// `epoll`'s behaviour in a place nobody would look for it.
-    #[cfg(target_os = "linux")]
+    /// **No longer Linux-only**, and that is worth a sentence because it used to be. The
+    /// refusal came from `epoll_ctl` answering `EPERM`, which `kqueue` does not do, so the
+    /// assertion could not be made on macOS. Now the refusal comes from `tcgetattr` -- a
+    /// regular file has no line discipline to read on any Unix -- and [`classify`] decides
+    /// the variant from the file type, so the answer is the same everywhere this crate
+    /// builds.
     #[tokio::test]
-    async fn a_regular_file_opens_and_is_refused_as_not_a_stream() {
+    async fn a_regular_file_is_refused_as_not_a_stream() {
         let dir = std::env::temp_dir().join(format!("mw-station-stream-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("a writable temporary directory");
         let path = dir.join("not-a-tty");
@@ -486,10 +521,73 @@ mod tests {
         );
     }
 
+    /// **The test that would have failed against the previous build** — GRA-788's criterion
+    /// 3, and the only one of its five that is a measurement rather than a decision.
+    ///
+    /// `serial` is called rather than [`open`] because this asserts on a `SerialPort` and
+    /// `open` erases it to a `Box<dyn ByteStream>`. The rate asked for is **115200**, which
+    /// is the owner's Campbell datalogger's and the number GRA-787 raised this against; the
+    /// pty's own default is 38400, so the assertion distinguishes "the rate was set" from
+    /// "the rate happened to match".
+    ///
+    /// # What this proves, and what it does not
+    ///
+    /// `SerialPort::baud_rate` is a `tcgetattr` on the descriptor the daemon is about to
+    /// read from. A pty is a real tty with real `termios`: Linux stores the rate set on it
+    /// and reports it back, which is why this assertion is possible at all and why
+    /// `stty -F <link> speed` answers 115200 after it. **Against the previous build it would
+    /// have answered 38400**, because that build never called `tcsetattr` — so this is not a
+    /// test that passes either way, which is the trap `docs/reconciliation.md` **G-1** names
+    /// and the reason the old emulator tests could not be allowed to stand in for it.
+    ///
+    /// **It is not evidence about timing, and nothing in this repository is.** No bits are
+    /// clocked at any rate on a pty. What is proven is that the configured value reaches the
+    /// kernel and is accepted for this device, which is exactly the defect A-M6-1-1 fixed;
+    /// that a UART then shifts bits at 115200 is a property of hardware, and the only
+    /// apparatus that could assert it is a Campbell datalogger on a real serial cable.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[tokio::test]
+    async fn the_configured_line_rate_is_set_on_the_tty() {
+        let pair = crate::testing::PtyPair::spawn("stream-baud")
+            .await
+            .expect("`socat` is a test dependency of this crate; see the round-trip test");
+
+        let port = serial(pair.daemon_side(), 115_200, "backyard").expect("opens the pty");
+        assert_eq!(
+            port.baud_rate().expect("the pty reports its line rate"),
+            115_200,
+            "`transport_baud` reached the line: a fresh `socat` pty's own rate is 38400, so \
+             this distinguishes a `tcsetattr` that happened from one that did not"
+        );
+        assert_eq!(port.device(), pair.daemon_side());
+
+        // The negative control, on the SAME device: drop the port -- which releases the
+        // `TIOCEXCL` and the `flock` `serialport` takes -- and open it again at a different
+        // rate. Two rates on two devices would leave open the reading that each device
+        // happened to be at the rate asked for; two rates on one device cannot. 9600 is
+        // `mw-output`'s KISS TNC default (`FrameSink::DEFAULT_BAUD`), which reaches this
+        // same function through `mw_station::stream::open`.
+        drop(port);
+        let port = serial(pair.daemon_side(), 9_600, "backyard").expect("reopens the pty");
+        assert_eq!(
+            port.baud_rate().expect("the pty reports its line rate"),
+            9_600,
+            "the line rate follows `transport_baud` rather than being a constant"
+        );
+    }
+
     /// A `socat` pty pair is the level W3 D-83 asks for, and it is also the only way to
     /// exercise the serial path in a unit test. Skipped rather than failed where `socat` is
     /// not installed, because this is not the gate that owns that requirement --
     /// `tests/emulators/manifest.toml` is, and it fails loudly.
+    ///
+    /// **Not on macOS**, where it used to run: the rate is set there with the `IOSSIOSPEED`
+    /// ioctl, which refuses a pseudo terminal with `ENOTTY` -- `serialport`'s own code says
+    /// so at `posix/termios.rs:93` -- so the open fails on a pty and succeeds on a real
+    /// `/dev/cu.*`. That is a cost of amendment A-M6-1-1 rather than a cost of this test, and
+    /// it is named at this module's documentation too. Every target in `ci/release.toml` is
+    /// Linux, where the rate goes on with `BOTHER` and `TCSETS2`.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     #[tokio::test]
     async fn a_pty_pair_round_trips_bytes_in_both_directions() {
         let pair = crate::testing::PtyPair::spawn("stream-roundtrip")
