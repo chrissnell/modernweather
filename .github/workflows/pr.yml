@@ -282,12 +282,16 @@ jobs:
             ci/spike/armv6-cross-spike.sh \
             ci/db/migrate-twice.sh \
             ci/db/rebuild-aggregates.sh \
+            ci/db/offsite-backup.sh \
+            ci/db/restore-rehearsal.sh \
             ci/db/migrate-from-go/migrate-from-go.sh \
             ci/db/migrate-from-go/extract-go-views.sh \
             ci/db/migrate-from-go/lab/run-in-pod.sh \
+            ci/db/migrate-from-go/lab/lab-env.sh \
             ci/db/migrate-from-go/lab/emit-old-schema.sh \
             ci/db/migrate-from-go/lab/10-seed.sh \
-            ci/conformance/go-target.sh
+            ci/conformance/go-target.sh \
+            ci/diff/self-test.sh
 
   gates:
     name: deferred gates
@@ -367,6 +371,28 @@ jobs:
         run: |
           if [ -n "$(git status --porcelain)" ]; then
             echo "::error::the migration-SQL drift check modified the working tree"
+            git status --porcelain
+            exit 1
+          fi
+
+  mgmt-schema-drift:
+    name: management schema drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask gate mgmt-schema-drift
+      # The same R-2 assertion as the two drift gates above, which this gate's own note in
+      # ci/gates.toml asks for by name: a check that writes its own fix into the tree always
+      # passes. Separate from codegen-drift on purpose (D-57) -- its input is the Rust
+      # handler set in crates/mw-api-mgmt rather than the metric registry.
+      - name: Assert the check left the tree clean
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::the management-schema drift check modified the working tree"
             git status --porcelain
             exit 1
           fi
@@ -657,6 +683,65 @@ jobs:
           done
       - run: cargo xtask gate driver-emulators
 
+  serial-bridge:
+    name: a ser2net fan-out broadcasts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      # `ser2net` is the thing under test, not a test dependency that could be stubbed:
+      # GRA-787 exists because `max-connections` is documented to broadcast and the
+      # programme needed that measured rather than read. A hand-written fan-out would prove
+      # only that its author can write one. `socat` provides the pty pair that stands in for
+      # the station, so the whole proof runs with no hardware.
+      #
+      # The runner also reports the version it measured. Debian/Ubuntu and Arch do not ship
+      # the same release, and both were checked by hand (4.6.4 and 4.6.8) -- so a future
+      # divergence should be visible in the log rather than assumed away.
+      - name: Install the bridge under test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ser2net socat
+      - run: cargo xtask gate serial-bridge
+
+  diff-harness:
+    name: the diff harness, made to differ on purpose
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          components: rustfmt, clippy
+      # Two workspaces, for the reason the conformance jobs name two: the root one builds
+      # xtask, and ci/diff is standalone on purpose so that mechanism (b) stays runnable
+      # against the Go daemon's database from a machine with no Rust daemon in the tree.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: diff-harness
+          workspaces: |
+            .
+            ci/diff
+      # M5-2's mechanisms need two running daemons, two databases and a live station, so
+      # neither can run here. The DIFFER needs only inputs, and ci/diff/recorded/ is a pair
+      # of them -- a capture of the Go side and a Rust side derived from it by applying
+      # exactly the deviations ci/diff/expected.toml predicts.
+      #
+      # So this job is the harness's own negative control, which is M5-2's declared test
+      # strategy and W1 D-10's principle: a differ that cannot be made to differ proves
+      # nothing. Green on the recorded pair, red on a 1% error injected on either side, red
+      # when an injection moved nothing, red when a bound has no reading count behind it.
+      # ci/diff is its own workspace, so the root `cargo fmt --all --check` and
+      # `cargo clippy --workspace` do not reach it. Checked here rather than left unchecked.
+      - name: Lint the harness, which the root workspace's jobs do not reach
+        run: |
+          cargo fmt --manifest-path ci/diff/Cargo.toml --all --check
+          cargo clippy --manifest-path ci/diff/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo xtask gate diff-harness
+
   database:
     name: migrations and server version
     runs-on: ubuntu-latest
@@ -734,6 +819,67 @@ jobs:
         run: psql --set ON_ERROR_STOP=1 "$DATABASE_URL" -f ci/sql/assert-timescaledb-version.sql
       - name: Apply the migrations twice and compare
         run: cargo xtask gate db-migrate-twice
+
+  db-restore-rehearsal:
+    name: off-site backup restored and reconciled
+    runs-on: ubuntu-latest
+    services:
+      timescaledb:
+        # The same image and the same reasoning as the `database` job: DESIGN.md D-2
+        # requires TimescaleDB 2.31 with timescaledb_toolkit.
+        image: timescale/timescaledb-ha:pg17
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgresql://postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      # The same PostgreSQL 17 client the `database` job needs, and for the same reason: the
+      # runner images ship 16, pg_dump refuses a newer server than itself, and /usr/bin/pg_dump
+      # is a postgresql-common wrapper that resolves its version from the local cluster list
+      # rather than from the server.
+      - name: Install PostgreSQL 17 client
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+          echo /usr/lib/postgresql/17/bin >> "$GITHUB_PATH"
+          /usr/lib/postgresql/17/bin/pg_restore --version
+      # rclone is the archive's only transport, in CI as in the cluster -- the default mode
+      # writes to a LOCAL rclone remote, which needs the binary and no configuration at all.
+      # Pinned rather than `apt install rclone`, because the runner image's version is not
+      # something this gate should silently inherit.
+      - name: Install rclone
+        env:
+          RCLONE_VERSION: "1.68.2"
+        run: |
+          curl -fsSL -o /tmp/rclone.zip \
+            "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-amd64.zip"
+          unzip -q -j /tmp/rclone.zip "*/rclone" -d /tmp/rclone-bin
+          sudo install -m 0755 /tmp/rclone-bin/rclone /usr/local/bin/rclone
+          rclone version | head -1
+      # Default mode: seed, dump through a local rclone remote, restore into a second
+      # database, reconcile byte for byte, re-measure A-W9-2 and assert the four /span bands
+      # after phase 1 only. No credential, so this runs on every PR including from a fork.
+      # The R2 half is `--from-archive`, run by a monthly CronJob beside the cluster.
+      - name: Restore the archive and reconcile it
+        run: cargo xtask gate db-restore-rehearsal
 
   db-tests:
     name: database tests (real TimescaleDB)
@@ -859,11 +1005,14 @@ jobs:
       - layout
       - codegen-drift
       - legacy-import-drift
+      - mgmt-schema-drift
       - conformance
       - conformance-fixtures
       - driver-emulators
       - database
       - db-tests
+      - db-restore-rehearsal
+      - diff-harness
       - coverage
     if: always()
     runs-on: ubuntu-latest

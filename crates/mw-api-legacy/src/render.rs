@@ -51,7 +51,11 @@ use crate::sun;
 /// change invalidates a cached response. **Bump it in the same commit as any change to the
 /// emitted bytes** -- a new key, a changed unit, a different `omitempty` -- because an
 /// `ETag` that did not move across a payload change is a `304` serving the old body.
-const REVISION: u64 = 1;
+/// 2 since **M5-5**: `stationname` is read from `config.stations` rather than off the
+/// reading, which changes the bytes for any key seeded by `snapshot:warm` -- the reading it
+/// seeds from no longer carries a name, so the old code emitted `""` where this emits the
+/// configured one.
+const REVISION: u64 = 2;
 
 /// The ten minutes W1 Decision 15 freezes: a reading older than this makes `/latest` a
 /// `404` rather than a stale `200`.
@@ -99,6 +103,30 @@ impl Renderer {
         self.zones.len()
     }
 
+    /// The device name for one station: configuration, then the frame's claim, then the
+    /// key.
+    ///
+    /// The same precedence `mw_store::writer`'s `stations` projection applies, and for the
+    /// same reasons. Configuration is authoritative (W4 §2.1), and it arrives **on the
+    /// source** rather than through a map this renderer was built with, so an operator
+    /// renaming a station is reflected on the next reading rather than at the next plan
+    /// restart -- see [`mw_component::SnapshotSource::display_name`], which has the whole
+    /// argument. The frame is next because a station this node has no configuration row for
+    /// still has to render a name -- a received station before M6-4 -- and the key is last
+    /// because the frozen key is not optional and an empty string is worse than an
+    /// identifier.
+    ///
+    /// An associated function rather than a method: it reads nothing off `self`, and saying
+    /// so is the point — a `Renderer` field would be a construction-time copy of exactly
+    /// the thing that must not be copied at construction.
+    fn station_name(source: &SnapshotSource) -> String {
+        source
+            .display_name
+            .clone()
+            .or_else(|| source.reading.station_name.clone())
+            .unwrap_or_else(|| source.key.station.as_str().to_string())
+    }
+
     /// [`REVISION`], for a surface that builds an `ETag` without going through a snapshot.
     ///
     /// `/snow` is the one: **DEV-1** puts a tag on it and its bytes are not a snapshot's,
@@ -128,8 +156,20 @@ impl Renderer {
             .or_else(|| self.zones.get(&source.key.station))
             .map(|z| z.tz());
 
+        // **`stationname` is configuration, `stationtype` is the device's own claim**, and
+        // the two keys differ on purpose. `config.stations.name` is the string `?station=`
+        // matches and the one the Go writer projected onto the column, so an operator
+        // renaming a station is reflected here without touching any reading -- and, since
+        // M5-5 took the column away, the snapshot source is the only thing that knows it.
+        // `stationtype` is the DRIVER's self-reported name, `campbell` where the configured
+        // type is `campbellscientific`: `docs/legacy-api-contract.md` §3.1 is explicit that
+        // the two vocabularies are not the same set and must not be unified, so the
+        // configured `kind` is not a substitute for it and is not used. It rides the wire
+        // instead, which is what `role = "metadata"` means, and it is `omitempty` on both
+        // sides -- so a key seeded by `snapshot:warm` before its station has reported omits
+        // it, exactly as a Go station that reports no type does.
         let mut dto = LegacyWeatherReading {
-            station_name: r.station_name.clone().unwrap_or_default(),
+            station_name: Self::station_name(source),
             station_type: r.station_type.clone().unwrap_or_default(),
             // Q-3: milliseconds since the epoch, as a bare JSON integer.
             reading_timestamp: r.time.timestamp_millis(),
@@ -499,8 +539,56 @@ mod tests {
                 altitude_m: Some(1800.0),
                 snow_base_distance_mm: None,
             },
+            display_name: None,
             windows,
         }
+    }
+
+    /// **`stationname` is configuration, and `stationtype` is still the device's claim.**
+    ///
+    /// M5-5's criterion 2 -- "nothing reads `stationname` from a reading" -- as an
+    /// assertion. The reading in this test claims a name of its own and the response does
+    /// not use it, which is the half that would otherwise be invisible: before M5-5 the
+    /// column existed and the two strings were routinely equal, so a renderer reading the
+    /// wrong one produced the right answer until `snapshot:warm` read back a reading that
+    /// had no name at all.
+    ///
+    /// `stationtype` is asserted in the same test and deliberately goes the other way.
+    /// `docs/legacy-api-contract.md` §3.1: `/latest`'s is the driver's self-reported name
+    /// (`campbell`) and `/stationinfo`'s is the configured type (`campbellscientific`), and
+    /// the two sets must not be unified -- so substituting the configured `kind` here would
+    /// be a contract change wearing a consistency costume.
+    #[test]
+    fn the_station_name_is_configurations_and_the_type_is_the_devices() {
+        let renderer = Renderer::new(BTreeMap::new(), BTreeMap::new());
+
+        let mut src = source(
+            Reading {
+                station_name: Some("what the device calls itself".into()),
+                station_type: Some("campbell".into()),
+                out_temp: Some(40.0),
+                ..Reading::default()
+            },
+            resolved(),
+        );
+        src.display_name = Some("The Back Yard".into());
+        let dto = renderer.reading(&src);
+        assert_eq!(dto.station_name, "The Back Yard");
+        assert_eq!(dto.station_type, "campbell");
+
+        // A station configuration has no row for -- a received station before M6-4. The
+        // frame's claim is the fallback, because the frozen key is not optional.
+        let mut unconfigured = src.clone();
+        unconfigured.display_name = None;
+        assert_eq!(
+            renderer.reading(&unconfigured).station_name,
+            "what the device calls itself"
+        );
+
+        // And a reading that claims nothing either: the key, never an empty string.
+        let mut anonymous = unconfigured.clone();
+        anonymous.reading.station_name = None;
+        assert_eq!(renderer.reading(&anonymous).station_name, "davis-full");
     }
 
     /// **The primary station's position orients the moon, the queried station's the sun.**

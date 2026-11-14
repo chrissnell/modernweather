@@ -20,13 +20,16 @@
 //! 1 and would be an infinite loop for 2 -- except that 2 can only come from the unit's
 //! own `ExecStart`, so it is a packaging failure that one restart makes obvious.
 
+mod admin;
 mod args;
 mod boot;
 mod config;
+mod hostinfo;
 mod logctl;
 mod notify;
 mod signals;
 mod spool;
+mod view;
 
 use std::process::ExitCode;
 

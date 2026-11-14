@@ -98,7 +98,7 @@ const DECLARED: &[&str] = &[
     // The only test in the tree that does NOT materialise the whole window first.
     "a_closed_bucket_the_aggregate_has_not_caught_up_to_is_still_returned",
     // implementation-plan.md M4-1's one database-shaped claim: `ReadingStore::latest`
-    // reads 216 real columns back into a `Reading` in the types they hold, which the
+    // reads 214 real columns back into a `Reading` in the types they hold, which the
     // snapshot tests over a fake store cannot say anything about.
     "the_newest_reading_in_the_window_is_read_back_whole",
     // implementation-plan.md M4-2's named regression test: W1-BUG-1, end to end. The

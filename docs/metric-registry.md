@@ -130,15 +130,23 @@ field_number = 221
 |---|---|---|---|---|
 | `time` | `NOT NULL` | becomes `time_bucket(...) AS bucket` | no | the hypertable's time dimension |
 | `partition` | `NOT NULL` | the `GROUP BY` key | no | `station_id` |
-| `attribute` | nullable | **absent** | no | `stationname`, `stationtype` |
-| `metadata` | **absent** | **absent** | **yes** | on the wire and in the reading types only |
+| `attribute` | nullable | **absent** | no | none today; `stationname`/`stationtype` until M5-5 |
+| `metadata` | **absent** | **absent** | **yes** | `station_name`, `station_type` — on the wire and in the reading types only |
 
-Two notes on that table. `station_id` is new: the Go table keys readings by station *name*.
+Three notes on that table. `station_id` is new: the Go table keys readings by station *name*.
 Protobuf 221 was already allocated to `station_id` upstream and means the same thing, so it is
-carried over rather than reallocated. And the attribute dimensions are deliberately kept out
-of the aggregates — the Go views group by `stationname`, which means renaming a station splits
-its buckets. With `station_id` as the key, the name is a station-registry attribute joined at
-read time.
+carried over rather than reallocated.
+
+The attribute dimensions were deliberately kept out of the aggregates — the Go views group by
+`stationname`, which means renaming a station splits its buckets. With `station_id` as the key,
+the name is a station-registry attribute joined at read time.
+
+**`attribute` now has no members**, because M5-5 moved both of them to `metadata` (OQ-W4-2 /
+OQ-W2-6 below). The role stays, and so does the distinction `Role::stored()` and
+`Role::optional()` make between "occupies a column" and "is absent-able": they coincide only
+because `stored() && optional()` was exactly `Attribute`, so a fifth role for which they
+disagreed would need them separated, and `xtask/src/registry.rs` says so where it is easy to get
+wrong.
 
 **`metadata` is the one retirable role, and that is why it exists** (N-14, implemented by
 M1-2; it answers OQ-W4-2 / OQ-W2-6 below). It means: present in the protobuf and in the
@@ -476,6 +484,12 @@ history. This file is only the shape.
 The registry ships populated from the **Go source definition**: 215 columns, of which 3 are
 dimensions (`time`, `stationname`, `stationtype`), plus `station_id` which is new. **212
 metrics and 4 dimensions, 216 allocated columns.**
+
+Since **M5-5** two of those four are `role = "metadata"`, so the raw table carries **214**
+generator-owned columns while the registry still holds **216 allocated identifiers** — a
+`metadata` dimension keeps its protobuf field number forever, exactly as a deprecated metric
+does. `cargo xtask budget` prints both numbers for that reason, and the table below is the
+allocation rather than the DDL.
 
 | | |
 |---|---|
@@ -906,7 +920,7 @@ command.**
 2. `key`, `column` and `field_number` are three append-only namespaces, and the generator checks uniqueness across the union of metrics and dimensions because they share a table and a protobuf message.
 3. A metric's stable key is distinct from its column name: the key names the metric in Rust, TypeScript and OpenAPI, the column names it in PostgreSQL, and the bootstrapped registry deliberately differs between the two (`out_temp` / `outtemp`).
 4. Non-metric columns live in the registry as `[[dimension]]` entries, not outside it, because they consume identifiers from the same namespaces and must be counted against the same budget.
-5. A dimension's `role` is `time`, `partition` or `attribute`; attribute dimensions (`stationname`, `stationtype`) are present in the raw table and the reading types and **absent from the aggregates**, which also fixes the Go views' station-rename bucket split.
+5. A dimension's `role` is `time`, `partition`, `attribute` or `metadata`; attribute dimensions are present in the raw table and the reading types and **absent from the aggregates**, which also fixes the Go views' station-rename bucket split. `stationname` and `stationtype` were the only two, and **M5-5 moved both to `metadata`** — present on the wire and in the reading types, absent from the raw DDL — so `attribute` currently has no members and `metadata` is the only retirable role (N-14).
 6. `station_id` is a new `NOT NULL` partition column and the aggregates group by `(bucket, station_id)` only; protobuf 221 is carried over from the Go proto because it already meant `station_id`.
 7. Aggregate levels are registry data (`[[level]]`), and the generator validates that the first reads `raw` and every later level reads the level immediately below it.
 8. Level membership must be contiguous from the first level; a metric carried at `1h` but not `1m` is a fatal error, because there would be no source column to roll up. **This is why OQ-5 cannot be answered as `DESIGN.md` states it — see A-W2-1 and OQ-W2-1.**
@@ -1030,9 +1044,20 @@ change is contained. Left in for now because removing a column from the bootstra
 would mean deprecating something that has never existed.
 
 *Status.* W4 answered it as OQ-W4-2: they should go, by way of a new `metadata` role. That role
-now exists — §1.2, work item N-14, landed as M1-2 — so the question is no longer "can this be
-expressed". Moving `stationname`/`stationtype` onto it is **M5-5**, after the data migration has
-proved the read path takes a station's name from `config.stations` rather than from a reading.
+exists — §1.2, work item N-14, landed as M1-2 — and **M5-5 moved both dimensions onto it**, after
+M5-1's migration had proved the read path takes a station's name from `config.stations` rather than
+from a reading. **Answered; nothing is left open here.**
+
+The answer this question did not anticipate is *who* owns them afterwards, and it is not one owner
+for both. The display name is **configuration** and `/latest` and `/span` resolve it from
+`config.stations.name` — on `/latest` through `SnapshotSource::display_name`, resolved per fold from
+the published registry so that a rename does not wait for a plan restart. The type on `/latest` is the **device's own claim** — `campbell` where the
+configured type is `campbellscientific`, and `docs/legacy-api-contract.md` §3.1 forbids unifying the
+two vocabularies — so configuration is not a source for it, and it is kept in
+`stations.reported_type`, a second column beside the configured `stations.type`. Two columns on a
+per-station projection rather than two columns on every row of a hundred-million-row table, which is
+what this question was asking for; one column would have unified exactly the two sets that may not
+be unified.
 
 ---
 

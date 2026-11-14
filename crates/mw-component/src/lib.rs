@@ -44,12 +44,13 @@
 //! -- the roll-up's own surface -- [`LatestSnapshot`], which is what makes the `/latest`
 //! handler unable to query -- the two methods of `StationRegistry` that admission and the
 //! enrich stage need -- and, as of the frozen REST surface, [`ForecastStore`] and
-//! [`SnowCache`], beside [`ReadingStore`]'s `span` and `almanac`. `AlertStore`,
-//! `ConfigStore`, `ConfigAdmin` and `HttpRoutes` are still absent and arrive with the work
-//! items that consume them, because a handle trait is a *query set* and the item that
-//! writes the queries is the item that knows them. `StationRegistry` grew its second method
-//! that way, and `ReadingStore` grew `latest` for `snapshot:warm` and then `span`/`almanac`
-//! for `api:legacy`.
+//! [`SnowCache`], beside [`ReadingStore`]'s `span` and `almanac`. [`AlertStore`] arrived
+//! with the Aeris components (M6-3), which also gave the first two their write halves and
+//! `ReadingStore` its `mean_series`. `ConfigStore`, `ConfigAdmin` and `HttpRoutes` are
+//! still absent and arrive with the work items that consume them, because a handle trait is
+//! a *query set* and the item that writes the queries is the item that knows them.
+//! `StationRegistry` grew its second method that way, and `ReadingStore` grew `latest` for
+//! `snapshot:warm` and then `span`/`almanac` for `api:legacy`.
 //!
 //! What is fixed here is the mechanism every one of them uses: [`CapabilityHandle`]
 //! associates a handle type with its capability, and [`BuildCx`] resolves it in `build`.
@@ -110,10 +111,11 @@ pub use snapshot::{
 pub use spec::{ComponentSpec, ConfigDigest, SpecFingerprint, DEFAULT_GRACE};
 pub use state::{ComponentStatus, Counters, ScheduleState, State, WaitingOn};
 pub use store::{
-    AlmanacQuery, AlmanacRecord, Bucket, BucketLevel, BucketQuery, Bucketed, Forecast,
-    ForecastQuery, ForecastStore, LatestQuery, Piece, ReadingSink, ReadingStore, SeriesQuery,
-    SnowCache, SnowTotals, Span, SpanBucket, SpanColumn, SpanQuery, Store, StoreError, Stored,
-    TotalsQuery,
+    Alert, AlertStore, AlmanacQuery, AlmanacRecord, Bucket, BucketLevel, BucketQuery, Bucketed,
+    DepthEstimate, EstimateWindow, EventClass, Forecast, ForecastQuery, ForecastStore, LatestQuery,
+    MeanBucket, MeanSeriesQuery, Piece, ReadingSink, ReadingStore, SeriesQuery, SnowCache,
+    SnowEvent, SnowPatch, SnowTotals, Span, SpanBucket, SpanColumn, SpanQuery, Store, StoreError,
+    Stored, TotalsQuery,
 };
 pub use stream::{ReadingStream, ReadingSubscription, StreamError};
 pub use trigger::{

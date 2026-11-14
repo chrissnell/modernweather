@@ -1,0 +1,4218 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "ModernWeather management API",
+    "description": "The management API over ConfigAdmin and ComponentControl. GENERATED from the Rust handlers in crates/mw-api-mgmt by `cargo xtask mgmt-schema`. DO NOT EDIT. Every route is /api/v1/* (DESIGN.md D-49); the frozen public contract is unversioned and is not described here (D-37).",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/v1/config": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "summary": "The whole configuration, with every secret omitted.",
+        "operationId": "get_config",
+        "responses": {
+          "200": {
+            "description": "The configuration, secrets omitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigView"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The configuration could not be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/config/preview": {
+      "post": {
+        "tags": [
+          "config"
+        ],
+        "summary": "Try a change: run `plan()` against it and report the diff without committing.",
+        "operationId": "post_preview",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Change"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "What this change would do",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "It names something that is not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The plan refuses it, with the field that caused it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/config/revert": {
+      "post": {
+        "tags": [
+          "config"
+        ],
+        "summary": "Put the previous committed configuration back — §2.4's **Undo save**.",
+        "operationId": "post_revert",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevertInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The previous configuration is back",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "That generation is not the one step this process kept",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/forecasts": {
+      "get": {
+        "tags": [
+          "services"
+        ],
+        "summary": "Forecasts and alerts.",
+        "description": "Its own resource rather than `/services/aerisweather`, and the reason is §4.4's: an\naccount with a client-id pair and a station list has no field in common with an upload\naccount's interval, endpoint and APRS symbols, so one union would be an object with every\nfield optional. §1.4's mapping is honoured by the *page*, which is one page under \"Share\nmy data\" either way.",
+        "operationId": "get_forecasts",
+        "responses": {
+          "200": {
+            "description": "The forecast account",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForecastsView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No forecast account is configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "services"
+        ],
+        "summary": "Turn forecasts and alerts on, off, or change their settings.",
+        "operationId": "put_forecasts",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForecastsInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved, with what starts or restarts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The page has problems, by field",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "services"
+        ],
+        "summary": "Stop fetching forecasts and forget the account.",
+        "operationId": "delete_forecasts",
+        "responses": {
+          "200": {
+            "description": "Stopped, with what stops",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/logs": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "The log rings.",
+        "operationId": "get_logs",
+        "parameters": [
+          {
+            "name": "stream",
+            "in": "query",
+            "description": "app, access, or omitted for both merged",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "How many entries; capped at 2000",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The newest entries, oldest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogsView"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runtime/components": {
+      "get": {
+        "tags": [
+          "runtime"
+        ],
+        "summary": "Every component's status.",
+        "operationId": "get_components",
+        "responses": {
+          "200": {
+            "description": "Every component",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComponentsView"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runtime/components/{id}": {
+      "get": {
+        "tags": [
+          "runtime"
+        ],
+        "summary": "One component's status.",
+        "operationId": "get_component",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The component's internal id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The component",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComponentView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The plan has no component with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runtime/components/{id}/restart": {
+      "post": {
+        "tags": [
+          "runtime"
+        ],
+        "summary": "Cancel a component and create it again.",
+        "description": "§2.6: `run-now` and `restart` are safe and reversible, and a general \"stop this\ncomponent\" button is **not** offered -- it would create a running state no configuration\ndescribes (W5 Decision 22). Turning something off is a configuration change, on the page\nthat owns it.",
+        "operationId": "post_restart",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The component's internal id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Restarting, with the component's state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComponentView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The plan has no component with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The supervisor is shutting down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runtime/components/{id}/run-now": {
+      "post": {
+        "tags": [
+          "runtime"
+        ],
+        "summary": "Run a scheduled component now, in addition to its schedule.",
+        "description": "Deduplicated by occurrence key, so a double-click runs it once.",
+        "operationId": "post_run_now",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The component's internal id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Queued, with the component's state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComponentView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The plan has no component with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "It has no occurrence to run, or it is not live",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runtime/log-level": {
+      "post": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Change the log level at run time, or put it back (**D-52**).",
+        "operationId": "post_log_level",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LogLevelInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The filter now in force",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogLevelsView"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "This build's logging cannot be reconfigured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "That is not a valid filter",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runtime/log-levels": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "The standing log-level override.",
+        "operationId": "get_log_levels",
+        "responses": {
+          "200": {
+            "description": "The filter in force",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogLevelsView"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runtime/summary": {
+      "get": {
+        "tags": [
+          "runtime"
+        ],
+        "summary": "One root cause, not five outages.",
+        "operationId": "get_summary",
+        "responses": {
+          "200": {
+            "description": "The root-cause rollup Home renders",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SummaryView"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/services": {
+      "get": {
+        "tags": [
+          "services"
+        ],
+        "summary": "Every upload service.",
+        "operationId": "get_services",
+        "responses": {
+          "200": {
+            "description": "Every upload service",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesView"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/services/{service}": {
+      "get": {
+        "tags": [
+          "services"
+        ],
+        "summary": "One upload service.",
+        "operationId": "get_service",
+        "parameters": [
+          {
+            "name": "service",
+            "in": "path",
+            "description": "wunderground, pwsweather or aprs",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The service",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "That service has no account configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "services"
+        ],
+        "summary": "Turn an upload service on, off, or change its settings.",
+        "description": "There is no \"add a controller\": creating a service **is** this `PUT` (§1.4).",
+        "operationId": "put_service",
+        "parameters": [
+          {
+            "name": "service",
+            "in": "path",
+            "description": "wunderground, pwsweather or aprs",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServiceInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved, with what starts or restarts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The page has problems, by field",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "services"
+        ],
+        "summary": "Stop sharing with an upload service, and forget its account.",
+        "operationId": "delete_service",
+        "parameters": [
+          {
+            "name": "service",
+            "in": "path",
+            "description": "wunderground, pwsweather or aprs",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stopped, with what stops",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "That service has no account configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stations": {
+      "get": {
+        "tags": [
+          "stations"
+        ],
+        "summary": "Every weather station.",
+        "operationId": "get_stations",
+        "responses": {
+          "200": {
+            "description": "Every station",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StationsView"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "stations"
+        ],
+        "summary": "Add a weather station.",
+        "operationId": "post_station",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StationInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Added, with what restarted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The form has problems, by field",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stations/{key}": {
+      "get": {
+        "tags": [
+          "stations"
+        ],
+        "summary": "One weather station.",
+        "operationId": "get_station",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "The station's identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The station",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StationView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No station has that identifier",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "stations"
+        ],
+        "summary": "Change a weather station's settings.",
+        "operationId": "put_station",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "The station's identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StationInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved, with what restarts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No station has that identifier",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The form has problems, by field",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "stations"
+        ],
+        "summary": "Delete a weather station.",
+        "description": "The consequences the confirmation dialog shows (§8.7) come from\n`POST /api/v1/config/preview` with the same change, so they cannot drift from what this\ndoes.",
+        "operationId": "delete_station",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "The station's identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted, with what stops",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No station has that identifier",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stations/{key}/secret": {
+      "delete": {
+        "tags": [
+          "stations"
+        ],
+        "summary": "Forget a station's stored protocol secret.",
+        "description": "Its own route rather than a field on the form, because omitting a credential means \"keep\nthe stored one\" everywhere else in this API -- no response returns a secret to retype, so\ntreating an absent field as a clear would erase a working credential on every save.",
+        "operationId": "delete_station_secret",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "The station's identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Forgotten",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No station has that identifier",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/storage": {
+      "get": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Where readings are kept.",
+        "operationId": "get_storage",
+        "responses": {
+          "200": {
+            "description": "The weather database, if one is configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageView"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Set up the weather database.",
+        "operationId": "post_storage",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StorageInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Set, with what starts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The connection address is not usable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/storage/{id}": {
+      "get": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "The weather database, by id.",
+        "description": "§1.3 notes that the Go surface has no by-id read for storage while weather stations and\nwebsites have one, and that the new surface removes the inconsistency. It removes it by\n**having** the route rather than by pretending there can be two.",
+        "operationId": "get_storage_by_id",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Always 1 — there is one weather database",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The weather database",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "There is no weather database with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Change the weather database's connection.",
+        "description": "A connection the database **rejects** is still a legitimate save (§7.2): the database may\nbe down or about to be reconfigured, so the save succeeds, `db:postgres` moves to\n`Backoff`, and §2.4's banner ⑤ reports it. Conflating \"I can't reach it\" with \"that input\nis invalid\" is how a UI ends up refusing to let an operator fix a configuration while the\nthing it configures is down.",
+        "operationId": "put_storage",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Always 1 — there is one weather database",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StorageInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved, with what restarts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "There is no weather database with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The connection address is not usable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Stop saving readings to a weather database.",
+        "operationId": "delete_storage",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Always 1 — there is one weather database",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Removed, with what stops",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "There is no weather database with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/system/info": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "This process and this host.",
+        "operationId": "get_system_info",
+        "responses": {
+          "200": {
+            "description": "This machine",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemInfoView"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/system/serial-ports": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Every serial port a station could be plugged into.",
+        "operationId": "get_serial_ports",
+        "responses": {
+          "200": {
+            "description": "Every serial port found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SerialPortsView"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The devices could not be listed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/website-server": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Where this node listens.",
+        "description": "One resource for both pages that edit it, because it is one row. §1.4 splits the *screen*\n-- the public ports are \"Website & API\" and the management address, port and certificate\nare `System → Advanced` -- and two routes writing one row would mean one page's save\nsilently rewriting the other page's fields with whatever it last read.",
+        "operationId": "get_website_server",
+        "responses": {
+          "200": {
+            "description": "Where this node listens",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListenerView"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Change where this node listens.",
+        "operationId": "put_website_server",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListenerInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved, with what restarts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The form has problems, by field",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/websites": {
+      "get": {
+        "tags": [
+          "websites"
+        ],
+        "summary": "Every website.",
+        "operationId": "get_websites",
+        "responses": {
+          "200": {
+            "description": "Every website",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebsitesView"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "websites"
+        ],
+        "summary": "Add a website.",
+        "operationId": "post_website",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebsiteInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Added, with what starts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The form has problems, by field",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/websites/{id}": {
+      "get": {
+        "tags": [
+          "websites"
+        ],
+        "summary": "One website.",
+        "operationId": "get_website",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The website's id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The website",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebsiteView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No website has that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "websites"
+        ],
+        "summary": "Change a website's settings.",
+        "operationId": "put_website",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The website's id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebsiteInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved, with what restarts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No website has that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The form has problems, by field",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "websites"
+        ],
+        "summary": "Delete a website.",
+        "operationId": "delete_website",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The website's id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted, with what stops",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No website has that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/websites/{id}/radar": {
+      "post": {
+        "tags": [
+          "websites"
+        ],
+        "summary": "Turn on the weather radar map by recording its registration.",
+        "operationId": "post_radar",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The website's id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RadarInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Registered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No website has that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The registration is empty",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "websites"
+        ],
+        "summary": "Turn off the weather radar map and forget its registration.",
+        "operationId": "delete_radar",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The website's id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Withdrawn",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No website has that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Applied": {
+        "type": "object",
+        "description": "What a preview or a save answers with.\n\nOne type for both, because the client renders the same three things either way: whether\nit is acceptable, what it does, and what it is worth knowing. §2.4's `{ \"valid\": true,\n\"diff\": {...}, \"warnings\": [...] }` and §2.2's `{ \"generation\": 42, \"affects\": [...] }`\nare the same object seen twice.",
+        "required": [
+          "valid",
+          "generation",
+          "committed",
+          "diff",
+          "affects",
+          "warnings"
+        ],
+        "properties": {
+          "affects": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The ids a client watches `applied_generation` on to decide when the change is live\n(§2.2). The union of `start` and `restart`: a stopped component never reports an\napplied generation again, so waiting for one would wait forever."
+          },
+          "committed": {
+            "type": "boolean",
+            "description": "Whether the configuration was committed, or only tried."
+          },
+          "diff": {
+            "$ref": "#/components/schemas/PlanOutline",
+            "description": "What it does to the running component set."
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The configuration generation. On a save this is the **new** one; on a preview it is\nthe generation the preview was taken against, so a client can tell that the ground\nmoved under it.",
+            "minimum": 0
+          },
+          "valid": {
+            "type": "boolean",
+            "description": "Whether the configuration is acceptable. Always `true` on a `200`; a refusal is a\n`422` with [`crate::error::ErrorBody`], which carries the field paths."
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Consequences that do not block (§8.5)."
+          }
+        }
+      },
+      "Badge": {
+        "type": "object",
+        "description": "The badge a state gets, as §0.4's table names it.\n\nNote that the badge is **not** the state's own word: `Failed` is badged **Stopped** and\n`Stopped` is badged **Off**, because the only way an operator deliberately reaches\n`Stopped` is by turning something off — and a red \"Failed\" on something they switched off\nthemselves is the UI lying in the other direction.\n`String` rather than `&'static str`, even though every value is a literal: the badge is\ndeserialised by the generated TypeScript client's Rust-side counterpart in this\nrepository's own tests, and `Deserialize` cannot produce a `&'static str`.",
+        "required": [
+          "label",
+          "tone"
+        ],
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "The badge's text."
+          },
+          "tone": {
+            "type": "string",
+            "description": "Its tone: `info`, `success`, `warning`, `danger` or `neutral`."
+          }
+        }
+      },
+      "Blocked": {
+        "type": "object",
+        "description": "One thing a root cause is holding up.",
+        "required": [
+          "display",
+          "href"
+        ],
+        "properties": {
+          "display": {
+            "type": "string",
+            "description": "What it is on screen."
+          },
+          "href": {
+            "type": "string",
+            "description": "Where to look at it."
+          }
+        }
+      },
+      "Blocker": {
+        "type": "object",
+        "description": "What is blocking a component, named as the thing it is.",
+        "required": [
+          "provider_display"
+        ],
+        "properties": {
+          "href": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where to go to look at it, when it has a page."
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The provider's internal id, when the plan names one. For keying and deep links."
+          },
+          "provider_display": {
+            "type": "string",
+            "description": "What it is, on screen: \"the weather database\", not `ReadingStore`."
+          }
+        }
+      },
+      "Change": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Add or update a weather station.",
+            "required": [
+              "station",
+              "change"
+            ],
+            "properties": {
+              "change": {
+                "type": "string",
+                "enum": [
+                  "put_station"
+                ]
+              },
+              "key": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Which station. Absent on a create, where [`StationInput::key`] carries it."
+              },
+              "station": {
+                "$ref": "#/components/schemas/StationInput",
+                "description": "The form's values."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Delete a weather station.",
+            "required": [
+              "key",
+              "change"
+            ],
+            "properties": {
+              "change": {
+                "type": "string",
+                "enum": [
+                  "delete_station"
+                ]
+              },
+              "key": {
+                "type": "string",
+                "description": "Which station."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Clear a station's stored protocol secret.",
+            "required": [
+              "key",
+              "change"
+            ],
+            "properties": {
+              "change": {
+                "type": "string",
+                "enum": [
+                  "clear_station_secret"
+                ]
+              },
+              "key": {
+                "type": "string",
+                "description": "Which station."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Add or update a website.",
+            "required": [
+              "website",
+              "change"
+            ],
+            "properties": {
+              "change": {
+                "type": "string",
+                "enum": [
+                  "put_website"
+                ]
+              },
+              "id": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "description": "Which website. Absent on a create."
+              },
+              "website": {
+                "$ref": "#/components/schemas/WebsiteInput",
+                "description": "The form's values."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Delete a website.",
+            "required": [
+              "id",
+              "change"
+            ],
+            "properties": {
+              "change": {
+                "type": "string",
+                "enum": [
+                  "delete_website"
+                ]
+              },
+              "id": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Which website."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Record a radar registration.",
+            "required": [
+              "id",
+              "radar",
+              "change"
+            ],
+            "properties": {
+              "change": {
+                "type": "string",
+                "enum": [
+                  "register_radar"
+                ]
+              },
+              "id": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Which website."
+              },
+              "radar": {
+                "$ref": "#/components/schemas/RadarInput",
+                "description": "The registration."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Withdraw a radar registration.",
+            "required": [
+              "id",
+              "change"
+            ],
+            "properties": {
+              "change": {
+                "type": "string",
+                "enum": [
+                  "unregister_radar"
+                ]
+              },
+              "id": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Which website."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Set the weather database's connection.",
+            "required": [
+              "storage",
+              "change"
+            ],
+            "properties": {
+              "change": {
+                "type": "string",
+                "enum": [
+                  "put_storage"
+                ]
+              },
+              "storage": {
+                "$ref": "#/components/schemas/StorageInput",
+                "description": "The connection."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Remove the weather database.",
+            "required": [
+              "change"
+            ],
+            "properties": {
+              "change": {
+                "type": "string",
+                "enum": [
+                  "delete_storage"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Turn an upload service on, off, or change its settings.",
+            "required": [
+              "service",
+              "settings",
+              "change"
+            ],
+            "properties": {
+              "change": {
+                "type": "string",
+                "enum": [
+                  "put_service"
+                ]
+              },
+              "service": {
+                "type": "string",
+                "description": "Which service: `wunderground`, `pwsweather` or `aprs`."
+              },
+              "settings": {
+                "$ref": "#/components/schemas/ServiceInput",
+                "description": "The page's values."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Stop sharing with an upload service, and forget its account.",
+            "required": [
+              "service",
+              "change"
+            ],
+            "properties": {
+              "change": {
+                "type": "string",
+                "enum": [
+                  "delete_service"
+                ]
+              },
+              "service": {
+                "type": "string",
+                "description": "Which service."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Turn forecasts and alerts on, off, or change their settings.",
+            "required": [
+              "forecasts",
+              "change"
+            ],
+            "properties": {
+              "change": {
+                "type": "string",
+                "enum": [
+                  "put_forecasts"
+                ]
+              },
+              "forecasts": {
+                "$ref": "#/components/schemas/ForecastsInput",
+                "description": "The page's values."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Stop fetching forecasts and forget the account.",
+            "required": [
+              "change"
+            ],
+            "properties": {
+              "change": {
+                "type": "string",
+                "enum": [
+                  "delete_forecasts"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Change where this node listens.",
+            "required": [
+              "listener",
+              "change"
+            ],
+            "properties": {
+              "change": {
+                "type": "string",
+                "enum": [
+                  "put_listener"
+                ]
+              },
+              "listener": {
+                "$ref": "#/components/schemas/ListenerInput",
+                "description": "The form's values."
+              }
+            }
+          }
+        ],
+        "description": "Everything an operator can change, as one discriminated union.\n\nBoth `POST /api/v1/config/preview` and every mutating route construct one of these, which\nis what makes the preview and the save one code path. The discriminant is `change` so\nthat `openapi-typescript` emits a union the client narrows on rather than an object with\nevery field optional."
+      },
+      "ComponentView": {
+        "type": "object",
+        "description": "One component, as §2.3 returns it.",
+        "required": [
+          "id",
+          "display",
+          "state",
+          "badge",
+          "sentence",
+          "waiting_on",
+          "degraded",
+          "since",
+          "applied_generation",
+          "pending",
+          "schedule",
+          "counters",
+          "notes"
+        ],
+        "properties": {
+          "applied_generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The generation the **running instance** was built from (**D-53**).\n\nPer component, not global: a global \"configuration version applied\" would be wrong\nthe moment one component restarts and another does not, which is the common case,\nsince unchanged components are deliberately not touched.",
+            "minimum": 0
+          },
+          "badge": {
+            "$ref": "#/components/schemas/Badge",
+            "description": "The badge §0.4 gives that state. Note that it is not the state's own word: `failed`\nis badged **Stopped** and `stopped` is badged **Off**."
+          },
+          "counters": {
+            "$ref": "#/components/schemas/CountersView",
+            "description": "Its counters."
+          },
+          "degraded": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Which soft requirements are unavailable, as things. Empty is the ordinary case — and\na degraded component **is running and serving** (W2a Decision 27)."
+          },
+          "display": {
+            "$ref": "#/components/schemas/Display",
+            "description": "What it is called on screen — the server does the translation, once (**D-36**)."
+          },
+          "id": {
+            "type": "string",
+            "description": "The internal id. **Never rendered raw** outside `System → Advanced`; it travels for\nkeying, deep links and support."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last error, with its full cause chain (**D-34**), for the Details disclosure."
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "§0.4's counter sentences, each already filtered by its own \"shown when\" condition."
+          },
+          "pending": {
+            "type": "boolean",
+            "description": "Whether this component is still catching up with the change that was just saved.\n\n§2.2's derived fact, computed here as well as being computable by the client: the\ncomparison is the whole mechanism, and a server that reports the integers but not\ntheir relation invites five clients to re-derive it five ways.\n\n**Scoped to the components the newest change affects** ([`Awaiting`]), not to every\ncomponent below the newest generation. An unchanged component is deliberately not\ntouched, so it is not behind -- it was never asked to move."
+          },
+          "retry_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the next retry happens, for a `backoff` state.\n\nAn **absolute timestamp**, because W5 **D-46** makes the only client-side timer a\ncountdown rendering one of these: a server-supplied \"12 seconds\" is wrong by the time\nit is painted."
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/ScheduleView",
+            "description": "Its schedule."
+          },
+          "sentence": {
+            "type": "string",
+            "description": "The sentence §0.4 gives that state, in the operator's words."
+          },
+          "since": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Since when it has been in this state."
+          },
+          "state": {
+            "type": "string",
+            "description": "The lifecycle state's one word: `planned`, `waiting`, `starting`, `running`,\n`failed`, `backoff`, `finished`, `stopping`, `stopped`."
+          },
+          "waiting_on": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Blocker"
+            },
+            "description": "What it is waiting for, as things rather than capabilities."
+          }
+        }
+      },
+      "ComponentsView": {
+        "type": "object",
+        "description": "§2.3's resource: every component, and the newest committed generation.",
+        "required": [
+          "generation",
+          "components"
+        ],
+        "properties": {
+          "components": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ComponentView"
+            },
+            "description": "Every component in the plan, in id order."
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The newest committed configuration generation.",
+            "minimum": 0
+          }
+        }
+      },
+      "ConfigView": {
+        "type": "object",
+        "description": "The whole configuration, with every secret omitted.\n\n`GET /api/v1/config` under `System → Advanced` only (§1.10). No ordinary screen fetches\nthis; the per-resource routes are projections of it.",
+        "required": [
+          "generation",
+          "listener",
+          "stations",
+          "websites",
+          "services"
+        ],
+        "properties": {
+          "forecasts": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ForecastsView",
+                "description": "Forecasts and alerts, if an account is configured."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The newest committed configuration generation (**D-53**). The integer every screen\ncompares a component's `applied_generation` against.",
+            "minimum": 0
+          },
+          "listener": {
+            "$ref": "#/components/schemas/ListenerView",
+            "description": "Where this node listens."
+          },
+          "node": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NodeView",
+                "description": "This node, if it has started before. `None` is a first start."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ServiceView"
+            },
+            "description": "Every upload service that has an account row."
+          },
+          "stations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StationView"
+            },
+            "description": "Every weather station, including the disabled ones."
+          },
+          "storage": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/StorageView",
+                "description": "The weather database, if one is configured."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "websites": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WebsiteView"
+            },
+            "description": "Every website, in id order."
+          }
+        }
+      },
+      "CountersView": {
+        "type": "object",
+        "description": "§2.3's per-component counters.",
+        "required": [
+          "runs_total",
+          "failed_total",
+          "skipped_total",
+          "deadline_exceeded_total",
+          "misfired_total",
+          "restart_total",
+          "lagged_total",
+          "stop_timeout_total"
+        ],
+        "properties": {
+          "deadline_exceeded_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Occurrences cancelled at their deadline.",
+            "minimum": 0
+          },
+          "failed_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Occurrences that failed.",
+            "minimum": 0
+          },
+          "lagged_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Readings this component was too slow to receive.",
+            "minimum": 0
+          },
+          "misfired_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Scheduled occurrences missed while the daemon was not running.",
+            "minimum": 0
+          },
+          "restart_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Times this component has been rebuilt.",
+            "minimum": 0
+          },
+          "runs_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Occurrences that ran, whatever the outcome.",
+            "minimum": 0
+          },
+          "skipped_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Occurrences skipped because the previous one was still going.",
+            "minimum": 0
+          },
+          "stop_timeout_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Stops that had to be forced.",
+            "minimum": 0
+          }
+        }
+      },
+      "Counts": {
+        "type": "object",
+        "description": "How many components are in each state.",
+        "required": [
+          "running",
+          "waiting",
+          "failed",
+          "backoff",
+          "off"
+        ],
+        "properties": {
+          "backoff": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Waiting out a retry delay.",
+            "minimum": 0
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Failed.",
+            "minimum": 0
+          },
+          "off": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Stopped, finished, or not started.",
+            "minimum": 0
+          },
+          "running": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Live.",
+            "minimum": 0
+          },
+          "waiting": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Waiting on something.",
+            "minimum": 0
+          }
+        }
+      },
+      "Credential": {
+        "type": "object",
+        "description": "Whether a credential is stored, which is the only thing any endpoint says about one.\n\nA unit-like struct rather than a bare `bool` so that the schema -- and therefore the\ngenerated TypeScript -- carries the reason, and so that a field of this type cannot be\nconfused with a feature toggle by a reader of either side.",
+        "required": [
+          "is_set"
+        ],
+        "properties": {
+          "is_set": {
+            "type": "boolean",
+            "description": "Whether something is stored. Never what."
+          }
+        }
+      },
+      "Display": {
+        "type": "object",
+        "description": "What a component is called on screen.",
+        "required": [
+          "name",
+          "section",
+          "href"
+        ],
+        "properties": {
+          "href": {
+            "type": "string",
+            "description": "The page that owns it."
+          },
+          "name": {
+            "type": "string",
+            "description": "What it is: \"Weather Underground\", \"Saving readings\", \"your Davis station\"."
+          },
+          "qualifier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which station or website it belongs to, when it belongs to one."
+          },
+          "section": {
+            "$ref": "#/components/schemas/Section",
+            "description": "Which part of the UI owns it."
+          }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "description": "The management API's error body.\n\n`summary` is the one plain line a banner shows when there is no field to attach to;\n`detail` is the technical half, which W5 §0.4 puts behind a **Details** disclosure rather\nthan on the screen. Both are present on every error so the client never has to decide\nwhich one it got.",
+        "required": [
+          "summary"
+        ],
+        "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The technical cause chain, for the disclosure. Empty when there is nothing more."
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FieldError"
+            },
+            "description": "Per-field problems, when the request's *values* are what is wrong."
+          },
+          "summary": {
+            "type": "string",
+            "description": "One plain sentence, for a banner."
+          }
+        }
+      },
+      "FieldError": {
+        "type": "object",
+        "description": "One problem with one field of a submitted form.\n\n`field` is a **path** into the request body -- `stations[0].hostname`, `interval_seconds`\n-- because that is what lets the client put the message beside the input. `message` is in\nthe operator's words and says what to type (§0.1): \"Enter a hostname or IP address.\", not\n\"invalid hostname\".",
+        "required": [
+          "field",
+          "message"
+        ],
+        "properties": {
+          "field": {
+            "type": "string",
+            "description": "Where in the submitted body the problem is.",
+            "example": "stations[0].hostname"
+          },
+          "message": {
+            "type": "string",
+            "description": "What is wrong, as a sentence that says what to do.",
+            "example": "Enter a hostname or IP address."
+          }
+        }
+      },
+      "ForecastsInput": {
+        "type": "object",
+        "description": "Forecasts and alerts, as their page submits them.",
+        "properties": {
+          "api_endpoint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An endpoint override."
+          },
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The account's client id."
+          },
+          "client_secret": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A new client secret. Omit to keep the stored one."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether to fetch forecasts and alerts."
+          },
+          "refresh_interval_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How often to refresh, in seconds."
+          },
+          "stations": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Which stations get forecasts and alerts."
+          }
+        }
+      },
+      "ForecastsView": {
+        "type": "object",
+        "description": "\"Forecasts & alerts\" — the Aeris account, named as a detail and not as the feature\n(§0.2).",
+        "required": [
+          "enabled",
+          "client_secret",
+          "stations"
+        ],
+        "properties": {
+          "api_endpoint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An endpoint override. `None` is the vendor's."
+          },
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The account's client id, which is not a secret on its own."
+          },
+          "client_secret": {
+            "$ref": "#/components/schemas/Credential",
+            "description": "Whether the client secret is stored."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether forecasts and alerts are being fetched."
+          },
+          "refresh_interval_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How often forecasts are refreshed, in seconds. `None` is the derived span/4."
+          },
+          "stations": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Which stations get forecasts and alerts."
+          }
+        }
+      },
+      "ListenerInput": {
+        "type": "object",
+        "description": "Where this node listens, as `System → Advanced` submits it.",
+        "required": [
+          "listen_addr",
+          "http_port",
+          "grpc_port",
+          "management_listen_addr",
+          "management_port"
+        ],
+        "properties": {
+          "grpc_port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The \"App & integration port\".",
+            "minimum": 0
+          },
+          "http_port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The public HTTP port.",
+            "minimum": 0
+          },
+          "https_port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The public HTTPS port.",
+            "minimum": 0
+          },
+          "listen_addr": {
+            "type": "string",
+            "description": "The address the public site binds."
+          },
+          "management_listen_addr": {
+            "type": "string",
+            "description": "The address this API binds."
+          },
+          "management_port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The port this API binds.",
+            "minimum": 0
+          },
+          "management_tls_cert_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "This API's certificate."
+          },
+          "management_tls_key_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "This API's key."
+          }
+        }
+      },
+      "ListenerView": {
+        "type": "object",
+        "description": "\"Website & API\" plus `System → Advanced`: where this node listens.\n\nThe `management` controller gets no page of its own (§1.4) — it is the thing the operator\nis looking at. Its address, port and certificate are here, where changing the port shows\nthe warning and the new URL; its `auth_token` does not exist under §3.",
+        "required": [
+          "listen_addr",
+          "http_port",
+          "grpc_port",
+          "management_listen_addr",
+          "management_bound_addr",
+          "management_port"
+        ],
+        "properties": {
+          "grpc_port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The \"App & integration port\" (§0.2) — where the phone app connects.",
+            "minimum": 0
+          },
+          "http_port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The public HTTP port.",
+            "minimum": 0
+          },
+          "https_port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The public HTTPS port, when one is configured. `Some` makes the HTTP port a redirect.",
+            "minimum": 0
+          },
+          "listen_addr": {
+            "type": "string",
+            "description": "The address the public site binds."
+          },
+          "management_bound_addr": {
+            "type": "string",
+            "description": "The address it is **actually** bound to.\n\nNot always [`ListenerView::management_listen_addr`]: until implementation-plan.md\n**M7-2** there is no authentication, so a configured non-loopback address is narrowed\nto `127.0.0.1`. Reported rather than left to the log, because §1.4's \"changing the\nport shows the new URL\" is only honest if the URL is where the API is."
+          },
+          "management_listen_addr": {
+            "type": "string",
+            "description": "The address this API binds. Loopback by default (**A-W5-3**)."
+          },
+          "management_port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The port this API binds.",
+            "minimum": 0
+          },
+          "management_tls_cert_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "This API's certificate.\n\nA **path**, not a credential, so it is returned — and it has to be, for\n[`StationView::aprs_callsign`]'s reason: a form that cannot prefill it writes `NULL`\nback, and an unrelated port change would silently turn off TLS on this API."
+          },
+          "management_tls_key_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "This API's key."
+          }
+        }
+      },
+      "LogEntry": {
+        "type": "object",
+        "description": "One log entry, already rendered.\n\n`message` is the formatted event and `causes` is its chain, rendered at the point it was\nrecorded (**D-34**) rather than reconstructed here. `fields` is flattened to strings\nbecause the log view shows them and does not compute on them — and because a `Value`\nunion in the schema would make the generated TypeScript a tagged union the log table has\nno use for.",
+        "required": [
+          "ts",
+          "level",
+          "stream",
+          "target",
+          "spans",
+          "message",
+          "causes",
+          "fields"
+        ],
+        "properties": {
+          "causes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Its cause chain."
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LogField"
+            },
+            "description": "Its structured fields, in the order the event recorded them."
+          },
+          "level": {
+            "type": "string",
+            "description": "`ERROR`, `WARN`, `INFO`, `DEBUG` or `TRACE`."
+          },
+          "message": {
+            "type": "string",
+            "description": "The formatted message."
+          },
+          "spans": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The spans it happened inside, outermost first. This is what makes per-station\nfiltering possible at all (§5.4)."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Which ring it came from: `app` or `access`.\n\nW3 §5.7 keeps the two **rings** separate -- its eviction-asymmetry argument holds --\nand §1.8 merges the *presentation*, because correlating a 500 with the query that\nfailed is the whole job."
+          },
+          "target": {
+            "type": "string",
+            "description": "The event's target."
+          },
+          "ts": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When."
+          }
+        }
+      },
+      "LogField": {
+        "type": "object",
+        "description": "One structured field on a log entry.\n\nA named pair rather than a `(String, String)` tuple or a map, and each alternative is\nrejected for its own reason: a tuple becomes a positional array in the schema, which is a\nshape with no name on either side of the wire, and a map loses the order the event\nrecorded its fields in -- which is the order the log table shows them in.",
+        "required": [
+          "name",
+          "value"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The field's name."
+          },
+          "value": {
+            "type": "string",
+            "description": "Its value, rendered."
+          }
+        }
+      },
+      "LogLevelInput": {
+        "type": "object",
+        "description": "What a log-level change submits.",
+        "properties": {
+          "directive": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The directive to install, or `null` to go back to the one the process started with."
+          }
+        }
+      },
+      "LogLevelsView": {
+        "type": "object",
+        "description": "A standing log-level override.",
+        "required": [
+          "directive"
+        ],
+        "properties": {
+          "directive": {
+            "type": "string",
+            "description": "The filter directive in force, in `RUST_LOG` syntax.\n\nCarried verbatim and **not** translated: a person turning on debug logging for one\nstation is reading documentation that uses this syntax, which is §0.3's test applied\nto a field only that person sees."
+          }
+        }
+      },
+      "LogsView": {
+        "type": "object",
+        "description": "What a read of the log rings returns.",
+        "required": [
+          "entries",
+          "dropped"
+        ],
+        "properties": {
+          "dropped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many entries the ring has evicted since the process started.\n\n§0.4 renders this as the **gap marker** in the log view rather than as a number in a\ncorner: \"{n} log entries dropped\" belongs where the gap is, because that is the\nquestion it answers.",
+            "minimum": 0
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LogEntry"
+            },
+            "description": "The entries, oldest first."
+          }
+        }
+      },
+      "Named": {
+        "type": "object",
+        "description": "A thing the configuration names, in the words a screen uses.\n\nReturned beside a change so that the **server** renders the vocabulary once (§2.3) rather\nthan every client doing it: `display.section` and `display.href` are what let the UI link\na consequence to the page that owns it without knowing the component model.",
+        "required": [
+          "id",
+          "display",
+          "section",
+          "href"
+        ],
+        "properties": {
+          "display": {
+            "type": "string",
+            "description": "What it is called on screen."
+          },
+          "href": {
+            "type": "string",
+            "description": "Where to go to see it."
+          },
+          "id": {
+            "type": "string",
+            "description": "The internal id. Travels for keying, deep links and support; rendered raw only inside\n`System → Advanced` (**D-36**)."
+          },
+          "section": {
+            "$ref": "#/components/schemas/Section",
+            "description": "Which part of the UI owns it."
+          }
+        }
+      },
+      "NodeView": {
+        "type": "object",
+        "description": "\"This machine\" — the node's own row.",
+        "required": [
+          "name",
+          "node_id",
+          "timezone",
+          "spool_path",
+          "spool_ceiling_bytes",
+          "spool_max_lag_seconds"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The node's name."
+          },
+          "node_id": {
+            "type": "string",
+            "description": "The node's identity, as a UUID string."
+          },
+          "spool_ceiling_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The spool's ceiling in bytes."
+          },
+          "spool_max_lag_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How far behind the spool is allowed to get, in seconds."
+          },
+          "spool_path": {
+            "type": "string",
+            "description": "Where unsent readings are kept."
+          },
+          "timezone": {
+            "type": "string",
+            "description": "The deployment time zone, for components not scoped to a station."
+          }
+        }
+      },
+      "PairingInput": {
+        "type": "object",
+        "description": "One station a service is turned on for.",
+        "required": [
+          "station_key"
+        ],
+        "properties": {
+          "remote_station_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "That station's identifier at the far end."
+          },
+          "station_key": {
+            "type": "string",
+            "description": "Which station."
+          }
+        }
+      },
+      "PairingView": {
+        "type": "object",
+        "description": "One station this service is turned on for.",
+        "required": [
+          "station_key"
+        ],
+        "properties": {
+          "remote_station_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "That station's identifier at the far end -- a Weather Underground or PWS Weather\nstation id. A property of the pairing, not of the account."
+          },
+          "station_key": {
+            "type": "string",
+            "description": "Which station."
+          }
+        }
+      },
+      "PlanOutline": {
+        "type": "object",
+        "description": "What a change does to the running component set.\n\n§2.4's `diff`, with one difference in naming that is worth being explicit about:\n`PlanDiff`'s words are `added`/`removed`/`changed`, and this resource's are\n`start`/`stop`/`restart`, because those are what the operator is being asked to agree to.\n`unchanged` is a **count** rather than a list for the same reason — twenty-seven things\nnot happening is one fact.",
+        "required": [
+          "start",
+          "stop",
+          "restart",
+          "unchanged"
+        ],
+        "properties": {
+          "restart": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Named"
+            },
+            "description": "Things whose configuration changed, which are stopped and started again."
+          },
+          "start": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Named"
+            },
+            "description": "Things that do not exist yet and will."
+          },
+          "stop": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Named"
+            },
+            "description": "Things that exist and will not."
+          },
+          "unchanged": {
+            "type": "integer",
+            "description": "How many are left exactly as they are. **Not touched** — which is what makes \"saving\na website no longer disturbs the APRS schedule\" observable rather than asserted.",
+            "minimum": 0
+          }
+        }
+      },
+      "RadarInput": {
+        "type": "object",
+        "description": "A radar registration, as \"Turn on the weather radar map\" submits it.",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "The token the registration returned. Write-only: no response returns it (§1.5)."
+          }
+        }
+      },
+      "RevertInput": {
+        "type": "object",
+        "description": "`POST /api/v1/config/revert`.",
+        "required": [
+          "to_generation"
+        ],
+        "properties": {
+          "to_generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Which generation to go back to. One step only, and only within this process's life.",
+            "minimum": 0
+          }
+        }
+      },
+      "RootCause": {
+        "type": "object",
+        "description": "One underlying problem, and everything waiting on it.",
+        "required": [
+          "id",
+          "display",
+          "state",
+          "message",
+          "since",
+          "blocking"
+        ],
+        "properties": {
+          "blocking": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Blocked"
+            },
+            "description": "Everything that is waiting on this, directly or through something else."
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The technical half, for the Details disclosure."
+          },
+          "display": {
+            "type": "string",
+            "description": "What it is on screen."
+          },
+          "id": {
+            "type": "string",
+            "description": "The internal id."
+          },
+          "message": {
+            "type": "string",
+            "description": "One plain sentence: \"Can't connect to the weather database. Retrying in 12 seconds.\""
+          },
+          "retry_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the next retry happens, for the client's countdown (**D-46**)."
+          },
+          "since": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Since when."
+          },
+          "state": {
+            "type": "string",
+            "description": "Its state's one word."
+          },
+          "unaffected_note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What is **still working**, when anything is.\n\nNot reassurance padding: W3 §2a.6's measured result is that `/latest` is served from\nthe in-memory snapshot and is untouched by a database outage, and this is exactly the\nthing an operator cannot currently determine during an incident. Computed from the\nlistener's and the frozen surface's actual states rather than asserted, so it cannot\nclaim the website is up while it is down."
+          }
+        }
+      },
+      "ScheduleView": {
+        "type": "object",
+        "description": "One component's schedule state.\n\n**Real, not inferred.** W2a §1.3 puts the clock in the supervisor, so these are state;\ntoday they are local variables inside `for { select { case <-ticker.C: } }` loops and are\nnot observable at all.",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "The trigger's kind: `Every`, `Calendar`, `OnReading`, `OnStartup`, `Service`,\n`OnDemand`. Internal vocabulary, carried for the Advanced view and for keying; the\nsentence beside it is what a screen renders (**D-36**)."
+          },
+          "last_outcome": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How that went: `ok`, `failed`, `skipped` or `deadline_exceeded`."
+          },
+          "last_run": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When it last ran."
+          },
+          "next_run": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When it runs next."
+          },
+          "period_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The period in seconds, where the trigger has one.",
+            "minimum": 0
+          },
+          "sentence": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The sentence: \"Runs every 10 minutes.\" `None` for `OnDemand`, which is a button\nrather than a schedule (§0.4)."
+          }
+        }
+      },
+      "Section": {
+        "type": "string",
+        "description": "Which part of the UI owns a thing.\n\n§2.3's list exactly. A closed enum rather than a string because the client switches on\nit to choose a navigation group, and a typo would be a silently unreachable screen.",
+        "enum": [
+          "home",
+          "stations",
+          "share",
+          "website",
+          "storage",
+          "system"
+        ]
+      },
+      "SerialPort": {
+        "type": "object",
+        "description": "One serial port the operator can pick.",
+        "required": [
+          "device"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What it is, if the kernel says: \"FTDI FT232R USB UART\". Shown beside the path,\nbecause `/dev/ttyUSB0` and `/dev/ttyUSB1` are indistinguishable without it."
+          },
+          "device": {
+            "type": "string",
+            "description": "The device path to store."
+          },
+          "stable_device": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A stable path that survives a reboot, where the kernel offers one.\n\nOffered because `/dev/ttyUSB0` is assigned in probe order: a Pi with a console and a\nTNC plugged in swaps them across a reboot, and the station silently reads the wrong\ndevice. The picker defaults to this where it exists."
+          }
+        }
+      },
+      "SerialPortsView": {
+        "type": "object",
+        "description": "What `GET /api/v1/system/serial-ports` returns.",
+        "required": [
+          "ports"
+        ],
+        "properties": {
+          "ports": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SerialPort"
+            },
+            "description": "Every port found, by path."
+          }
+        }
+      },
+      "ServiceInput": {
+        "type": "object",
+        "description": "One upload service, as its page submits it — the account and its stations together.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "api_endpoint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An endpoint override."
+          },
+          "api_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A new API key. Omit to keep the stored one."
+          },
+          "aprs_comment": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The APRS status comment."
+          },
+          "aprs_kiss_destination": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The KISS destination callsign."
+          },
+          "aprs_kiss_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The digipeater path."
+          },
+          "aprs_kiss_serial_baud": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The KISS TNC's baud rate."
+          },
+          "aprs_kiss_serial_device": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The KISS TNC's serial device."
+          },
+          "aprs_kiss_tcp_address": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The KISS-over-TCP address."
+          },
+          "aprs_server": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The APRS-IS server."
+          },
+          "aprs_symbol_code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The APRS symbol code character."
+          },
+          "aprs_symbol_table": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The APRS symbol table character."
+          },
+          "aprs_transport": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`aprs-is`, `kiss-serial` or `kiss-tcp`."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether it is on."
+          },
+          "interval_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How often it uploads, in seconds. Omit for the service's default."
+          },
+          "name": {
+            "type": "string",
+            "description": "The account's name, which is the stable suffix of its component ids."
+          },
+          "passcode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A new APRS passcode. Omit to keep the stored one."
+          },
+          "stations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PairingInput"
+            },
+            "description": "Which stations this service is on for. Replaces the whole set."
+          }
+        }
+      },
+      "ServiceView": {
+        "type": "object",
+        "description": "One upload service — a page under \"Share my data\".\n\nThere is no \"add a controller\" action and no list of controllers (§1.4): creating a\nservice is \"turn on Weather Underground for this station\", which is a `PUT` to this\nresource.",
+        "required": [
+          "service",
+          "display",
+          "name",
+          "enabled",
+          "api_key",
+          "passcode",
+          "stations"
+        ],
+        "properties": {
+          "api_endpoint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An endpoint override. `None` is the vendor's."
+          },
+          "api_key": {
+            "$ref": "#/components/schemas/Credential",
+            "description": "Whether an API key is stored."
+          },
+          "aprs_comment": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The APRS status comment."
+          },
+          "aprs_kiss_destination": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The KISS destination callsign."
+          },
+          "aprs_kiss_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The digipeater path. Keeps its name (§0.3): it is the word on the licence."
+          },
+          "aprs_kiss_serial_baud": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The KISS TNC's baud rate."
+          },
+          "aprs_kiss_serial_device": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The KISS TNC's serial device."
+          },
+          "aprs_kiss_tcp_address": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The KISS-over-TCP address."
+          },
+          "aprs_server": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The APRS-IS server."
+          },
+          "aprs_symbol_code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The APRS symbol code character."
+          },
+          "aprs_symbol_table": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The APRS symbol table character."
+          },
+          "aprs_transport": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`aprs-is`, `kiss-serial` or `kiss-tcp`."
+          },
+          "display": {
+            "type": "string",
+            "description": "What it is called on screen: \"Weather Underground\", \"PWS Weather\", \"APRS / CWOP\"."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether it is on."
+          },
+          "interval_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How often it uploads, in seconds. `None` is the kind's default."
+          },
+          "name": {
+            "type": "string",
+            "description": "The account's name, which is also the stable suffix of its component ids."
+          },
+          "passcode": {
+            "$ref": "#/components/schemas/Credential",
+            "description": "Whether an APRS passcode is stored. The **callsign** is on the station, because it is\npublic identity printed on every packet."
+          },
+          "service": {
+            "type": "string",
+            "description": "`wunderground`, `pwsweather` or `aprs` -- the path segment."
+          },
+          "stations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PairingView"
+            },
+            "description": "Which stations this service is on for."
+          }
+        }
+      },
+      "ServicesView": {
+        "type": "object",
+        "description": "`GET /api/v1/services`.",
+        "required": [
+          "generation",
+          "services"
+        ],
+        "properties": {
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The newest committed configuration generation.",
+            "minimum": 0
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ServiceView"
+            },
+            "description": "Every upload service that has an account."
+          }
+        }
+      },
+      "StationInput": {
+        "type": "object",
+        "description": "A weather station, as the \"Add a station\" and \"Station settings\" forms submit it.",
+        "required": [
+          "name",
+          "kind",
+          "identity_kind"
+        ],
+        "properties": {
+          "altitude_m": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Metres."
+          },
+          "aprs_callsign": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The APRS callsign — public identity, printed on every packet."
+          },
+          "collecting": {
+            "type": "boolean",
+            "description": "The \"Collecting readings\" toggle."
+          },
+          "identity_kind": {
+            "type": "string",
+            "description": "How a frame's station identity is resolved."
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The domain identity. Required on a create and ignored on an update — the path\nsegment is what identifies the row, and the key is not renameable."
+          },
+          "kind": {
+            "type": "string",
+            "description": "The hardware type."
+          },
+          "latitude": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Degrees north."
+          },
+          "longitude": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Degrees east."
+          },
+          "name": {
+            "type": "string",
+            "description": "What the operator calls it."
+          },
+          "poll_interval_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How often a WeatherLink Live unit is polled, in seconds."
+          },
+          "presented_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The identifier a non-`fixed` station presents."
+          },
+          "protocol_secret": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A new protocol secret. Omit to keep the stored one."
+          },
+          "sensor_mapping": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "\"Which sensor is which\", as the resolved mapping."
+          },
+          "snow_base_distance_mm": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "The distance a snow gauge reads with no snow under it, in millimetres."
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An IANA time-zone name."
+          },
+          "transport": {
+            "$ref": "#/components/schemas/TransportInput",
+            "description": "How it is connected."
+          },
+          "wind_dir_correction_degrees": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The vane's offset from north, in degrees."
+          }
+        }
+      },
+      "StationView": {
+        "type": "object",
+        "description": "One weather station, as a read returns it.",
+        "required": [
+          "key",
+          "id",
+          "name",
+          "kind",
+          "kind_display",
+          "collecting",
+          "identity_kind",
+          "protocol_secret",
+          "wind_dir_correction_degrees",
+          "transport",
+          "shared_with"
+        ],
+        "properties": {
+          "altitude_m": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Metres. The column's name carries its unit so the conversion cannot be done twice."
+          },
+          "aprs_callsign": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The APRS callsign — public identity, printed on every packet, which is why it is on\nthe station and not beside the passcode.\n\n**Returned**, unlike every credential on this type: a form that cannot prefill it\nwrites `NULL` back on the next save, and `plan()` then refuses the whole\nconfiguration while APRS is paired — a station that cannot be edited at all."
+          },
+          "collecting": {
+            "type": "boolean",
+            "description": "The \"Collecting readings\" toggle."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The surrogate integer the **frozen** contract returns as `stations[].id`. Carried\nhere because the UI deep-links the public site, which takes `?station_id=`."
+          },
+          "identity_kind": {
+            "type": "string",
+            "description": "How a frame's station identity is resolved: `fixed`, `from_path`, `from_query`,\n`from_payload` or `from_registration`."
+          },
+          "key": {
+            "type": "string",
+            "description": "The domain identity, and the id every path segment uses.\n\n**Not renameable.** It is the stable suffix of this station's component ids and the\nkey its history is stored under, so changing it would orphan the readings in the\nweather database -- a migration rather than an edit."
+          },
+          "kind": {
+            "type": "string",
+            "description": "The hardware type, in the frozen contract's spelling."
+          },
+          "kind_display": {
+            "type": "string",
+            "description": "What the hardware type is called on screen (§0.2) -- \"Snow depth sensor\", not\n`snowgauge`."
+          },
+          "latitude": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Degrees north."
+          },
+          "longitude": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Degrees east."
+          },
+          "name": {
+            "type": "string",
+            "description": "What the operator calls it."
+          },
+          "poll_interval_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How often a WeatherLink Live unit is polled, in seconds."
+          },
+          "presented_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The identifier a non-`fixed` station presents."
+          },
+          "protocol_secret": {
+            "$ref": "#/components/schemas/Credential",
+            "description": "Whether a protocol secret is stored for this station."
+          },
+          "sensor_mapping": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "\"Which sensor is which\", as the stored mapping (§1.6). Opaque here; the picker\nresolves templates client-side."
+          },
+          "shared_with": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Which services this station's readings are shared with, as the service keys.\n\nRead-only on the station page, which is **OQ-W5-4**'s resolution: the Go schema\nconfigures the same service in two places, and the UI's answer is one page per\nservice plus this line, which links there."
+          },
+          "snow_base_distance_mm": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "The distance a snow gauge reads with no snow under it, in millimetres."
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An IANA time-zone name. `None` is a station whose day boundaries happen in UTC."
+          },
+          "transport": {
+            "$ref": "#/components/schemas/TransportView",
+            "description": "How it is connected."
+          },
+          "wind_dir_correction_degrees": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The vane's offset from north, in degrees."
+          }
+        }
+      },
+      "StationsView": {
+        "type": "object",
+        "description": "`GET /api/v1/stations`.",
+        "required": [
+          "generation",
+          "stations"
+        ],
+        "properties": {
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The newest committed configuration generation.",
+            "minimum": 0
+          },
+          "stations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StationView"
+            },
+            "description": "Every station, including the disabled ones."
+          }
+        }
+      },
+      "StorageInput": {
+        "type": "object",
+        "description": "The weather database's connection, as its form submits it.",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The PostgreSQL URL. A credential, so it is write-only: no response returns it."
+          }
+        }
+      },
+      "StorageView": {
+        "type": "object",
+        "description": "The weather database — \"Data storage\" on screen, never \"TimescaleDB\" (§0.2).\n\n**Its absence is meaningful**, which is why this is an `Option` on [`ConfigView`] rather\nthan a row with empty fields: a node with no weather database has no `db:postgres` and\ntherefore no `writer:timescale` (**D-44**), and the screen says so.",
+        "required": [
+          "id",
+          "host",
+          "database",
+          "connection"
+        ],
+        "properties": {
+          "connection": {
+            "$ref": "#/components/schemas/Credential",
+            "description": "Whether a connection URL is stored. It is a credential, so that is all this says."
+          },
+          "database": {
+            "type": "string",
+            "description": "The database name the URL names."
+          },
+          "host": {
+            "type": "string",
+            "description": "The host the URL names, for the screen. **Not the URL**: it carries a password."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "There is one weather database, so one id. Carried because the route is\n`PUT /api/v1/storage/{id}` -- §1.3's note that the Go surface has no by-id read for\nstorage while stations and websites do is an inconsistency this surface removes by\n*having* the by-id route, not by pretending there can be two."
+          }
+        }
+      },
+      "SummaryView": {
+        "type": "object",
+        "description": "§2.5's resource: the root-cause rollup Home renders.",
+        "required": [
+          "generation",
+          "health",
+          "root_causes",
+          "counts",
+          "pending"
+        ],
+        "properties": {
+          "counts": {
+            "$ref": "#/components/schemas/Counts",
+            "description": "How many components are in each state."
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The newest committed configuration generation.",
+            "minimum": 0
+          },
+          "health": {
+            "type": "string",
+            "description": "`ok`, `degraded` or `broken`.\n\n**`broken` means the public website is not serving**, and nothing else does: that is\nthe one distinction an operator makes a different decision on. A failed uploader with\na healthy site is `degraded`, because the thing the owner's visitors see is up."
+          },
+          "pending": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many components have not yet caught up with [`SummaryView::generation`].\n\n§2.4's `ApplyBanner { count }`: \"Saved. 1 item is restarting…\". Zero is \"Saved and\nlive.\"",
+            "minimum": 0
+          },
+          "root_causes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RootCause"
+            },
+            "description": "One entry per underlying problem — not one per symptom."
+          }
+        }
+      },
+      "SystemInfoView": {
+        "type": "object",
+        "description": "`System → This machine`.",
+        "required": [
+          "version",
+          "target",
+          "hostname",
+          "os",
+          "started_at",
+          "uptime_seconds",
+          "pid"
+        ],
+        "properties": {
+          "hostname": {
+            "type": "string",
+            "description": "The host's name."
+          },
+          "os": {
+            "type": "string",
+            "description": "The operating system and release."
+          },
+          "pid": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The process id, which is what an operator needs to find it in `journalctl`.",
+            "minimum": 0
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When this process started."
+          },
+          "target": {
+            "type": "string",
+            "description": "The target triple it was built for."
+          },
+          "uptime_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How long it has been running, in seconds.",
+            "minimum": 0
+          },
+          "version": {
+            "type": "string",
+            "description": "This build's version."
+          }
+        }
+      },
+      "TransportInput": {
+        "type": "object",
+        "description": "How a station is reached, as a form submits it.",
+        "properties": {
+          "baud": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The baud rate."
+          },
+          "credential": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A transport credential. **Omit to keep the stored one**; no response ever returns it,\nso treating absence as a clear would erase a working credential on every save."
+          },
+          "device": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The serial port."
+          },
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The consumer group."
+          },
+          "host": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The host to dial."
+          },
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One of `serial`, `tcp_out`, `http_out`, `grpc_out`, `mqtt_sub`, `http_in`, `udp_in`.\nOmitted for a station a peer forwards readings for."
+          },
+          "method": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The HTTP method."
+          },
+          "mount": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The mount point an inbound transport listens on."
+          },
+          "port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The port to dial."
+          },
+          "streaming": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether this transport streams rather than polls."
+          },
+          "tls_ca_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The CA bundle to verify against."
+          },
+          "tls_cert_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "This end's certificate."
+          },
+          "tls_key_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "This end's key."
+          },
+          "topic": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The MQTT topic."
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The URL to poll or subscribe to."
+          }
+        }
+      },
+      "TransportView": {
+        "type": "object",
+        "description": "How a station is reached, as the operator configured it.\n\nFlat rather than a tagged union over the seven `transport_kind`s, because the form is:\nW5 §0.7 step 2 shows one \"How is it connected?\" picker and then the fields that kind\nneeds, and a discriminated union would make the client reconstruct the whole object to\nchange the picker. The schema's own `CHECK`s are what pair a kind with its columns.",
+        "required": [
+          "credential"
+        ],
+        "properties": {
+          "baud": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The baud rate. Keeps its name for §0.3's reason: the person holding the cable uses it."
+          },
+          "credential": {
+            "$ref": "#/components/schemas/Credential",
+            "description": "Whether a transport credential is stored. Never the credential."
+          },
+          "device": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The serial device path. \"Serial port\" keeps its name on screen (§0.3)."
+          },
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The consumer group, where the transport has one."
+          },
+          "host": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The host to dial."
+          },
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`serial`, `tcp_out`, `http_out`, `grpc_out`, `mqtt_sub`, `http_in` or `udp_in`.\n`None` is a station a peer forwards readings for -- inventory, not a component."
+          },
+          "method": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The HTTP method, where the transport takes one."
+          },
+          "mount": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The mount point an inbound transport listens on."
+          },
+          "port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The port to dial."
+          },
+          "streaming": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether this transport streams rather than polls."
+          },
+          "tls_ca_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The CA bundle this transport verifies against."
+          },
+          "tls_cert_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "This end's certificate."
+          },
+          "tls_key_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "This end's key."
+          },
+          "topic": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The MQTT topic or the mount point, per kind."
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The URL to poll or subscribe to."
+          }
+        }
+      },
+      "WebsiteInput": {
+        "type": "object",
+        "description": "A website, as its form submits it.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "about_station_html": {
+            "type": "string",
+            "description": "The \"about this station\" text, as HTML."
+          },
+          "air_quality_enabled": {
+            "type": "boolean",
+            "description": "Whether the air-quality panel is on."
+          },
+          "air_quality_station_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which station the air-quality panel reads."
+          },
+          "apple_app_id": {
+            "type": "string",
+            "description": "The App Store id for the `apple-itunes-app` tag."
+          },
+          "hostname": {
+            "type": "string",
+            "description": "The hostname it is served under. `\"\"` is the default website."
+          },
+          "is_default_tls": {
+            "type": "boolean",
+            "description": "Whether this site's certificate is the SNI fallback."
+          },
+          "is_portal": {
+            "type": "boolean",
+            "description": "Whether this is the portal."
+          },
+          "name": {
+            "type": "string",
+            "description": "What the operator calls it."
+          },
+          "page_title": {
+            "type": "string",
+            "description": "The `<title>`."
+          },
+          "primary_station_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The station the site shows when the request names none."
+          },
+          "snow_enabled": {
+            "type": "boolean",
+            "description": "Whether the snow panel is on."
+          },
+          "snow_station_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which station the snow panel reads."
+          },
+          "tls_cert_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "This site's certificate."
+          },
+          "tls_key_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "This site's key."
+          }
+        }
+      },
+      "WebsiteView": {
+        "type": "object",
+        "description": "One website, as a read returns it.",
+        "required": [
+          "id",
+          "name",
+          "hostname",
+          "page_title",
+          "about_station_html",
+          "snow_enabled",
+          "air_quality_enabled",
+          "is_portal",
+          "apple_app_id",
+          "radar_enabled",
+          "is_default_tls"
+        ],
+        "properties": {
+          "about_station_html": {
+            "type": "string",
+            "description": "The \"about this station\" text. **HTML**, not plain text."
+          },
+          "air_quality_enabled": {
+            "type": "boolean",
+            "description": "Whether the air-quality panel is on."
+          },
+          "air_quality_station_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which station the air-quality panel reads."
+          },
+          "apple_app_id": {
+            "type": "string",
+            "description": "The App Store id for the `apple-itunes-app` tag. Empty removes the tag."
+          },
+          "hostname": {
+            "type": "string",
+            "description": "The hostname it is served under. `\"\"` is the **default** website, which an unmatched\n`Host` resolves to."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The surrogate key."
+          },
+          "is_default_tls": {
+            "type": "boolean",
+            "description": "Whether this site's certificate is the SNI fallback."
+          },
+          "is_portal": {
+            "type": "boolean",
+            "description": "Whether this is the portal -- the one website `/api/stations` answers for."
+          },
+          "name": {
+            "type": "string",
+            "description": "What the operator calls it."
+          },
+          "page_title": {
+            "type": "string",
+            "description": "The `<title>`."
+          },
+          "primary_station_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The station the site shows when the request names none."
+          },
+          "radar_enabled": {
+            "type": "boolean",
+            "description": "Whether the weather radar map is turned on."
+          },
+          "radar_registered_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the radar was registered.\n\n**The token itself is never returned** (§1.5): the screen shows \"Registered on\n4 March 2026\" and a **Re-register** action."
+          },
+          "snow_enabled": {
+            "type": "boolean",
+            "description": "Whether the snow panel is on."
+          },
+          "snow_station_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which station the snow panel reads."
+          },
+          "tls_cert_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "This site's certificate."
+          },
+          "tls_key_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "This site's key."
+          }
+        }
+      },
+      "WebsitesView": {
+        "type": "object",
+        "description": "`GET /api/v1/websites`.",
+        "required": [
+          "generation",
+          "websites"
+        ],
+        "properties": {
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The newest committed configuration generation.",
+            "minimum": 0
+          },
+          "websites": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WebsiteView"
+            },
+            "description": "Every website, in id order."
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "config",
+      "description": "The configuration, the save preview and one step back"
+    },
+    {
+      "name": "stations",
+      "description": "My weather stations"
+    },
+    {
+      "name": "websites",
+      "description": "My website"
+    },
+    {
+      "name": "storage",
+      "description": "Data storage"
+    },
+    {
+      "name": "services",
+      "description": "Share my data"
+    },
+    {
+      "name": "runtime",
+      "description": "Configured versus running"
+    },
+    {
+      "name": "system",
+      "description": "System"
+    }
+  ]
+}

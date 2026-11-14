@@ -549,6 +549,300 @@ impl Drop for PtyBridge {
     }
 }
 
+/// A **real `ser2net`** fanning one character device out to several TCP clients, with a
+/// `socat` pty pair standing in for the station — GRA-787's apparatus.
+///
+/// This is the one piece of the station path that is neither a driver nor an emulator: it
+/// is the *bridge*, and M5-2's mechanism (b) on a serial station depends on a property of
+/// it that no amount of reading the documentation establishes. One serial line has one
+/// reader, so feeding two daemons the same readings means a multiplexer — and if
+/// that multiplexer hands bytes to whichever client reads first instead of broadcasting
+/// every byte to all of them, the two daemons silently split the stream and both produce
+/// gap-ridden data that still parses. `tests/serial_bridge.rs` is the assertion that it
+/// broadcasts; this is what that assertion runs against.
+///
+/// # Why the real binary and not a double
+///
+/// A hand-written fan-out would prove only that the test author can write one. The claim
+/// under test is about **`ser2net` 4.x's `max-connections`**, and `ser2net` is what
+/// `packaging/serial-bridge/` deploys — so the binary is the thing under test and a missing
+/// binary is a failure rather than a skip, the same rule [`PtyBridge`] follows for
+/// `socat`.
+///
+/// `SER2NET` overrides the executable, because the Debian package installs it in
+/// `/usr/sbin` and that is not on a non-root `PATH`. `GENSIO_LIBRARY_PATH` is gensio's own
+/// variable and is honoured by it directly: `serialdev` is a dynamically loaded module, so
+/// a `ser2net` whose gensio modules are somewhere unusual answers every connector with
+/// `Unknown gensio type: serialdev,…` while still listening on the port.
+///
+/// # Two things this apparatus does that a deployed configuration must not copy
+///
+/// **`nouucplock`.** gensio takes a uucp lock per device — one keyed by the path and one
+/// keyed by the device's *major.minor*, which for a `socat` pty is whichever `/dev/pts/N`
+/// it was handed. A `ser2net` killed with `SIGKILL`, which is what `kill_on_drop` does,
+/// leaves both behind; the next test gets the same `/dev/pts/N`, finds the stale lock, and
+/// answers its client `Device open failure: Object was already in use` while looking
+/// perfectly healthy. The lock is a real safeguard on a real port and stays on in
+/// `packaging/serial-bridge/ser2net.yaml.example` — with the consequence recorded there,
+/// because it
+/// is also why that unit must be stopped with `SIGTERM`.
+///
+/// **A guessed port.** A deployment's is fixed and in its configuration; this one is
+/// chosen per bridge so the tests may run beside each other.
+#[derive(Debug)]
+pub struct Ser2netBridge {
+    socat: tokio::process::Child,
+    ser2net: tokio::process::Child,
+    dir: std::path::PathBuf,
+    line_side: std::path::PathBuf,
+    station_side: std::path::PathBuf,
+    port: u16,
+}
+
+impl Ser2netBridge {
+    /// A bridge with `max_connections` client slots, on an ephemeral port.
+    ///
+    /// The station side is a pty: a line rate cannot be set on one, which is deliberate —
+    /// `crate::stream`'s module documentation has why that makes the pty the honest
+    /// stand-in for a bridge and not for a directly attached console.
+    ///
+    /// Returns once a throwaway client has **received a byte that this apparatus put into
+    /// this pty**, which is the only check that distinguishes a working bridge of ours from
+    /// a listener on a recycled port that belongs to something else.
+    pub async fn spawn(name: &str, max_connections: u32) -> Option<Self> {
+        let dir = std::env::temp_dir().join(format!(
+            "mw-ser2net-{}-{name}-{max_connections}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok()?;
+        let line_side = dir.join("line");
+        let station_side = dir.join("station");
+        let socat = tokio::process::Command::new("socat")
+            .arg(format!("PTY,raw,echo=0,link={}", line_side.display()))
+            .arg(format!("PTY,raw,echo=0,link={}", station_side.display()))
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut linked = false;
+        for _ in 0..200 {
+            if line_side.exists() && station_side.exists() {
+                linked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        if !linked {
+            return None;
+        }
+
+        let config = dir.join("ser2net.yaml");
+        let mut chosen = None;
+        for attempt in 0..8 {
+            // A guessed port, retried, rather than one the kernel chose.
+            //
+            // Binding zero and reading the port back is the usual trick and it is not
+            // available here: `ci/layers.toml`'s `only-mw-http-binds-a-socket` forbids this
+            // crate the listener types, and that rule is right — exactly one place in this
+            // system binds a listener. It costs nothing, because `ser2net` takes a port
+            // number in its configuration and could not have been handed a bound socket
+            // anyway, and because what ends this loop is not "the port was free" but the
+            // end-to-end check below: a byte this apparatus put into *this* pty coming out
+            // of a client of that port. A collision therefore retries rather than producing
+            // a test that reads someone else's stream.
+            //
+            // Below 32768, which is where Linux starts handing out ephemeral ports, so a
+            // guess here does not race the kernel's own allocation.
+            let port = 24_000
+                + (std::process::id() as u64)
+                    .wrapping_mul(2_654_435_761)
+                    .wrapping_add(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.subsec_nanos() as u64)
+                            .unwrap_or(0),
+                    )
+                    .wrapping_add(attempt * 997)
+                    % 8_000;
+            let port = port as u16;
+            std::fs::write(
+                &config,
+                format!(
+                    "%YAML 1.1\n\
+                     ---\n\
+                     connection: &{name}\n\
+                     \x20 accepter: tcp,127.0.0.1,{port}\n\
+                     \x20 connector: serialdev(nouucplock),{dev},19200n81,local\n\
+                     \x20 options:\n\
+                     \x20   max-connections: {max_connections}\n",
+                    dev = line_side.display(),
+                ),
+            )
+            .ok()?;
+            let mut ser2net = tokio::process::Command::new(
+                std::env::var("SER2NET").unwrap_or_else(|_| "ser2net".into()),
+            )
+            // `-n` keeps it in the foreground so that `kill_on_drop` reaches the process
+            // that holds the device; a daemonised `ser2net` would outlive the test and keep
+            // it.
+            .arg("-n")
+            .arg("-c")
+            .arg(&config)
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+            if answers(port).await {
+                let ours =
+                    match tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+                        .await
+                    {
+                        Ok(mut probe) => {
+                            let mut one: [&mut tokio::net::TcpStream; 1] = [&mut probe];
+                            deliver_sentinels(&station_side, &mut one).await
+                        }
+                        Err(_) => false,
+                    };
+                if ours {
+                    chosen = Some((ser2net, port));
+                    break;
+                }
+            }
+            let _ = ser2net.start_kill();
+            let _ = ser2net.wait().await;
+        }
+        let (ser2net, port) = chosen?;
+
+        Some(Self {
+            socat,
+            ser2net,
+            dir,
+            line_side,
+            station_side,
+            port,
+        })
+    }
+
+    /// The TCP port a client connects to.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The bridge as a station driver's `Transport`.
+    pub fn transport(&self) -> crate::transport::Transport {
+        crate::transport::Transport::TcpOut {
+            host: "127.0.0.1".into(),
+            port: self.port,
+            tls: None,
+        }
+    }
+
+    /// The character device the *bridge* owns — the near end of the pty pair, standing in
+    /// for the station's serial port. A test opens this to show that nothing else can.
+    pub fn line_side(&self) -> &std::path::Path {
+        &self.line_side
+    }
+
+    /// Block until every one of `clients` has had a byte from this pty delivered to it,
+    /// then drain them.
+    ///
+    /// **A test that skips this reads nothing and blames the bridge.** Two states have to
+    /// be reached before a byte written to the station side comes out of a client's socket,
+    /// and neither is observable from the client: the bridge opens the device on the *first*
+    /// client connection rather than at startup, and a byte that arrives while the device
+    /// is closed is dropped, because this is a fan-out and not a spool. So readiness is
+    /// established the only way that cannot be wrong — by delivering bytes — and the
+    /// sentinels are then drained so that what follows is only what the test sent.
+    ///
+    /// Pass **only the clients that are supposed to be wired**. A client beyond
+    /// `max_connections` never receives the stream, and draining it would throw away the
+    /// refusal a test wants to assert on.
+    pub async fn wait_until_delivering(&self, clients: &mut [&mut tokio::net::TcpStream]) -> bool {
+        deliver_sentinels(&self.station_side, clients).await
+    }
+
+    /// Push bytes down the line, as the datalogger would.
+    ///
+    /// Opened and closed per call so that a test can say when the bytes left the station.
+    pub fn feed(&self, bytes: &[u8]) -> std::io::Result<()> {
+        feed(&self.station_side, bytes)
+    }
+}
+
+impl Drop for Ser2netBridge {
+    fn drop(&mut self) {
+        // Immediate rather than at the next runtime poll: `ser2net` sets `TIOCEXCL` on the
+        // device, so a bridge that is still alive when the next test starts makes that
+        // test's `open(2)` fail with `EBUSY` rather than merely take a port.
+        let _ = self.ser2net.start_kill();
+        let _ = self.socat.start_kill();
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+/// The sentinel [`Ser2netBridge::wait_until_delivering`] pushes down the line.
+///
+/// A complete Campbell record rather than arbitrary bytes, so that a driver on the far side
+/// decodes it instead of counting it undecodable while the apparatus is still settling.
+/// Public because a test whose other client is a *driver* has to establish that client's
+/// readiness through its admissions, and so has to push the same bytes itself.
+pub const SENTINEL: &[u8] = b"{\"airtemp_f\":32.0,\"rh\":50.0}\n";
+
+fn feed(station_side: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut dev = std::fs::OpenOptions::new().write(true).open(station_side)?;
+    dev.write_all(bytes)?;
+    dev.flush()
+}
+
+/// [`Ser2netBridge::wait_until_delivering`]'s body, also used by `spawn` before there is a
+/// `Self` to call it on.
+async fn deliver_sentinels(
+    station_side: &std::path::Path,
+    clients: &mut [&mut tokio::net::TcpStream],
+) -> bool {
+    use tokio::io::AsyncReadExt;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut seen = vec![false; clients.len()];
+    while !seen.iter().all(|s| *s) {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        if feed(station_side, SENTINEL).is_err() {
+            return false;
+        }
+        for (i, client) in clients.iter_mut().enumerate() {
+            let mut buf = [0_u8; 4096];
+            if let Ok(Ok(n)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), client.read(&mut buf))
+                    .await
+            {
+                if n > 0 {
+                    seen[i] = true;
+                }
+            }
+        }
+    }
+    // Every sentinel is now accounted for, so a test's next read sees only what the test
+    // sent. Quiet rather than counted, because how many sentinels each client received
+    // depends on when it was wired.
+    for client in clients.iter_mut() {
+        let mut buf = [0_u8; 16 * 1024];
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), client.read(&mut buf)).await
+        {
+            if n == 0 {
+                break;
+            }
+        }
+    }
+    true
+}
+
 /// A [`StationRegistry`] that resolves one claim, for a test that needs the gate itself
 /// rather than a driver's view of it.
 #[derive(Debug)]

@@ -236,6 +236,76 @@ tests passed, because a filter that matches no tests exits zero and a gate that 
 green while running nothing is docs/reconciliation.md G-1."""
 
 [[gate]]
+id = "serial-bridge"
+description = "A `ser2net` fan-out broadcasts every byte to every client, with its controls"
+owner = "GRA-787 (the serial multiplexer); consumed by M5-2 mechanism (b)"
+arms_when = "packaging/serial-bridge/ser2net.yaml.example"
+cmd = ["ci/serial-bridge/prove.sh"]
+note = """
+M5-2's mechanism (b) diffs the two implementations by value on real data, which needs both
+daemons fed the same readings. The WeatherLink Live broadcasts over UDP and gives that away;
+the Campbell station is on a serial line, which has exactly one reader, so for that station
+(b) does not exist without the multiplexer this gate guards.
+
+The property is not that the multiplexer works -- it is that it BROADCASTS. A multiplexer
+that handed bytes to whichever client read first would leave both daemons with gap-ridden
+data that still parses, which is the worst available outcome because nothing downstream
+could tell it from weather. `ser2net`'s documentation says `max-connections` does the right
+thing; this gate is the measurement, byte for byte, with two negative controls (one
+misconfigured bridge, one unbridged character device read twice).
+
+`ser2net` and `socat` are hard requirements and the runner says so rather than skipping: the
+binary under test is the one `packaging/serial-bridge/` deploys, and a faked fan-out would
+prove only that its author can write one. The runner asserts the declared number of tests passed, because a
+`--ignored` filter that matches no tests exits zero and a gate that reports green while
+running nothing is docs/reconciliation.md G-1 -- the same rule `cargo xtask emulator-tests`
+applies.
+
+packaging/serial-bridge/README.md has what each test establishes, the cutover order the
+measurements require, and the two values on the box that no test here can confirm."""
+
+[[gate]]
+id = "diff-harness"
+description = "The M5-2 diff harness is green on a recorded pair and red on every injection"
+owner = "M5-2 (the diff harness); the two mechanisms it controls need two running systems"
+arms_when = "ci/diff/expected.toml"
+cmd = ["ci/diff/self-test.sh"]
+note = """
+M5-2's mechanisms (b) and (c) diff the two implementations by value on real data, which needs
+two running daemons, two databases and a live station -- so neither can be a CI gate. The
+DIFFER can: it needs only inputs, and ci/diff/recorded/ is a pair of them.
+
+This gate is the harness's own negative control. W1 D-10, which M5-2 restates as its test
+strategy: a differ that cannot be made to differ proves nothing. It asserts a clean run over
+the recorded pair is green, that a 1% error injected into one metric on EITHER side is red and
+names the metric, that an injection which moved nothing is refused rather than passed, and
+that a run whose tolerance has no reading count reports no_census instead of guessing one.
+
+The green half and the red half are both load-bearing and neither is a control alone: a
+harness that reported red on everything would pass the injections and be useless, and one
+that reported green on everything would pass the clean run.
+
+The recorded Rust side is DERIVED from the captured Go side by ci/diff/recorded/build.py,
+which applies exactly the deviations ci/diff/expected.toml predicts. So the gate also checks
+that derivation -- a corpus edited by hand would make the control pass for a reason nobody
+chose -- and a rule that drifted from its own prediction turns the gate red, because the
+manufactured difference would stop matching it.
+
+The test counts are declared in self-test.sh for the reason `cargo xtask db-tests` declares
+its names: a filter that matches no tests exits zero, and a gate that reports green while
+running nothing is docs/reconciliation.md G-1.
+
+ci/diff/README.md has how to run the two mechanisms, how to read the summary, and the two
+preconditions no test here can confirm -- that the two daemons are configured equivalently and
+that both databases hold the same readings over the window.
+
+THIS GATE IS CUTOVER-SCOPED AND IS MEANT TO BE DELETED. The owner's scoping, 2026-11-13: the
+two implementations have to be checked against each other once, as suncrestweather.com moves
+to the new service, and then the Go daemon is gone. When it is, this entry goes with
+ci/diff/ -- a gate whose subject no longer exists reports green forever and guards nothing.
+ci/diff/README.md's "Lifetime" section is the removal list."""
+
+[[gate]]
 id = "coverage-ratchet"
 description = "Line coverage has not decreased against the committed floor"
 owner = "W8 (this item); becomes meaningful once there are tests"
@@ -327,6 +397,68 @@ closing two of them is not enough:
      name to an evidence file the gate creates, and the gate requires one line per declared
      test. Verified by doing it: with one body emptied, libtest reported `9 passed` and the
      gate exited 2 naming the gutted test."""
+
+[[gate]]
+id = "db-restore-rehearsal"
+description = "The off-site archive is restored into a fresh database and reconciled byte for byte"
+owner = "implementation-plan.md M0-2 (work item N-19)"
+arms_when = "ci/db/offsite-backup.sh"
+cmd = ["ci/db/restore-rehearsal.sh"]
+on_exit.1 = """
+the archive restored and the result is not what was backed up. Read the lines above marked
+MISMATCH: each one names an object, the row count and digest the manifest recorded, and the
+row count and digest the restored database produced. The digest is of the ordered COPY
+stream, so a single changed value fails this and a row count alone would not have.
+
+Three other things exit 1, all of them verdicts about the restore path rather than about the
+run: a pre-seeded aggregate row SURVIVING a refresh, which would mean A-W9-2 no longer holds
+and the exclusion of the aggregate levels from the archive needs revisiting; a /span band
+that is still wrong after phase 1, which breaks W4 D-23's restore ordering; and a restored
+configuration database that differs from the one that was dumped."""
+on_exit.2 = """
+the run reached no verdict, so it proved nothing about the restore path either way. No
+server that databases may be created and dropped on, a missing psql / pg_dump / pg_restore /
+rclone / python3, migrations/ that would not apply, an archive whose layout version this
+script does not read, or an aggregate that REFUSED the A-W9-2 probe insert outright -- which
+is a different behaviour from the one the exclusion is argued from and has to be re-measured
+rather than ruled on.
+
+Deliberately not exit 1, following `db-tests` and `conformance` for the same reason
+(docs/reconciliation.md C-W2-20): "there was no database" and "the restore lost a reading"
+must not produce the same red."""
+note = """
+docs/reconciliation.md 7.5 is the reasoning and DESIGN.md D-6 is the mechanism: backup and
+restore is pg_dump plus an aggregate refresh, and no bespoke tool is built. D-6's first half
+had no owner and no schedule, which was latent on pitcairn and load-bearing the moment the
+database became a single-replica local-PV StatefulSet (M0-1). This gate is its second half:
+the restore, REHEARSED rather than written down, because a backup you hesitate to restore
+from is not a backup.
+
+TWO MODES, and the PR gate runs the one that needs no credential.
+
+  default         seed -> dump -> restore -> reconcile, through a LOCAL rclone remote in a
+                  temporary directory. This is what `cmd` above runs. It exercises the
+                  archive layout, the per-year slicing, the explicit column lists, the
+                  byte-for-byte reconciliation and the phase-1 rebuild. It does not touch
+                  R2 and says so on every run.
+  --from-archive  the real archive at MW_BACKUP_REMOTE. This is the mode that proves R2
+                  specifically; it is run by a monthly CronJob next to the cluster rather
+                  than on every PR.
+
+The split is deliberate and it is not a deferral. A gate that is red on every PR because a
+secret is unavailable gets overridden until nobody reads it, which is where
+docs/reconciliation.md G-1 ended up by a different route. So the half that can always run
+runs always, and the half that needs a credential runs on a schedule where its failure is
+visible on its own.
+
+Needs psql, pg_dump, pg_restore, rclone, python3 and a TimescaleDB it may create and drop
+databases on. It fails rather than skipping when it cannot have them, for the reason
+W3 Decision 84 gives for the database tests.
+
+Both halves have been seen failing, which is this repository's standing requirement for
+trusting a check (docs/reconciliation.md G-1): with one row dropped from the restore stream
+the reconciliation reported both raw years MISMATCH and exited 1, and with the layout
+version bumped against an existing archive the restore refused to run at all."""
 
 [[gate]]
 id = "mgmt-schema-drift"

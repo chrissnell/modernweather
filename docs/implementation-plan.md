@@ -72,7 +72,7 @@ first" recommendation was withdrawn rather than deleted.
 **Done when:** `ci/sql/assert-timescaledb-version.sql` passes against it; the schema migrations apply
 from empty into a fresh `modernweather` database; the node is tainted and the PV is bound.
 
-### M0-2 — weekly off-site backup, and a restore rehearsal in CI *(N-19)*
+### M0-2 — weekly off-site backup, and a restore rehearsal in CI *(N-19)* — ✅ **DONE 2026-11-12**
 **Depends on:** M0-1. **Blocks:** cutover (M7-5). **This is the owner's stated condition for
 accepting a single replica**, so it is not optional and it is not after cutover.
 A weekly `CronJob` dumping **per year** to Cloudflare R2 — so the recurring upload is the current year
@@ -87,6 +87,15 @@ dump size, which replaces §7.5's only extrapolated figure.
 on the next refresh, so pre-seeded aggregate rows are not a restore mechanism; and W4 D-23's
 phase-1-first ordering (0.87 s to make the charts right against 467 s to materialise everything), so
 a restore runbook does not block on a full rebuild.
+**Landed:** `ci/db/offsite-backup.sh` (a closed relation inventory; raw per calendar year; the legacy
+archive dumped with its schema because `migrations/` does not create it; the four aggregate levels
+excluded), `ci/db/restore-rehearsal.sh` and the `db-restore-rehearsal` gate, which reconciles the
+restored database against the manifest's **sha256 of the ordered COPY stream** rather than against a
+row count, re-measures A-W9-2 instead of citing it, and asserts the four `/span` bands after phase 1
+only. A restore of 1 382 400 rows from a real R2 object reconciled byte for byte in CI's database.
+The dump size is measured and §7.5's extrapolation holds — ~3.4 GB/year stored against its 40–50 GB
+decade; `docs/backup-and-restore.md` §4. Manifests in `kube-cluster-helm-values` under
+`apps/modernweather-db/backup/`.
 
 ---
 
@@ -1003,6 +1012,9 @@ so **both daemons can receive the same packets at the same time** with no reconf
 side and no risk to it. Each writes to its own database. A diff harness then compares, per timestamp:
 every stored metric column, and the derived values **R1** stores at ingest (wind chill, heat index,
 AQI, solar, snow depth).
+**The Campbell station is not free in the same way.** A serial line has exactly one reader, so for
+that station (b) does not exist until a multiplexer sits in front of the port — **M5-1a**, which is
+why that item is where it is.
 *Expected diffs, and they are predicted rather than discovered:* NULL where Go writes `0.0` for an
 unreported metric (D-26 — the intended change), and nothing else. **Any other diff is a defect in the
 Rust implementation**, which is what makes this harness useful: its expected output is "one known
@@ -1051,16 +1063,174 @@ the Go source definition, so `w9.expected_column INTERSECT w9.source_column` wil
 `w9.assert_no_unknown_source_columns()` should raise nothing — and if it does, something has changed
 since 2026-10-31 and that is worth stopping for.
 
+**DONE 2026-11-13. The migration ran, and all four criteria are met.**
+`docs/data-migration.md` §2a is the record and §2b is what the run found. In short: **17,162,826**
+readings for three stations over 2025-10-30 .. 2026-11-12, reconciled at **1,182 of 1,182** (station,
+year, metric) digests with zero tolerance and zero mismatches; the two bounded statistics at 5.77e-7
+and 1.65e-3 against bounds of 1.03e-3 and 1.69e-1, with the other twelve **exact** over 964 buckets;
+`w9.assert_no_unknown_source_columns()` silent at 215 of 215; 42 of 42 spot checks exact including
+each extreme's timestamp; per-year counts in §2a. `pitcairn` was not written to at all — `archive`
+found the 2026-10-31 tables and left them, and `pause-source-retention` found nothing enabled and
+issued no statement.
+
+**But the station ids it imported could not be station keys, so M5-1b re-ran it.** See below.
+
+### M5-1b — the migrated station keys were not usable as station keys
+**Depends on:** M5-1. **Blocks:** the owner's own side-by-side comparison, which is why it is carved
+out of M7-4 rather than waiting behind it.
+A `station_id` becomes a station key and a station key becomes a `ComponentId`, which permits only
+lower-case ASCII, digits, `-`, `_`, `.` and `:`. M5-1 took the documented default `station_id =
+stationname`, and two of the three Go display names — `CSI` and `Suncrest Air Quality` — are refused
+by that type, so a live station configured against a year of its own history is
+`StationPlanError::Key` at plan time. The preview showed it: it minted a **second** station `csi`
+beside the migrated `CSI`, and `/span?station=CSI` answered one bucket of live data.
+**The fix is a derived default and two refusals, not three corrected values.** Any station with a
+capital letter or a space would have hit this. `w9.station_key(stationname)` derives the id,
+`w9.assert_station_map_usable()` refuses any id — derived or hand-written — that could not be a
+station key, and `w9.seed_station_map()` names two source names that derive one id rather than
+letting a unique violation name a constraint. Done through `w9.station_map`, which is what
+`30-reconcile.sql` also maps through, so the reconciliation still compares the right rows.
+**Two things the re-run needed that did not exist.** `reset-target`, because `stage` creates its
+relations without `IF NOT EXISTS` and a procedure whose second run needs hand-typed SQL cannot be
+repeated; and `carry-out` / `carry-in`, because the source's raw window had receded 14 days since
+M5-1 and 462,495 readings existed only in the target (data-migration.md Decision 3a).
+**DONE 2026-11-13.** `docs/data-migration.md` §2c is the record. **1,182 of 1,182** digests `ok` with
+zero tolerance, the two bounded statistics at 5.7742e-7 and 1.6502e-3 with the other twelve exact
+over 964 buckets, `assert_no_unknown_source_columns()` silent at 215 of 215, 42 of 42 spot checks
+exact, and **every settled per-year row count identical to §2a's** — the only two deltas are the two
+live stations' 7 h 26 m of new readings. Verified against the running preview:
+`/span/8760h?station=CSI` returns **365 daily buckets, 2025-11-13 → 2026-11-13** beside the live
+reading, and `stations` holds one row per device instead of four.
+
+**Three defects only this run could find**, all three green in the lab, all three fixed and
+re-verified here: the legacy boundary compared a bucket's *start* against a reading's timestamp and
+double-counted one bucket per station; the digest's year key was the server's **local** year, and
+US/Mountain against Etc/UTC reported all 1,182 rows as mismatches with nothing missing; and the
+reconciliation window ran past the imported extent because the source is live. §2b has the evidence
+for each, including the control that distinguished the second from real loss.
+
+**Two things for whoever plans the cutover.**
+
+- **The pause O-2 took is not durable.** Retention on `weather` was job 1004, paused 2026-10-31. It
+  is now job **1022**, `drop_after = 365 days`, **enabled** — a new job id with identical config,
+  which is what the Go provisioner creating policies at start-up looks like. It has already dropped
+  raw below **2025-11-12**, so the new database is the only copy of 2025-10-30 .. 2025-11-12. Those
+  14 days *were* reconciled against production before it dropped them. Not re-paused here: it no
+  longer protects data the new database lacks, and unbounded raw growth on `pitcairn` is the owner's
+  disk. One statement reverses it, and a restart will undo that too.
+- **The parallel database was two migrations behind** and nothing would have caught up on its own —
+  the daemon applies `migrations/config` at start-up, not `migrations/`. Fixed, with the
+  `_sqlx_migrations` rows `sqlx` itself would have written; all nine checksums are the SHA-384 of the
+  files on `main`.
+
+### M5-1a — a serial multiplexer, so two daemons can read one station *(GRA-787)*
+**Depends on:** nothing — both ends already support it. **Blocks:** M5-2's mechanism (b) on a serial
+station, and nothing else.
+
+**Not in the original plan.** Proposed on 2026-11-12 and recorded here rather than left on an issue,
+because it is the only thing that makes (b) available on a serial station and because deploying it
+touches a live machine. It is **N-20**'s production path arriving a milestone early: `ser2net` owns
+the character device, and both daemons read it over TCP. The Go side is a configuration change and
+not a code change (`campbell/station.go:254` takes the serial path only when `serial_device` is
+non-empty); the Rust side already maps Campbell as `Serial | TcpOut`.
+
+**The deliverable is the proof before it is the bridge.** The question that decides whether any of
+this is worth doing is whether the multiplexer *broadcasts* every byte to every connected client or
+hands bytes to whichever client reads first. If it is the second, the two daemons split the stream
+and **both** produce gap-ridden data that still parses — nothing downstream could tell it from
+weather, which makes it the worst available outcome and strictly worse than having no (b) for that
+station at all. `ser2net`'s documentation says `max-connections` broadcasts; the documentation is
+not the measurement.
+
+**Done when:** `ci/serial-bridge/prove.sh` is green — two clients connected at once receive the
+identical byte stream, asserted byte for byte over a known sequence pushed through a `socat` pty, so
+the whole proof runs with no hardware and without touching a live station; the bridge runs as a unit
+that survives a reboot; the Go daemon reads it over TCP with its site serving current readings,
+checked by a timestamp and not by a process being up; and `modernweather`'s Campbell driver reads
+the same stream at the same time.
+
+**Test strategy:** the assertion plus **two** negative controls, because an identity assertion that
+cannot be made to fail proves nothing (W1 **D-10**): the same apparatus with `max-connections: 1`,
+where the refused client's stream must differ; and the same apparatus with the bridge removed and
+one character device read twice, which is the real failure mode. The second control is also
+load-bearing for the runbook — `remoteweather`'s serial library takes no exclusive lock, so a bridge
+started while the daemon still holds the port opens it successfully and the two then split the line
+with no error anywhere. That is why `packaging/serial-bridge/README.md`'s cutover order is a
+measured requirement rather than caution.
+
+**What this item introduces, stated rather than discovered:** the port is writable. `ser2net`
+forwards what a client sends to the datalogger. Neither daemon writes to a Campbell line — checked
+in both trees — but before this change the only thing that *could* was a descriptor the daemon held.
+That is the one new hazard and it is in the README beside the mitigation.
+
+**Nothing in this repository records a particular installation.** The device path, the line rate and
+the listen address are site-specific, and each of them fails *quietly* when guessed wrong, so
+`packaging/serial-bridge/ser2net.yaml.example` leaves them as placeholders that are deliberately not
+valid rather than shipping a plausible default. An operator's actual values belong wherever that
+machine's configuration is kept, which is not here.
+
 ### M5-2 — the diff harness
-**Depends on:** M5-1, M3-1. Build (b) and (c) above as a runnable harness in `ci/diff/`, with its
-expected-diff set encoded as data rather than prose so an unexpected diff is a failure rather than a
-judgement call.
+**Depends on:** M5-1, M3-1, and **M5-1a** for the Campbell half of (b). Build (b) and (c) above as a
+runnable harness in `ci/diff/`, with its expected-diff set encoded as data rather than prose so an
+unexpected diff is a failure rather than a judgement call.
 **Done when:** (b) reports only NULL-versus-zero differences across a 24-hour run; (c) reports only
 `period_rain` and `windd` differences, within DEV-4's measured bound, across all four `/span` bands
 and `/latest`, `/snow` and `/almanac`.
 **Test strategy:** the harness's own negative control — inject a 1% error into one metric and assert
 the harness reports it. **Same principle as W1 D-10: a differ that cannot be made to differ proves
 nothing.**
+
+**BUILT 2026-11-13, and both mechanisms have run against production.** `ci/diff/` is the
+harness — `mw-diff readings` is (b), `mw-diff responses` is (c), `expected.toml` is the
+expected-diff set, and `ci/diff/README.md` is how to run them and how to read the summary.
+`ci/diff/self-test.sh` is the negative control and the new `diff-harness` gate: it drives both
+mechanisms over a recorded pair and asserts a clean run is green, a 1% error injected on
+either side is red and names the metric, an injection that moved **nothing** is refused rather
+than passed, and a run whose bound has no reading count reports `no_census` instead of
+guessing one. The recorded Rust side is derived from a capture of the Go side by applying
+exactly the deviations `expected.toml` predicts, so the control is attributable and a rule
+that drifted from its own prediction turns the gate red.
+
+**Neither done-criterion is met yet, and in both cases the obstacle is an input.** (b) paired
+**480 of 480** readings of the Campbell station over the `ser2net` bridge with a largest
+pairing offset of 1 ms, and reported 184 of 197 columns differing only as **D-26** predicts,
+`windchill`/`heatindex` only as **DEV-9** predicts, nine exactly equal — and two columns
+differing because the two deployments are not configured alike: a `wind_dir_correction` of
+−94° on the Go side and absent on the new one, and the station's coordinates, which move
+`potentialsolarwatts`. The criterion asks for 24 hours; the window was 40 minutes because that
+is how long both daemons had been receiving the same station.
+
+(c) ran all four `/span` bands, `/latest`, `/snow` and `/almanac`. **DEV-4 fired 148 times and
+DEV-7 353, inside their bound and matching their relationship** — the first evidence on real
+data that either deviation behaves as predicted, and DEV-7's own ledger entry says the
+conformance suite cannot establish it. Five findings no decision predicts, all recorded in
+`ci/diff/README.md` with evidence: `stationtype` is `"campbell"` against
+`"campbellscientific"`; **a `float32` tie-break difference** where both sides hold the
+identical `float8` value and it lies exactly on a `float32` midpoint, the Go server emitting
+the upper neighbour and this one rounding half to even — contract-visible in the last digit,
+on a minority of buckets, and the conformance suite misses it because no fixture sits on a
+tie; `/span`'s `rainincremental` serving `0.04` against the Go side's zero-filled `0` on nine
+of twenty-nine daily buckets; `/latest` serving `stationname` as `""` with `stationtype` absent
+and `monthrain` / `yearrain` as `0`; and `/almanac` serving `{}`, because the migration carries no
+`almanac_cache` and the Go cache holds records from **2025-08-19**, earlier than the first
+imported reading, so those all-time extremes are not reproducible from the migrated data and
+would reset at cutover.
+
+**The harness is cutover apparatus and the owner scoped it as such on 2026-11-13:** the two
+implementations have to be checked against each other once, as `suncrestweather.com` moves to
+the new service, and then the Go daemon is decommissioned. `ci/diff/README.md`'s "Lifetime"
+section is the removal list -- the crate, the `diff-harness` gate, its CI job and its row in
+`docs/release.md` -- and the one thing that must not be removed with it is any defect the
+harness merely *found*, which belongs in a work item rather than in a README scheduled for
+deletion.
+
+**§5.0's "nothing else" for (c) is incomplete against its own deviation ledger,** which is
+recorded here rather than worked around: **DEV-7** changes `/span`'s `solarjoules` from the
+bucket mean to the bucket total — by roughly the bucket's reading count, so up to four orders
+of magnitude — and **DEV-12** adds one leading bucket to every response. Both are in
+`expected.toml` as predicates rather than exemptions, each citing its decision. The tie-break
+difference is deliberately **not** there: a rule needs a ledger entry behind it first, and
+`ci/diff/README.md` states the rule that would encode it so that accepting it is one edit.
 
 ### M5-3 — the `sunrise`/`sunset` assertion *(N-10 / C-W2a-27)*
 **Depends on:** M4-1. **Blocks:** M5-4.
@@ -1114,7 +1284,7 @@ recorded here rather than assumed, and the three cases where deletion *does* cha
 are in **DEV-17** with their measurements and their directions. Whether to correct the formula is a
 separate decision, deliberately not taken here.
 
-### M5-5 — drop `stationname` and `stationtype` from the raw table
+### M5-5 — drop `stationname` and `stationtype` from the raw table — ✅ **DONE 2026-11-13**
 **Depends on:** M1-2, M5-1. Now safe: the `metadata` role exists, and the migration has proved
 `snapshot:latest` reads display metadata from `config.stations` rather than off a reading (W4
 assumption 24). The import's column list shrinks automatically, because it is derived from the
@@ -1122,6 +1292,94 @@ registry.
 **Done when:** `observations` carries **214** generator-owned columns (216 today, minus two) plus the
 hand-authored `extra jsonb`; nothing reads `stationname` from a reading; the diff harness still
 reports only its expected set.
+
+**Landed.** Two `role = "attribute"` edits to `role = "metadata"` in `metrics/registry.toml`, a
+regeneration, and `cargo xtask migrate --allow-breaking`. `cargo xtask budget` prints
+`allocated identifiers 216` against `live columns 214`, which is criterion 1 and is also the whole
+point of printing two numbers: a `metadata` dimension keeps its protobuf field number forever, so the
+identifier count does not move. `generated/sql/020_observations.sql` loses two lines, the protobuf
+and both reading types keep the fields, and all four aggregates are byte-identical — they never
+grouped by either column. The migration emits **no `DROP COLUMN`** and says why: a dropped attribute
+number is never released and is charged twice against the 1600-column ceiling once the hypertable is
+compressed (H-4, D-19), so the columns stay where they are, unwritten.
+
+**The two values do not go to the same place, and that is the part the plan did not say.**
+
+The display name is **configuration**. `SnapshotSource` grows a `display_name`, resolved per fold
+from the published station registry, and `mw_api_legacy::Renderer` serves `/latest`'s `stationname`
+from it — `config.stations.name`, the string `?station=` matches and the one the Go writer projected
+onto the column — with the frame's claim as a fallback and the station key as the last resort, which
+is the precedence `mw_store`'s `stations` projection already documents. `/span` already read it from
+configuration. **Per fold and not at construction**, which the code review caught: the first version
+handed the renderer a map built in `boot.rs`, and `shared_fingerprint` deliberately excludes a
+station's `name` so that a rename does not restart every component — so a rename would have left
+`/latest` serving the old name until the next plan restart, silently. Resolving it on the fold makes
+it visible on the next reading, which is what `/span` already does, and W4 assumption 24 had named
+the snapshot source as the place for it all along.
+
+`/latest`'s **`stationtype` is the device's own claim** and therefore cannot come from configuration
+at all: `docs/legacy-api-contract.md` §3.1 is explicit that `campbell` and `campbellscientific` are
+not the same set and must not be unified. So it goes to a new `stations.reported_type` — a second
+column beside the configured `stations.type`, on a per-station projection instead of on every row —
+written by `writer:timescale` from the envelope and read back by `ReadingStore::latest`, as a scalar
+subquery on the station parameter rather than a join so that the statement's index-seek argument
+still holds word for word. That is what lets `snapshot:warm` reconstruct the same body after a
+restart. The migration backfills it once from the retired raw column, one seek per station, which is
+the only chance to keep a decade of a non-reporting station's type. Serving it from `stations.type`
+instead would have been one column fewer and would have unified exactly the two vocabularies §3.1
+forbids unifying.
+
+**The import needed a decision, not just an omission.** Dropping the two from `w9.expected_column`
+left them in the *source* with no destination, which is what
+`w9.assert_no_unknown_source_columns()` refuses an import over — correctly. The staging schema
+already had the resolution: `w9.record_retired_dimensions()`, generated from the registry's
+`metadata` dimensions and joined to `w9.source_column`, records both in `w9.dropped_source_column`
+with the reason, and only for a column the source really declares.
+`migrate-from-go.sh`'s `gap` step calls it immediately before the assertion.
+
+**The procedure is emitted whatever the registry says**, which is the second review finding: it was
+emitted only when there was something to record, and the shell script calls it by name — so the next
+registry with no `metadata` dimension would have failed the `gap` step with `undefined_function`,
+after the archive and before the import. An `INSERT` over an empty `VALUES` list is not expressible,
+so the empty case is a plpgsql `NULL` rather than a shorter `LANGUAGE sql` body, and a generator test
+pins both branches.
+
+**Verified**, all of it locally because GitHub CI is disabled until December:
+
+| | |
+|---|---|
+| `cargo xtask budget` | `allocated identifiers 216`, `live columns 214` — criterion 1 |
+| `validate`, `codegen --check`, `legacy-import --check`, `mgmt-schema --check`, `gate-layout` | clean |
+| `cargo test --workspace --all-targets --locked` | green, 67 test binaries |
+| `cargo fmt --check`, `cargo clippy --workspace --all-targets` | clean |
+| `cargo xtask db-tests` | **16/16 against a real TimescaleDB** — where criterion 1 is checked against the catalogue rather than against the generator, and where "nothing writes the retired columns" is asserted |
+| `ci/db/migrate-twice.sh` | both paths agree and a second application is a no-op; path B applied nine migrations over seeded tables and then these two, so the `ADD COLUMN` and the backfill ran as a real upgrade and the result matched a fresh install |
+| `cargo xtask conformance` | **green: 61 passed, 9 failed, all nine the declared `retired` set, `PENDING` empty, every `/latest` fixture passing** |
+| `ci/diff/self-test.sh` | **PASSED** — green on the recorded pair, red on every injection. Criterion 3, as far as it runs without two live daemons |
+| `generated/00-staging.sql` **executed**, not just diffed | against a throwaway database on the CI instance: the whole file applies, and `w9.record_retired_dimensions()` records nothing against an empty inventory, exactly `stationname` and `stationtype` once the source declares them, nothing further on a second call, and the no-op branch applies and records nothing too |
+
+The conformance run is the one that matters here: `stationname` is a key with no `omitempty`, and
+`/latest` in that replay is served **entirely** by `snapshot:warm` — there is no live station — so it
+exercises exactly the read path this item changed, end to end through the daemon.
+
+**Verified able to fail.** `w9.assert_no_unknown_source_columns()` was made to raise and then to
+pass over the same inventory: with a third unrouted column present it raises naming **only** that
+column — so the two retired ones are genuinely routed and the assertion has not been blunted — and it
+passes once that column is recorded too. The catalogue test fails if a later migration does drop the two columns,
+and names the line to delete rather than going quiet. The renderer test's reading claims a name of
+its own and the response does not use it — the half that was invisible while the column existed and
+the two strings were routinely equal. The projection test configures `weatherlink-live` and has the
+device claim `davis-vantage-pro`, so a writer that coalesced the two type columns would pass every
+other assertion in the file and fail that one. The backfill was checked by hand against the CI
+instance inside a rolled-back transaction: the newest non-NULL value wins, a newer NULL does not
+displace it, a station with no rows stays NULL, and an already-known value is left alone.
+
+**One hand-off for the next live diff run.** `ci/diff/README.md` records, from M5-2's first run,
+`/latest` serving `stationname` as `""` with `stationtype` absent on the new side where the Go side
+sent `"CSI"` and `"campbell"`. Both were the migrated rows carrying NULL in the two columns, and both
+are addressed by the routing above rather than by anything in the harness — so that line should come
+off the findings list when (c) next runs against a daemon built from this branch. Nothing here
+touches the other four findings.
 
 **Milestone 5 done when:** the Rust implementation has been diffed against the Go implementation by
 value, on real data, with every difference predicted in advance from a decision. **The Go version is
@@ -1182,8 +1440,13 @@ forecasts fine" must be expressible (W2a D-33). The snow cache becomes three.
 **`aeris:alerts:gc` stays the `Calendar` component W2a specified**, per C-W2a-15: OQ-C offered W4 a
 retention policy as the alternative and W4 declined to make the alerts table a hypertable, which
 settles it by elimination.
-**Done when:** `/forecast` and `/alerts` are conformance-green; `Freshness` renders "forecast last
+**Done when:** `/forecast` is conformance-green; `Freshness` renders "forecast last
 updated 3 h ago / never" as distinct from component state (W2a D-20).
+**`/alerts` was removed from this criterion on 2026-11-12** — see `docs/reconciliation.md`'s
+**A-M6-3-1**. This line was written 2026-10-30; `docs/reconciliation.md` §6.3 retired `/alerts` the
+next day, so the criterion required an endpoint a later decision had already deleted. Build the
+Aeris alert components and the `gc` sweep; do **not** implement the `/alerts` endpoint, and leave its
+four fixtures in the conformance runner's `retired` roster.
 
 ### M6-4 — the collector
 **Depends on:** M3-2, M1-1, M2-2. W7's `collector.v1.Collector` service in a **new file** —
@@ -1220,6 +1483,16 @@ which is what lets §2.4's save preview and §8.7's deletion consequences come f
 that will actually run.
 **Done when:** `mgmt-schema-drift` is armed and green; a save's preview names exactly the components
 that then restart.
+**Three deviations, recorded in `docs/reconciliation.md`** as **A-M7-1-1** (the preview takes a
+change rather than a partial document, so that §8.7's deletion consequences and §2.4's save preview
+really are one code path), **A-M7-1-2** (the TypeScript client is emitted by `cargo xtask` rather
+than by `openapi-typescript`, so the gate needs no `npm`) and **A-M7-1-3** (forecasts and alerts are
+their own resource rather than a `services/` entry).
+**One stated cost.** Adding or removing a station or a website restarts **every** component, because
+the rollup state's and the snapshot table's key sets are fixed at construction and every holder of
+either has to be rebuilt together. Editing a station's settings, a service, the forecast account, the
+storage connection or the ports restarts only what changed. The save preview reports both cases in
+advance, which is what makes it a stated cost rather than a surprise.
 
 ### M7-2 — authentication and first-run
 **Depends on:** M7-1, M2-2. Argon2id at m=64 MiB/t=3/p=4, sessions as hashed 32-byte secrets in an
@@ -1234,6 +1507,14 @@ creates the account.
 **Owner decisions this needs:** **O-10**'s four (loopback-until-claimed, the breached-password list,
 no API tokens in v1, one step of config history). All four have recommendations and none blocks the
 others.
+**Constraint from another work item.** M7-1 ships the management surface with **no authentication**
+and binds it to loopback regardless of `listener.management_listen_addr`, warning when it narrows a
+configured address. This item is what makes that column mean what it says: until an administrator
+account exists there is nothing to authenticate, and the narrowing is the interim answer rather than
+a decision. The three `/api/v1/auth/*` routes and `POST /api/v1/auth/password` are this item's to
+add; the router they attach to exists. The one step of config history O-10 asks about is already
+implemented as `POST /api/v1/config/revert`, scoped to this process rather than to a session,
+because a session-scoped one cannot be written before sessions exist.
 
 ### M7-3 — the UI
 **Depends on:** M7-1, M7-2. SvelteKit 2 + `adapter-static` + Vite 6 in SPA mode on `chonky`, embedded
@@ -1253,12 +1534,61 @@ visible), `spool_time_remaining_seconds`, the `ceiling < max_lag × rate` adviso
 polls — the only client-side timer is the `Backoff` countdown rendering a server-supplied absolute
 timestamp (W5 D-46).
 **Owner decision this needs:** **O-11** — which `chonky` gaps to upstream.
+**Constraints from another work item.** Three route families M7-1 maps are deliberately **not** in
+its surface, and each is this item's or needs work this item depends on:
+- `GET /api/v1/events` — the SSE endpoint of §5, which belongs with the client that consumes its
+  channels. There is no polling to replace until there is a page.
+- `POST /api/v1/checks/*` — all seven. Each is a `check:<name>` component with `Trigger::OnDemand`
+  run through `ComponentControl::run_now` (W2a §4.4), and **no work item creates those components**;
+  the routes are two lines each and the components are not. The seventh, `check:aprs`, is W2a §3.2's
+  observation that the APRS controller's 90-second health monitor is a connectivity check wearing a
+  health hat.
+- `GET /api/v1/discovery/weatherlink/*` — needs M3-1's in-process mDNS probe driven from a request
+  rather than from a station's build, which is a change to `mw-station`'s surface rather than a
+  handler.
+Adding each is additive under §4.4 and needs no version bump. `mw_api_mgmt::freshness` is also not
+yet wired into the runtime resource: a freshness sentence needs the instant its capability was last
+written, which no `ComponentStatus` carries.
+
+**Constraint from M5-2, at the owner's instruction (2026-11-13): the station form must expose
+`wind_dir_correction_degrees`, `latitude`, `longitude` and `altitude_m`.** The store and the
+management API already carry all four — `StationInput` takes the correction and validates
+`-360..=360`, `StationView` returns it, and
+`mw_store::config_admin::tests::a_wind_direction_correction_survives_a_write_and_a_read` is the
+round trip — so this is the one remaining place a vane calibration cannot be set. It is not a
+cosmetic field: M5-2 measured the Go configuration's **−94°** against this side's `0` and it
+made `winddir` differ on 100% of readings and `windd` on 100% of `/span` buckets, with nothing
+downstream able to tell. The coordinates are the same class of value: they feed the clear-sky
+model (DEV-9) and `/latest`'s `sunrise`/`sunset`, and a wrong longitude is a wrong answer that
+still looks like weather.
 
 ### M7-4 — the configuration migration *(N-5 / G-2)*
 **Depends on:** M2-2, M7-1, M5-1. Move the owner's existing configuration onto the new schema:
 stations with their calibration, websites with hostnames, titles and about-text HTML, certificate
 paths, per-service settings into `station_service`, and `remote_stations` →
 `peers`/`peer_origins`/`config.stations` with the **four plaintext secret columns dropped** (**D-67**).
+
+**"Stations with their calibration" is load-bearing, and M5-2 measured what the preview is
+missing.** The owner's instruction, 2026-11-13: *"obviously we want to correct the station
+location so calculations are correct. Remoteweather/Go has the right configuration."* So the Go
+configuration is the authority and this item is where it arrives. What M5-2 established about
+the Campbell station, so that it is not re-derived:
+
+| | Go, which is right | the preview node's seed |
+|---|---|---|
+| `latitude` | **40.47571** | `40.0` |
+| `longitude` | **−111.84543** | `−105.0` |
+| `wind_dir_correction_degrees` | **−94** (equivalently 266) | `0` |
+| `altitude_m` | not exposed by any unauthenticated Go endpoint — **read it from the Go configuration** | `1800.0`, which is the conformance seed's placeholder |
+| `timezone` | `America/Denver` | `America/Denver`, already right |
+
+The coordinates come from the live Go server's `/stationinfo`, which serves the website's
+primary device's own `latitude` and `longitude`. The correction is measured rather than read:
+the `ser2net` bridge's raw `wind_d` is what this side stores and the Go side stores raw − 94,
+over nine consecutive readings, which is also the first independent confirmation that
+`mw_codec::WindDirCorrection` applies the Go arithmetic. **A placeholder carried forward is the
+failure mode here** — every one of these values fails quietly, which is why M5-2 found them and
+no gate did.
 Allocate a UUIDv7 `NodeId` per existing node, **not** reusing the `station_id` UUIDs in
 `remote_stations`, which are station identities (W7 assumption 35).
 **Done when:** the Rust daemon starts from the migrated configuration and plans the same component set

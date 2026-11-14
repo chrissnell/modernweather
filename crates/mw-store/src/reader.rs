@@ -60,8 +60,8 @@ use std::fmt::Write as _;
 use chrono::{DateTime, Utc};
 use mw_component::{
     AlmanacQuery, AlmanacRecord, BoxFuture, Bucket, BucketLevel, BucketQuery, Bucketed,
-    LatestQuery, Piece, ReadingStore, SeriesQuery, Span, SpanBucket, SpanColumn, SpanQuery,
-    StoreError, TotalsQuery,
+    LatestQuery, MeanBucket, MeanSeriesQuery, Piece, ReadingStore, SeriesQuery, Span, SpanBucket,
+    SpanColumn, SpanQuery, StoreError, TotalsQuery,
 };
 use mw_types::{
     Agg, AggregateColumn, MetricKey, MetricValue, Reading, SqlType, Strategy, LEVELS, METRICS,
@@ -96,7 +96,7 @@ const MAX_BACKFILL_BUCKETS: i32 = 4;
 /// the only reads of.
 const OBSERVATIONS: &str = "observations";
 
-/// The four stored dimension columns of `observations`, in the order the writer declares
+/// The two stored dimension columns of `observations`, in the order the writer declares
 /// them -- so a `SELECT` built here and the `INSERT` built there name the same columns in
 /// the same order.
 ///
@@ -104,14 +104,18 @@ const OBSERVATIONS: &str = "observations";
 /// the writer *asserts* this list against `mw_types::DIMENSIONS` at build time and refuses
 /// to construct if they disagree, which is the check that keeps both copies honest. Sharing
 /// one constant would make the assertion cover a list nobody could get wrong.
-const DIMENSION_COLUMNS: [&str; 4] = ["time", "station_id", "stationname", "stationtype"];
+///
+/// It was four until M5-5. `stationname` and `stationtype` are `role = "metadata"` now, so
+/// a reading read back from the database carries neither -- see [`ReadingStore::latest`]'s
+/// note on who supplies them instead.
+const DIMENSION_COLUMNS: [&str; 2] = ["time", "station_id"];
 
 /// The read half of the pool (W3 §2a.1's `ReadingStore`).
 pub struct TimescaleReader {
     pool: PgPool,
     /// Built once, because it is 624 cast column expressions.
     buckets: String,
-    /// Built once, because it is 216 column names.
+    /// Built once, because it is 214 column names.
     latest: String,
 }
 
@@ -224,11 +228,29 @@ impl ReadingStore for TimescaleReader {
                 // answer the contract already has bytes for.
                 return Ok(None);
             };
+            // **The two `metadata` dimensions, and they come from two different places.**
+            //
+            // `station_name` stays `None`. M5-5's criterion is that nothing reads
+            // `stationname` from a reading, and a reading reconstructed here is not where
+            // the frozen surface's `stationname` comes from: `mw_api_legacy::Renderer`
+            // takes the device name from `config.stations`, which is the rule W4
+            // assumption 24 already applies to the coordinates -- a display name is
+            // configuration, and taking it from a frame would make it whatever the device
+            // last claimed.
+            //
+            // `station_type` is the opposite case and is read from the projection's
+            // `reported_type`. It *is* whatever the device last claimed, by contract:
+            // `docs/legacy-api-contract.md` §3.1 makes `/latest`'s `stationtype` the
+            // driver's self-reported name (`campbell`) and keeps it distinct from the
+            // configured type (`campbellscientific`), so configuration is not a source for
+            // it and the last claim is the only honest answer. `stations.reported_type` is
+            // where `writer:timescale` keeps that claim now that no raw column does.
             let mut reading = Reading {
                 time: row.try_get(0).map_err(StoreError::rejected)?,
                 station_id: row.try_get(1).map_err(StoreError::rejected)?,
-                station_name: row.try_get(2).map_err(StoreError::rejected)?,
-                station_type: row.try_get(3).map_err(StoreError::rejected)?,
+                station_type: row
+                    .try_get(DIMENSION_COLUMNS.len() + METRICS.len())
+                    .map_err(StoreError::rejected)?,
                 ..Reading::default()
             };
             for (i, meta) in METRICS.iter().enumerate() {
@@ -300,6 +322,47 @@ impl ReadingStore for TimescaleReader {
                     Ok(Bucketed {
                         bucket: row.try_get(0).map_err(StoreError::rejected)?,
                         total: row.try_get(1).map_err(StoreError::rejected)?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn mean_series<'a>(
+        &'a self,
+        q: MeanSeriesQuery,
+    ) -> BoxFuture<'a, Result<Vec<MeanBucket>, StoreError>> {
+        Box::pin(async move {
+            // `mw_mean(_sum, _count)` and not `_sum / _count`, for the same reason `span`
+            // uses it: the function is NULL-safe on a zero count, and a division written
+            // out here would be a second answer to what the mean of an empty bucket is.
+            let (sum, count) = mean_columns(q.metric, q.level)?;
+            let sql = format!(
+                // `COALESCE($3, 'infinity')` rather than `($3 IS NULL OR bucket < $3)`:
+                // the latter is correct and is **not** a stop key, so a scan runs forward
+                // past `until` until the `LIMIT` fills or the station's rows run out --
+                // which on a backfill pass over a window the gauge was dead for means
+                // reading and discarding every later bucket it has.
+                "SELECT bucket, mw_mean({sum}, {count}) FROM {view} \
+                 WHERE station_id = $1 AND bucket >= $2 \
+                 AND bucket < COALESCE($3::timestamptz, 'infinity'::timestamptz) \
+                 ORDER BY bucket LIMIT $4",
+                view = view(q.level),
+            );
+            let limit = i64::try_from(q.limit.min(MAX_ROWS)).unwrap_or(i64::from(i32::MAX));
+            let rows = sqlx::query(&sql)
+                .bind(q.station.as_str())
+                .bind(q.since)
+                .bind(q.until)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(classify)?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(MeanBucket {
+                        bucket: row.try_get(0).map_err(StoreError::rejected)?,
+                        mean: row.try_get(1).map_err(StoreError::rejected)?,
                     })
                 })
                 .collect()
@@ -700,8 +763,43 @@ fn total_column(
         })
 }
 
-/// `SELECT <216 columns> FROM observations WHERE station_id = $1 AND time >= $2 ORDER BY
-/// time DESC LIMIT 1`.
+/// The `_sum` and `_count` columns one `mean`-strategy metric declares at one level.
+///
+/// Two columns rather than one, because that is what **D-11** stores: an aggregate level
+/// holds composable *state*, so the mean of a bucket is a division the reader performs and
+/// not a column the view carries. `Err` for [`total_column`]'s reason — a metric that
+/// declares no `mean` here is a request to fix, not a build that is broken.
+fn mean_columns(
+    metric: MetricKey,
+    level: BucketLevel,
+) -> Result<(&'static str, &'static str), StoreError> {
+    let declared: Vec<&AggregateColumn> = LEVELS
+        .iter()
+        .find(|l| l.name == level.as_str())
+        .map(|l| l.columns)
+        .unwrap_or(&[])
+        .iter()
+        .filter(|c| c.metric == metric && c.strategy == Strategy::Mean)
+        .collect();
+    let find = |suffix: &'static str| -> Result<&'static str, StoreError> {
+        declared
+            .iter()
+            .map(|c| c.column)
+            .find(|name| name.ends_with(suffix))
+            .ok_or_else(|| {
+                StoreError::rejected(std::io::Error::other(format!(
+                    "metrics/registry.toml does not declare a `mean`'s `{suffix}` for \
+                     {metric:?} at the {level} level, so there is no column to finalise. \
+                     Add `mean` to that metric's `aggregates` and re-run `cargo xtask \
+                     codegen`, or ask for a strategy it already declares."
+                )))
+            })
+    };
+    Ok((find("_sum")?, find("_count")?))
+}
+
+/// `SELECT <214 columns>, <the station's reported type> FROM observations WHERE station_id
+/// = $1 AND time >= $2 ORDER BY time DESC LIMIT 1`.
 ///
 /// No casts, unlike [`buckets_statement`]: the aggregate read wants one decode path over
 /// four SQL types because it indexes 624 columns positionally, and this one wants the
@@ -714,6 +812,22 @@ fn total_column(
 /// reads the newest chunk the bound allows and stops. Without the bound it would be the
 /// same seek on a station that is reporting and a scan back through every chunk on one that
 /// is not -- which is exactly the station `snapshot:warm` asks about.
+///
+/// # The trailing selection, and why it is a subquery rather than a join
+///
+/// `stations.reported_type` is the device's self-reported `stationtype` (M5-5): wire
+/// metadata, so there is no column of `observations` holding it any more, and `/latest` has
+/// to keep emitting the key across a restart. It is read as a **scalar subquery on the
+/// parameter** rather than as a `LEFT JOIN`, which is what keeps the paragraph above true
+/// word for word: the subquery is a primary-key lookup that does not mention
+/// `observations`, so the planner evaluates it once and the seek it is appended to is the
+/// same seek. A join would put a second relation inside the `ORDER BY ... LIMIT 1` and make
+/// "the planner reads the newest chunk and stops" a claim about a plan rather than about
+/// the statement.
+///
+/// NULL for a station `stations` has no row for, which is the same answer as a station that
+/// has reported no type -- and `/latest` emits an absent key for both, as the Go daemon
+/// does.
 fn latest_statement() -> String {
     let mut sql = String::with_capacity(64 + (DIMENSION_COLUMNS.len() + METRICS.len()) * 20);
     sql.push_str("SELECT ");
@@ -728,6 +842,7 @@ fn latest_statement() -> String {
         }
         sql.push_str(column);
     }
+    sql.push_str(", (SELECT s.reported_type FROM stations s WHERE s.station_id = $1)");
     let _ = write!(
         sql,
         " FROM {OBSERVATIONS} WHERE station_id = $1 AND time >= $2 ORDER BY time DESC LIMIT 1"
@@ -833,7 +948,7 @@ mod tests {
     ///
     /// `ReadingStore::latest`'s loop reads column `DIMENSION_COLUMNS.len() + i` for
     /// `METRICS[i]`, so a statement that dropped a column, reordered one, or grew a
-    /// sixth dimension would shift every metric after the change — and decode a `float4`
+    /// third dimension would shift every metric after the change — and decode a `float4`
     /// out of an `int4` column, or a timestamp out of a text one. The only other coverage
     /// is the `#[ignore]`d database test, which does not run in an ordinary
     /// `cargo test`. This is the same assertion
@@ -843,8 +958,8 @@ mod tests {
     fn the_latest_statement_is_the_dimensions_then_the_registrys_metrics_in_order() {
         let sql = latest_statement();
         assert!(
-            sql.starts_with("SELECT time, station_id, stationname, stationtype, "),
-            "the four dimensions come first, in the writer's order: {}",
+            sql.starts_with("SELECT time, station_id, "),
+            "the two dimensions come first, in the writer's order: {}",
             &sql[..80]
         );
         // Every metric column, in `METRICS` order, each one after the last.
@@ -856,8 +971,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} is missing or out of order", m.column));
             cursor += found + needle.len();
         }
-        // Exactly as many comma-separated selections as declared columns, so nothing rode
-        // along: a `SELECT *` or a stray column would shift the decode's indices.
+        // Exactly as many comma-separated selections as declared columns plus the one
+        // trailing subquery, so nothing rode along: a `SELECT *` or a stray column would
+        // shift the decode's indices. `split(" FROM ").next()` takes the text before the
+        // FIRST ` FROM `, which is the subquery's own -- so the count works because the
+        // subquery is last and carries no comma, which the assertion below pins.
         let selections = sql
             .trim_start_matches("SELECT ")
             .split(" FROM ")
@@ -867,8 +985,17 @@ mod tests {
             .count();
         assert_eq!(
             selections,
-            DIMENSION_COLUMNS.len() + METRICS.len(),
-            "216 columns today, and the number is the registry's rather than a literal"
+            DIMENSION_COLUMNS.len() + METRICS.len() + 1,
+            "214 registry columns plus `stations.reported_type`, and the 214 is the \
+             registry's rather than a literal"
+        );
+        // The trailing selection is the decode's last index, so it has to be last and it
+        // has to be one selection. M5-5: it is where `/latest`'s `stationtype` comes from
+        // now, and a subquery that moved would be decoded as a metric.
+        let trailing = ", (SELECT s.reported_type FROM stations s WHERE s.station_id = $1)";
+        assert!(
+            sql.contains(&format!("{trailing} FROM {OBSERVATIONS} WHERE")),
+            "{sql}"
         );
         // **No casts**, unlike the bucket statement: a `::float8` here would decode the
         // eleven text and four timestamptz metrics as NULL.

@@ -49,7 +49,13 @@
 //! pre-serialised bytes, so a database outage no longer touches it: that module is the
 //! table, the fold, and the cold-start seed.
 //!
-//! Not yet, each with the item that owns it: `snow:*` (M6-3) and `live:stream`, which W3
+//! Also here: [`snow`] -- the four `snow:*` components, which are **R2**'s expensive tier.
+//! Every one of the seven numbers `/snow` serves is a function of a window of readings, so
+//! none of them may be computed per request; that module is the dual-threshold walk, the
+//! quantile smoother, the PELT changepoint detector and the four components that maintain
+//! them.
+//!
+//! Not yet: `live:stream`, which W3
 //! §2a.2's SSE surface needs and which no landed item serves -- M4-3 built the listener it
 //! would mount on and deliberately did not invent a consumer for it. The snapshot payload
 //! **renderer** landed with M4-2, which exclusively owns the frozen DTO. The seams
@@ -62,6 +68,7 @@ pub mod enrich;
 pub mod metrics;
 pub mod rollup;
 pub mod snapshot;
+pub mod snow;
 pub mod spool;
 pub mod testing;
 

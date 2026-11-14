@@ -1,0 +1,203 @@
+# The expected-diff set for the M5-2 diff harness.
+#
+# implementation-plan.md M5-2: "with its expected-diff set encoded as data rather than prose,
+# so an unexpected diff is a failure rather than a judgement call." This file is that data.
+#
+# HOW TO READ IT, AND THE ONE RULE THAT MATTERS
+#
+# The harness compares every metric and every key it finds. A difference is matched against
+# the rules below; a difference that matches none is UNEXPECTED and makes the run red. There
+# is no "ignore" and no wildcard key: a rule names a class, the endpoints or metrics it
+# applies to, and the decision it comes from. Widening one is an edit somebody reviews.
+#
+# Every `class` is a PREDICATE over the two values, implemented in src/expected.rs -- not a
+# name for "this key is allowed to differ". `float4_accumulated` is an arithmetic bound,
+# `mean_to_total` asserts the new value is the old one times the bucket's reading count.
+# Both of them fail when the two sides differ in the wrong direction or by the wrong amount,
+# which is what makes them narrower than a key list.
+#
+# `id` is a decision in docs/reconciliation.md or docs/DESIGN.md. A rule with no decision
+# behind it does not belong here: the point of the exercise is that every difference between
+# the two implementations was predicted in advance from a decision, and a rule invented to
+# make a red run green is the failure mode this file exists to prevent.
+
+schema = 1
+
+# ------------------------------------------------------------------------------------
+# Mechanism (b) -- same station, both daemons, diffed readings.
+# ------------------------------------------------------------------------------------
+[readings]
+# Each daemon stamps a reading when IT receives the frame, so the two timestamps for one
+# frame differ by the scheduling delay between two processes. Measured against the Campbell
+# station over the ser2net bridge on 2026-11-13: 3 ms, consistently. The tolerance is three
+# orders of magnitude above that and still far below the station's 5-second output interval,
+# so a pairing is never ambiguous -- which the harness checks rather than assumes, by
+# refusing a window in which any reading has two candidate partners.
+pair_tolerance_ms = 1000
+
+# Columns that are not metrics and are compared separately or not at all. `time` is the
+# pairing key; the two identity columns are the station, which is the thing held constant.
+#
+# `stationname` and `stationtype` are here for the GO side, which still has them: M5-5 retired
+# both to `role = "metadata"` so the new side's `observations` does not, and the filter is
+# applied to whatever columns a side actually declares. Removing them would make the Go side's
+# `stationname` a compared "metric" against nothing on the new side.
+not_metrics = ["time", "stationname", "station_id", "stationtype"]
+
+[[readings.rule]]
+id = "D-26"
+class = "null_vs_zero"
+direction = "go_zero_rust_null"
+metrics = ["*"]
+because = """
+The intended change, and the only class of difference (b) is allowed to report. A Go driver
+writes 0.0 into every column of its reading struct whether or not the station reported the
+metric, so a Campbell station stores a leaf wetness of 0.0; the Rust drivers store NULL for a
+metric the station did not report. DEV-16 is the same change for the five remaining drivers.
+
+`metrics = ["*"]` is as wide as this rule gets and it is still narrow: the predicate is
+"the Go side is exactly zero AND the Rust side is absent". A Go 0.0 against a Rust 0.0 is
+equal and not a difference; a Go 1.2 against a Rust NULL does not match, and nor does the
+reverse direction."""
+
+[[readings.rule]]
+id = "DEV-9"
+class = "null_vs_go_column"
+go_column = "outtemp"
+metrics = ["windchill", "heatindex"]
+because = """
+DEV-9 part (1), and the only other class (b) can report. The Go drivers store the AIR
+TEMPERATURE where the formula does not apply -- `internal/weatherstations/utils.go`'s
+`CalculateWindChill` returns `tempF` above 50 F or below 3 mph, and `CalculateHeatIndex`
+returns `tempF` below 80 F -- and R1's enrich stage stores NULL, because a stored
+`windchill == outtemp` is indistinguishable from a real wind chill and makes the column's
+`min` and `mean` the temperature's for every summer bucket.
+
+The predicate is the prediction and not the key: the new side must be ABSENT and the Go side
+must hold exactly this reading's `outtemp`. A `windchill` that differs from `outtemp` on the
+Go side, or a `windchill` present on both sides and unequal, does not match -- so the rule
+cannot absorb a wrong wind chill, which is the thing it would be most tempting to write
+loosely.
+
+It does not reach the frozen JSON on either implementation: `transform.go:18` recomputes both
+from `outtemp` plus wind speed or humidity on every request, which is what
+`metrics/registry.toml`'s `legacy_read_time_computed` flag records, and M4-2 recomputes them
+for the same reason. So this is a column-only difference and mechanism (c) should see none of
+it -- which is itself a check, because (c) reporting a `windch` or `heatidx` difference would
+mean one of the two read paths started reading the column.
+
+`potentialsolarwatts` is DEV-9 part (2) and is deliberately NOT here. The ledger's measurement
+is that the two agree to 1.1e-12 W/m^2 where the Go daemon's zone is the station's -- which is
+the production configuration -- so agreement is the prediction and a difference is a finding,
+normally about the two deployments' coordinates rather than about either implementation."""
+
+# ------------------------------------------------------------------------------------
+# Mechanism (c) -- same database, both read paths, diffed responses.
+# ------------------------------------------------------------------------------------
+[responses]
+# `/latest` serves the last raw reading, so the two sides are serving two different readings
+# of the same station taken milliseconds apart. They are compared only when their `ts` keys
+# are within this tolerance, which is one station output interval: pairing two readings
+# further apart than that would be comparing the weather against itself at another time.
+latest_pair_tolerance_ms = 6000
+
+# `ts` is the pairing key on both endpoints and is reported as the pairing offset rather than
+# as a value difference.
+not_values = ["ts"]
+
+# The four aggregate levels of legacy-api-contract.md §2.3, and the span string used to
+# select each. `/span/{span}` is a Go duration, so the 1d band is addressed in hours.
+[[responses.band]]
+id = "1m"
+span = "3h"
+bucket_seconds = 60
+
+[[responses.band]]
+id = "5m"
+span = "24h"
+bucket_seconds = 300
+
+[[responses.band]]
+id = "1h"
+span = "168h"
+bucket_seconds = 3600
+
+[[responses.band]]
+id = "1d"
+span = "720h"
+bucket_seconds = 86400
+
+[[responses.rule]]
+id = "DEV-4"
+class = "float4_accumulated"
+endpoints = ["span"]
+keys = ["period_rain", "windd"]
+because = """
+The two statistics the Go schema's own accumulator width makes exact agreement arithmetically
+impossible for. The Go views both accumulate AND store these in `real`: `sum(real)` returns
+`real`, and the Go `circular_avg_state` declares `sin_sum`, `cos_sum` and even its count as
+`real`. D-14 widened the accumulator, so here the NEW value is the accurate one and the bound
+is on how wrong the OLD one is allowed to be -- n * 2^-24 relative, the standard worst-case
+bound for a running sum in a 24-bit mantissa, which is the same model and the same constant
+`w9.rollup_report` reconciled the migration with.
+
+n is the bucket's reading count and comes from the census, not from a guess. A bucket with no
+census entry is reported as `no_census` and is NOT clean: a tolerance whose n is unknown is
+not a tolerance."""
+
+[[responses.rule]]
+id = "DEV-7"
+class = "mean_to_total"
+endpoints = ["span"]
+keys = ["solarjoules"]
+because = """
+`solarjoules` carries the Campbell logger's `slr_mj` -- energy per unit area accumulated since
+its previous output. The Go views stored `avg(solarjoules)`, the mean increment per reading,
+which moves when the logger's output interval does; the registry stores `total`, which is the
+bucket's insolation. So the new value is the old one times the bucket's reading count, which
+is what this class asserts: roughly 30x at the 1m band and 43,200x at the 1d band.
+
+DEV-7's own entry says "the conformance suite cannot catch any of this", and that is exactly
+why it is in this file: (c) is the mechanism that can. §5.0 of the implementation plan predicts
+`period_rain` and `windd` and then says "nothing else", which is incomplete against its own
+deviation ledger -- `solarjoules` differs on 100% of `/span` buckets that saw any sun, by
+orders of magnitude, from a decision taken in M1-6. A harness that reported it as a defect
+would be wrong, and one that ignored the key would stop checking the relationship. It checks
+the relationship.
+
+The ratio is asserted to a relative tolerance rather than exactly, because the Go side's mean
+and the new side's total are both float4-accumulated: n * 2^-24 applies twice, once per side."""
+
+[[responses.rule]]
+id = "DEV-12"
+class = "extra_leading_bucket"
+endpoints = ["span"]
+max_buckets = 1
+because = """
+Go's predicate is `bucket > NOW() - span` with an unaligned bound; D-55 floors `now - span`
+onto the level's grid and uses `>=`, so exactly one bucket Go excludes is included. The extra
+element is older data rather than different data, and it is on 100% of `/span` responses.
+
+This is a coverage rule, not a value rule: it permits up to one leading bucket present only
+on the Rust side, and nothing else. A bucket missing from the middle, a bucket missing from
+the Rust side, or two extra leading buckets are all still unexpected."""
+
+[[responses.rule]]
+id = "DEV-11"
+class = "nonfinite_body"
+endpoints = ["span", "latest"]
+because = """
+A metric whose stored value is NaN or +/-Inf serialises as the contract's 0 rather than failing
+the response (`mw_api_legacy::zf`). The Go server does fail: `encoding/json` refuses a
+non-finite mid-stream and truncates the body it has already started writing.
+
+So this is a BODY rule and not a value rule, which is the second draft of it. The first said
+"the Go side is a non-finite literal and the new side is exactly 0" -- a predicate that cannot
+fire, because the Go body never parses and there is no pair of values to compare. What the
+harness actually sees is one side's response being unusable, and the rule says that: the Go
+body is not JSON, it contains one of the non-finite literals, and the new side's body parsed.
+
+Without it a truncated Go body is a transport failure with no explanation, on an endpoint
+whose own deviation ledger predicted it. With it the line names the deviation and the run
+stays green -- and removing the rule removes the excuse, because the branch that reports it
+asks the rule set rather than deciding for itself."""

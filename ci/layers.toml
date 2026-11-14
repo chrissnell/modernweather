@@ -191,7 +191,13 @@ forbidden = ["sqlx", "mw-store"]
 [[crate]]
 name = "mw-output"
 layer = "surface"
-responsibility = "Rate-limited outputs over one shared Uploader<E> body"
+# Widened by implementation-plan.md M6-3 and recorded as docs/reconciliation.md A-M6-3-2:
+# §1.2's eighteen crates assign the Aeris components no home, and the one thing those
+# components need that no lower-layer crate has is the outbound HTTPS request with a public
+# trust anchor that the `webpki-roots-only-for-the-uploaders` rule below confines to this
+# crate. The `forbidden` list is unchanged and covers the new half for the same reason it
+# covers the old one: the fetchers write through capability handles and name no SQL.
+responsibility = "Third-party HTTPS integrations: rate-limited outputs, and the Aeris fetchers"
 # W2a decision 50 -- "no SQL in the radio component" -- made structural (§1.3 rule 3).
 forbidden = ["sqlx", "mw-store"]
 

@@ -90,6 +90,25 @@ const POLL_DEADLINE: Duration = Duration::from_secs(15);
 /// The per-occurrence deadline for a re-arm. The same request, the same reasoning.
 const REARM_DEADLINE: Duration = Duration::from_secs(15);
 
+/// The longest a station key may be before some component id built from it overflows.
+///
+/// [`ComponentId::MAX_LEN`] is 128 and the longest wrapper **in this crate** is
+/// `station:airgradient:` at 20 bytes, so 108 names a component for every driver here and
+/// 109 does not — which is what `tests/station_key_width.rs` checks, in both directions
+/// and against the mint functions rather than against this number.
+///
+/// **The margin is one byte, and the binding wrapper is not in this crate.**
+/// `mw_output::aeris` builds `aeris:forecast:<key>:<span_hours>`, 19 bytes around the key
+/// at a three-digit span, which allows 109. `ci/layers.toml` puts `mw-output` above this
+/// crate, so neither the constant nor the test can see it: a longer prefix added *there*
+/// invalidates this number silently, and that is the one direction to check by hand.
+///
+/// It is here because the limit is not only the daemon's. The Go-to-Rust migration derives
+/// a station key per station and has to refuse one it could not configure afterwards, which
+/// `w9.station_key_problem` does with this same limit — a key the migration minted and the
+/// plan then rejected is M5-1b. That function is emitted by `xtask/src/legacy.rs`.
+pub const MAX_KEY_LEN: usize = 108;
+
 /// Why a set of station rows does not produce a plan.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StationPlanError {

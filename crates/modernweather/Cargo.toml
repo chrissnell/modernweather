@@ -44,6 +44,12 @@ tokio.workspace = true
 # The supervisor's shutdown is a `CancellationToken` (§3.6) and `main` is what cancels it.
 tokio-util.workspace = true
 sqlx.workspace = true
+# The management API's router is an `axum::Router` and this is the one crate that may hold
+# one without serving it: `mw-api-mgmt` builds it, `mw-http` binds the socket it is served
+# on, and neither may name the other (ci/layers.toml). The binary is where they meet
+# (§1.3 rule 1). It binds nothing itself -- the `only-mw-http-binds-a-socket` source rule
+# is what holds that line.
+axum.workspace = true
 tracing.workspace = true
 sd-notify.workspace = true
 # `mw_build_info` is a fact about this binary, so the one crate that knows its version is
@@ -83,6 +89,10 @@ tokio = { workspace = true, features = ["test-util"] }
 # driver: `FrameMeta::received_at` is a `DateTime<Utc>` and the daemon itself never names
 # the type -- every clock it reads belongs to the supervisor or to the spool.
 chrono.workspace = true
+# `tests/management.rs` reads the management API's own JSON back. The daemon does not parse
+# JSON anywhere -- `mw-api-mgmt` serialises it and nothing in this crate deserialises one --
+# so this is a test dependency rather than a dependency with a test use.
+serde_json.workspace = true
 
 # Packaging, verbatim from docs/release.md §6, which asks for exactly this block when
 # `crates/modernweather` lands. `cargo xtask dist` reads ci/release.toml for the target

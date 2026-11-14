@@ -309,6 +309,135 @@ impl UploadError {
     }
 }
 
+/// Why an Aeris fetch did not produce a row.
+///
+/// A third enum rather than variants on [`UploadError`], because the two describe different
+/// exchanges: an upload's failure is a status and a reason string, and a fetch's failure is
+/// usually a **payload** that arrived with a `200`. The one thing they share is the
+/// transport, which is why the transport's failures stay [`UploadError`] and travel here as
+/// [`AerisError::Transport`] rather than being re-described.
+///
+/// `crate::aeris`'s module documentation has why the status code is not the verdict on this
+/// path: a bad credential is `200` with `{"success": false}`.
+#[derive(Debug, thiserror::Error)]
+pub enum AerisError {
+    /// The request never completed, or the response was not HTTP.
+    #[error(transparent)]
+    Transport(#[from] UploadError),
+
+    /// The body was not the JSON this endpoint answers with.
+    ///
+    /// `Retryable`, and the reason is the same one [`UploadError::Malformed`] gives: the
+    /// common cause is a proxy or a maintenance page in front of the API, which the next
+    /// occurrence may get past. A vendor that changed its schema would fail here forever
+    /// with the parse error in `last_error`, which is the visible shape W2a Decision 30
+    /// asks for instead of a give-up.
+    #[error("the Aeris response was not the JSON this endpoint answers with")]
+    Decode {
+        /// Where the parse stopped.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// The body was JSON, and the wrong shape for this endpoint.
+    #[error("{what} was {found} rather than the shape this endpoint answers with")]
+    Shape {
+        /// Which part of the payload.
+        what: &'static str,
+        /// What was there instead.
+        found: &'static str,
+    },
+
+    /// `success: false` — the upstream declined, and said why in the body.
+    ///
+    /// **`Fatal` for the tick**, which is this crate's established reading of `Fatal` and
+    /// not a give-up: the overwhelming cause is a credential the operator has to fix, and
+    /// retrying inside one occurrence spends the rate budget to be told the same thing.
+    /// The period is the retry, and the reason is in `last_error` where W5 renders it.
+    #[error("the Aeris API declined the request: {detail}")]
+    Refused {
+        /// The upstream's own `error` field, bounded to [`MAX_BODY_EXCERPT`].
+        detail: String,
+    },
+
+    /// `success: true`, and nothing in it.
+    ///
+    /// Its own variant rather than a `Shape`, because it is the ordinary consequence of a
+    /// maintenance window rather than a disagreement about the schema — and because it is
+    /// the input that **panics** the Go controller (`response.AerisForecastData[0]` on an
+    /// empty slice). Retryable: the next period is a different answer.
+    #[error("{what}, so there is nothing to store")]
+    Empty {
+        /// Which emptiness.
+        what: &'static str,
+    },
+
+    /// `weatherPrimaryCoded` was not `<coverage>:<intensity>:<weather>`.
+    ///
+    /// The second Go panic on this path (`strings.Split(...)[2]`). Retryable rather than
+    /// fatal because it is a property of one period of one response, and the next forecast
+    /// is a new one.
+    #[error(
+        "the forecast's `weatherPrimaryCoded` was `{coded}`, which is not the \
+         `<coverage>:<intensity>:<weather>` form the icon and the description are derived \
+         from"
+    )]
+    Coded {
+        /// What the vendor sent.
+        coded: String,
+    },
+
+    /// The stored JSON could not be built.
+    ///
+    /// Unreachable for a struct of scalars and a `String`, and named rather than
+    /// `expect`ed: a frozen route's writer may not panic over a serialiser.
+    #[error("the forecast could not be rendered as JSON")]
+    Encode {
+        /// Why.
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+/// **Read by nothing today, and that is worth knowing before trusting the split below.**
+///
+/// The only consumer of [`Classify`] in this crate is `crate::retry::ClassPolicy`, which is
+/// wired to the uploaders; the Aeris bodies wrap every failure in `ComponentError::tick`,
+/// whose own class is unconditionally `Retryable` (`mw_component::ComponentError`). So no
+/// classification here can cause a hot retry loop — there is no retry, and the period is the
+/// floor — and none can stop a component. What the impl is for is the day this path acquires
+/// a `tower` stack: the decision is made once, beside the error's definition, which is §4.2's
+/// mechanism and the reason `Fatal` is written down now rather than guessed at then.
+impl Classify for AerisError {
+    fn class(&self) -> Class {
+        match self {
+            AerisError::Transport(e) => e.class(),
+            AerisError::Decode { .. }
+            | AerisError::Shape { .. }
+            | AerisError::Empty { .. }
+            | AerisError::Coded { .. } => Class::RETRYABLE,
+            // See the variant: `Fatal` for the tick, not for the component.
+            AerisError::Refused { .. } | AerisError::Encode { .. } => Class::Fatal,
+        }
+    }
+}
+
+impl AerisError {
+    /// The metric label for this failure — a closed set, so the series' cardinality is
+    /// bounded by this function (§5.10).
+    pub fn reason(&self) -> &'static str {
+        match self {
+            AerisError::Transport(e) => e.reason(),
+            AerisError::Decode { .. } => "decode",
+            AerisError::Shape { .. } => "shape",
+            AerisError::Refused { .. } => "refused",
+            AerisError::Empty { .. } => "empty",
+            AerisError::Coded { .. } => "coded",
+            AerisError::Encode { .. } => "encode",
+        }
+    }
+}
+
 /// `: <body>` when there is one, trimmed and capped.
 fn excerpt(body: &str) -> String {
     let body = body.trim();

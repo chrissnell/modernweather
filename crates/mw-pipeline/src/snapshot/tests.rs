@@ -86,6 +86,7 @@ fn an_unconfigured_key_is_absent_and_unwritable() {
                 website: website(9, "ghost", "backyard"),
                 reading: Reading::default(),
                 meta: mw_component::StationMeta::EMPTY,
+                display_name: None,
                 windows: Resolved::new(at("2026-11-07T18:00:00Z"), []),
             },
             Staleness::Fresh,
@@ -535,6 +536,13 @@ mod driven {
             &'a self,
             _q: SeriesQuery,
         ) -> BoxFuture<'a, Result<Vec<Bucketed>, StoreError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn mean_series<'a>(
+            &'a self,
+            _q: mw_component::MeanSeriesQuery,
+        ) -> BoxFuture<'a, Result<Vec<mw_component::MeanBucket>, StoreError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
 

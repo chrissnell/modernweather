@@ -24,7 +24,7 @@ commit lands in a repository that can already tell it something is wrong. See
 | `contract/` | The frozen legacy REST surface: `legacy-v1.json`, 70 golden fixtures, and a conformance runner that replays them against any base URL |
 | `.github/workflows/` | `pr.yml` is the gate, `platform.yml` the target matrix, `release.yml` the release |
 | `ci/` | gate manifest, release matrix, database checks, the cross-compilation probe |
-| `ci/db/` | the `db-migrate-twice` gate, its seed fixture and schema assertions, the aggregate rebuild procedure, and `measure/` — the harness behind every number in `docs/database-schema.md` |
+| `ci/db/` | the `db-migrate-twice` gate, its seed fixture and schema assertions, the aggregate rebuild procedure, the off-site backup and its restore rehearsal (`docs/backup-and-restore.md`), and `measure/` — the harness behind every number in `docs/database-schema.md` |
 | `xtask/` | The code generator, plus every gate and release step — all runnable locally with the same command CI uses |
 | `packaging/` | systemd unit, sysusers, deb/rpm scriptlets, Arch PKGBUILD, Dockerfile |
 

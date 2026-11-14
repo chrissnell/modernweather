@@ -24,12 +24,12 @@
 //! that `mw-store` cannot grow a `Transport` and `mw-station` cannot grow a query.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use mw_component::{Generation, Ingress, Zone};
 use mw_store::config_db::{self, ConfigDbError, Listener, Node, WeatherDatabase, WebsiteRow};
 use mw_types::{StationKey, WebsiteId};
 use secrecy::ExposeSecret as _;
-use sqlx::SqlitePool;
 
 /// Everything `plan()` and the boot sequence read from the configuration database.
 pub struct Config {
@@ -209,6 +209,18 @@ pub struct Config {
     /// configured one.
     pub(crate) sni: Option<Arc<mw_http::SniResolver>>,
 
+    /// The management API's socket and router, once `main` has built them (**M7-1**).
+    ///
+    /// A root resource for [`Config::mount`]'s reason and the mirror of it: `mw-http` may
+    /// not name `mw-api-mgmt` (`ci/layers.toml`), and `mw-api-mgmt` may not bind a socket,
+    /// so the binary is where the router and the listener meet (§1.3 rule 1).
+    ///
+    /// `None` is a node whose management API has not been built, which is every
+    /// `crate::boot` test that plans without one. `http:listener` plans either way --
+    /// `/metrics` is on the one listener and every node has a `listener` row -- so the
+    /// absence is a configuration rather than a wiring error.
+    pub(crate) mgmt: Option<mw_http::Management>,
+
     /// Every enabled `uploader` row, joined to its `station_service` pairing, in the shape
     /// `mw-output` plans from.
     ///
@@ -282,6 +294,31 @@ pub struct Config {
     /// and the cursor lag for `IngestBatch.sender_depth`.
     pub(crate) spool: Option<Arc<mw_pipeline::Spool>>,
 
+    /// Every `uploader` row, enabled or not, joined to its pairing.
+    ///
+    /// **A second read of the same table**, and the reason is which question each answers:
+    /// [`Config::declared_uploaders`] is what the registrar plans from and holds only the
+    /// enabled rows, because a disabled uploader is not a component. The management API has
+    /// to show a service the operator has just switched off, or the toggle is write-only and
+    /// the page 404s the moment it is used (M7-1). One `WHERE` apart, so a second query is
+    /// cheaper than a second shape.
+    pub services: Vec<config_db::UploaderRow>,
+
+    /// The `aeris_account` row, if this node has one.
+    ///
+    /// Read here rather than by the component that consumes it for the reason every other
+    /// row is: `mw-output` may not depend on `mw-store` (`ci/layers.toml`), so the query is
+    /// this crate's and the shape the registrar plans from is the component crate's. **Its
+    /// absence is the ordinary case** -- most deployments have no Aeris account.
+    pub aeris_account: Option<config_db::AerisAccountRow>,
+
+    /// Every station paired with the Aeris service, in the shape `mw-output` plans from.
+    ///
+    /// `pub(crate)` for [`Config::declared_stations`]' reason. The pairing itself is a
+    /// `station_service` row with `service = 'aeris'`; the coordinates come off the station
+    /// row, because the forecast API is queried by `latitude,longitude`.
+    pub(crate) declared_aeris: Vec<mw_output::AerisStation>,
+
     /// The generation these rows were read at (**D-53**).
     ///
     /// `ZERO` until something can bump it: a generation is assigned by `ConfigAdmin` on
@@ -293,22 +330,28 @@ pub struct Config {
 
 impl Config {
     /// Read the configuration. Step 4 of the boot sequence.
-    pub async fn load(pool: &SqlitePool) -> Result<Self, ConfigDbError> {
-        let stations = config_db::stations(pool).await?;
-        let ingest = config_db::ingest(pool).await?;
+    ///
+    /// **A connection rather than the pool**, which is what lets `ConfigAdmin`'s save
+    /// preview read the configuration *it is proposing*: the preview applies its change in a
+    /// transaction, re-reads through this function, runs `plan()` and rolls back, so the
+    /// preview and the save are one code path (implementation-plan.md **M7-1**). Every call
+    /// on a pool takes its own connection and would see the pre-change rows.
+    pub async fn load(conn: &mut sqlx::SqliteConnection) -> Result<Self, ConfigDbError> {
+        let stations = config_db::stations(&mut *conn).await?;
+        let ingest = config_db::ingest(&mut *conn).await?;
         // The `uplink` rows joined to the `peers` rows, which is the one join this type
         // does: `mw_collector::UplinkRow` needs the peer's `NodeId` for the loop filter and
         // the `uplink` table keys on the peer's *name*. A row whose peer has no `peers` row
         // is dropped here and the warning is `mw_collector::register`'s, which is where
         // the plan error that names it lives.
-        let peers = config_db::peers(pool).await?;
-        let uplinks = config_db::uplinks(pool).await?;
-        let websites = config_db::websites(pool).await?;
+        let peers = config_db::peers(&mut *conn).await?;
+        let uplinks = config_db::uplinks(&mut *conn).await?;
+        let websites = config_db::websites(&mut *conn).await?;
         // `aerisWeatherEnabled` is a `station_service` row with `service = 'aeris'` rather
         // than a column -- the `website` table's own comment says so -- and it is folded
         // into the website views below rather than kept, because nothing else reads it.
-        let aeris_stations = config_db::aeris_stations(pool).await?;
-        let uploaders = config_db::uploaders(pool).await?;
+        let aeris_stations = config_db::aeris_stations(&mut *conn).await?;
+        let uploaders = config_db::uploaders(&mut *conn).await?;
         Ok(Config {
             declared_collector_ingest: ingest.iter().map(declare_collector_ingest).collect(),
             declared_uplinks: uplinks
@@ -326,13 +369,16 @@ impl Config {
             ingest_tls: None,
             spool: None,
             declared_uploaders: uploaders.iter().map(declare_uploader).collect(),
+            services: config_db::all_uploaders(&mut *conn).await?,
+            aeris_account: config_db::aeris_account(&mut *conn).await?,
+            declared_aeris: declare_aeris(&stations, &aeris_stations),
             web_sites: websites
                 .iter()
                 .map(|w| declare_site(w, &stations, &aeris_stations))
                 .collect(),
-            listener: config_db::listener(pool).await?,
-            weather_database: config_db::weather_database(pool).await?,
-            node: config_db::node(pool).await?,
+            listener: config_db::listener(&mut *conn).await?,
+            weather_database: config_db::weather_database(&mut *conn).await?,
+            node: config_db::node(&mut *conn).await?,
             declared_ingest: ingest.iter().map(declare_ingest).collect(),
             ingest,
             declared_stations: stations.iter().map(declare).collect(),
@@ -354,6 +400,7 @@ impl Config {
             web_states: None,
             mount: None,
             sni: None,
+            mgmt: None,
             generation: Generation::ZERO,
         })
     }
@@ -484,6 +531,74 @@ impl Config {
     ) {
         self.mount = Some(mount);
         self.sni = sni;
+    }
+
+    /// Hand the configuration the management API's socket and router (**M7-1**).
+    ///
+    /// Separate from [`Config::set_listener`] rather than folded into it, because the two
+    /// have different preconditions and the order is forced: the management router holds a
+    /// `ConfigAdmin`, which holds the plan sink, which the supervisor produces -- and the
+    /// supervisor is assembled after the route tables are mounted. One call would mean
+    /// mounting the public tables after the supervisor existed, which is the ordering
+    /// `assert_route_tables_match_the_plan` depends on not changing.
+    pub fn set_management(&mut self, mgmt: mw_http::Management) {
+        self.mgmt = Some(mgmt);
+    }
+
+    /// Where the management API binds, from `listener.management_listen_addr` and
+    /// `management_port`.
+    ///
+    /// **Loopback unless the instance has been claimed.** `A-W5-3` makes the column's
+    /// default `127.0.0.1`, and W5 §3.5 keeps the management API on loopback until an
+    /// administrator account exists -- which is implementation-plan.md **M7-2**'s work. This
+    /// item ships the surface without authentication, so the rule is enforced here rather
+    /// than left to the operator: a configured non-loopback address is **refused** and
+    /// narrowed to loopback with a warning naming what was configured, until M7-2 can tell
+    /// a claimed instance from an unclaimed one.
+    ///
+    /// Narrowed rather than refused outright, because the alternative is a daemon that will
+    /// not start on the owner's existing configuration -- and the thing the operator needs
+    /// is the management UI, reachable over an SSH tunnel in the meantime.
+    pub fn management_addr(&self) -> Result<std::net::SocketAddr, AddressError> {
+        let configured = &self.listener.management_listen_addr;
+        let port = self.listener.management_port;
+        let bare = configured
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(configured);
+        let addr: std::net::IpAddr = bare.parse().map_err(|_| AddressError {
+            addr: configured.clone(),
+            port,
+        })?;
+        if addr.is_loopback() {
+            return Ok(std::net::SocketAddr::new(addr, port));
+        }
+        tracing::warn!(
+            configured = %configured,
+            port,
+            "the management API has no authentication until M7-2, so it is bound to \
+             127.0.0.1 rather than the configured address; reach it over an SSH tunnel"
+        );
+        Ok(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port,
+        ))
+    }
+
+    /// The management API's certificate paths, when one is configured.
+    ///
+    /// Keyed by an empty hostname and marked the default, because there is one certificate
+    /// and no SNI to select on: an operator reaches this API by address, not by a name the
+    /// certificate has to match.
+    pub fn management_cert(&self) -> Option<mw_http::CertPaths> {
+        let cert = self.listener.management_tls_cert_path.as_ref()?;
+        let key = self.listener.management_tls_key_path.as_ref()?;
+        Some(mw_http::CertPaths {
+            hostname: String::new(),
+            cert: cert.into(),
+            key: key.into(),
+            is_default: true,
+        })
     }
 
     /// Every website's certificate paths, for the SNI resolver (§6.4).
@@ -650,6 +765,92 @@ impl mw_pipeline::RollupConfig for Config {
 /// Column into field, like every other registrar trait here. The handle the uploaders need
 /// is the **same** `Arc<dyn WindowedView>` the snapshot components are given -- one object,
 /// so an uploader and `/latest` cannot disagree about what the five-minute wind average is.
+impl mw_pipeline::snow::SnowConfig for Config {
+    fn has_weather_database(&self) -> bool {
+        self.weather_database.is_some()
+    }
+
+    /// Every enabled snow gauge, with its calibration and its **resolved** zone.
+    ///
+    /// Three predicates, each with a reason the registrar cannot supply:
+    ///
+    /// - `kind == "snowgauge"`, which is the configured device type `/stationinfo` returns
+    ///   (`docs/legacy-api-contract.md` §3.1 is explicit that it and the driver's
+    ///   self-reported `stationtype` "are not the same set and must not be unified").
+    /// - `enabled`, which is W5 §1.2's "Collecting readings" toggle: a gauge with
+    ///   collection switched off has no buckets to read, so planning four components over
+    ///   it would mean four ticks a minute finding nothing, forever.
+    /// - a `transport_kind`, which is what distinguishes a station this node **collects
+    ///   from** from one a peer forwards readings for (`mw_station::config`). A gauge
+    ///   received from a peer is inventory on this node; its snow totals are computed on
+    ///   the node that owns it, and computing them here as well would be two answers to one
+    ///   question.
+    ///
+    /// The zone comes from [`Config::station_zones`] -- the registry snapshot's resolved
+    /// parse, for `rollup_stations`' reason: the parse **is** the validation (W2a Decision
+    /// 11) and it already happened there, so a second parse would be a second answer to
+    /// which midnight the station's day begins at.
+    fn snow_stations(&self) -> Vec<mw_pipeline::snow::SnowStation> {
+        let zones: std::collections::BTreeMap<&str, Option<Zone>> = self
+            .station_zones
+            .iter()
+            .map(|(key, zone)| (key.as_str(), *zone))
+            .collect();
+        self.stations
+            .iter()
+            .filter(|r| r.kind == "snowgauge" && r.enabled && r.transport_kind.is_some())
+            .map(|r| mw_pipeline::snow::SnowStation {
+                key: StationKey::new(r.station_key.as_str()),
+                base_distance_mm: r.snow_base_distance_mm,
+                zone: zones
+                    .get(r.station_key.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+            })
+            .collect()
+    }
+}
+
+impl mw_output::AerisConfig for Config {
+    /// The account, or `None` when there is no row **or it is switched off**.
+    ///
+    /// The `enabled` flag is read here rather than in the registrar because this is the
+    /// layer that holds the row: the trait's contract is "the account this node fetches
+    /// with", and a disabled account is not one. An enabled row with no credential is
+    /// unrepresentable -- the table's own `CHECK` rejects it -- and is answered as absent
+    /// anyway rather than unwrapped, because a frozen boot path may not panic over a
+    /// constraint.
+    fn aeris_account(&self) -> Option<mw_output::AerisAccount> {
+        let row = self.aeris_account.as_ref()?;
+        if !row.enabled {
+            return None;
+        }
+        Some(mw_output::AerisAccount {
+            client_id: row.client_id.clone()?,
+            client_secret: row.client_secret.clone()?,
+            api_endpoint: row.api_endpoint.clone(),
+            refresh_interval: row
+                .refresh_interval_seconds
+                .and_then(|seconds| u64::try_from(seconds).ok())
+                .map(Duration::from_secs),
+        })
+    }
+
+    fn aeris_stations(&self) -> Vec<mw_output::AerisStation> {
+        self.declared_aeris.clone()
+    }
+
+    /// The deployment's own zone, for `aeris:alerts:gc`'s `Calendar`.
+    ///
+    /// `node.timezone` is `NOT NULL DEFAULT 'UTC'`, so the `None` here is a *malformed*
+    /// value rather than an absent one -- and it is a `PlanError::MissingTimeZone` naming
+    /// the sweep rather than a silent fallback, which is `TzSource`'s own rule. A node with
+    /// no `node` row at all has not started before and has no components either.
+    fn deployment_zone(&self) -> Option<Zone> {
+        Zone::new(&self.node.as_ref()?.timezone).ok()
+    }
+}
+
 impl mw_output::OutputConfig for Config {
     fn uploaders(&self) -> Vec<mw_output::UploaderRow> {
         self.declared_uploaders.clone()
@@ -850,6 +1051,19 @@ impl mw_http::ListenerConfig for Config {
     fn ingest_tls(&self) -> Option<Arc<rustls::ServerConfig>> {
         self.ingest_tls.clone()
     }
+
+    /// The management API's socket and router (**M7-1**).
+    ///
+    /// Cloned per call rather than borrowed, because [`mw_http::Management`] owns an
+    /// `axum::Router` that the component's builder closure moves into a task -- and a
+    /// `Backoff` retry builds again, so the router has to survive being taken.
+    fn management(&self) -> Option<mw_http::Management> {
+        self.mgmt.as_ref().map(|m| mw_http::Management {
+            addr: m.addr,
+            router: m.router.clone(),
+            tls: m.tls.clone(),
+        })
+    }
 }
 
 impl mw_collector::CollectorConfig for Config {
@@ -1035,6 +1249,58 @@ fn declare_station(row: &config_db::StationRow) -> mw_api_legacy::StationView {
     }
 }
 
+/// Every Aeris-paired station, joined to its coordinates.
+///
+/// The pairing is a `station_service` row with `service = 'aeris'` and the coordinates are
+/// the station's, which is the join `mw-output` cannot do: the two tables are `mw-store`'s
+/// and `ci/layers.toml` forbids that crate to it.
+///
+/// **A disabled station keeps its pairing and loses its components**, which is the same
+/// predicate `snow_stations` applies and for the same reason: an operator who switched a
+/// station off did not ask to keep paying for its forecasts. A station received from a
+/// peer, by contrast, **does** get its forecasts fetched here -- a forecast is a property
+/// of a *location*, not of who collects the readings, and the node that serves a website
+/// for a remote station is the node that needs its forecast.
+///
+/// # The disabled case is logged, because the website does not agree with it
+///
+/// `declare_site` derives the rendered page's `aerisWeatherEnabled` from the **unfiltered**
+/// pairing list, so a disabled, paired station that is a website's primary still advertises
+/// forecasts -- while this function drops it and no component is planned. That is the exact
+/// state `mw_output::aeris::register` refuses the NULL-coordinates route to ("a website with
+/// `aerisWeatherEnabled: true`, an empty forecast panel, and nothing anywhere saying why"),
+/// reached by a different route.
+///
+/// It is **logged rather than refused or re-enabled**, and each of the three was considered:
+/// refusing would make switching a station off a configuration the daemon will not start on;
+/// planning the components anyway would fetch -- and bill -- for a station the operator
+/// turned off; and changing what the website renders would change a frozen page's bytes for
+/// a reason that has nothing to do with this item. So it is a `warn` naming the row and both
+/// fixes, which is what `mw_output::plan`'s `station_is_disabled` branch does for the same
+/// situation one table over.
+fn declare_aeris(
+    stations: &[config_db::StationRow],
+    paired: &[String],
+) -> Vec<mw_output::AerisStation> {
+    for row in stations {
+        if !row.enabled && paired.contains(&row.station_key) {
+            tracing::warn!(
+                station = %row.station_key,
+                "this station is paired with the Aeris service and has collecting switched                  off, so NO forecast or alert component is planned for it -- while a website                  whose primary station it is still advertises forecasts. Re-enable the                  station, or remove its `station_service` row with `service = 'aeris'`."
+            );
+        }
+    }
+    stations
+        .iter()
+        .filter(|r| r.enabled && paired.contains(&r.station_key))
+        .map(|r| mw_output::AerisStation {
+            key: StationKey::new(r.station_key.as_str()),
+            latitude: r.latitude,
+            longitude: r.longitude,
+        })
+        .collect()
+}
+
 /// One `uploader` row, column into field.
 ///
 /// Field for field with no interpretation, which is the point: every default, every clamp
@@ -1143,6 +1409,9 @@ mod tests {
     fn config(addr: &str, port: u16) -> Config {
         Config {
             declared_uploaders: Vec::new(),
+            services: Vec::new(),
+            aeris_account: None,
+            declared_aeris: Vec::new(),
             stations: Vec::new(),
             declared_stations: Vec::new(),
             websites: Vec::new(),
@@ -1173,6 +1442,7 @@ mod tests {
             web_states: None,
             mount: None,
             sni: None,
+            mgmt: None,
             listener: Listener {
                 listen_addr: addr.to_string(),
                 http_port: port,
@@ -1180,6 +1450,8 @@ mod tests {
                 grpc_port: 50051,
                 management_listen_addr: "127.0.0.1".into(),
                 management_port: 8081,
+                management_tls_cert_path: None,
+                management_tls_key_path: None,
             },
             weather_database: None,
             node: None,

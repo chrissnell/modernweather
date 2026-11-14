@@ -107,11 +107,53 @@ impl Listen {
     }
 }
 
+/// The management API's socket and router.
+///
+/// **A separate socket and a separate router, which is not a retreat from §6.1's "the unit
+/// that is singular is the router and the route table".** That rule is about the surface a
+/// *visitor* reaches: three websites, the frozen REST contract, the gRPC peers and
+/// `/metrics` are one route table dispatched by host, which is why `Scope::Site` exists. The
+/// management API is a different surface by configuration -- the `listener` row has carried
+/// `management_listen_addr` and `management_port` since the schema's first migration, and
+/// W5 **A-W5-3** makes its default bind `127.0.0.1` while the public one is `0.0.0.0`. One
+/// router on both sockets would put every configuration-mutating route on the public port,
+/// which is the opposite of that decision.
+///
+/// It is bound by `http:listener` rather than by a component of its own for the reason
+/// `ci/layers.toml` gives: **only `mw-http` may bind a socket**, and `http:listener` is the
+/// one component in this crate. What that costs is stated rather than implied -- the
+/// management API stops when the listener stops -- and it is bounded by the listener having
+/// no hard requirement at all, so the only thing that stops it is a port another process
+/// holds.
+pub struct Management {
+    /// Where it binds, from `listener.management_listen_addr` and `management_port`.
+    pub addr: SocketAddr,
+    /// `mw_api_mgmt::router`, built by the binary as a root resource.
+    pub router: Router,
+    /// The certificate store, when `listener.management_tls_cert_path` is configured.
+    pub tls: Option<Arc<SniResolver>>,
+}
+
+impl std::fmt::Debug for Management {
+    /// An `axum::Router` is not `Debug`, and what is useful in a log line is the address.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Management")
+            .field("addr", &self.addr)
+            .field("tls", &self.tls.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Every bound socket, not yet serving.
 pub struct Bound {
     main: Either,
     redirect: Option<(TcpListener, SocketAddr)>,
+    /// The gRPC socket. `Either`, because it is also the **ingest** endpoint: a node with
+    /// a `config.ingest` row serves it over TLS with a client-certificate verifier, and one
+    /// without serves `grpc:weatherv1`'s read methods in plaintext (W7 §5.4, **D-46**).
     grpc: Either,
+    /// The management socket, when the configuration names one.
+    management: Option<(Either, Router)>,
     router: Router,
     redirect_to: Option<u16>,
     /// The host table, for the redirector's one use of it: refusing a `Location` built from
@@ -127,6 +169,10 @@ impl std::fmt::Debug for Bound {
             .field("redirect", &self.redirect.as_ref().map(|(_, a)| *a))
             .field("grpc", &self.grpc.addr())
             .field("grpc_tls", &matches!(self.grpc, Either::Tls { .. }))
+            .field(
+                "management",
+                &self.management.as_ref().map(|(e, _)| e.addr()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -202,6 +248,24 @@ pub async fn bind_with_hosts(
     hosts: Arc<crate::host::HostTable>,
     ingest_tls: Option<Arc<ServerConfig>>,
 ) -> Result<Bound, HttpError> {
+    bind_all(listen, router, resolver, hosts, None, ingest_tls).await
+}
+
+/// [`bind_with_hosts`] plus the management socket, which is what `http:listener` calls.
+///
+/// A third function rather than a fifth parameter on the other two, for the reason there are
+/// already two: the management socket exists only on a node that serves the management API,
+/// and every existing caller -- including the ones that only want a port the kernel chose --
+/// has nothing to pass. `ingest_tls` is in the same position one level down: it exists only
+/// on a node with a `config.ingest` row.
+pub async fn bind_all(
+    listen: &Listen,
+    router: Router,
+    resolver: Option<Arc<SniResolver>>,
+    hosts: Arc<crate::host::HostTable>,
+    management: Option<Management>,
+    ingest_tls: Option<Arc<ServerConfig>>,
+) -> Result<Bound, HttpError> {
     let main = match listen.https_port {
         Some(_) => {
             let resolver = resolver.ok_or(HttpError::NoCertificate {
@@ -249,6 +313,10 @@ pub async fn bind_with_hosts(
     // verifier when one was supplied, and plaintext otherwise -- the second is what every
     // node without a `config.ingest` row gets, and what `grpc:weatherv1`'s read services
     // are reached over on a LAN.
+    //
+    // Not `tls_or_plain`, which builds its own `ServerConfig` from an `SniResolver`: the
+    // ingest socket's configuration carries a **client**-certificate verifier, which is
+    // what makes it layer 1 (W7 **D-46**), and `mw_collector` is where that is assembled.
     let grpc = match ingest_tls {
         Some(config) => {
             let (listener, addr) = listen_on(listen.grpc()).await?;
@@ -263,10 +331,15 @@ pub async fn bind_with_hosts(
             Either::Plain(listener, addr)
         }
     };
+    let management = match management {
+        Some(m) => Some((tls_or_plain(m.addr, m.tls.as_ref()).await?, m.router)),
+        None => None,
+    };
     Ok(Bound {
         main,
         redirect,
         grpc,
+        management,
         router,
         // **The port actually bound, not the configured one.** `listener.https_port` can be
         // `0`, which asks the kernel to choose -- and a `Location` naming port 0 is a
@@ -274,6 +347,46 @@ pub async fn bind_with_hosts(
         // `local_addr` is read back rather than echoed.
         redirect_to: listen.https_port.map(|_| main_addr.port()),
         hosts,
+    })
+}
+
+/// Bind one socket, with TLS when a resolver is supplied.
+///
+/// The main socket does not use this because its TLS-ness is decided by `https_port` being
+/// set rather than by a resolver being present, and because a `https_port` with no usable
+/// resolver has to be [`HttpError::NoCertificate`] rather than a plaintext fallback. The
+/// management socket's rule is the simpler one: a certificate is configured or it is not.
+async fn tls_or_plain(
+    addr: SocketAddr,
+    resolver: Option<&Arc<SniResolver>>,
+) -> Result<Either, HttpError> {
+    let Some(resolver) = resolver else {
+        let (listener, addr) = listen_on(addr).await?;
+        return Ok(Either::Plain(listener, addr));
+    };
+    // Empty is the same refusal the main socket makes, and for the same reason: a listener
+    // that accepts connections and fails every handshake is worse than one that does not
+    // start, because the first is discovered by a client and the second by the operator who
+    // just changed the configuration (§6.4).
+    if resolver.is_empty() {
+        return Err(HttpError::NoCertificate { addr });
+    }
+    // The provider is named rather than resolved from rustls's crate features, for
+    // `bind_all`'s reason: `ServerConfig::builder()` `expect`s its result, so a future
+    // dependency enabling `aws-lc-rs` would turn a bind into a panic.
+    let mut config = ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|source| HttpError::Tls { addr, source })?
+    .with_no_client_auth()
+    .with_cert_resolver(Arc::clone(resolver) as Arc<dyn rustls::server::ResolvesServerCert>);
+    config.alpn_protocols = ALPN.iter().map(|p| p.to_vec()).collect();
+    let (listener, addr) = listen_on(addr).await?;
+    Ok(Either::Tls {
+        listener,
+        addr,
+        acceptor: TlsAcceptor::from(Arc::new(config)),
     })
 }
 
@@ -312,6 +425,14 @@ impl Bound {
     /// **D-35**'s "plaintext ingest is a plan-time error" answerable rather than assumed.
     pub fn grpc_tls(&self) -> bool {
         matches!(self.grpc, Either::Tls { .. })
+    }
+
+    /// The management socket's address, when one is bound.
+    ///
+    /// Read back from the socket rather than echoed, for `local_addr`'s reason: a test that
+    /// asks for port 0 has to be told what it got.
+    pub fn management_addr(&self) -> Option<SocketAddr> {
+        self.management.as_ref().map(|(e, _)| e.addr())
     }
 
     /// Serve every socket until `shutdown` completes, then drain for at most [`DRAIN`].
@@ -414,6 +535,28 @@ impl Bound {
                 }
             }
         };
+        let serve_management = {
+            let rx = signal.clone();
+            let management = self.management;
+            async move {
+                match management {
+                    None => Ok(()),
+                    Some((Either::Plain(listener, addr), router)) => {
+                        serve_one(listener, router, addr, wait(rx)).await
+                    }
+                    Some((
+                        Either::Tls {
+                            listener,
+                            addr,
+                            acceptor,
+                        },
+                        router,
+                    )) => {
+                        serve_one(TlsListener { listener, acceptor }, router, addr, wait(rx)).await
+                    }
+                }
+            }
+        };
         let deadline = {
             let rx = signal.clone();
             async move {
@@ -423,9 +566,10 @@ impl Bound {
         };
 
         tokio::select! {
-            (main, grpc, redirect, ()) =
-                async { tokio::join!(serve_main, serve_grpc, serve_redirect, fanout) } => {
-                main.or(grpc).or(redirect)
+            (main, grpc, redirect, management, ()) = async {
+                tokio::join!(serve_main, serve_grpc, serve_redirect, serve_management, fanout)
+            } => {
+                main.or(grpc).or(redirect).or(management)
             }
             () = deadline => {
                 // Abandoning the drain is a `WARN` rather than an error: every component is

@@ -88,7 +88,8 @@ inherited rather than discovered:
   at 0.09 B/row compressed — essentially zero, because `station_id` is the `compress_segmentby` key —
   and declined it. So the transform resolves `stationname` to a *text* `station_id`, and
   `stationname`/`stationtype` **stay** on the row as `role = "attribute"` dimensions. They leave
-  later, under OQ-W4-2, and that is a W2 follow-up.
+  later, under OQ-W4-2, and that is a W2 follow-up. **They left in M5-5**, after this migration
+  ran: see assumption 5 below for what that changed here and what it did not.
 - **Four levels, not three.** W4 added `observations_5m`. The rollup archive therefore has two
   destinations that matter and two that cannot reach it; §3.4.
 - **Retention on the lower levels.** 7 days on `observations_1m`, 14 on `_5m`, 90 on `_1h`. This is
@@ -233,12 +234,168 @@ separate, explicitly named step rather than part of `all`.
 > `.chunks` column it reads exists at 2.17.2 — and the §2 archive statements execute. `SRC_IMAGE` in
 > `lab/run-in-pod.sh` reproduces it.
 >
-> **Bounded claim:** this exercised the DDL and catalogue paths on an unseeded database, not a full
-> data run. The seeded end-to-end lab cannot be repeated at 2.17.2, because the target schema asserts
-> pg17/2.31 and refuses to build — which is correct, and is why the two halves are now separately
-> parameterised. Note also that `lab/10-seed.sh` manufactures the ~294 days of rollup-only history
-> on purpose; W6 §8 established production never had any, so the legacy-rollup path remains tested
-> only against a state that did not exist (D-71 keeps it anyway).
+> **Bounded claim, now discharged.** That run exercised the DDL and catalogue paths on an unseeded
+> database, not a full data run, and this note used to say the seeded end-to-end lab "cannot be
+> repeated at 2.17.2, because the target schema asserts pg17/2.31 and refuses to build". That was a
+> property of the *harness*, not of the procedure: both databases lived in one pod, so one image had
+> to serve both. `SRC_IMAGE` was declared and documented but never referenced. Wiring it to a second
+> pod removes the limitation — see the 2026-11-12 run below. `lab/10-seed.sh` still manufactures the
+> rollup-only history on purpose; W6 §8 established production never had any, so the legacy-rollup
+> path remains tested only against a state that did not exist (D-71 keeps it anyway).
+
+## 2a. The production run, 2026-11-13
+
+**The migration ran.** `pitcairn` as source over a read-only credential, M0-1's Kubernetes instance
+as target with `migrations/` at HEAD. This section is the record; the lab note below is the rehearsal
+that preceded it, kept because it is what made the run short.
+
+| | |
+|---|---|
+| source | PostgreSQL **16.6** / TimescaleDB **2.17.2**, re-confirmed. `weather` 215 columns, re-confirmed. 3 stations: `CSI` (campbell), `Suncrest Air Quality` (airgradient), `snow` (snowgauge) |
+| imported | **17,162,826** readings, 2025-10-30 .. 2026-11-12 23:17:49 UTC, in 55 slices of 7 days, each slice's count equal to the source's |
+| target after | `observations` **1,356 MB** compressed, 53 of 55 chunks, against the source's **20 GB** uncompressed for the same rows — production never had compression enabled (W6 O-3) |
+
+**Rows per station per year, at import time.** The one record of what moved.
+
+| station | year | rows | first | last |
+|---|---|---|---|---|
+| CSI | 2025 | 1,083,003 | 2025-10-30 00:00:03.929611+00 | 2025-12-31 23:59:57.036742+00 |
+| CSI | 2026 | 5,352,342 | 2026-01-01 00:00:02.037793+00 | 2026-11-12 23:17:48.460205+00 |
+| Suncrest Air Quality | 2025 | 1,620,854 | 2025-10-30 00:00:00.272627+00 | 2025-12-31 23:59:59.31424+00 |
+| Suncrest Air Quality | 2026 | 8,969,086 | 2026-01-01 00:00:02.387283+00 | 2026-11-12 23:17:49.853116+00 |
+| snow | 2025 | 45,600 | 2025-11-01 06:00:49.207257+00 | 2025-12-31 23:59:23.350755+00 |
+| snow | 2026 | 91,941 | 2026-01-01 00:00:18.368164+00 | 2026-10-02 19:29:31.68999+00 |
+
+The year key is UTC — see §6.1. **`snow` stops on 2026-10-02**, which is the station's own silence and
+not the migration's: the source agrees to the microsecond.
+
+**Derived, at import time and not stable.** `observations_1m` 1,193,224, `observations_5m` 240,122,
+`observations_1h` 20,661, `observations_1d` 991, `station_metrics` 636 pairs (3 stations x 212
+metrics), `stations` 3, `observations_1d_legacy` and `_1h_legacy` **0**. The first three figures are
+a snapshot: retention on the levels is 7 days, 14 days and 90 days, so a count taken the next
+morning is legitimately smaller. Raw has no retention and does not move.
+
+**The gates.**
+
+| | |
+|---|---|
+| **1. reconciliation, zero tolerance** | **1,182 of 1,182** (station, year, metric) digests `ok`, zero mismatches, `w9.assert_reconciled()` silent |
+| **2. the two bounded statistics** | `rain_incremental` total worst **5.77e-7** absolute against a 1.03e-3 bound; `wind_dir` circular mean worst **1.65e-3** degrees against a 1.69e-1 bound. The other twelve statistics **exact** — zero difference — over 964 daily buckets |
+| **3. `assert_no_unknown_source_columns()`** | raises nothing. 215 of 215 `ok`, nothing else |
+| **4. row counts per year** | the table above |
+| spot checks | **42 of 42** `ok` — every extreme and the timestamp that produced it, identical on both sides |
+| the §6.3 control | scalar and vector wind-direction means disagree in **378** buckets, so the circular-mean check is not passing for the wrong reason |
+| contract-visible | the two bounded statistics round to a different float32 in **39** and **337** of 964 buckets. Expected, recorded in §7, and the new value is the accurate one |
+
+**Negative controls, on the target that holds the data.** An empty `w9.recon` raises `w9.recon is
+empty: nothing was reconciled`. One digest row reduced by 101 readings raises
+`reconciliation found 1 mismatching (station, year, metric) rows: CSI/2026/outtemp: row_count`. Both
+inside a transaction that rolled back, and the verdict afterwards is 1,182 `ok` — the data-level
+version of the second control was run in the lab (§6.4) rather than against the only compressed copy
+of readings `pitcairn` has since dropped.
+
+**Nothing was written to `pitcairn`.** `archive` found the 2026-10-31 tables and left them alone.
+`pause-source-retention` found no enabled retention job on `weather` at the time it ran and therefore
+issued no `alter_job` — zero statements. Every other statement sent to the source was a `SELECT` or a
+`COPY ... TO STDOUT`.
+
+**What this run cost, because the numbers are not obvious.** `raw` 13 minutes for 17.2M rows.
+`populate_station_metrics` **62 minutes** — it is one `INSERT ... SELECT` per metric, so 212
+sequential single-threaded passes over the raw hypertable, and it is the slowest step in the
+procedure by an order of magnitude. `aggregates` 24 minutes, almost all of it `observations_1m`
+phase 1. Each digest 25-30 minutes. Each spot-check query ~1m50s on the source. The whole procedure
+is a few hours and none of it is interactive.
+
+**Three defects only a production run could find.** §2b. **And one the production run could not:
+the station ids it imported could not be station keys.** §2c.
+
+## 2b. What the production run found
+
+Each of these passed in the lab and failed here, and the reason is the same in all three: the lab's
+source and target were equivalent in a way that two real servers are not.
+
+**1. The legacy boundary compared a bucket's start against a reading's timestamp.**
+`w9.set_legacy_boundary()` records the first raw *reading*; `import_legacy_1d()` took every archived
+bucket whose *start* was below it. Production's first reading is **3.9 seconds** after midnight, so
+the daily bucket containing it starts before the cutover and was imported as legacy while
+`observations_1d` also held it, computed from the same raw. `w9.assert_legacy_disjoint()` caught it at
+exactly **3 buckets, one per station**, and `rollup` exited 1. The comparison is now against the
+bucket's **end**, per level. The lab could not reproduce it: its seeded raw starts exactly on a bucket
+boundary, so no bucket straddles.
+
+**2. The digest's year key was the server's local year.** `extract(year from <timestamptz>)` is
+evaluated in the session's `TimeZone`. Production is **US/Mountain**, the new instance **Etc/UTC**, so
+the seven hours after local New Year land in 2025 on one side and 2026 on the other. The first
+reconciliation reported **all 1,182 rows** as `row_count` mismatches with no data missing — the
+per-metric min and max agreed exactly, and `snow`, which had stopped reporting and so gained nothing
+new, showed **+458 in 2025 against -458 in 2026**: offsetting to zero, which is what a bucketing
+error looks like and what loss does not. Now extracted `AT TIME ZONE 'UTC'` on both sides, in the
+digest and in the spot checks. A lab with both databases in one pod shares one `TimeZone` and cannot
+see this.
+
+**3. The reconciliation window ran past what was imported.** `hi` was the *source's* current maximum,
+and the source is live and stays live — it is the rollback (D-2). By the time the digests ran it held
+readings that arrived after `raw` finished: **1,255** and **2,085** extra old-side rows on the two
+live stations. `hi` is now bounded by the target's maximum as well, and the step prints how many
+source rows the window excludes, so the exclusion is stated rather than inferred.
+
+**And one false positive the run exposed in the rollup check.** The old daily view is
+`materialized_only = false`, so `archive` captures a real-time tail bucket — a part-day. The new
+hierarchy computes that day from complete raw, so the two disagree by construction: every single
+disagreement in the first clean run was the **2026-10-31** bucket, `out_temp` max off by 8.9 degrees
+and `wind_speed` mean by 24% relative, while all 966 other buckets were exact or inside bound.
+`40-rollup-check.sql` now excludes each station's newest archived bucket and says why. A check that
+fails the same way on every run is a check that gets ignored.
+
+**Two steps could not be run alone**, which matters when a digest takes half an hour: `spot` and
+`rollup-check` were reachable only through `reconcile`. Both are now subcommands, and both are
+read-only and leave `w9.recon` alone, so a passing digest run does not have to be repeated to
+re-check them.
+
+> **Seeded end to end across the real version pair, 2026-11-12 (M5-1).** Source
+> `timescale/timescaledb-ha:pg16.6-ts2.17.2` in its own pod, target
+> `timescale/timescaledb-ha:pg17` with `migrations/` at HEAD — nine migrations, including the two
+> M6-3 added on 2026-11-12. Every step ran in order: `preflight`, the interlock refusal, `archive`,
+> `pause-source-retention`, `stage`, `gap`, `stations`, `raw`, `aggregates`, `rollup`, `reconcile`,
+> `policies`.
+>
+> | | result |
+> |---|---|
+> | source shape | 397,440 raw readings over 61 days, 3 stations at a 40 s cadence; `weather_1d` and `weather_1h` reach back 174 days, so **113 / 113 / 110 days per station are rollup-only** (P-4b) |
+> | the dangerous query | P-3b returns **2** invalidations reaching below raw on each of `weather_1d` and `weather_1h` — the A-W9-1 condition reproduced at 2.17.2, which is what makes the archive urgent rather than theoretical |
+> | column gap | 215 of 215 `ok`, nothing else; `w9.assert_no_unknown_source_columns()` raises nothing |
+> | `archive` | 520 daily and 12,480 hourly buckets, each verified equal to the view it came from |
+> | `pause-source-retention` | paused the one enabled retention job on `weather` and left both aggregate retention jobs enabled, as documented |
+> | `raw` | 9 slices, 397,440 rows, every slice's count equal to the source's |
+> | `rollup` | 336 legacy daily and 8,064 legacy hourly buckets, `assert_legacy_disjoint()` clean on both levels |
+> | `reconcile` | **591 of 591** (station, year, metric) digests `ok`, zero mismatches, `assert_reconciled()` raises nothing; 21 of 21 spot checks exact including the timestamp that produced each extreme |
+> | the two bounded statistics | `rain_incremental` total worst relative 3.13e-6 and `wind_dir` circular mean 1.73e-7, both against the 1.29e-4 derived bound; the other twelve statistics exact over 184 buckets |
+> | the §6.3 control | a scalar mean of the wind direction disagrees with the vector mean in **184 of 184** buckets, so the circular-mean check is not passing for the wrong reason |
+> | legacy re-read | 336 of 336 rows exact on mean, angle, extrema and total |
+>
+> **Reproducing it.** `SRC_IMAGE=timescale/timescaledb-ha:pg16.6-ts2.17.2 … run-in-pod.sh up`,
+> then `FROM=2025-01-01 TO=2025-06-25 CADENCE=40 RETAIN='60 days' 10-seed.sh`, then `run-in-pod.sh
+> migrate <step>`. That reproduces the shape — about 61 days of raw under 174 days of rollup; the
+> exact raw row count depends on which 7-day chunk boundary the retention cut lands on.
+>
+> **Two harness constraints the lab's clock imposes, worth knowing before reading any lab output.**
+> The lab's data sits in the past while `now()` does not, and two things follow.
+>
+> First, a *real* retention policy on the lab source deletes everything:
+> `add_retention_policy('weather', '60 days')` is due the moment it is created, because the whole
+> seeded range is older than 60 days *ago*. That is why `10-seed.sh` produces the retention window
+> with an explicit `drop_chunks` and no policy, and why the five policies it does create — so that
+> `pause-source-retention` has the one it pauses and the four it must not touch — take a `drop_after`
+> derived to reach past the oldest row in **any** of the five relations. Deriving it from raw alone
+> is not sufficient and was measured: a `drop_after` of raw's age + 30 days leaves the `weather_1d`
+> policy free to delete the rollup-only buckets, since the whole point of the seed is that
+> `weather_1d` reaches further back than `weather` does. In a lab seeded to a 98-day window it
+> removed 56 of those days within minutes of the policy being created — the A-W9-1 mechanism again,
+> this time with the lab's own clock supplying the invalidation.
+>
+> Second, `rebuild-aggregates.sh` phase 1 — "the widest `/span` band above each level", bounded by
+> `now() - 366 days` — matches no rows in the lab and the whole hierarchy is built by phase 2. On
+> production, where `max(time)` is minutes old, phase 1 is the part that matters.
 
 **Through the view, not through `pg_dump -t`.** The prompt asserts that `pg_dump -t weather_1d`
 captures only a view definition. Verified:
@@ -293,6 +450,157 @@ SELECT user_view_name,
 A `-infinity` watermark on a `materialized_only = false` level means the archive copy of that level
 would capture a real-time computation rather than stored history. Check the watermarks before
 believing an archive copy. P-5 reports them.
+
+## 2c. The re-import, 2026-11-13 — the station ids of §2a could not be station keys
+
+**M5-1 imported three stations under ids no configuration could address.** `station_id = stationname`
+was the documented default and it is not a usable one: a `station_id` becomes a station key, a
+station key becomes a `ComponentId` — `station:campbell:<key>` — and
+`crates/mw-component/src/id.rs` permits only lower-case ASCII, digits, `-`, `_`, `.` and `:`. Of the
+three names imported, `CSI` and `Suncrest Air Quality` are both refused, so a live station
+configured against a year of its own history is `StationPlanError::Key` at plan time and never
+starts. The preview deployment showed it the way it would always have shown: it was configured with
+the key `csi`, minted a **second** station beside the migrated `CSI`, and `/span/720h?station=CSI`
+answered one bucket of live data instead of a year of history.
+
+Nothing about the owner's names caused this. Any station with a capital letter or a space would have
+hit it, which is why the fix is a derived key and two refusals rather than three corrected values
+(Decision 15).
+
+| Go `stationname` | `w9.station_key()` | M5-1's id | usable as a station key |
+|---|---|---|---|
+| `CSI` | `csi` | `CSI` | no — upper case |
+| `snow` | `snow` | `snow` | yes |
+| `Suncrest Air Quality` | `suncrest-air-quality` | `Suncrest Air Quality` | no — upper case and spaces |
+
+**Through `w9.station_map`, not an `UPDATE`.** 53 of the target's 55 chunks were compressed, so
+rewriting the ids in place meant decompressing and rewriting 6.4 M rows and re-materialising four
+levels afterwards. The source is read-only by D-3 and therefore reproducible by construction, so the
+import was run again — which is what `reset-target` is for, because `stage` creates its relations
+without `IF NOT EXISTS` and a second run would otherwise need hand-typed SQL.
+
+### What the re-run found: the source had dropped fourteen days of raw
+
+`preflight` reported the source's raw beginning at **2025-11-13 00:00:02 UTC**, not the 2025-10-30
+§2a imported from. Retention job **1022** — `drop_after = 365 days` — ran once at **02:35 UTC on
+2026-11-13**, about three hours after §2a's import finished, and dropped every chunk older than a
+year. It is the **Go daemon's** policy, re-added on every start
+(`remoteweather internal/storage/timescaledb/sql.go:2038`), which is why pausing job 1004 in October
+did not prevent it; job 1022 is paused now.
+
+So **462,495 readings existed only in the migrated database**, and a re-import that took only what
+the source still had would have destroyed them. `rollup` is not the answer for those: it turns
+rollup-only history into daily and hourly buckets, which is right for history that was already
+rollup-only and wrong for raw that still exists. `carry-out` / `carry-in` are that case — the rows
+below the source's minimum, copied out before the reset and inserted back after `stations`, re-keyed
+through `w9.station_map` on `stationname` like every imported row.
+
+| station | carried rows | from | to |
+|---|---|---|---|
+| `csi` | 237,022 | 2025-10-30 00:00:03.929611+00 | 2025-11-12 23:59:57.052146+00 |
+| `suncrest-air-quality` | 214,181 | 2025-10-30 00:00:00.272627+00 | 2025-11-12 23:59:59.572889+00 |
+| `snow` | 11,292 | 2025-11-01 06:00:49.207257+00 | 2025-11-12 13:06:52.731904+00 |
+| | **462,495** | | |
+
+### The gates, on the re-imported data
+
+| | |
+|---|---|
+| imported | **16,713,644** readings in 53 slices of 7 days, 2025-11-13 00:00:02 .. 2026-11-13 06:44:11 UTC, each slice's count equal to the source's. Plus the **462,495** carried: **17,176,139** in `observations` |
+| **1. reconciliation, zero tolerance** | **1,182 of 1,182** (station, year, metric) digests `ok`, zero mismatches, `w9.assert_reconciled()` silent |
+| **2. the two bounded statistics** | `rain_incremental` total worst **5.7742e-7** absolute and relative; `wind_dir` circular mean worst **1.6502e-3** degrees, **5.6119e-6** relative. The other twelve statistics **exact** — zero difference — over **964** daily buckets, and R-4b lists no disagreement at all |
+| **3. `assert_no_unknown_source_columns()`** | raises nothing. **215 of 215** `ok`, nothing else |
+| **4. row counts per year** | the table below |
+| spot checks | **42 of 42** `ok` — every extreme and the timestamp that produced it, identical on both sides |
+| the §6.3 control | scalar and vector wind-direction means disagree in **379** buckets, so the circular-mean check is not passing for the wrong reason |
+| contract-visible | the two bounded statistics round to a different float32 in **39** and **337** of 964 buckets — the same counts §2a measured |
+| the carry | an exact row-set comparison over all 216 columns, **both directions**, returns **0**: `w9_carried_observations EXCEPT ALL observations` and the reverse, over all 462,495 rows |
+| legacy | `observations_1d_legacy` and `_1h_legacy` **0 rows**, `assert_legacy_disjoint()` clean on both levels, same as §2a — and now with a measured reason: every station's earliest archived bucket is the bucket that *contains* its first raw reading (`csi` and `suncrest-air-quality` 2025-10-30, `snow` 2025-11-01), so no archived bucket ends at or before a cutover |
+
+**Rows per station per year, against §2a's.** The comparison the work item asked for, and the one
+that proves the carry: **every settled bucket is identical.**
+
+| station (M5-1's id) | year | §2a | this run | delta |
+|---|---|---|---|---|
+| `csi` (`CSI`) | 2025 | 1,083,003 | **1,083,003** | 0 |
+| `csi` (`CSI`) | 2026 | 5,352,342 | **5,356,936** | +4,594 |
+| `snow` (`snow`) | 2025 | 45,600 | **45,600** | 0 |
+| `snow` (`snow`) | 2026 | 91,941 | **91,941** | 0 |
+| `suncrest-air-quality` (`Suncrest Air Quality`) | 2025 | 1,620,854 | **1,620,854** | 0 |
+| `suncrest-air-quality` (`Suncrest Air Quality`) | 2026 | 8,969,086 | **8,977,805** | +8,719 |
+
+Four of the six are exact, including both of `snow`'s — the station stopped reporting on 2026-10-02,
+so it had nothing to add. The two deltas are the two live stations and they are the readings that
+arrived in the **7 h 26 m** between §2a's last imported reading (2026-11-12 23:17:48) and this run's
+(2026-11-13 06:44:11). At their measured cadences — one reading every 5.1 s for `csi`, every 3.04 s
+for `suncrest-air-quality` — that window predicts ≈5,250 and ≈8,800. A delta of the wrong order, or
+any delta at all in a settled year, would have been the stop-the-line case the work item names.
+
+`19,837` further source rows arrived above the comparison window while the import ran, and the step
+says so rather than leaving it to be inferred (§2b defect 3).
+
+**Derived, at the end of the run and not stable.** `observations` 14 GB over 55 chunks with 14
+compressed and the columnstore policy still working through the rest; `observations_1d` **993**
+buckets — **379** for `csi`, 373 for `suncrest-air-quality`, 241 for `snow` — and `observations_1m`
+1,194,098, `_5m` 240,298, `_1h` 20,677, which are a snapshot because those three retain 7, 14 and 90
+days; `station_metrics` **636** pairs (3 × 212); `stations` **3** — one per device, where §2a's
+database had four.
+
+**The procedure was amended after this run, by a code review of it, and the amendments are
+additive.** Named because an unflagged change to the thing that produced a record invalidates the
+record. `w9.station_key` now lowers under `COLLATE "C"` rather than the database default — the three
+derived keys were re-checked against the regenerated SQL and are unchanged, as they must be for
+ASCII; `carry-in` gained `ON CONFLICT DO NOTHING`, a NULL-safe orphan guard and the `EXCEPT ALL`
+proof; `carry-out` and `carry-in` gained the paused-retention interlock; `reset-target` gained the
+carry interlock and a non-empty-database-name guard. Every one of them is a refusal or a no-op on
+this data, and each was exercised against this database rather than reasoned about: `carry-in` was
+re-run (0 rows inserted, both `EXCEPT ALL` counts 0), `carry-out` refuses an existing carry,
+`reset-target` refuses without `CONFIRM_RESET` and refuses again with the carry hidden, naming the
+462,495 readings it would have destroyed.
+
+### Verified against the running preview
+
+`/span` resolves a device *name* and selects by *key*, so this is the end-to-end test of the whole
+change:
+
+| request | before | after |
+|---|---|---|
+| `/span/8760h?station=CSI` | one bucket | **365 daily buckets, 2025-11-13 → 2026-11-13** |
+| `/span/720h?station=CSI` | one bucket | **31 daily buckets** (720 h is 30 days, not a year) |
+| `/span/48h?station=CSI` | one bucket | 431 five-minute buckets |
+| `/span/6h?station=CSI` | one bucket | minute buckets from the live reading backwards |
+| `stations` | `CSI` *and* `csi` | `csi` alone, `first_seen` 2025-10-30, `last_seen` live |
+
+Two things the preview showed that are not this work item's. `stations.type` for `csi` reads
+`campbellscientific` and not the `campbell` the migration wrote: the ingest path keeps the projection
+current and writes the Rust spelling, which is the one the configuration store's `CHECK` list uses.
+The weather schema has no `CHECK` on that column, so neither value is refused. And `/latest` returns
+an empty `stationname`, which is a snapshot-path question for the preview work item and not a
+migration one.
+
+### Two things this does not close
+
+**The reconciliation cannot see the carried rows, so `carry-in` verifies them itself.**
+`recon_window` starts at the source's minimum and `w9.digest_body` filters on it, so every carried
+row is below the window by construction: a forgotten `carry-in` reconciles **1,182 of 1,182 clean**
+with 462,495 readings missing. The `EXCEPT ALL` pair in the table above is therefore not a
+belt-and-braces check written up afterwards — it is the only check that covers those rows, and it is
+in the step rather than in this document for that reason. `reset-target` also refuses outright while
+the target holds readings below the source's minimum and no carry table exists, which is the same
+interlock shape `pause-source-retention` has and for the same reason.
+
+**A derived key that is *usable* is not necessarily the key that is *configured*.**
+`w9.assert_station_map_usable()` proves an id could be a station key; nothing proves it is the one
+the configuration store holds, and that mismatch — not the character set — is the immediate cause of
+the `CSI`/`csi` split the owner saw. Configure `station_key = 'suncrest_aq'` against history imported
+as `suncrest-air-quality` and §2c happens again with both assertions passing. The configuration store
+is SQLite and **M7-4** is what populates it; this is the assumption that item has to discharge, and
+it is recorded under "About W3" below.
+
+**`w9_carried_observations` is still there, 893 MB.** Its own comment says it is droppable once this
+reconciliation has passed, and it has; it was left in place deliberately because no offsite backup
+has run since the import, so those 462,495 readings exist in exactly one place either way and the
+table costs nothing but disc. `DROP TABLE w9_carried_observations;` when a backup has been taken.
 
 ---
 
@@ -459,6 +767,16 @@ SELECT <station_id resolved from stationname>, <the same 215 columns>
   FROM weather;
 ```
 
+**215 as of M5-1; 213 since M5-5**, which retired `stationname` and `stationtype` to
+`role = "metadata"`. The list is derived from the registry, so it shrank on its own — but the two
+columns are still in the *source*, which makes them `unknown_in_source` in `w9.gap_report` and
+`w9.assert_no_unknown_source_columns()` would refuse the import over them. That is the assertion
+working: an unrouted source column is data with no destination. The resolution is the one the
+staging schema was built for — `w9.record_retired_dimensions()`, generated from the registry, records
+both in `w9.dropped_source_column` with the reason, for the columns the source actually declares.
+`w9.populate_stations()` still writes the display name into `stations.name`, so nothing is lost:
+the import stopped copying a per-row duplicate, not a value.
+
 **The risk is not the mapping, it is the width.** The Go source declares 215 columns and production
 carries about 143 (W0 OQ-6), and nothing in the repository knows which 143. A baked column list would
 either fail on a column production does not have, or silently skip one it does. So the emitted SQL
@@ -518,12 +836,36 @@ where the default float output is shortest-exact. Slices are 7 days to match the
 interval, and `w9.import_slice` records which are done, so an interrupted import resumes.
 
 `station_id` is resolved on the source side by a `CASE` built from `w9.station_map`, so the source
-needs no join and no temporary object. **The default is `station_id = stationname`**, which is what
-keeps `/span?station=<device name>` — a device *name*, frozen, and the only parameter that selects
-`/span` data — addressing the history it addressed before. The map is populated explicitly and
-asserted complete against the station list actually present in the source, rather than defaulted
-silently, because choosing something else is legitimate and means the history is reachable only under
-the new id.
+needs no join and no temporary object. **The default is `station_id = w9.station_key(stationname)`**:
+the old name lowered, with every run of characters the destination will not accept collapsed to a
+single `-`. It is a derived key and not the name itself because a `station_id` *becomes* a station
+key, and a station key becomes a `ComponentId` — `station:campbell:<key>` — which permits only
+lower-case ASCII, digits, `-`, `_`, `.` and `:` inside 128 bytes (`crates/mw-component/src/id.rs`).
+A Go `stationname` is a display name: `CSI` and `Suncrest Air Quality` are both refused by that type,
+so a station configured against history imported under its own name is `StationPlanError::Key` at
+startup and never runs. **§2c is what that cost**, and it is not specific to those names — any
+station with a capital letter or a space would have hit it.
+
+Two refusals rather than a convention. `w9.assert_station_map_usable()` rejects any `station_id` in
+the map — derived or hand-written — that could not be a station key, and `w9.seed_station_map()`
+names the two source stations whose names derive the same key rather than letting a unique violation
+name a constraint. Both run inside `w9.populate_stations()`, which is the last step before 19 GB
+moves.
+
+**The frozen contract is unaffected**, which is what the old `stationname` default was protecting.
+`/span?station=<device name>` matches a station's *name* and selects data by its *key* —
+`station_by_name` in `crates/mw-api-legacy/src/span.rs` — so a derived key changes nothing a shipped
+client already sends.
+
+Be exact about where that name comes from, because getting it wrong is how `station_id = stationname`
+looked safe: it is the **configuration store's** `stations.name`, not this database's.
+`w9.populate_stations()` writes `stationname` into the weather database's `stations.name`, which is
+the read-side projection that renders a station's name in a response — the match itself never reads
+it. So the frozen parameter keeps working only if the configuration store's `station_key` equals the
+id written in `w9.station_map`. **This migration cannot check that**: the configuration store is
+SQLite and M7-4 is what populates it, and that residual gap is the one part of §2c these refusals do
+not close. Overriding a row in the map is still legitimate and still means the history is reachable
+only under the id written there.
 
 `stations` is populated **before** any reading (W4 §2.1 makes it the projection every `/span` join
 goes through, and the low-volume tables carry foreign keys to it). `station_metrics` is populated
@@ -632,14 +974,27 @@ look at all 399 columns?" is answerable with a query rather than from a document
 ```
 preflight    report only. Versions, retention state, extents, the loss window, the column gap.
 archive      THE ONLY STEP THAT WRITES TO THE SOURCE. §2.
+carry-out    RE-RUN ONLY. The readings the source's raw window no longer reaches, copied out
+             of `observations` before the reset truncates it. §2c.
+reset-target RE-RUN ONLY. Undo every TARGET-side effect of stage..rollup, so the procedure can
+             run again. Refuses without CONFIRM_RESET=<target database>. §2c.
 stage        the w9 schema on the target; load both inventories; the gap report.
-stations     populate `stations` from w9.station_map. Nothing imports before it.
+stations     seed w9.station_map with the derived keys, then populate `stations` from it.
+             Nothing imports before it.
+carry-in     RE-RUN ONLY. Those readings back, re-keyed through w9.station_map. §2c.
 raw          stream the hypertable, slice by slice, resumably. Then station_metrics.
 aggregates   create the four levels and materialise them bottom-up, recent-first.
 rollup       import the archived daily/hourly buckets into observations_*_legacy.
 reconcile    both digests, the hierarchy comparison, the spot checks.
 policies     refresh policies, compression, retention. Last.
 ```
+
+**A re-run is the same order with three steps added**, and the order of those three is the whole of
+it: `carry-out` must precede `reset-target` because the reset is what truncates the readings it
+copies, and `carry-in` must follow `stations` (it needs `w9.station_map`) and precede `raw` (so that
+`set_legacy_boundary`, `populate_station_metrics` and the aggregate rebuild all see the carried
+rows). `all` runs `carry-in` only when a carry table exists, because forgetting it is the one mistake
+here that loses readings without saying so.
 
 ### 5.1 Export and verify the copy before touching anything
 
@@ -878,6 +1233,20 @@ scalar mean sneaking into the hierarchy would also be within 1e-9 of itself.
 | a source column with no registry entry | migration **stopped** before any data moved (§4.1) |
 | an interrupted import slice re-run | debris removed, slice re-imported to the full count (§5.4) |
 
+**Three of the five re-run at HEAD on 2026-11-12**, against the pg16.6/2.17.2 source and the
+nine-migration target, because a control that passed once against an older schema is a claim about
+that schema:
+
+| control | result, 2026-11-12 |
+|---|---|
+| `TRUNCATE w9.recon`, then `assert_reconciled()` | **raises** `w9.recon is empty: nothing was reconciled`, HINT *a reconciliation that ran against no rows is not a pass*. Rolled back; the 1,182 digest rows survive |
+| 101 readings deleted from one station on the new side | **197** `row_count` mismatches, `assert_reconciled()` raises naming them, the `reconcile` step exits **1** |
+| that slice marked unfinished and re-imported | `reset_slice` removed the debris, the slice came back to its full count, `observations` back to 397,440, and `reconcile` returned to **591 of 591 `ok`** and exit 0 |
+
+The other two are unchanged by anything since: `pause-source-retention`'s interlock was re-checked in
+the same run (it refused with both archives missing, exit 1, and paused nothing), and the
+unknown-source-column stop is the `gap` step, which ran clean at 215 of 215 above.
+
 ---
 
 ## 7. Validate by running both
@@ -918,11 +1287,21 @@ job uses, so a result here is a result there.
   retyped — a "faithful copy" that was retyped is a measurement of the retyping;
 - the new schema is built from `migrations/`, so it is the schema that ships;
 - the rollup-only window is produced by the mechanism production used: materialise all four levels
-  over the full range, then let retention drop the raw chunks underneath;
+  over the full range, then let retention drop the raw chunks underneath. Its width is
+  `(TO - FROM) - RETAIN`, and `RETAIN` defaults to production's 365 days — so a shortened span needs
+  it lowered too. **`10-seed.sh` measures the window it produced and fails when it is zero**, because
+  a seed with no such window reports success and then `rollup` imports nothing,
+  `assert_legacy_disjoint()` passes over an empty table, and the reconciliation downstream is green
+  on a lab that never exercised the legacy path at all;
 - the cadence is **40 seconds, not 60**, which puts 1 or 2 readings in each 1-minute bucket rather
   than exactly one. That is D-12's uneven-bucket condition — the condition under which a mean of
   means is wrong and a sum-and-count hierarchy is not. A 60-second cadence would make §6.3 pass for
-  the wrong reason.
+  the wrong reason;
+- **one pod or two.** By default both databases share a pod, which is the cheap case and what every
+  run before 2026-11-12 used. Set `SRC_IMAGE` to a different image and the source gets its own pod
+  at that version, which is the only way to seed and migrate across the real version pair — the
+  target's migrations assert pg17/2.31 and will not build on 16.6. `SRC_POD` names it; `10-seed.sh`
+  reads the same variable.
 
 **Load-independent, quote freely:** the column mapping and its gaps (215/215, 451/627, 43/396 and the
 four semantic ones); every structural result in §3.4 and §1.2; the bytes-per-row figures for the old
@@ -1006,6 +1385,14 @@ throughput additionally crosses two `kubectl exec` hops, which dominate it.
    separate, explicitly named step for that reason.
 3. **The source database is read-only for the duration apart from step 2.** Every other statement
    sent to it is a `SELECT` or a `COPY ... TO STDOUT`.
+3a. **Read-only is not the same as unchanging, and "pitcairn is the rollback" has an exception now.**
+   The Go daemon re-adds its own 365-day raw retention policy on every start
+   (`remoteweather internal/storage/timescaledb/sql.go:2038`), so pausing a policy by job id protects
+   nothing across a restart. §2c: three hours after §2a imported it, job **1022** dropped every raw
+   chunk older than a year, and **462,495 readings now exist only in the migrated database**. Check
+   `scheduled` on the raw retention job before any long operation, and treat the source as a rollback
+   for everything *except* the window between the two databases' minima. `carry-out` / `carry-in`
+   exist for that window.
 4. **The rollup archive goes into plain tables — `observations_1d_legacy` and
    `observations_1h_legacy` — and never into a continuous aggregate.** An `INSERT` into a level is
    accepted on 2.31 (and accepts duplicates), and the rows are then destroyed by a refresh over the
@@ -1056,10 +1443,13 @@ throughput additionally crosses two `kubectl exec` hops, which dominate it.
     `lightning_hour` are `sum()` in the Go view against `max` in the registry, `lightning_time` has
     no aggregate at all, `min_gdd` has no `min` destination — and 39 are truncated integer means.
     None is contract-visible.
-15. **`station_id = stationname` is the default station mapping, and it is explicit rather than
-    silent.** It keeps `/span?station=<device name>` addressing the history it addressed before.
-    `w9.station_map` is populated by hand and asserted complete against the stations actually present
-    in the source.
+15. **The default station mapping is the DERIVED key `w9.station_key(stationname)`, and a mapping
+    that could not be a station key is refused rather than imported.** A `station_id` becomes a
+    `ComponentId`, so the Go display name is usually not one: `station_id = stationname` was the
+    default for the first production run and two of its three stations could not then be configured
+    against their own history (§2c). `/span?station=<device name>` is unaffected — it matches
+    `stations.name`, which still carries the old name. `w9.station_map` is still asserted complete
+    against the stations actually present in the source, and is now also asserted *usable*.
 16. **Reconciliation sums in `numeric` and compares with `IS DISTINCT FROM`, with no tolerance.**
     Float addition is not associative, so a float sum over 19 GB depends on row order and worker
     count; `numeric` is exact and order-independent, and `float4 → numeric` loses nothing. A
@@ -1155,8 +1545,9 @@ deviation ledger or only in this document.
 
 `w9` holds the column inventories, the station map, the slice bookkeeping, the archive landing tables
 and the reconciliation results — 81 MB in the lab, mostly the hourly archive staging. Everything in
-it is reconstructible except `w9.station_map`, and `observations_1d_legacy` is deliberately **not** in
-it.
+it is reconstructible, `w9.station_map` included since the keys became derived (Decision 15) — the
+one thing that is not is a row in it somebody overrode by hand — and `observations_1d_legacy` is
+deliberately **not** in it.
 
 *Options.* (a) Drop `w9` once reconciliation passes and the source is decommissioned; keep the
 reconciliation output as a text artefact first. (b) Keep it indefinitely; 81 MB. (c) Keep only
@@ -1200,6 +1591,13 @@ rather than changed.
    dimensions. The import copies them. When OQ-W4-2 drops them, the import's column list shrinks
    automatically because it is derived from the registry — but `w9.station_map` becomes the only
    source of a station's name, which is what OQ-W4-2 intends.
+   **Discharged by M5-5 and the prediction held**, with one thing it did not foresee: the columns
+   stay in the *source*, so omitting them from `w9.expected_column` makes them
+   `unknown_in_source` and `w9.assert_no_unknown_source_columns()` refuses the import until the
+   decision is on the record. `w9.record_retired_dimensions()` is that record, generated from the
+   registry's `metadata` dimensions and joined to `w9.source_column` so it only ever claims a
+   column the source really has. `migrate-from-go.sh`'s `gap` step calls it immediately before the
+   assertion.
 6. `station_metrics` is keyed by the registry's stable `key` and not by the column name (W4 §2.2).
    `w9.metric_key` is generated from the registry for this.
 7. Every metric column in `observations` is nullable (W4 §3.4), so a column production does not have
@@ -1233,13 +1631,24 @@ rather than changed.
 
 **About W3 (service architecture)**
 
-16. `/span` resolves a device name to a `station_id` through `StationRegistry`/`stations`
-    (W3 §1.2, §2.6). Decision 15's `station_id = stationname` default assumes the resolution path
-    matches on `stations.name`, which is the column `w9.populate_stations()` fills with the old
-    `stationname`.
+16. `/span` resolves a device **name** to a station key through the **configuration store's**
+    station list (`station_by_name`, W3 §1.2, §2.6) and selects data by that key. Decision 15 depends
+    on it: the migrated `station_id` may be a derived key precisely because the frozen parameter
+    matches a name. **Two things M7-4 therefore has to discharge, and the migration cannot:** the
+    configuration store's `stations.name` must equal the old Go `stationname`, and its `station_key`
+    must equal `w9.station_key(stationname)`. If the second one drifts, §2c's defect recurs with
+    every assertion in this document passing — a usable key is not the same as the configured one.
+    The weather database's own `stations.name`, which `w9.populate_stations()` fills, is the
+    read-side projection a response renders; the match never reads it.
 17. `snapshot:latest` reads `stations` for display name and type rather than reading
     `stationname`/`stationtype` off a reading (W4 assumption 24). The migration populates `stations`
-    before any reading for this reason.
+    before any reading for this reason. **M5-5 acted on this**, and split it: the display name is
+    configuration and is read from `config.stations` (through `SnapshotSource::display_name`, so a
+    rename does not wait for a restart), while `/latest`'s *type* is the device's own claim (§3.1 of
+    the legacy contract keeps `campbell` and `campbellscientific` distinct) and is read from
+    `stations.reported_type`. A re-run of this migration populates `stations.type` from the source's
+    `stationtype` as it always did; `reported_type` is backfilled once, from the raw column, by
+    `migrations/20261113230000`.
 18. `ReadingStore::span` reads `observations_1d` and not `observations_1d_with_legacy` (Decision 6).
     If W3 or a later work item points it at the union view, §3.1's 37% is the cost and the 365-row
     result is the benefit.
@@ -1341,7 +1750,7 @@ numbers are the accurate ones.
 
 ## Generator edits made by this work item, flagged
 
-Two files owned by other work items were changed, both minimally, both named here because an
+Three files owned by other work items were changed, all minimally, all named here because an
 unflagged edit to someone else's artefact is the thing the output contract exists to catch.
 
 1. **`ci/db/rebuild-aggregates.sh` (W4)** — `PSQL` now overrides the whole `psql` invocation, so the
@@ -1353,3 +1762,10 @@ unflagged edit to someone else's artefact is the thing the output contract exist
    block, and the `legacy_import` function. `gen::all` is untouched and `codegen --check` still means
    exactly "generated/ matches `metrics/registry.toml`"; the W9 emitter is a separate subcommand with
    a separate gate because it has a second input describing a frozen tree at a named commit.
+3. **`crates/mw-station` (W2a)** — `pub const MAX_KEY_LEN` beside `plan::component_id`, re-exported,
+   plus `tests/station_key_width.rs`. No behaviour: the plan already refused a key it could not turn
+   into a `ComponentId`, and nothing reads the constant at run time. It is here because the number is
+   this crate's — `ComponentId::MAX_LEN` minus the longest `station:<driver>:` prefix — and §2c is
+   what happens when the migration has to know it and cannot. The test checks the bound against the
+   mint functions in both directions, so a driver with a longer prefix fails here rather than in a
+   migration that has already imported 17 M rows.

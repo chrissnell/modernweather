@@ -809,6 +809,7 @@ mod tests {
                 "fixed"
             }
             .into(),
+            aprs_callsign: None,
             presented_key: claim.map(str::to_string),
             ingest_secret_hash: None,
             latitude: Some(39.7392),

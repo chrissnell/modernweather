@@ -169,7 +169,13 @@ loom = "0.7"
 
 # The management OpenAPI schema is derived from the Rust handlers rather than
 # hand-maintained (A-W3-1, W5 D-37).
-utoipa = "6"
+#
+# `chrono` because the handler types carry `DateTime<Utc>` -- the one `since`/`last_run`/
+# `radar_registered_at` shape the whole surface uses -- and without the feature `utoipa`
+# has no schema for it and the derive does not compile. `preserve_order` is deliberately
+# NOT enabled: without it the paths and schemas are `BTreeMap`s and the emitted JSON is
+# sorted, which is what makes `mgmt-schema-drift` compare like with like across two runs.
+utoipa = { version = "6", features = ["chrono"] }
 
 # `Type=notify` without linking `libsystemd`, which a static musl build cannot (A-W3-1).
 sd-notify = "0.5"

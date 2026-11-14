@@ -93,6 +93,12 @@ impl mw_component::ReadingStore for Recording {
     ) -> BoxFuture<'a, Result<Vec<mw_component::Bucketed>, StoreError>> {
         Self::gone()
     }
+    fn mean_series<'a>(
+        &'a self,
+        _q: mw_component::MeanSeriesQuery,
+    ) -> BoxFuture<'a, Result<Vec<mw_component::MeanBucket>, StoreError>> {
+        Self::gone()
+    }
     fn latest<'a>(
         &'a self,
         _q: mw_component::LatestQuery,

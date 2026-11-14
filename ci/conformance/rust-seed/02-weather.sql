@@ -12,10 +12,17 @@
 -- matters here is which keys can be present and which responses are non-empty -- not the
 -- numbers. Where a number does change a key's presence it is called out:
 --
---   * `stationtype` is `omitempty`, so the column must be non-NULL or `/latest` and
---     `/span` lose the key. It carries the DRIVER's self-reported type (`campbell`), which
---     is **not** the configured type `/stationinfo` returns (`campbellscientific`):
---     `docs/legacy-api-contract.md` §3.1 is explicit that the two sets must not be unified.
+--   * `stationtype` is `omitempty`, so it must be non-NULL or `/latest` and `/span` lose
+--     the key. Since **M5-5** it is not a column of `observations` at all: it is wire
+--     metadata, and `stations.reported_type` is where the writer keeps a station's last
+--     claim about itself, so that is the column this seeds. It carries the DRIVER's
+--     self-reported type (`campbell`), which is **not** the configured type
+--     `/stationinfo` returns (`campbellscientific`): `docs/legacy-api-contract.md` §3.1 is
+--     explicit that the two sets must not be unified, and that is why `stations` has two
+--     columns for it rather than one.
+--   * `stationname` likewise left `observations` in M5-5 and is **not** seeded here at
+--     all: it is configuration, so `/latest` and `/span` both resolve it from
+--     `config.stations.name` -- `ci/conformance/config-seed.sql` is where it comes from.
 --   * `extratext1`..`extratext10` are `omitempty` and stay **NULL**, because all six
 --     `/latest` fixtures recorded 78 keys and not 88.
 --   * a reading inside the last ten minutes is what makes `/latest` a 200 (W1 Decision 15),
@@ -40,16 +47,19 @@ BEGIN;
 -- conversion between the two sides and is in both column names so it cannot be done twice.
 DELETE FROM stations;
 INSERT INTO stations
-  (station_id, name, type, timezone, latitude, longitude, altitude_ft,
+  (station_id, name, type, reported_type, timezone, latitude, longitude, altitude_ft,
    snow_base_distance_mm, first_seen, last_seen)
 VALUES
-  ('davis-full',      'davis-full',      'davis',              'America/Denver',  39.900, -105.500, 5905.5, NULL,   now() - interval '31 days', now()),
-  ('csi-minimal',     'csi-minimal',     'campbellscientific', 'America/Denver',  39.800, -105.400, 5741.5, NULL,   now() - interval '31 days', now()),
-  ('snowgauge',       'snowgauge',       'snowgauge',          'America/Denver',  39.910, -105.510, 5905.5, 1500.0, now() - interval '31 days', now()),
-  ('aqmon',           'aqmon',           'airgradient',        'America/Denver',  39.905, -105.505, 5905.5, NULL,   now() - interval '31 days', now()),
-  ('nolocation',      'nolocation',      'campbellscientific', 'America/Denver',  0.0,    0.0,      0.0,    NULL,   now() - interval '31 days', NULL),
-  ('snowgauge-dead',  'snowgauge-dead',  'snowgauge',          'America/Denver',  39.920, -105.520, 5905.5, 1500.0, now() - interval '31 days', NULL),
-  ('snowgauge-stale', 'snowgauge-stale', 'snowgauge',          'America/Denver',  39.930, -105.530, 5905.5, 1500.0, now() - interval '31 days', now() - interval '3 days');
+  ('davis-full',      'davis-full',      'davis',              'davis',       'America/Denver',  39.900, -105.500, 5905.5, NULL,   now() - interval '31 days', now()),
+  ('csi-minimal',     'csi-minimal',     'campbellscientific', 'campbell',    'America/Denver',  39.800, -105.400, 5741.5, NULL,   now() - interval '31 days', now()),
+  ('snowgauge',       'snowgauge',       'snowgauge',          'snowgauge',   'America/Denver',  39.910, -105.510, 5905.5, 1500.0, now() - interval '31 days', now()),
+  ('aqmon',           'aqmon',           'airgradient',        'airgradient', 'America/Denver',  39.905, -105.505, 5905.5, NULL,   now() - interval '31 days', now()),
+  -- `reported_type` is NULL for the two stations with no readings, and that is the honest
+  -- value rather than a tidy one: the column is what a DEVICE has said about itself, and
+  -- neither of these has ever said anything. `/latest` 404s for both, so nothing renders it.
+  ('nolocation',      'nolocation',      'campbellscientific', NULL,          'America/Denver',  0.0,    0.0,      0.0,    NULL,   now() - interval '31 days', NULL),
+  ('snowgauge-dead',  'snowgauge-dead',  'snowgauge',          NULL,          'America/Denver',  39.920, -105.520, 5905.5, 1500.0, now() - interval '31 days', NULL),
+  ('snowgauge-stale', 'snowgauge-stale', 'snowgauge',          'snowgauge',   'America/Denver',  39.930, -105.530, 5905.5, 1500.0, now() - interval '31 days', now() - interval '3 days');
 
 DELETE FROM observations;
 
@@ -62,7 +72,7 @@ DELETE FROM observations;
 -- *value*, so what a seed has to provide is values of both kinds -- which a sine does, and
 -- a table of constants would not.
 INSERT INTO observations (
-    time, station_id, stationname, stationtype,
+    time, station_id,
     outtemp, outhumidity, barometer, windspeed, windspeed10, winddir,
     rainrate, rainincremental, dayrain, monthrain, yearrain, stormrain,
     solarwatts, potentialsolarwatts, solarjoules, uv, radiation,
@@ -72,7 +82,7 @@ INSERT INTO observations (
     extrafloat1, extrafloat2, extrafloat3,
     windchill, heatindex)
 SELECT
-    t, 'davis-full', 'davis-full', 'davis',
+    t, 'davis-full',
     (55 + 12 * sin(extract(epoch FROM t) / 43200.0))::float4,
     (47 + 20 * cos(extract(epoch FROM t) / 43200.0))::float4,
     (29.981 + 0.2 * sin(extract(epoch FROM t) / 86400.0))::float4,
@@ -103,10 +113,10 @@ FROM generate_series(now() - interval '31 days', now(), interval '5 minutes') AS
 -- already covers every fifth minute, and the raw table's uniqueness on
 -- `(station_id, time)` is what makes a replayed prefix idempotent (W3 assumption 22) --
 -- the same property this relies on.
-INSERT INTO observations (time, station_id, stationname, stationtype,
+INSERT INTO observations (time, station_id,
                           outtemp, outhumidity, barometer, windspeed, winddir,
                           rainincremental, solarwatts, intemp, inhumidity)
-SELECT t, 'davis-full', 'davis-full', 'davis',
+SELECT t, 'davis-full',
        (55 + 12 * sin(extract(epoch FROM t) / 43200.0))::float4,
        (47 + 20 * cos(extract(epoch FROM t) / 43200.0))::float4,
        29.981::float4,
@@ -119,9 +129,9 @@ FROM generate_series(now() - interval '90 minutes', now(), interval '1 minute') 
 ON CONFLICT (station_id, time) DO NOTHING;
 
 -- `csi-minimal`: a Campbell logger, which is what `latest-minimal-complement` and
--- `span-1h-one-minute-buckets` read. **`stationtype` is `campbell`**, the driver's name,
--- not the configured `campbellscientific` -- the two sets must not be unified
--- (`docs/legacy-api-contract.md` §3.1).
+-- `span-1h-one-minute-buckets` read. Its `stationtype` is `campbell`, the driver's name,
+-- not the configured `campbellscientific` -- and since M5-5 it is seeded on the `stations`
+-- row above rather than on every reading here, which is the whole point of the change.
 --
 -- Two series, exactly as `davis-full` has, and the reason is a trap worth recording: the
 -- first version of this block generated one 1-minute series and filtered it with
@@ -129,10 +139,10 @@ ON CONFLICT (station_id, time) DO NOTHING;
 -- a minute boundary, so no member of a series stepping from it is ever congruent to zero.
 -- `generate_series` with the spacing it wants is the fix; the per-station assertion in
 -- `xtask/src/conformance.rs` is what would have caught it.
-INSERT INTO observations (time, station_id, stationname, stationtype,
+INSERT INTO observations (time, station_id,
                           outtemp, outhumidity, barometer, windspeed, winddir,
                           rainincremental, solarwatts, solarjoules, radiation)
-SELECT t, 'csi-minimal', 'csi-minimal', 'campbell',
+SELECT t, 'csi-minimal',
        (48 + 9 * sin(extract(epoch FROM t) / 43200.0))::float4,
        (55 + 15 * cos(extract(epoch FROM t) / 43200.0))::float4,
        (29.7 + 0.15 * sin(extract(epoch FROM t) / 86400.0))::float4,
@@ -146,10 +156,10 @@ FROM generate_series(now() - interval '31 days', now(), interval '5 minutes') AS
 
 -- The last two hours at one-minute spacing, which is what makes `/span/1h` -- the only
 -- fixture that reads the 1-minute level -- an array with more than one element.
-INSERT INTO observations (time, station_id, stationname, stationtype,
+INSERT INTO observations (time, station_id,
                           outtemp, outhumidity, barometer, windspeed, winddir,
                           rainincremental, solarwatts)
-SELECT t, 'csi-minimal', 'csi-minimal', 'campbell',
+SELECT t, 'csi-minimal',
        (48 + 9 * sin(extract(epoch FROM t) / 43200.0))::float4,
        (55 + 15 * cos(extract(epoch FROM t) / 43200.0))::float4,
        29.7::float4,
@@ -167,9 +177,9 @@ ON CONFLICT (station_id, time) DO NOTHING;
 --
 -- `snowdepth` is a stored column here (**DEV-9**), in **millimetres**: `/latest` serves it
 -- unconverted and `/span` and `/snow` convert to inches (Q-4).
-INSERT INTO observations (time, station_id, stationname, stationtype,
+INSERT INTO observations (time, station_id,
                           outtemp, outhumidity, snowdistance, snowdepth, extrafloat1)
-SELECT t, 'snowgauge', 'snowgauge', 'snowgauge',
+SELECT t, 'snowgauge',
        (30 + 8 * sin(extract(epoch FROM t) / 43200.0))::float4,
        (78 + 10 * cos(extract(epoch FROM t) / 43200.0))::float4,
        (1500 - 119.38 - 20 * sin(extract(epoch FROM t) / 86400.0))::float4,
@@ -184,10 +194,10 @@ WHERE NOT (t BETWEEN now() - interval '36 hours' AND now() - interval '30 hours'
 -- `aqi_pm25_aqin` is left **NULL**, which exercises the branch the contract actually has:
 -- `transform.go:209` reads the column only when it is positive and computes from `pm25`
 -- otherwise, so a client was never charting a flat zero here.
-INSERT INTO observations (time, station_id, stationname, stationtype,
+INSERT INTO observations (time, station_id,
                           outtemp, outhumidity, pm25, pm25_in_aqin, pm10_in_aqin, co2,
                           pm_in_temp_aqin, pm_in_humidity_aqin)
-SELECT t, 'aqmon', 'aqmon', 'airgradient',
+SELECT t, 'aqmon',
        (52 + 4 * sin(extract(epoch FROM t) / 43200.0))::float4,
        (44 + 8 * cos(extract(epoch FROM t) / 43200.0))::float4,
        (6.2 + 3 * abs(sin(extract(epoch FROM t) / 1800.0)))::float4,
@@ -200,9 +210,9 @@ FROM generate_series(now() - interval '2 hours', now(), interval '2 minutes') AS
 -- `snowgauge-stale`: silent for three days. `/snow` keeps answering from its cache row and
 -- `/latest` is a 404, which is the pair `snow-device-stale` and
 -- `latest-snow-device-offline` record.
-INSERT INTO observations (time, station_id, stationname, stationtype,
+INSERT INTO observations (time, station_id,
                           outtemp, snowdistance, snowdepth)
-SELECT t, 'snowgauge-stale', 'snowgauge-stale', 'snowgauge',
+SELECT t, 'snowgauge-stale',
        28::float4, (1500 - 71.12)::float4, 71.12::float4
 FROM generate_series(now() - interval '10 days', now() - interval '3 days', interval '1 hour') AS t;
 

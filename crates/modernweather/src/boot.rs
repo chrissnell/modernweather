@@ -4,7 +4,7 @@
 //! 1. parse args (--config <path>)                 W8 assumption 2's spelling
 //! 2. install the tracing subscriber, capture the reload handle          §5
 //! 3. open the SQLite pool and run its migrations  <- the root resource (D-41)
-//! 4. cfg = Config::load(&pool)
+//! 4. cfg = Config::load(&mut pool.acquire().await.expect("a connection"))
 //! 4a. assert the database version                 <- D-62, after the pool, before plan()
 //! 4b. open the spool                              <- the fan-out, the second root (D-30a)
 //! 4c. registry + rollup + snapshot table           <- `config:sqlite` has no work item
@@ -51,11 +51,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use mw_component::Generation;
 use mw_store::config_db;
 use mw_store::version::{self, Observed, VersionError};
 use mw_store::SqliteScheduleStore;
-use mw_supervisor::plan::{plan, PlanContext, RegisterError, Registrar};
+use mw_supervisor::plan::{PlanContext, RegisterError, Registrar};
 use mw_supervisor::{Roots, RunReport, Supervisor};
 use mw_types::Classify;
 use secrecy::ExposeSecret;
@@ -71,9 +70,20 @@ use crate::spool;
 
 /// Which component crates contribute specs.
 ///
-/// One line per component crate, which is §1.3 rule 2: adding a component crate adds a line
-/// here and edits nothing else -- the shape `managers/controller.go` could not take, down to
-/// its `if con.Type == "management" { continue }`.
+/// One line per component **family**, which is §1.3 rule 2's property: adding one adds a
+/// line here and edits nothing else -- the shape `managers/controller.go` could not take,
+/// down to its `if con.Type == "management" { continue }`.
+///
+/// Rule 2's own wording is "each component crate contributes one `fn register(cfg, out)`",
+/// and three crates here contribute more than one: `mw-pipeline` through `Rollup`, `Snow`
+/// and `Snapshot`, `mw-output` through `Outputs` and `Aeris`, and `mw-station` through
+/// `Stations` and `SnowGauges`. Each split is one configuration table against another --
+/// `uploader` against `aeris_account`, the station rows against the ingest rows -- and the
+/// reason is the same every time: one registrar reading two tables is one `RegisterError`
+/// for two unrelated refusals, so an operator who mistyped a credential is told about a
+/// coordinate. The order is not load-bearing: `Phase::Spread` is derived from a hash of the
+/// component id and `plan()` orders by the hard-edge digraph, so position affects only
+/// which refusal surfaces first.
 const REGISTRARS: &[&dyn Registrar<Config>] = &[
     &Stations,
     &SnowGauges,
@@ -82,9 +92,11 @@ const REGISTRARS: &[&dyn Registrar<Config>] = &[
     &Uplinks,
     &Database,
     &Rollup,
+    &Snow,
     &Snapshot,
     &Legacy,
     &Outputs,
+    &Aeris,
     &Web,
     &Listener,
 ];
@@ -367,6 +379,59 @@ impl Registrar<Config> for Outputs {
     }
 }
 
+/// `snow:*` -- the four components behind `/snow`'s seven numbers.
+///
+/// An adapter here for `Rollup`'s reason. Every decision belongs to
+/// `mw_pipeline::snow::register`: a node with no weather database plans nothing (**D-44**),
+/// a gauge with no `snow_base_distance_mm` is skipped because the schema makes that state
+/// representable on purpose, and a gauge with no usable zone is a refusal naming the
+/// station -- "today" and "this season" are both station-local (**D-24**).
+#[derive(Debug)]
+struct Snow;
+
+impl Registrar<Config> for Snow {
+    fn name(&self) -> &'static str {
+        "mw-pipeline (the snow cache)"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        mw_pipeline::snow::register(cfg, out)
+            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
+    }
+}
+
+/// `aeris:*` -- the two forecast spans, the alert fetch and the expired-alert sweep.
+///
+/// A **second** registrar over `mw-output`, beside `Outputs`, and the reason is that they
+/// are two component families with two configuration tables: an `uploader` row is an egress
+/// account and the `aeris_account` row is a fetch account (**D-66**'s split, one layer up).
+/// One registrar reading both would be one `RegisterError` for two unrelated refusals.
+///
+/// Every decision belongs to `mw_output::aeris::register`: no account or no pairing plans
+/// nothing, and a paired station with no coordinates is a refusal naming it -- the forecast
+/// API is queried by `latitude,longitude`, so such a station can never be asked about.
+#[derive(Debug)]
+struct Aeris;
+
+impl Registrar<Config> for Aeris {
+    fn name(&self) -> &'static str {
+        "mw-output (the Aeris components)"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        mw_output::aeris::register(cfg, out)
+            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
+    }
+}
+
 /// `api:legacy` -- the frozen REST surface.
 ///
 /// An adapter here for `Rollup`'s reason. `mw_api_legacy::register` makes every decision,
@@ -462,7 +527,10 @@ impl Registrar<Config> for Listener {
 ///
 /// A function rather than inline code, so that the tests below drive the *same* assembly
 /// the daemon does. A second copy in a test would be a test of the copy.
-fn attach_registry(cfg: &mut Config) -> anyhow::Result<Arc<mw_store::ConfigRegistry>> {
+fn attach_registry(
+    cfg: &mut Config,
+    slots: &mut Slots,
+) -> anyhow::Result<Option<mw_store::RegistrySnapshot>> {
     // The receivers a `Fixed` frame resolves through, minted by the registrar that minted
     // the component ids -- so the registry and the plan cannot disagree about what a
     // component is called.
@@ -524,23 +592,57 @@ fn attach_registry(cfg: &mut Config) -> anyhow::Result<Arc<mw_store::ConfigRegis
         .zones()
         .map(|(key, zone)| (key.clone(), zone))
         .collect();
-    // Held as the concrete type as well as upcast, for `crate::config`'s `rollup` reason
-    // one more time: **two** consumers want two types. The station half travels as
-    // `Arc<dyn StationRegistry>`, and `mw_store::PeerStore` needs the object itself,
-    // because publishing the peer half is an inherent method on it (W7 §5.1: one
-    // capability, two accessor sets).
-    let registry = Arc::new(mw_store::ConfigRegistry::new(snapshot));
-    cfg.set_registry(
-        Arc::clone(&registry) as Arc<dyn mw_component::StationRegistry>,
-        zones,
-    );
+
+    // **The reuse decision, and it is made here because here is where every input exists.**
+    // `Slots`' documentation has the whole argument; the fingerprint below is the exact set
+    // of values the four shared objects are constructed from, written out rather than
+    // approximated by "the station rows changed" -- which would rebuild the snapshot table
+    // when an operator corrected a baud rate, and with it restart the entire plan.
+    let fingerprint = shared_fingerprint(cfg, &zones);
+
+    // The registry is **published into**, never rebuilt, so it is handled before the reuse
+    // branch and on both sides of it. The snapshot travels back to the caller rather than
+    // being stored here, because a preview must not publish: see [`Mounted::registry`].
+    let registry = match &slots.registry {
+        Some(live) => {
+            cfg.set_registry(
+                Arc::clone(live) as Arc<dyn mw_component::StationRegistry>,
+                zones.clone(),
+            );
+            Some(snapshot)
+        }
+        None => {
+            let live = Arc::new(mw_store::ConfigRegistry::new(snapshot));
+            cfg.set_registry(
+                Arc::clone(&live) as Arc<dyn mw_component::StationRegistry>,
+                zones.clone(),
+            );
+            slots.registry = Some(live);
+            None
+        }
+    };
+
+    if let Some(shared) = &slots.shared {
+        if shared.fingerprint == fingerprint {
+            debug!(
+                epoch = slots.epoch,
+                "the station and website sets are unchanged, so the shared root state is \
+                 reused and only the components whose own configuration changed restart"
+            );
+            cfg.set_rollup(Arc::clone(&shared.rollup));
+            cfg.set_snapshot(Arc::clone(&shared.snapshot));
+            cfg.set_legacy(Arc::clone(&slots.legacy_routes), Arc::clone(&shared.render));
+            return Ok(registry);
+        }
+    }
     // The maintained window values, over the same station set the registrar plans from --
     // read through the trait rather than rebuilt here, so the state's keys and the
     // components' ids cannot disagree about which stations exist. A root resource `main`
     // owns, for the reason `crate::config`'s `rollup` field records: two components write
     // it.
     let stations = mw_pipeline::RollupConfig::rollup_stations(&*cfg);
-    cfg.set_rollup(Arc::new(mw_pipeline::RollupState::new(stations)));
+    let rollup = Arc::new(mw_pipeline::RollupState::new(stations));
+    cfg.set_rollup(Arc::clone(&rollup));
     // The snapshot table, over the same two sets the key is a product of (**D-31**).
     // Another root resource for the rollup state's reason -- two components write it -- and
     // built here rather than in the registrar so that both of them are handed the same
@@ -584,10 +686,8 @@ fn attach_registry(cfg: &mut Config) -> anyhow::Result<Arc<mw_store::ConfigRegis
         keys = websites.len() * snapshot_stations.len(),
         "snapshot table allocated"
     );
-    cfg.set_snapshot(Arc::new(mw_pipeline::SnapshotState::new(
-        websites,
-        snapshot_stations,
-    )));
+    let snapshot_state = Arc::new(mw_pipeline::SnapshotState::new(websites, snapshot_stations));
+    cfg.set_snapshot(Arc::clone(&snapshot_state));
     // The frozen surface's two root resources: the route table's state slot, which the
     // listener reads and `api:legacy` fills, and the DTO's serialiser, which both snapshot
     // components render through. Built together because the slot without the renderer is a
@@ -599,7 +699,7 @@ fn attach_registry(cfg: &mut Config) -> anyhow::Result<Arc<mw_store::ConfigRegis
     // `mw_api_legacy::register` parses them itself, from the column, and skips one that is
     // not an IANA name with a warning -- see its own note on why a cosmetic field may not
     // take the frozen table down.
-    let zones: std::collections::BTreeMap<mw_types::StationKey, mw_component::Zone> = cfg
+    let render_zones: std::collections::BTreeMap<mw_types::StationKey, mw_component::Zone> = cfg
         .station_zones
         .iter()
         .filter_map(|(key, zone)| zone.map(|z| (key.clone(), z)))
@@ -618,11 +718,229 @@ fn attach_registry(cfg: &mut Config) -> anyhow::Result<Arc<mw_store::ConfigRegis
             ))
         })
         .collect();
-    let renderer = Arc::new(mw_api_legacy::Renderer::new(zones, positions));
+    let renderer = Arc::new(mw_api_legacy::Renderer::new(render_zones, positions));
     info!(
         zones = renderer.zones(),
         "the frozen DTO's serialiser is built, so the snapshot components are planned"
     );
+    cfg.set_legacy(Arc::clone(&slots.legacy_routes), Arc::clone(&renderer));
+
+    // Everything that was just built, and the epoch that makes the whole plan restart.
+    // Bumped rather than set from the fingerprint, so that the log line and the digests
+    // read as "the Nth shape of this process" rather than as an opaque hash.
+    slots.epoch = slots.epoch.saturating_add(1);
+    slots.shared = Some(SharedState {
+        fingerprint,
+        rollup,
+        snapshot: snapshot_state,
+        render: renderer,
+    });
+    Ok(registry)
+}
+
+/// The exact inputs the four shared root objects are constructed from.
+///
+/// Written out as a string rather than hashed from the rows, because that is the whole
+/// point: the rollup state is built from the **collecting** stations and their zones, the
+/// snapshot table from every station and the five website fields its key is a product of,
+/// and the renderer from the resolved zones and the coordinates. A station's baud rate is in
+/// none of them, so correcting one restarts that station and nothing else.
+fn shared_fingerprint(
+    cfg: &Config,
+    zones: &[(mw_types::StationKey, Option<mw_component::Zone>)],
+) -> mw_component::ConfigDigest {
+    use std::fmt::Write as _;
+    // Every free-text value is length-prefixed. Without that, a website an operator named
+    // `x;w9:` could make two different configurations produce one string -- and a collision
+    // here means stale shared root state with no epoch bump, which is the one input on this
+    // path a person types freely.
+    fn text(s: &mut String, value: &str) {
+        let _ = write!(s, "{}:{value}", value.len());
+    }
+    let mut s = String::new();
+    for (key, zone) in zones {
+        let _ = write!(s, "z");
+        text(&mut s, key.as_str());
+        text(&mut s, zone.map_or("-", |z| z.name()));
+        s.push(';');
+    }
+    for row in &cfg.stations {
+        // `enabled` and "has a transport" are `rollup_stations`' filter; the coordinates
+        // are the renderer's; the key is both the snapshot table's and the rollup's.
+        //
+        // The columns that are **not** here -- the name, the device type, the altitude, the
+        // snow base distance, the protocol secret, the presented key -- are the station
+        // registry's, and the registry is published into rather than rebuilt
+        // ([`Slots::publish_registry`]). Putting them here would restart the whole plan for
+        // a rename.
+        let _ = write!(s, "s");
+        text(&mut s, &row.station_key);
+        let _ = write!(
+            s,
+            ":{}:{}:{:?}:{:?};",
+            row.enabled,
+            row.transport_kind.is_some(),
+            row.latitude,
+            row.longitude
+        );
+    }
+    for w in &cfg.websites {
+        let _ = write!(s, "w{}", w.id);
+        text(&mut s, &w.name);
+        text(&mut s, w.primary_station_key.as_deref().unwrap_or("-"));
+        text(&mut s, w.snow_station_key.as_deref().unwrap_or("-"));
+        let _ = write!(s, ":{};", w.snow_enabled);
+    }
+    mw_component::ConfigDigest::of(&s)
+}
+
+/// The root resources that **outlive one plan**, and the fingerprint that decides it.
+///
+/// # Why anything is carried across a re-plan at all
+///
+/// Four of these hold live state that is not in the configuration database: the rollup's
+/// window values, the snapshot table's rendered bytes, and the two route-state slots a
+/// component installs its handlers into. Rebuilding them on every save would mean a
+/// configuration change silently emptied the current conditions and 503-ed every frozen
+/// path -- which is the class of defect W5 §2 exists to remove, reached from the other
+/// direction.
+///
+/// # The fingerprint, and the epoch it drives
+///
+/// They cannot *always* be reused either: the rollup state's and the snapshot table's key
+/// sets are fixed at construction, so a station the operator just added has nowhere to fold
+/// into. Which gives the rule:
+///
+/// > A shared root resource is reused while the inputs it was constructed from are
+/// > unchanged, and rebuilt when they change. A rebuild bumps [`Slots::epoch`], which
+/// > [`stamp`] folds into **every** component's `ConfigDigest` -- so the whole plan restarts
+/// > and nothing is left holding the previous object.
+///
+/// The epoch is what makes that honest rather than hopeful. Without it, a station added to
+/// the configuration would rebuild the rollup state, restart `window:rollup` -- whose digest
+/// *is* the station set -- and leave every `rain:rollover:<station>` holding the old one,
+/// because that component's digest is its own station and its own zone. Two writers of two
+/// states, and the symptom is a rain total that stops rolling over at midnight for every
+/// station except the new one.
+///
+/// What it costs is stated rather than implied: **adding or removing a station or a website
+/// restarts every component**, which the save preview says in advance because the preview is
+/// the same `plan()` and the same diff. Editing a station's settings, a service, the forecast
+/// account, the storage connection or the ports restarts only what changed.
+#[derive(Clone)]
+pub(crate) struct Slots {
+    /// The frozen route table's state slot. Never rebuilt: its identity is not a function
+    /// of the configuration, and `api:legacy` installs into it while it runs.
+    legacy_routes: Arc<mw_api_legacy::RouteState>,
+    /// The Ambient ingest endpoint's slot. Never rebuilt, for the same reason.
+    ambient: Arc<mw_station::ambient::UploadState>,
+    /// The reading receiver's slot. Never rebuilt, for the same reason.
+    grpcrx: Arc<mw_grpc::grpcrx::ServiceState>,
+    /// One slot per website, **by id** rather than by position.
+    web: std::collections::BTreeMap<i64, Arc<mw_web::SiteState>>,
+    /// The station registry, which is **published into** rather than rebuilt.
+    ///
+    /// The one shared root object with a swap of its own: `ConfigRegistry` holds its
+    /// snapshot in an `ArcSwap` precisely so that a configuration change can replace it
+    /// without restarting the components that hold the handle -- which is the seam
+    /// `mw_store::registry::ConfigRegistry::publish` was written for and that nothing called
+    /// until this item. Rebuilding it instead would mean a rotated ingest secret, a renamed
+    /// station or a corrected altitude did not take effect until the daemon restarted,
+    /// because `mw_station::config` already declines to restart a station for a secret
+    /// rotation on the grounds that the registry is what compares it.
+    ///
+    /// `None` until the first build, which is the one call that has a snapshot and no
+    /// registry to put it in.
+    registry: Option<Arc<mw_store::ConfigRegistry>>,
+    /// The three whose key sets are fixed at construction, and the fingerprint of the inputs
+    /// they were built from. `None` before the first build.
+    shared: Option<SharedState>,
+    /// Bumped whenever [`Slots::shared`] is rebuilt. Folded into every digest by [`stamp`].
+    epoch: u64,
+}
+
+/// The shared root state, and what it was built from.
+#[derive(Clone)]
+struct SharedState {
+    fingerprint: mw_component::ConfigDigest,
+    rollup: Arc<mw_pipeline::RollupState>,
+    snapshot: Arc<mw_pipeline::SnapshotState>,
+    render: Arc<mw_api_legacy::Renderer>,
+}
+
+impl Slots {
+    /// The slots a process starts with: the four permanent ones, and nothing shared yet.
+    pub(crate) fn new() -> Self {
+        Self {
+            legacy_routes: Arc::new(mw_api_legacy::RouteState::new()),
+            ambient: Arc::new(mw_station::ambient::UploadState::new()),
+            grpcrx: Arc::new(mw_grpc::grpcrx::ServiceState::new()),
+            web: std::collections::BTreeMap::new(),
+            registry: None,
+            shared: None,
+            epoch: 0,
+        }
+    }
+
+    /// The epoch every spec's digest is stamped with.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Replace the station registry's snapshot. **After a commit only.**
+    ///
+    /// This is what makes a rotated ingest secret, a renamed station, a corrected altitude
+    /// or a changed device type take effect without a restart -- `ConfigRegistry` holds its
+    /// snapshot in an `ArcSwap` for exactly this, and `mw_station::config` already declines
+    /// to restart a station for a secret rotation on the grounds that the registry is what
+    /// compares it. Before this call that reasoning had nothing behind it.
+    pub(crate) fn publish_registry(&self, snapshot: mw_store::RegistrySnapshot) {
+        if let Some(registry) = &self.registry {
+            registry.publish(snapshot);
+        }
+    }
+}
+
+/// Both directions of the pairing between what is mounted and what is planned, over tables
+/// that have **not been mounted yet**.
+///
+/// [`assert_route_tables_match_the_plan`] asks the live `Mount` the same question and is the
+/// boot sequence's. A re-plan cannot use it: the live mount still holds the previous
+/// configuration's tables at the point the question has to be answered, which is before the
+/// commit. Same assertion, same two defects, different subject.
+pub(crate) fn assert_mounted_tables_match(
+    mounted: &Mounted,
+    specs: &[mw_component::ComponentSpec],
+) -> anyhow::Result<()> {
+    use mw_component::Capability;
+    use std::collections::BTreeSet;
+
+    let planned: BTreeSet<String> = specs
+        .iter()
+        .filter(|spec| {
+            spec.provides
+                .iter()
+                .any(|p| p.capability == Capability::HttpRoutes)
+        })
+        .map(|spec| spec.id.as_str().to_string())
+        .collect();
+    // `http:listener` owns `/metrics` and provides nothing (§5.10), so it is mounted and
+    // not planned by design.
+    let owners: BTreeSet<String> = mounted
+        .owners()
+        .into_iter()
+        .filter(|owner| owner != mw_http::ID)
+        .collect();
+    anyhow::ensure!(
+        planned == owners,
+        "the route tables and the planned route providers disagree: \
+         mounted-not-planned {:?}, planned-not-mounted {:?}",
+        owners.difference(&planned).collect::<Vec<_>>(),
+        planned.difference(&owners).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
     cfg.set_legacy(Arc::new(mw_api_legacy::RouteState::new()), renderer);
     Ok(registry)
 }
@@ -726,6 +1044,18 @@ async fn attach_peers(
         identity,
     );
     Ok(())
+}
+
+/// Fold the shared root state's epoch into every component's `ConfigDigest`.
+///
+/// [`Slots`]' documentation has the argument. In one sentence: a component's digest covers
+/// the configuration **its own builder** closes over, and the shared root state is
+/// configuration it closes over that no registrar can see -- so the one place that can
+/// account for it is the one place that owns it.
+pub(crate) fn stamp(specs: &mut [mw_component::ComponentSpec], epoch: u64) {
+    for spec in specs {
+        spec.config_digest = mw_component::ConfigDigest::of(&(spec.config_digest.get(), epoch));
+    }
 }
 
 /// What an uplink's `Hello` announces about this node (§5.2).
@@ -838,7 +1168,48 @@ fn attach_ingress(cfg: &mut Config, fanout: &spool::Fanout) -> anyhow::Result<()
 /// `plan()` that the answers agreed. M4-2's code review found the other direction of that
 /// mismatch -- a table mounted where no component was planned, answering a permanent
 /// body-less `503` on five frozen paths -- so the pairing is asserted rather than arranged.
-fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<()> {
+/// The route tables, the host table and the certificate store, built and not yet published.
+///
+/// Returned rather than mounted, because **M7-1** needs the two halves apart. A committed
+/// configuration change has to swap the *live* `Mount` -- `http:listener` holds that `Arc`
+/// and its digest covers only the socket set, so a second `Mount` would never be served --
+/// and the swap has to happen **after** the transaction commits, or a `plan()` refusal would
+/// leave the router serving tables for a configuration the database rolled back. So the
+/// caller builds, validates by planning, commits, and only then swaps.
+pub(crate) struct Mounted {
+    tables: Vec<mw_http::RouteTable>,
+    hosts: mw_http::HostTable,
+    /// `None` when `listener.https_port` is not set, which is every node without TLS.
+    certs: Option<mw_http::CertStore>,
+    /// For the log line: how many hostnames the table resolves.
+    hostnames: usize,
+    /// The station registry's new snapshot, waiting to be published.
+    ///
+    /// Carried rather than published in place for the `Mount`'s reason exactly: publishing
+    /// is a change to what the **running** daemon resolves, and a preview must not make one.
+    /// `None` on the first build, where there was no registry to publish into and the
+    /// snapshot went straight into it.
+    registry: Option<mw_store::RegistrySnapshot>,
+}
+
+/// Build the route tables, the host table and the certificate store.
+///
+/// `slots` carries the per-surface state slots **across** a re-plan, and that is not an
+/// optimisation. Each slot is the seam between a mounted route and the component that
+/// answers it -- `api:legacy` installs its handler set into `RouteState` while it is
+/// `Running`, which is what makes "the table is mounted" and "the component is running" one
+/// fact (**D-48**). A re-plan that minted a fresh slot would point the swapped router at a
+/// slot nobody has installed into, and every frozen path would answer `503` until the
+/// component happened to restart for an unrelated reason. The website slots are keyed by
+/// website id for the same reason, and not by position: `web_states[i]` and
+/// `cfg.web_sites[i]` are paired by index, so inserting a website would otherwise hand one
+/// site's component another site's slot.
+fn build_route_tables(
+    cfg: &mut Config,
+    render: mw_http::Render,
+    slots: &mut Slots,
+    registry: Option<mw_store::RegistrySnapshot>,
+) -> anyhow::Result<Mounted> {
     use mw_api_legacy::LegacyConfig as _;
 
     // Parsed here rather than inside the registrar: a bad `listener.listen_addr` is a
@@ -849,13 +1220,25 @@ fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("`listener.listen_addr` is not an address to listen on")?;
 
-    // One slot per website, in id order. `mw_web::register` refuses a count that does not
-    // match, which is what stops one website's page being mounted under another's hostname.
+    // One slot per website, in id order -- **the same slot as last time for a website that
+    // already had one**. `mw_web::register` refuses a count that does not match, which is
+    // what stops one website's page being mounted under another's hostname.
     let states: Vec<Arc<mw_web::SiteState>> = cfg
         .web_sites
         .iter()
-        .map(|_| Arc::new(mw_web::SiteState::new()))
+        .map(|site| {
+            Arc::clone(
+                slots
+                    .web
+                    .entry(site.id.get())
+                    .or_insert_with(|| Arc::new(mw_web::SiteState::new())),
+            )
+        })
         .collect();
+    // A website that has been deleted leaves a slot nothing mounts, which would otherwise
+    // accumulate one entry per delete for the life of the process.
+    let live: std::collections::BTreeSet<i64> = cfg.web_sites.iter().map(|s| s.id.get()).collect();
+    slots.web.retain(|id, _| live.contains(id));
     cfg.set_web_states(states);
 
     let snapshot = cfg.snapshot.clone();
@@ -894,7 +1277,7 @@ fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<
     // `plan()` that the two agreed -- which is the pairing M4-2's review found broken in
     // the other direction on the frozen surface.
     if let Some(mount) = mw_station::ambient_mount(cfg) {
-        let state = Arc::new(mw_station::ambient::UploadState::new());
+        let state = Arc::clone(&slots.ambient);
         tables.push(mw_http::upload_table(
             mw_component::ComponentId::new(mw_station::ambient::ID)
                 .context("`station:ambient` is not a usable component id")?,
@@ -918,7 +1301,7 @@ fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<
         .iter()
         .any(|row| row.listen == mw_grpc::IngestRow::GRPC)
     {
-        let state = Arc::new(mw_grpc::grpcrx::ServiceState::new());
+        let state = Arc::clone(&slots.grpcrx);
         tables.push(
             mw_grpc::grpcrx::route_table(Arc::clone(&state))
                 .map_err(|e| anyhow::anyhow!("{e}"))
@@ -971,14 +1354,10 @@ fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<
             .find(|w| w.hostname.is_empty())
             .or_else(|| cfg.websites.first())
             .map(|w| w.hostname.clone());
-        let store = mw_http::CertStore::load(&paths, fallback.as_deref())
-            .context("loading the configured TLS certificates")?;
-        info!(
-            certificates = store.len(),
-            fallback = store.has_default(),
-            "the SNI resolver is loaded"
-        );
-        Some(Arc::new(mw_http::SniResolver::new(store)))
+        Some(
+            mw_http::CertStore::load(&paths, fallback.as_deref())
+                .context("loading the configured TLS certificates")?,
+        )
     } else {
         if !paths.is_empty() {
             // A certificate with nowhere to be served from is the kind of half-finished
@@ -993,6 +1372,105 @@ fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<
         None
     };
 
+    Ok(Mounted {
+        tables,
+        hosts,
+        certs: sni,
+        hostnames,
+        registry,
+    })
+}
+
+impl Mounted {
+    /// The three pieces, for the caller that is about to publish them.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<mw_http::RouteTable>,
+        mw_http::HostTable,
+        Option<mw_http::CertStore>,
+        Option<mw_store::RegistrySnapshot>,
+    ) {
+        (self.tables, self.hosts, self.certs, self.registry)
+    }
+
+    /// Which components own a mounted table, for the pairing assertion.
+    pub(crate) fn owners(&self) -> std::collections::BTreeSet<String> {
+        self.tables
+            .iter()
+            .map(|t| t.owner().as_str().to_string())
+            .collect()
+    }
+}
+
+/// Steps 4c to 4e of the boot sequence, as one function a re-plan can call.
+///
+/// The same assembly the daemon does at start, which is the point: `ConfigAdmin`'s save
+/// path runs this against the configuration it is proposing, so a saved configuration is
+/// assembled by the same code as a booted one rather than by a second implementation that
+/// has to keep agreeing with it.
+///
+/// Returns the route tables **unpublished** -- see [`Mounted`] for why the two halves are
+/// apart.
+pub(crate) fn assemble(
+    cfg: &mut Config,
+    render: mw_http::Render,
+    fanout: Option<&spool::Fanout>,
+    slots: &mut Slots,
+) -> anyhow::Result<Mounted> {
+    let registry = attach_registry(cfg, slots).context("publishing the station registry")?;
+    if let Some(fanout) = fanout {
+        attach_ingress(cfg, fanout).context("assembling the reading pipeline")?;
+    }
+    build_route_tables(cfg, render, slots, registry).context("building the route tables")
+}
+
+/// `plan()`, with every spec's digest stamped with the shared root state's epoch.
+///
+/// The registrar loop is `mw_supervisor::plan::plan`'s, repeated here rather than called,
+/// because the stamp has to happen **between** registration and validation: `validate`
+/// orders the specs and builds the `Plan`, and a `Plan`'s digests are not reachable
+/// afterwards. [`Slots`] has the argument for why the stamp exists at all.
+pub(crate) fn plan_stamped(
+    cfg: &Config,
+    ctx: &PlanContext,
+    epoch: u64,
+) -> Result<mw_supervisor::plan::Plan, mw_component::PlanError> {
+    let mut specs = Vec::new();
+    for registrar in REGISTRARS {
+        registrar
+            .register(cfg, &mut specs)
+            .map_err(|e| mw_component::PlanError::Registrar {
+                registrar: registrar.name(),
+                reason: e.to_string(),
+            })?;
+    }
+    stamp(&mut specs, epoch);
+    mw_supervisor::plan::validate(specs, ctx)
+}
+
+/// Build the route tables and publish them into a **new** `Mount` — the boot sequence's
+/// step 4e.
+fn attach_listener(
+    cfg: &mut Config,
+    render: mw_http::Render,
+    slots: &mut Slots,
+    registry: Option<mw_store::RegistrySnapshot>,
+) -> anyhow::Result<()> {
+    let listen = cfg
+        .listen()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("`listener.listen_addr` is not an address to listen on")?;
+    let built = build_route_tables(cfg, render, slots, registry)?;
+    let hostnames = built.hostnames;
+    let sni = built.certs.map(|store| {
+        info!(
+            certificates = store.len(),
+            fallback = store.has_default(),
+            "the SNI resolver is loaded"
+        );
+        Arc::new(mw_http::SniResolver::new(store))
+    });
     // **Layer 1** (W7 §5.4): the ingest socket's own `ServerConfig`, which is what makes
     // `peer_auth` enforced rather than merely read. The certificate it presents is the
     // website's, out of the same SNI resolver the main socket uses (W3 assumption 47),
@@ -1070,7 +1548,7 @@ fn attach_listener(cfg: &mut Config, render: mw_http::Render) -> anyhow::Result<
     }
 
     let (mount, report) =
-        mw_http::Mount::new(tables, hosts).context("mounting the route tables")?;
+        mw_http::Mount::new(built.tables, built.hosts).context("mounting the route tables")?;
     info!(
         shared = report.shared,
         sites = report.sites,
@@ -1187,7 +1665,11 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     };
 
     // Step 4.
-    let mut cfg = Config::load(&pool)
+    let mut conn = pool
+        .acquire()
+        .await
+        .context("taking a connection to read the configuration")?;
+    let mut cfg = Config::load(&mut conn)
         .await
         .context("reading the configuration")?;
     if cfg.node.is_none() {
@@ -1203,8 +1685,11 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
                 .context("allocating this node's identity")?,
         );
     }
-    if let Some(node) = &cfg.node {
-        info!(
+    // Returned to the pool before anything else runs: every read above is done, and SQLite
+    // in WAL mode has a bounded connection budget that a held handle spends for nothing.
+    drop(conn);
+    match &cfg.node {
+        Some(node) => info!(
             node = %node.node_name,
             timezone = %node.timezone,
             spool = %node.spool_path,
@@ -1274,11 +1759,15 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     // serves but does not ingest is W7 §8.2's shape.
     mw_pipeline::metrics::register();
     notify::starting("opening the spool");
+    // `Arc`, because the spool outlives one plan: a re-plan rebuilds the `SpoolIngress`
+    // over the **same** spool and the same registry, and a second `Spool::open` on a
+    // directory this process already holds would be a second cursor over one log.
     let fanout = match &cfg.node {
-        Some(node) => Some(
-            spool::open(node)
-                .with_context(|| format!("opening the spool at {}", node.spool_path))?,
-        ),
+        Some(node) => {
+            Some(Arc::new(spool::open(node).with_context(|| {
+                format!("opening the spool at {}", node.spool_path)
+            })?))
+        }
         None => {
             info!("no node identity, so no spool and no reading fan-out yet");
             None
@@ -1292,7 +1781,9 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     // (§5.10).
     mw_output::metrics::register();
     mw_collector::metrics::register();
-    let registry = attach_registry(&mut cfg).context("publishing the station registry")?;
+    let mut slots = Slots::new();
+    let registry =
+        attach_registry(&mut cfg, &mut slots).context("publishing the station registry")?;
     if let Some(fanout) = &fanout {
         attach_ingress(&mut cfg, fanout).context("assembling the reading pipeline")?;
         // Step 4d: the peer half of the same capability (W7 §5.1), and the two numbers the
@@ -1309,8 +1800,12 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     // have, and for the same reason (§1.3 rule 1: the binary is where a consumer and a
     // provider meet).
     let metrics = obs.metrics();
-    attach_listener(&mut cfg, Arc::new(move || metrics.render()))
+    let render: mw_http::Render = Arc::new(move || metrics.render());
+    attach_listener(&mut cfg, Arc::clone(&render), &mut slots, registry)
         .context("mounting the route tables")?;
+    // Read before `slots` moves into the `ConfigAdmin`: the stamp below is the first plan's,
+    // and every later one reads it back out of the admin's own copy.
+    let epoch = slots.epoch();
 
     // Step 5. Pure: every structural error in W2a Decision 2's list is caught here,
     // before anything is constructed.
@@ -1324,22 +1819,87 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
             .map(|f| Arc::clone(&f.stream) as Arc<dyn mw_component::ReadingStream>),
         log,
     };
+    let root_set = roots.capabilities();
+
+    // Step 5a, which is new with **M7-1**: the supervisor, before `plan()` rather than
+    // after.
+    //
+    // The ordering is forced by what the management API is. `ComponentControl` and the plan
+    // sink are both the supervisor's, and the management router holds the first and the
+    // `ConfigAdmin` behind it holds the second -- while `http:listener`'s own
+    // `ConfigDigest` covers the management socket, so the router has to be in the
+    // configuration **before** `plan()` runs. Constructing the supervisor earlier costs
+    // nothing: `Supervisor::new` publishes the two root capabilities and returns, and
+    // nothing is started until `run`.
+    let (supervisor, control, plans) = Supervisor::new(roots, shutdown.clone());
+    let readiness = supervisor.readiness();
+
+    // Step 5b: the management API, and the one thing in this process that can write
+    // configuration (W2a §2.5: a write bumps the generation and the supervisor reconciles
+    // the plan diff; nothing calls "reload").
+    //
+    // The first plan is handed to the `ConfigAdmin` below, so it is built here against a
+    // configuration that already names the management socket -- and the `Arc` is cloned
+    // rather than re-planned, because every diff this process takes is against *the plan the
+    // supervisor is running*.
+    let mgmt_sni = match cfg.management_cert() {
+        Some(paths) => {
+            let store = mw_http::CertStore::load(std::slice::from_ref(&paths), Some(""))
+                .context("loading the management API's TLS certificate")?;
+            Some(Arc::new(mw_http::SniResolver::new(store)))
+        }
+        None => None,
+    };
+    let admin = Arc::new(crate::admin::SqliteConfigAdmin::new(
+        crate::admin::Shared {
+            pool: pool.clone(),
+            render: Arc::clone(&render),
+            fanout: fanout.clone(),
+            roots: root_set.clone(),
+            plans,
+            mount: Arc::clone(
+                cfg.mount
+                    .as_ref()
+                    .context("the route tables have not been mounted")?,
+            ),
+            router: std::sync::OnceLock::new(),
+        },
+        slots,
+        cfg.sni.clone(),
+        mgmt_sni.clone(),
+    ));
+    let mgmt_router = mw_api_mgmt::router(Arc::new(mw_api_mgmt::Mgmt::new(
+        Arc::clone(&admin) as Arc<dyn mw_api_mgmt::ConfigAdmin>,
+        Arc::clone(&control),
+        Arc::new(crate::hostinfo::Rings::new(obs.rings())),
+        Arc::new(crate::hostinfo::Host::new()),
+    )));
+    admin.install_router(mgmt_router.clone());
+    cfg.set_management(mw_http::Management {
+        addr: cfg
+            .management_addr()
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("`listener.management_listen_addr` is not an address to listen on")?,
+        router: mgmt_router,
+        tls: mgmt_sni,
+    });
+
+    // Step 5. Pure: every structural error in W2a Decision 2's list is caught here,
+    // before anything is constructed.
     notify::starting("planning the configuration");
-    let ctx = PlanContext::new(Generation::ZERO).with_roots(roots.capabilities());
-    let plan = plan(&cfg, REGISTRARS, &ctx).context("planning the configuration")?;
+    let ctx = PlanContext::new(cfg.generation).with_roots(root_set);
+    let plan = plan_stamped(&cfg, &ctx, epoch).context("planning the configuration")?;
     info!(
         components = plan.len(),
         generation = %cfg.generation,
+        management = %cfg
+            .mgmt
+            .as_ref()
+            .map(|m| m.addr.to_string())
+            .unwrap_or_else(|| "-".to_string()),
         "plan validated"
     );
-
-    // Step 6.
-    let (supervisor, _control, _plans) = Supervisor::new(roots, shutdown.clone());
-    // `_control` is the `ComponentControl` handle, which `api:management` consumes (M7-1),
-    // and `_plans` is how a re-plan reaches a running supervisor once something can write
-    // configuration. Both are held by the supervisor as well; nothing in this milestone
-    // has a second consumer for either.
-    let readiness = supervisor.readiness();
+    admin.adopt(&plan).await;
 
     // **Every mounted route table has a planned owner, and every planned route provider
     // has a mounted table.** The mount happens before `plan()` now, so the pairing that
@@ -1429,6 +1989,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    // `Generation` and `plan` are the tests' alone now: `run` carries the generation on the
+    // configuration and plans through `plan_stamped`, so importing them at the module level
+    // would be a dead import in the daemon's own build.
+    use mw_component::Generation;
+    use mw_supervisor::plan::plan;
+
     use super::*;
     use mw_store::config_db::{Listener, WeatherDatabase};
     use secrecy::SecretString;
@@ -1444,6 +2010,9 @@ mod tests {
     fn config(with_database: bool) -> Config {
         let mut cfg = Config {
             declared_uploaders: Vec::new(),
+            services: Vec::new(),
+            aeris_account: None,
+            declared_aeris: Vec::new(),
             stations: Vec::new(),
             declared_stations: Vec::new(),
             websites: Vec::new(),
@@ -1474,6 +2043,7 @@ mod tests {
             web_states: None,
             mount: None,
             sni: None,
+            mgmt: None,
             listener: Listener {
                 listen_addr: "127.0.0.1".into(),
                 http_port: 8080,
@@ -1481,6 +2051,8 @@ mod tests {
                 grpc_port: 50051,
                 management_listen_addr: "127.0.0.1".into(),
                 management_port: 8081,
+                management_tls_cert_path: None,
+                management_tls_key_path: None,
             },
             weather_database: with_database.then(|| WeatherDatabase {
                 url: SecretString::from("postgres://mw:hunter2@db.internal/weather".to_string()),
@@ -1702,14 +2274,18 @@ mod tests {
         stations: &[String],
     ) -> (sqlx::SqlitePool, Config, spool::Fanout) {
         let pool = configure(scratch, stations).await;
-        let mut cfg = Config::load(&pool).await.expect("the configuration reads");
+        let mut cfg = Config::load(&mut pool.acquire().await.expect("a connection"))
+            .await
+            .expect("the configuration reads");
         let node = cfg.node.clone().expect("the node row was inserted");
         let fanout = spool::open(&node).expect("the spool opens");
-        attach_registry(&mut cfg).expect("the registry publishes");
+        let mut slots = Slots::new();
+        let _registry = attach_registry(&mut cfg, &mut slots).expect("the registry publishes");
         attach_ingress(&mut cfg, &fanout).expect("the pipeline assembles");
         // Step 4e, which `plan()` needs: `http:listener` and every `web:site:<id>` plan
         // from the mounted router and the per-website slots.
-        attach_listener(&mut cfg, Arc::new(String::new)).expect("the route tables mount");
+        attach_listener(&mut cfg, Arc::new(String::new), &mut slots, None)
+            .expect("the route tables mount");
         (pool, cfg, fanout)
     }
 
@@ -2075,12 +2651,17 @@ mod tests {
                                45.1, -122.05)"
             .to_string();
         let pool = configure(&scratch, &[station]).await;
-        let mut cfg = Config::load(&pool).await.expect("the configuration reads");
+        let mut cfg = Config::load(&mut pool.acquire().await.expect("a connection"))
+            .await
+            .expect("the configuration reads");
         let node = cfg.node.clone().expect("the node row was inserted");
         let fanout = spool::open(&node).expect("the spool opens");
-        attach_registry(&mut cfg).expect("a blank zone is not a registry problem");
+        let mut slots = Slots::new();
+        let _registry =
+            attach_registry(&mut cfg, &mut slots).expect("a blank zone is not a registry problem");
         attach_ingress(&mut cfg, &fanout).expect("the pipeline assembles");
-        attach_listener(&mut cfg, Arc::new(String::new)).expect("the route tables mount");
+        attach_listener(&mut cfg, Arc::new(String::new), &mut slots, None)
+            .expect("the route tables mount");
         cfg.weather_database = Some(config_db::WeatherDatabase {
             url: secrecy::SecretString::from(
                 "postgresql://mw@127.0.0.1:5432/modernweather".to_string(),
@@ -2162,7 +2743,9 @@ mod tests {
                 .unwrap_or_else(|e| panic!("the schema rejected a row: {e}\n{sql}"));
         }
 
-        let mut cfg = Config::load(&pool).await.expect("the configuration reads");
+        let mut cfg = Config::load(&mut pool.acquire().await.expect("a connection"))
+            .await
+            .expect("the configuration reads");
         assert_eq!(
             cfg.declared_uploaders.len(),
             2,
@@ -2170,9 +2753,11 @@ mod tests {
         );
         let node = cfg.node.clone().expect("the node row was inserted");
         let fanout = spool::open(&node).expect("the spool opens");
-        attach_registry(&mut cfg).expect("the registry publishes");
+        let mut slots = Slots::new();
+        let _registry = attach_registry(&mut cfg, &mut slots).expect("the registry publishes");
         attach_ingress(&mut cfg, &fanout).expect("the pipeline assembles");
-        attach_listener(&mut cfg, Arc::new(String::new)).expect("the route tables mount");
+        attach_listener(&mut cfg, Arc::new(String::new), &mut slots, None)
+            .expect("the route tables mount");
         // The `weather_database` row, without which there is no `db:postgres`, no
         // `window:rollup` and therefore nothing to upload (**D-44**). Set on the loaded
         // configuration rather than inserted, for the reason
@@ -2246,7 +2831,9 @@ mod tests {
             aprs_kiss_path: None,
             aprs_kiss_destination: None,
         }];
-        attach_listener(&mut cfg, Arc::new(String::new)).expect("the route tables mount");
+        let mut slots = Slots::new();
+        attach_listener(&mut cfg, Arc::new(String::new), &mut slots, None)
+            .expect("the route tables mount");
 
         let roots = Roots {
             schedule: Arc::new(mw_supervisor::testing::MemoryScheduleStore::new()),
@@ -2278,7 +2865,9 @@ mod tests {
         )));
         // No `ingress`, which is what "no spool" means to the registrar.
         assert!(cfg.ingress.is_none());
-        attach_listener(&mut cfg, Arc::new(String::new)).expect("the route tables mount");
+        let mut slots = Slots::new();
+        attach_listener(&mut cfg, Arc::new(String::new), &mut slots, None)
+            .expect("the route tables mount");
 
         let roots = Roots {
             schedule: Arc::new(mw_supervisor::testing::MemoryScheduleStore::new()),
@@ -2508,7 +3097,9 @@ mod tests {
             .execute(&pool)
             .await
             .expect("the row is valid");
-        let cfg = Config::load(&pool).await.expect("the configuration reads");
+        let cfg = Config::load(&mut pool.acquire().await.expect("a connection"))
+            .await
+            .expect("the configuration reads");
         assert!(cfg.node.is_none(), "no identity, so step 4b opens no spool");
         let ctx =
             PlanContext::new(Generation::ZERO).with_roots(mw_supervisor::plan::RootSet::empty());
@@ -2535,7 +3126,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("the toggle is a column");
-        let reloaded = Config::load(&pool)
+        let reloaded = Config::load(&mut pool.acquire().await.expect("a connection"))
             .await
             .expect("the configuration re-reads");
         let mut specs = Vec::new();
