@@ -18,25 +18,25 @@ export const nav: readonly NavItem[] = [
   { href: '/', label: 'Home', summary: 'Everything at a glance', section: 'home' },
   {
     href: '/stations',
-    label: 'My weather stations',
+    label: 'My Weather Stations',
     summary: 'The hardware',
     section: 'stations'
   },
   {
     href: '/share',
-    label: 'Share my data',
+    label: 'Share My Data',
     summary: 'Weather Underground, PWS Weather, APRS/CWOP, forecasts and alerts',
     section: 'share'
   },
   {
     href: '/website',
-    label: 'My website',
+    label: 'My Website',
     summary: 'The public site and its settings',
     section: 'website'
   },
   {
     href: '/data-storage',
-    label: 'Data storage',
+    label: 'Data Storage',
     summary: 'The weather database, and sending and receiving between RemoteWeathers',
     section: 'storage'
   },
@@ -88,7 +88,7 @@ export const common = {
   offlineHint:
     'The page is showing what it last knew. It will catch up on its own when the connection comes back.',
   lastUpdated: (when: string) => `last updated ${when}`,
-  notAvailableYet: 'Not available in this version.',
+  notSetUp: 'Not set up',
   themeLight: 'Light',
   themeDark: 'Dark',
   // Not "device": §0.2 bans the word because the current UI alternates it with "station"

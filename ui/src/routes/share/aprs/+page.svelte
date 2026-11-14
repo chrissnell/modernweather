@@ -169,7 +169,6 @@
       <Toggle
         id={id}
         checked={enabled}
-        label={copy.fields.enabled.label}
         aria-describedby={describedBy}
         onCheckedChange={(n) => (enabled = n)}
       />
@@ -243,7 +242,7 @@
   </Field>
 </Box>
 
-<Box title="How to send it">
+<Box title="How to Send It">
   <Field copy={copy.fields.aprsTransport}>
     {#snippet children({ id, describedBy })}
       <Select

@@ -20,6 +20,19 @@
   src: url('./lib/fonts/inconsolata-latin-700-normal.woff2') format('woff2');
 }
 
+/* The toolkit's scale tops out at 0.9rem for body text, which is small for a console
+   read at arm's length on a desktop. These are plain custom properties, so raising them
+   here lifts every chonky component at once rather than forking any of them. The anchor
+   is --text-base at the browser's own default. */
+:root {
+  --text-xs: 0.82rem;
+  --text-sm: 0.92rem;
+  --text-base: 1rem;
+  --text-lg: 1.15rem;
+  --text-xl: 1.4rem;
+  --text-2xl: 1.75rem;
+}
+
 html,
 body {
   margin: 0;
@@ -34,8 +47,42 @@ body {
   box-sizing: border-box;
 }
 
+/* A Box stacks its children with no gap of its own, so a status badge and the sentence
+   explaining it end up flush against each other. Give every Box a vertical rhythm.
+   Adjacent margins collapse, so anything that already spaces itself is left alone, and
+   inline badges sitting side by side are excluded.
+
+   The second selector carries the `.box` ancestor it does not strictly need: the page
+   components each scope a `.dim { margin: 0 0 0.75rem }` rule of their own, and without
+   the extra class this would tie with them on specificity and lose. */
+.box:not(.box--titled) > * + *:not(.badge),
+.box .box-body > * + *:not(.badge) {
+  margin-block-start: 0.75rem;
+}
+
+/* Rows need a little more height now that the text in them is larger. */
+th {
+  padding-block: 0.4rem;
+}
+
+td {
+  padding-block: 0.55rem;
+}
+
+/* The toolkit strips the underline from every link, which leaves colour as the only cue
+   that a station name in a table is the way into that station. Put it back for content
+   links; the sidebar and anything styled as a button opt out. */
 a {
   color: var(--color-primary);
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
+nav a,
+a.btn,
+a[role='button'],
+a[data-no-underline] {
+  text-decoration: none;
 }
 
 /* §7.4: every control is at least a 44px touch target, because checking a station from

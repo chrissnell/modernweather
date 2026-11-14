@@ -54,7 +54,7 @@ export const system = {
       `Showing the newest ${n} entries. Older entries are available in the full log.`,
     fullLog: 'Open the full log',
     moreDetail: {
-      heading: 'Show more detail',
+      heading: 'Show More Detail',
       forLabel: 'For',
       detailLabel: 'Detail',
       durationLabel: 'For how long',
@@ -79,7 +79,7 @@ export const system = {
     checksHeading: 'Checks',
     checksUnavailable:
       'On-demand checks are not in this version. Everything below is live, and the activity log has the detail.',
-    runningHeading: 'Everything that is running',
+    runningHeading: 'Everything That Is Running',
     columns: { what: 'What', status: 'Status', schedule: 'Schedule', lastRun: 'Last run' },
     runNow: 'Run now',
     restart: 'Restart',
@@ -89,7 +89,7 @@ export const system = {
       'There is no stop button here on purpose. Turning something off is a setting on its own page, so it survives a restart and is visible where it belongs.'
   },
   machine: {
-    title: 'This machine',
+    title: 'This Machine',
     blurb: 'What this copy of RemoteWeather is and where it is running.',
     rows: {
       version: 'Version',
@@ -111,7 +111,7 @@ export const system = {
     changePassword: 'Change password',
     passwordChanged:
       'Password changed. Every other browser has been signed out; this one is still signed in.',
-    sessionsHeading: 'Where you are signed in',
+    sessionsHeading: 'Where You Are Signed In',
     sessionColumns: { created: 'Signed in', lastSeen: 'Last used', from: 'From', agent: 'Browser' },
     thisSession: 'This browser',
     revoke: 'Sign out',
@@ -127,11 +127,11 @@ export const system = {
     title: 'Advanced',
     blurb: 'For when you know what you are looking for.',
     sections: {
-      admin: 'Admin address',
-      cors: 'Allowed origins',
-      logLevels: 'Standing detail overrides',
-      raw: 'Raw configuration',
-      ids: 'Internal names',
+      admin: 'Admin Address',
+      cors: 'Allowed Origins',
+      logLevels: 'Standing Detail Overrides',
+      raw: 'Raw Configuration',
+      ids: 'Internal Names',
       metrics: 'Metrics'
     },
     portChangeWarning: (url: string) =>

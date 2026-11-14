@@ -2,7 +2,7 @@ import { field, type FieldCopy } from './types';
 
 export const website = {
   index: {
-    title: 'My website',
+    title: 'My Website',
     blurb: 'The public weather site this machine serves.',
     addButton: 'Add a website',
     columns: {
@@ -13,17 +13,17 @@ export const website = {
       certificate: 'Certificate'
     },
     empty: {
-      heading: 'No website yet',
+      heading: 'No Website Yet',
       body: 'Your readings are being collected. Adding a website is how other people see them.'
     }
   },
   settings: {
     title: 'Settings',
     sections: {
-      identity: 'Name and address',
-      content: 'What it says',
-      features: 'What it shows',
-      app: 'Phone app'
+      identity: 'Name and Address',
+      content: 'What It Says',
+      features: 'What It Shows',
+      app: 'Phone App'
     },
     deleteTitle: 'Remove this website?',
     deleteBody: 'The site stops being served. Your readings are untouched.',
@@ -31,7 +31,7 @@ export const website = {
   },
   extras: {
     title: 'Extras',
-    radarHeading: 'Weather radar map',
+    radarHeading: 'Weather Radar Map',
     radarBlurb: 'A radar map on your site, supplied by a third party that needs to know it is you.',
     registeredOn: (when: string) => `Registered on ${when}`,
     register: 'Register',
@@ -41,7 +41,7 @@ export const website = {
     registerFailed: 'Registration was refused. The reason is below; nothing was changed.'
   },
   certificate: {
-    title: 'Security certificate',
+    title: 'Security Certificate',
     blurb: 'The certificate that serves your site over https.',
     sniNote:
       'One certificate per address. The right one is chosen from the address the visitor asked for, so several sites can share one port.',

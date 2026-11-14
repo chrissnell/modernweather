@@ -56,7 +56,7 @@ test('the form is built from the type, and the calibration fields persist', asyn
   // Now the other connection the same type offers. Same form, same four calibration
   // fields, different transport -- which is §0.7's point about the form being built from
   // the type rather than from a fixed list of columns.
-  await page.getByLabel('How it connects').click();
+  await page.getByLabel('How It Connects').click();
   await page.getByRole('option', { name: 'Over the network' }).click();
   await expect(page.getByLabel('Address')).toBeVisible();
   await expect(page.getByLabel('Serial port')).toHaveCount(0);

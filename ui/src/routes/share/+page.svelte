@@ -22,6 +22,9 @@
 
   let busy = $state<string | null>(null);
 
+  /** The forecast fetcher's parts, for the row that has no uploader behind it. */
+  const forecastParts = $derived(stream.components.filter((c) => c.id.startsWith('aeris:')));
+
   function componentFor(service: string) {
     const prefix = service === 'wunderground' ? 'wu' : service === 'pwsweather' ? 'pws' : service;
     return stream.components.filter((c) => c.id.startsWith(`${prefix}:`));
@@ -109,7 +112,7 @@
                 onCheckedChange={(next) => toggle(d.service, next)}
               />
             {:else}
-              <span class="dim">{common.notAvailableYet}</span>
+              <span class="dim">{common.notSetUp}</span>
             {/if}
           </td>
           <td>
@@ -151,11 +154,21 @@
           {/if}
         </td>
         <td>
-          {#each stream.components.filter((c) => c.id.startsWith('aeris:')) as c (c.id)}
-            <StatusBadge badge={c.badge} state={c.state} />
-          {/each}
+          {#if forecastParts.length > 0}
+            {#each forecastParts as c (c.id)}
+              <StatusBadge badge={c.badge} state={c.state} />
+            {/each}
+          {:else}
+            <Badge variant="default">{common.off}</Badge>
+          {/if}
         </td>
-        <td class="dim">{copy.index.forecastsSummary}</td>
+        <td>
+          {#if forecastParts.length > 0 && forecastParts[0].schedule.last_run}
+            {stamp(forecastParts[0].schedule.last_run)}
+          {:else}
+            <span class="dim">{common.never}</span>
+          {/if}
+        </td>
       </tr>
     </tbody>
   </Table>

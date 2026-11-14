@@ -55,7 +55,7 @@ export const receivedFromPeer = {
 
 export const stations = {
   list: {
-    title: 'My weather stations',
+    title: 'My Weather Stations',
     blurb: 'The hardware that sends readings to this machine.',
     addButton: 'Add a station',
     columns: {
@@ -72,13 +72,13 @@ export const stations = {
       `${name} stays configured and the readings already saved are kept. Nothing new arrives from it until you turn it back on.`,
     stopConfirm: 'Stop collecting',
     empty: {
-      heading: 'No weather stations yet',
+      heading: 'No Weather Stations Yet',
       body: 'Nothing is sending readings to this machine. Adding a station is the first step.',
       action: 'Add a station'
     }
   },
   add: {
-    title: 'Add a station',
+    title: 'Add a Station',
     blurb: 'Pick what you have. Only the settings that kind needs are shown.',
     chooserTitle: 'What kind of weather station do you have?',
     found: (address: string) => `We found one on your network at ${address}`,
@@ -100,9 +100,9 @@ export const stations = {
   settings: {
     title: 'Settings',
     sections: {
-      identity: 'Name and kind',
-      connection: 'How it connects',
-      location: 'Where it is',
+      identity: 'Name and Kind',
+      connection: 'How It Connects',
+      location: 'Where It Is',
       calibration: 'Calibration',
       sharing: 'Shared with'
     },
@@ -114,7 +114,7 @@ export const stations = {
   },
   status: {
     title: 'Status',
-    livePanelHeading: 'Live readings',
+    livePanelHeading: 'Live Readings',
     noReadingsYet: 'No readings yet.',
     noReadingsDiagnostic:
       'Nothing has arrived since this page opened. Check the connection, then look at the activity log.',

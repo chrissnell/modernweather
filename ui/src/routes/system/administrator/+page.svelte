@@ -90,7 +90,7 @@
 <h1>{copy.administrator.title}</h1>
 <p class="blurb">{copy.administrator.blurb}</p>
 
-<Box title="Who you are">
+<Box title="Who You Are">
   <p>
     Signed in as <strong>{session.username ?? common.unknown}</strong>
   </p>

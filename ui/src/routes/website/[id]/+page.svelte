@@ -178,7 +178,6 @@
         <Toggle
           id={fid}
           checked={isDefaultTls}
-          label={copy.fields.isDefaultTls.label}
           aria-describedby={describedBy}
           onCheckedChange={(n) => (isDefaultTls = n)}
         />
@@ -228,7 +227,6 @@
         <Checkbox
           id={fid}
           checked={snowEnabled}
-          label={copy.fields.snowEnabled.label}
           aria-describedby={describedBy}
           onCheckedChange={(n) => (snowEnabled = n === true)}
         />
@@ -252,7 +250,6 @@
         <Checkbox
           id={fid}
           checked={airEnabled}
-          label={copy.fields.airQualityEnabled.label}
           aria-describedby={describedBy}
           onCheckedChange={(n) => (airEnabled = n === true)}
         />
@@ -276,7 +273,6 @@
         <Checkbox
           id={fid}
           checked={isPortal}
-          label={copy.fields.isPortal.label}
           aria-describedby={describedBy}
           onCheckedChange={(n) => (isPortal = n === true)}
         />

@@ -36,7 +36,7 @@ export const destinations: readonly DestinationCopy[] = [
 
 export const share = {
   index: {
-    title: 'Share my data',
+    title: 'Share My Data',
     blurb: 'Where your readings go, besides your own website.',
     columns: {
       destination: 'Where',
@@ -46,17 +46,16 @@ export const share = {
       lastSent: 'Last sent'
     },
     empty: {
-      heading: 'Not sharing with anyone yet',
+      heading: 'Not Sharing with Anyone Yet',
       body: 'Pick a service below to start sending your readings to it.'
     },
-    forecastsLabel: 'Forecasts & alerts',
-    forecastsHref: '/share/forecasts',
-    forecastsSummary: 'Fetch a forecast for your website.'
+    forecastsLabel: 'Forecasts & Alerts',
+    forecastsHref: '/share/forecasts'
   },
   upload: {
     globalSection: 'Account',
-    perStationSection: 'Which stations to send',
-    statusSection: 'How it is going',
+    perStationSection: 'Which Stations to Send',
+    statusSection: 'How It Is Going',
     lastUpload: 'Last upload',
     lastError: 'Last error',
     noStations: 'No stations are being sent to this service.',
@@ -64,7 +63,7 @@ export const share = {
       "A rejected upload is not a bad setting here — the service may be down, or the station ID may not be registered with them yet. The status above says what they answered."
   },
   forecasts: {
-    title: 'Forecasts & alerts',
+    title: 'Forecasts & Alerts',
     blurb: 'A forecast for your website, fetched from a weather data provider.',
     vendorNote: 'Supplied by Aeris Weather. An account with them is needed.',
     lastForecast: 'Forecast',

@@ -165,7 +165,6 @@
       <Toggle
         id={id}
         checked={enabled}
-        label={copy.fields.enabled.label}
         aria-describedby={describedBy}
         onCheckedChange={(next) => (enabled = next)}
       />
@@ -190,7 +189,7 @@
     {/snippet}
   </Field>
 
-  <Field copy={copy.fields.interval} note="seconds" error={err('interval_seconds') ?? intervalWarning}>
+  <Field copy={copy.fields.interval} error={err('interval_seconds') ?? intervalWarning}>
     {#snippet children({ id, describedBy, invalid })}
       <Input
         {id}

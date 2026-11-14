@@ -182,6 +182,7 @@
           <th>{copy.list.columns.collecting}</th>
           <th>{copy.list.columns.status}</th>
           <th>{copy.list.columns.lastReading}</th>
+          <th class="actions">{common.details}</th>
         </tr>
       </thead>
       <tbody>
@@ -224,6 +225,9 @@
               {/if}
             </td>
             <td>{reading ? shortAgo(reading.ts, stream.now) : '—'}</td>
+            <td class="actions">
+              <a href={`/stations/${station.key}`}>{common.details}</a>
+            </td>
           </tr>
         {/each}
       </tbody>

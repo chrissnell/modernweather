@@ -87,8 +87,11 @@
   .field {
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
-    margin-block-end: 1rem;
+    /* A label, its control and its hint read as one thing only if they are closer to each
+       other than the next field is -- 0.25rem against 1rem was not enough of a gap for
+       that to come across, and a column of fields ran together. */
+    gap: 0.4rem;
+    margin-block-end: 1.75rem;
   }
 
   /* §0.5: small, dim, and ALWAYS visible -- not revealed on hover, which does not exist

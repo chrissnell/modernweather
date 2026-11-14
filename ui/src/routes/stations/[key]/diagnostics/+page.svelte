@@ -41,7 +41,7 @@
   message={copy.diagnostics.unavailable}
 />
 
-<Box title="What the running station reports">
+<Box title="What the Running Station Reports">
   {#if component}
     <p class="sentence">{component.sentence}</p>
     {#if component.last_error}

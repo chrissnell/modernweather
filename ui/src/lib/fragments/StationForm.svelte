@@ -241,7 +241,6 @@
           <Toggle
             id={id}
             checked={collecting}
-            label={copy.fields.collecting.label}
             aria-describedby={describedBy}
             onCheckedChange={(next) => (collecting = next)}
           />

@@ -28,7 +28,7 @@
     { name: 'Weather database', description: 'Connect, and check the schema is the one this build expects.' },
     { name: 'Weather Underground', description: 'Send a test upload and report what they answered.' },
     { name: 'PWS Weather', description: 'Send a test upload and report what they answered.' },
-    { name: 'Forecasts & alerts', description: 'Fetch a forecast with the stored account details.' },
+    { name: 'Forecasts & Alerts', description: 'Fetch a forecast with the stored account details.' },
     { name: 'Another RemoteWeather', description: 'Open the peer link and confirm the handshake.' },
     {
       name: 'APRS / CWOP',

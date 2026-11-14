@@ -118,7 +118,6 @@
       <Toggle
         id={id}
         checked={enabled}
-        label={copy.fields.enabled.label}
         aria-describedby={describedBy}
         onCheckedChange={(n) => (enabled = n)}
       />
@@ -179,7 +178,7 @@
   </Field>
 </Box>
 
-<Box title="Which stations get a forecast">
+<Box title="Which Stations Get a Forecast">
   {#if config.stations.length === 0}
     <p class="dim">No stations yet.</p>
   {:else}

@@ -5,7 +5,7 @@ export const auth = {
     title: 'Welcome to RemoteWeather',
     blurb: "Let's get your weather station online. This takes about 5 minutes.",
     step1: 'Create your administrator account',
-    codeHeading: 'The setup code',
+    codeHeading: 'The Setup Code',
     codeNote:
       'RemoteWeather printed a one-time setup code to the console when it started. Paste it here. It works once.',
     codeMissing:
@@ -13,7 +13,7 @@ export const auth = {
     create: 'Create my account',
     creating: 'Creating…',
     claimed: {
-      heading: 'Already set up',
+      heading: 'Already Set Up',
       body: 'This machine already has an administrator account. Sign in instead.'
     }
   },
@@ -29,7 +29,7 @@ export const auth = {
     sessionExpired: 'Your session expired. Sign in again to carry on.'
   },
   firstRun: {
-    heading: 'Getting started',
+    heading: 'Getting Started',
     collapsed: 'Getting started — all done',
     dismiss: 'Hide this',
     steps: {

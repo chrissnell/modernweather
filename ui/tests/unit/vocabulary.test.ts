@@ -77,7 +77,9 @@ describe('the user-facing vocabulary', () => {
   it('keeps the words that are the operator’s own', () => {
     // §0.3: "station" and "website" are not jargon in the other direction, and APRS/CWOP
     // keeps its own words because the audience has a callsign.
-    const labels = nav.map((n) => n.label).join(' ');
+    // Case-insensitive: the claim is about which words the nav uses, and the labels are
+    // in title case.
+    const labels = nav.map((n) => n.label).join(' ').toLowerCase();
     expect(labels).toContain('station');
     expect(labels).toContain('website');
     expect(destinations.map((d) => d.label)).toContain('APRS / CWOP');

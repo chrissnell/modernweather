@@ -40,7 +40,7 @@ test('a second browser is listed, is revocable, and is turned away', async ({
   // a page built from boxes has no heading outline at all. Reported upstream as gap G15;
   // every page in this application has an `<h1>` of its own, which is what keeps the
   // outline from being empty in the meantime.
-  await expect(page.getByText('Where you are signed in')).toBeVisible();
+  await expect(page.getByText('Where You Are Signed In')).toBeVisible();
   await expect(rows).toHaveCount(before + 1);
   await expect(page.getByText('This browser')).toHaveCount(1);
 

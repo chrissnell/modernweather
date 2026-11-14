@@ -2,7 +2,7 @@ import { field, type FieldCopy } from './types';
 
 export const storage = {
   index: {
-    title: 'Data storage',
+    title: 'Data Storage',
     blurb: 'Where your readings are kept, and who else gets them.',
     database: 'Weather database',
     databaseSummary: 'Where your readings are kept.',
@@ -12,7 +12,7 @@ export const storage = {
     receiveSummary: 'Accept readings from peers and treat them as stations.'
   },
   database: {
-    title: 'Weather database',
+    title: 'Weather Database',
     blurb: 'Your readings are written here, and your website reads history from it.',
     sections: { connection: 'Connection', state: 'How it is going' },
     oldestReading: 'Oldest reading',
@@ -21,7 +21,7 @@ export const storage = {
     summaryHistoryNote:
       'Hourly and daily summaries are built from your readings so a year of history draws quickly.',
     noDatabase: {
-      heading: 'No weather database yet',
+      heading: 'No Weather Database Yet',
       body: 'Live readings still work and your phone app still works. A database is what gives you history.'
     },
     unreachable: {
@@ -37,7 +37,7 @@ export const storage = {
       'Database size and oldest reading are not in this version. The status above is what the running system reports.'
   },
   send: {
-    title: 'Send my readings to another RemoteWeather',
+    title: 'Send My Readings to Another RemoteWeather',
     blurb: 'Every reading is forwarded to a peer, which keeps its own copy.',
     sections: { connection: 'Where to send', state: 'How it is going' },
     unsent: 'Unsent readings',
@@ -62,12 +62,12 @@ export const storage = {
     peerReportedNone: 'The peer has not reported a figure.'
   },
   receive: {
-    title: 'Receive readings from another RemoteWeather',
+    title: 'Receive Readings from Another RemoteWeather',
     blurb: 'Peers send readings here, and they appear under My weather stations.',
     sections: { listener: 'How peers reach us', peers: 'Peers', enrolment: 'Enrolment' },
     peerColumns: { name: 'Peer', stations: 'Stations', lastSeen: 'Last seen', depth: 'Unsent' },
     noPeers: {
-      heading: 'No peers yet',
+      heading: 'No Peers Yet',
       body: 'Nothing is sending readings to this machine over a peer link.'
     },
     /** N-11: outstanding enrolment tokens -- leaving enrolment open is the mistake. */

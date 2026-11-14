@@ -2,13 +2,13 @@ export const home = {
   title: 'Home',
   blurb: 'What your weather station is doing right now.',
   attention: {
-    heading: 'Something needs attention',
+    heading: 'Something Needs Attention',
     because: (n: number) =>
       n === 1 ? 'Because of this, 1 thing is waiting:' : `Because of this, ${n} things are waiting:`,
     details: 'Details'
   },
   allWell: {
-    heading: 'Everything is running',
+    heading: 'Everything Is Running',
     body: 'Nothing needs attention.'
   },
   counts: {
@@ -26,7 +26,7 @@ export const home = {
     off: 'Not running'
   },
   stations: {
-    heading: 'Your stations',
+    heading: 'Your Stations',
     noneYet: 'No stations yet.',
     addOne: 'Add a station',
     ago: (human: string) => `${human} ago`,
