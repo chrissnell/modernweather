@@ -78,6 +78,26 @@ pub enum Command {
     },
 }
 
+/// A `migrate-config` command line.
+///
+/// Its own type rather than two more fields on [`Args`], because it is a different thing to
+/// do: nothing binds, nothing is planned and the process exits when the migration is
+/// written. [`MigrateArgs::args`] is the part the two share -- where the configuration
+/// database is, and how to log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrateArgs {
+    /// `--config <path>` (the destination), `--log-format` and `--log-level`.
+    pub args: Args,
+    /// `--from <path>`: the Go daemon's own configuration database. **Read only**, and
+    /// never written to.
+    pub from: PathBuf,
+    /// `--dry-run`: apply everything inside a transaction, print the report,
+    /// and roll back. The same code path as a real migration, differing only in whether the
+    /// transaction commits -- which is how `POST /api/v1/config/preview` and a save already
+    /// relate (W5 §2.4).
+    pub dry_run: bool,
+}
+
 /// What a parse produced.
 #[derive(Debug)]
 pub enum Parsed {
@@ -85,6 +105,14 @@ pub enum Parsed {
     Run(Args),
     /// Run one of W5 §3.6's commands and exit.
     Command(Command),
+    /// Translate a Go configuration database into the `--config` one, and exit.
+    ///
+    /// Its own variant rather than a [`Command`], even though it is spelled as one on the
+    /// command line: W5 §3.6's commands run **before** any subscriber and print to the
+    /// console, because what they have to say is one line to somebody who is locked out.
+    /// The migration's report is dozens of lines about a deployment and belongs in the
+    /// journal, so it installs the subscriber first and logs. Two plumbings, two variants.
+    MigrateConfig(MigrateArgs),
     /// `--help` or `--version` was asked for and has been printed.
     Printed,
 }
@@ -121,13 +149,19 @@ pub enum ArgsError {
     },
     /// `{words}` is not a command this binary has.
     #[error(
-        "`{words}` is not a command; expected reset-password, reset-setup-token or \
-             `sessions revoke --all`"
+        "`{words}` is not a command; expected reset-password, reset-setup-token, \
+             `sessions revoke --all` or migrate-config"
     )]
     NoSuchCommand {
         /// What was typed.
         words: String,
     },
+    /// `migrate-config` with no source to read.
+    #[error(
+        "`migrate-config` needs --from <path>: the RemoteWeather daemon's own \
+         configuration database, which is what --config names for IT"
+    )]
+    MigrateNeedsSource,
     /// `sessions revoke` without `--all`.
     #[error("`sessions revoke` needs --all; there is no way to name one session from here")]
     NeedsAll,
@@ -168,6 +202,15 @@ configuration database:
   reset-setup-token        Print a new one-time setup code for an instance that has no
                            administrator account yet.
   sessions revoke --all    Sign out of every browser.
+  migrate-config --from <path>
+                           Translate the RemoteWeather (Go) daemon's own SQLite
+                           configuration database into the one --config names, then exit
+                           without serving. The source is opened READ ONLY. --config must
+                           not already hold configuration, and the spool is placed beside
+                           it. Every value that was changed, that has no successor here, or
+                           that you have to enter yourself is reported one line at a time.
+                           Add --dry-run to do all of it inside a transaction and roll it
+                           back, so the report is produced and nothing is kept.
 ";
 
 /// Parse the arguments, with `--help` and `--version` handled here.
@@ -183,6 +226,8 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, ArgsEr
     let mut setup_listen = None;
     let mut username = None;
     let mut all = false;
+    let mut from: Option<PathBuf> = None;
+    let mut dry_run = false;
     // The subcommand, as the words that were not flags. `sessions revoke` is two, which is
     // why this is a list rather than an `Option<String>`.
     let mut words: Vec<String> = Vec::new();
@@ -218,6 +263,9 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, ArgsEr
                 })?);
             }
             "--log-level" => directive = Some(value()?.to_string_lossy().into_owned()),
+            // A path, like `--config`, so it is kept as bytes for the same reason.
+            "--from" => from = Some(PathBuf::from(value()?)),
+            "--dry-run" => dry_run = true,
             "--setup-listen" => {
                 let v = value()?.to_string_lossy().into_owned();
                 // The bare address, not `addr:port`: the port is `listener.management_port`
@@ -259,6 +307,20 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, ArgsEr
         "" => {
             // The daemon. The command-only flags are rejected rather than ignored: silently
             // accepting `--username` here would read as having renamed something.
+            if from.is_some() {
+                return Err(ArgsError::WrongCommand {
+                    flag: "--from",
+                    command: "migrate-config",
+                });
+            }
+            // Without the word this would have STARTED THE DAEMON, which is the one outcome
+            // somebody typing a dry-run flag did not want.
+            if dry_run {
+                return Err(ArgsError::WrongCommand {
+                    flag: "--dry-run",
+                    command: "migrate-config",
+                });
+            }
             if username.is_some() {
                 return Err(ArgsError::WrongCommand {
                     flag: "--username",
@@ -309,6 +371,28 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, ArgsEr
                 return Err(ArgsError::NeedsAll);
             }
             Ok(Parsed::Command(Command::RevokeSessions { config }))
+        }
+        // M7-4. Spelled as a command for the three above's reason -- it runs instead of
+        // the daemon -- and plumbed separately, because its report goes to the journal.
+        "migrate-config" => {
+            reject_daemon_flags(setup_listen.is_some(), all)?;
+            if username.is_some() {
+                return Err(ArgsError::WrongCommand {
+                    flag: "--username",
+                    command: "reset-password",
+                });
+            }
+            let from = from.ok_or(ArgsError::MigrateNeedsSource)?;
+            Ok(Parsed::MigrateConfig(MigrateArgs {
+                args: Args {
+                    config,
+                    format,
+                    directive,
+                    setup_listen: None,
+                },
+                from,
+                dry_run,
+            }))
         }
         _ => Err(ArgsError::NoSuchCommand { words: joined }),
     }
@@ -622,5 +706,92 @@ mod tests {
                 "{flag} should print and stop"
             );
         }
+    }
+
+    /// The command M7-4 adds, in both flag spellings, and the two combinations that are
+    /// rejections rather than defaults.
+    #[test]
+    fn a_configuration_migration_is_its_own_command_line() {
+        let m = match parse(
+            [
+                "migrate-config",
+                "--config",
+                "/var/lib/modernweather/config.db",
+                "--from",
+                "/etc/remoteweather/config.db",
+            ]
+            .iter()
+            .map(OsString::from),
+        ) {
+            Ok(Parsed::MigrateConfig(m)) => m,
+            other => panic!("expected a migration command line, got {other:?}"),
+        };
+        assert_eq!(
+            m.args.config,
+            PathBuf::from("/var/lib/modernweather/config.db")
+        );
+        assert_eq!(m.from, PathBuf::from("/etc/remoteweather/config.db"));
+        assert!(!m.dry_run);
+
+        // `--flag=value`, which a Dockerfile `CMD` array often writes, and the word AFTER
+        // the flags -- which `words` collecting rather than matching is what buys.
+        let m = match parse(
+            [
+                "--config=/d/config.db",
+                "--from=/s/go.db",
+                "--dry-run",
+                "migrate-config",
+            ]
+            .iter()
+            .map(OsString::from),
+        ) {
+            Ok(Parsed::MigrateConfig(m)) => m,
+            other => panic!("expected a migration command line, got {other:?}"),
+        };
+        assert_eq!(m.from, PathBuf::from("/s/go.db"));
+        assert!(m.dry_run);
+
+        // The source is the whole input, so its absence is a rejection and not an empty
+        // migration.
+        let e = match parse(
+            ["migrate-config", "--config", "/d/config.db"]
+                .iter()
+                .map(OsString::from),
+        ) {
+            Err(e) => e,
+            other => panic!("expected a rejection, got {other:?}"),
+        };
+        assert_eq!(e, ArgsError::MigrateNeedsSource);
+
+        // Without the word, these two flags would have STARTED THE DAEMON -- the one
+        // outcome somebody typing them did not want.
+        for flag in ["--dry-run", "--from=/s/go.db"] {
+            let e = match parse(
+                ["--config", "/d/config.db", flag]
+                    .iter()
+                    .map(OsString::from),
+            ) {
+                Err(e) => e,
+                other => panic!("expected a rejection of {flag}, got {other:?}"),
+            };
+            assert!(
+                matches!(e, ArgsError::WrongCommand { command, .. } if command == "migrate-config"),
+                "{flag}: {e}"
+            );
+        }
+
+        // And the ordinary command line is untouched.
+        assert!(matches!(
+            parse(["--config", "/d/config.db"].iter().map(OsString::from)),
+            Ok(Parsed::Run(_))
+        ));
+    }
+
+    /// The usage text names the command and its two flags, because an operator at cutover
+    /// reads `--help` and not this file.
+    #[test]
+    fn the_usage_names_the_migration() {
+        assert!(USAGE.contains("migrate-config --from <path>"));
+        assert!(USAGE.contains("--dry-run"));
     }
 }

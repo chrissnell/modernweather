@@ -2879,4 +2879,318 @@ mod tests {
         .expect("a node with no weather database is a legitimate node (D-44)");
         assert_eq!(asserted, None);
     }
+
+    /// A committed PEM from `crates/mw-http/tests/data`, by absolute path.
+    ///
+    /// The one migration test that carries a certificate needs a real one: `attach_listener`
+    /// loads what the `website` row names, so a path to nothing is a failure in the boot
+    /// sequence rather than in the migration. Reaching into another crate's test data is the
+    /// same move `mw_api_legacy`'s `sun_times.rs` makes for its golden files, and it is
+    /// better than a second copy of a key.
+    fn pem(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../mw-http/tests/data")
+            .join(name)
+    }
+
+    /// **M7-4's "done when": the daemon starts from the migrated configuration and plans
+    /// the component set the Go daemon was running.**
+    ///
+    /// Nothing is typed by hand here. The source is the owner's own deployment as his public
+    /// endpoints describe it, through the Go schema
+    /// `ci/db/migrate-config-from-go/extract-go-schema.sh` extracted; the destination is
+    /// written by the real migration through the real `ConfigAdmin`; and what is asserted is
+    /// `plan()` over `Config::load` of the result, with the real registrar list. So this test
+    /// fails if the migration writes a row the schema accepts and the planner does not --
+    /// which is the whole class of mistake a configuration migration makes.
+    ///
+    /// The component set is the assertion rather than the row contents, because that is what
+    /// the work item says: `crates/mw-store/src/config_go.rs`'s own tests assert the columns.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_owners_migrated_configuration_plans_what_the_go_daemon_was_running() {
+        use mw_store::config_go::testing as go;
+
+        let scratch = Scratch::new("migrated");
+        let source = scratch.0.join("go-config.db");
+        go::go_db(
+            &source,
+            &[
+                go::OWNER_DEVICES,
+                go::OWNER_WEBSITE,
+                go::OWNER_STORAGE,
+                go::OWNER_CONTROLLERS,
+            ],
+        )
+        .await;
+
+        let migrated = crate::migrate::migrate(&crate::args::MigrateArgs {
+            args: Args {
+                config: scratch.db(),
+                format: None,
+                directive: None,
+                setup_listen: None,
+            },
+            from: source,
+            dry_run: false,
+        })
+        .await
+        .expect("the owner's configuration migrates");
+        assert_eq!(
+            migrated.station_keys(),
+            vec!["csi", "suncrest-air-quality", "snow"],
+            "the keys the data migration wrote the history under"
+        );
+
+        // From here on this is the boot sequence, in the order W3 §3.1 writes it, against a
+        // configuration database this process did not seed.
+        let pool = config_db::open_and_migrate(&scratch.db())
+            .await
+            .expect("the migrated database opens");
+        let mut cfg = Config::load(&mut pool.acquire().await.expect("a connection"))
+            .await
+            .expect("the migrated configuration reads");
+        let node = cfg
+            .node
+            .clone()
+            .expect("the migration wrote a node identity");
+        assert_eq!(node.timezone, "America/Denver");
+        let fanout = spool::open(&node).expect("the spool opens where the migration put it");
+        let mut slots = Slots::new();
+        let _registry = attach_registry(&mut cfg, &mut slots).expect("the registry publishes");
+        attach_ingress(&mut cfg, &fanout).expect("the pipeline assembles");
+        attach_listener(&mut cfg, Arc::new(String::new), &mut slots, None)
+            .expect("the route tables mount");
+
+        let roots = Roots {
+            schedule: Arc::new(SqliteScheduleStore::new(pool.clone())),
+            stream: Some(Arc::clone(&fanout.stream) as Arc<dyn mw_component::ReadingStream>),
+            log: Arc::new(mw_supervisor::testing::MemoryLogControl::new("info")),
+        };
+        let ctx = PlanContext::new(Generation::ZERO).with_roots(roots.capabilities());
+        let planned = plan(&cfg, REGISTRARS, &ctx)
+            .expect("the migrated configuration plans; a refusal here is a migration defect");
+        let mut ids: Vec<&str> = planned
+            .ids()
+            .map(mw_component::ComponentId::as_str)
+            .collect();
+        ids.sort_unstable();
+        // **The component set, against what the Go daemon runs for this configuration.**
+        //
+        // | Go | here |
+        // |---|---|
+        // | `campbell.NewStation` for `CSI` | `station:campbell:csi` |
+        // | `airgradient.NewStation` for `Suncrest Air Quality` | `station:airgradient:suncrest-air-quality` |
+        // | `snowgauge.NewStation` for `snow` | `station:snowgauge:snow` |
+        // | the `timescaledb` storage backend | `db:postgres` + `writer:timescale` |
+        // | the `rest` controller | `api:legacy`, `web:site:1`, `web:static`, `http:listener` |
+        // | the `aerisweather` controller | two forecast periods, the alert fetch and its sweep |
+        // | the `snowcache` controller | `snow:depth`, `snow:events`, `snow:smoothing`, `snow:season:snow` |
+        // | *nothing*: Go truncates the day in the database session's zone | one `rain:rollover:<station>` each |
+        // | *nothing*: Go reads the database on every request | `snapshot:latest`, `snapshot:warm`, `window:rollup` |
+        //
+        // The last two rows are the only differences, and neither is a migration artefact:
+        // they are W2a **D-11**'s per-station `Calendar` replacing a `date_trunc` in the
+        // server's zone, and **D-27**'s snapshot replacing a read-through. Every row above
+        // them is one-for-one, and the three station ids carry the keys the data migration
+        // wrote the history under.
+        assert_eq!(
+            ids,
+            vec![
+                "aeris:alerts:csi",
+                "aeris:alerts:gc",
+                "aeris:forecast:csi:24",
+                "aeris:forecast:csi:240",
+                "api:legacy",
+                "db:postgres",
+                "http:listener",
+                "rain:rollover:csi",
+                "rain:rollover:snow",
+                "rain:rollover:suncrest-air-quality",
+                "snapshot:latest",
+                "snapshot:warm",
+                "snow:depth",
+                "snow:events",
+                "snow:season:snow",
+                "snow:smoothing",
+                "station:airgradient:suncrest-air-quality",
+                "station:campbell:csi",
+                "station:snowgauge:snow",
+                "web:site:1",
+                "web:static",
+                "window:rollup",
+                "writer:timescale",
+            ],
+            "the migrated configuration plans the Go daemon's component set"
+        );
+
+        // The one thing the component ids cannot show, and the reason this work item also
+        // fixes something the owner has already noticed: the station the frozen read path
+        // resolves `?station=CSI` to is keyed `csi`, which is the id the migrated history is
+        // stored under. One key, derived from his device name, instead of two.
+        let station = cfg
+            .stations
+            .iter()
+            .find(|s| s.name == "CSI")
+            .expect("`?station=CSI` still resolves by name");
+        assert_eq!(station.station_key, "csi");
+        assert_eq!(station.id, 1, "the integer three frozen fields carry");
+        pool.close().await;
+    }
+
+    /// **The other direction of the same "done when": a configuration that exercises every
+    /// shape the migration has to resolve still PLANS.**
+    ///
+    /// The first migration test is the owner's own deployment, which is three stations and a
+    /// website. This one is deliberately awkward: an Ambient console whose identity and
+    /// credential the Go schema does not hold, one station sharing with all three upload
+    /// services at once, a website with a certificate, and a device switched off. Each of
+    /// those is a row the schema or the planner has an opinion about, and a migration that
+    /// wrote them wrong would produce a database that accepts the rows and a daemon that
+    /// refuses to start on them -- which is the whole class of mistake a configuration
+    /// migration makes, and not one any single-table assertion catches.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_awkward_migrated_configuration_still_plans() {
+        use mw_store::config_go::testing as go;
+
+        let scratch = Scratch::new("awkward");
+        let source = scratch.0.join("go-config.db");
+        go::go_db(
+            &source,
+            &[
+                // One station sharing with Weather Underground, PWS Weather and APRS over a
+                // KISS TNC at the Go default interval of 300 s, which is below O-8's floor.
+                // Coordinates as well as a callsign, because the Go daemon's own
+                // `aprsDeviceReady` requires both -- an APRS weather report IS a position
+                // report, and `mw_output::plan` says the same thing from the other end.
+                "INSERT INTO devices (id, config_id, name, type, enabled, hostname, port,
+                                      timezone, latitude, longitude,
+                                      wu_enabled, wu_station_id, wu_password,
+                                      pws_enabled, pws_station_id, pws_password,
+                                      aprs_enabled, aprs_callsign, aprs_passcode,
+                                      aprs_upload_interval, aprs_transport,
+                                      aprs_kiss_connection, aprs_kiss_tcp_address)
+                 VALUES (1, 1, 'Roof Davis', 'davis', 1, '10.0.0.9', '6785',
+                         'America/Denver', 40.47571, -111.84543,
+                         1, 'KONE', 'wukey', 1, 'PWSROOF', 'pwskey',
+                         1, 'N0CALL-1', '12345', 300, 'kiss', 'tcp', '10.0.0.20:8001');",
+                // An Ambient console: `plan()` wants the `?ID=` and the `?PASSWORD=`, and
+                // the Go daemon stored neither.
+                "INSERT INTO devices (id, config_id, name, type, enabled, port, path,
+                                      timezone)
+                 VALUES (2, 1, 'Patio', 'ambient-customized', 1, '8088', '/weatherstation',
+                         'America/Denver');",
+                // Switched off in the Go configuration, and still a row here.
+                "INSERT INTO devices (id, config_id, name, type, enabled, serial_device,
+                                      baud, timezone)
+                 VALUES (3, 1, 'Spare', 'davis', 0, '/dev/ttyUSB7', 19200,
+                         'America/Denver');",
+                // A real certificate pair, because `attach_listener` loads what the
+                // website row names: `crates/mw-http/tests/data` is where this repository
+                // keeps the ones its SNI tests use.
+                &format!(
+                    "INSERT INTO weather_websites (id, config_id, name, device_id, hostname,
+                                                   page_title, tls_cert_path, tls_key_path)
+                     VALUES (1, 1, 'site', 1, 'Example.TEST.:443', 'Example', '{}', '{}');",
+                    pem("exact-cert.pem").display(),
+                    pem("exact-key.pem").display(),
+                ),
+                "INSERT INTO storage_configs (config_id, backend_type, enabled,
+                                              timescale_host, timescale_port,
+                                              timescale_database, timescale_user,
+                                              timescale_password, timescale_ssl_mode)
+                 VALUES (1, 'timescaledb', 1, 'pitcairn', 5432, 'weather', 'mw', 'pw',
+                         'disable');",
+                "INSERT INTO controller_configs (config_id, controller_type, enabled,
+                                                 rest_port)
+                 VALUES (1, 'rest', 1, 443);",
+            ],
+        )
+        .await;
+
+        let migrated = crate::migrate::migrate(&crate::args::MigrateArgs {
+            args: Args {
+                config: scratch.db(),
+                format: None,
+                directive: None,
+                setup_listen: None,
+            },
+            from: source,
+            dry_run: false,
+        })
+        .await
+        .expect("an awkward configuration still migrates");
+
+        let pool = config_db::open_and_migrate(&scratch.db())
+            .await
+            .expect("the migrated database opens");
+        let mut cfg = Config::load(&mut pool.acquire().await.expect("a connection"))
+            .await
+            .expect("the migrated configuration reads");
+        let node = cfg.node.clone().expect("a node identity");
+        let fanout = spool::open(&node).expect("the spool opens");
+        let mut slots = Slots::new();
+        let _registry = attach_registry(&mut cfg, &mut slots).expect("the registry publishes");
+        attach_ingress(&mut cfg, &fanout).expect("the pipeline assembles");
+        attach_listener(&mut cfg, Arc::new(String::new), &mut slots, None)
+            .expect("the route tables mount");
+        let roots = Roots {
+            schedule: Arc::new(SqliteScheduleStore::new(pool.clone())),
+            stream: Some(Arc::clone(&fanout.stream) as Arc<dyn mw_component::ReadingStream>),
+            log: Arc::new(mw_supervisor::testing::MemoryLogControl::new("info")),
+        };
+        let ctx = PlanContext::new(Generation::ZERO).with_roots(roots.capabilities());
+        let planned = plan(&cfg, REGISTRARS, &ctx)
+            .expect("the migrated configuration plans; a refusal here is a migration defect");
+        let mut ids: Vec<&str> = planned
+            .ids()
+            .map(mw_component::ComponentId::as_str)
+            .collect();
+        ids.sort_unstable();
+
+        // The three uploaders are the assertion that matters: `uploader.name` is UNIQUE
+        // across kinds, so the station key alone as a name would have made the second
+        // insert fail and aborted the whole migration before anything got here.
+        assert!(
+            ids.contains(&"wu:wu-roof-davis")
+                && ids.contains(&"pws:pws-roof-davis")
+                && ids.contains(&"aprs:aprs-roof-davis"),
+            "three uploaders on one station: {ids:?}"
+        );
+        // The Davis plans and the two stations the migration could not complete do not,
+        // which is what "migrated switched off" buys.
+        assert!(ids.contains(&"station:davis:roof-davis"), "{ids:?}");
+        assert!(
+            !ids.iter().any(|id| id.starts_with("station:ambient")),
+            "the Ambient console has no identity to resolve against: {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id.contains("spare")),
+            "a device switched off in Go stays off: {ids:?}"
+        );
+
+        // O-8: the KISS beacon's Go default of 300 s was raised, and the report says so in
+        // one line. Without that the `aprs:*` component could not be built at all and this
+        // plan would have failed.
+        let raised: Vec<_> = migrated
+            .report
+            .of(mw_store::config_go::NoteKind::Raised)
+            .filter(|n| n.subject == "aprs:aprs-roof-davis")
+            .collect();
+        assert_eq!(raised.len(), 1, "{:#?}", migrated.report.notes);
+
+        // The website's certificate moved Go's one socket to the TLS port, and the hostname
+        // went through all three normalisation steps on the way.
+        let site: (String, i64) = sqlx::query_as("SELECT hostname, is_default_tls FROM website")
+            .fetch_one(&pool)
+            .await
+            .expect("the website");
+        assert_eq!(site, ("example.test".to_string(), 1));
+        let listener: (i64, Option<i64>) =
+            sqlx::query_as("SELECT http_port, https_port FROM listener")
+                .fetch_one(&pool)
+                .await
+                .expect("the listener");
+        assert_eq!(listener, (8080, Some(443)));
+        pool.close().await;
+    }
 }
