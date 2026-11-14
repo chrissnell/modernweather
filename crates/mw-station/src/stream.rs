@@ -282,7 +282,9 @@ pub async fn open(transport: &Transport, station: &str) -> Result<Box<dyn ByteSt
 ///   and `Backoff`s. **Which one loses depends on build order, so the failure is not
 ///   deterministic** — that is worse than it should be and better than the split stream it
 ///   replaced. Refusing it at plan time, where [`OpenError::Tls`] and
-///   [`OpenError::NotAStream2`] already are, is a separate work item.
+///   [`OpenError::NotAStream2`] already are, is **GRA-796** — separate because the two plan
+///   stages are in different crates with no shared seam, which is a decision rather than a
+///   patch.
 /// - **A device another process holds is refused**, where it previously opened. If `ser2net`
 ///   or `gpsd` owns the line, this daemon's transport is `tcp_out` and not `serial`; that is
 ///   N-20's path and it is unaffected.

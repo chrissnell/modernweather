@@ -2913,7 +2913,9 @@ because "`tcsetattr` returned" and "the line is at 115200" are not the same clai
   and an APRS `kiss-serial` sink may both name `/dev/ttyUSB0` and whichever is built second gets
   `EBUSY` and `Backoff`s. **Build order decides which**, so the failure is not deterministic. That
   is worse than it should be and better than the silent split it replaced; refusing it at plan time
-  is a separate work item and is raised as one.
+  is **GRA-796**, raised from this review — separate because `mw_station::plan` and
+  `mw_output::plan` are different crates with no shared stage, so the check needs a seam that does
+  not exist yet.
 - **Applying the rate is an upgrade hazard in the inverse direction, and this entry argued only one
   way.** `transport_baud` has been *mandatory* for a serial station since
   `migrations/config/20261102230000_config_schema_initial.sql`'s `CHECK`, and nothing ever compared

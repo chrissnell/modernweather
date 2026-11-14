@@ -1428,7 +1428,7 @@ Two operational consequences the amendment did not predict, both recorded in ful
 serial open is now **exclusive** (`TIOCEXCL` + `flock`), which is kept deliberately — one line has
 one reader, and two readers split the stream rather than each getting it — but **nothing refuses two
 components naming one `transport_dev` at plan time**, so that configuration now fails at startup
-non-deterministically instead of silently splitting. Refusing it in `plan` is a follow-up item. And
+non-deterministically instead of silently splitting. Refusing it in `plan` is **GRA-796**. And
 `transport_baud` was decorative and is now **authoritative**, so a deployment whose `udev` rule or
 `stty` set the line correctly while the column was stale worked before this change and fails after;
 `uploader.aprs_kiss_serial_baud` is the sharper case, because `mw_output::plan` defaults a NULL to
