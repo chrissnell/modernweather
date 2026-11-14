@@ -129,7 +129,7 @@
     <p class="dim">{copy.certificate.saveWarningNote}</p>
     <p class="dim">{copy.certificate.unavailable}</p>
 
-    {#if failure && failure.fields.size === 0}
+    {#if failure}
       <p class="error" role="alert">{failure.summary}</p>
     {/if}
 

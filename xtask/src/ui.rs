@@ -506,6 +506,32 @@ fn strip_comments(text: &str, is_svelte: bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < chars.len() {
+        // **A string literal is not a comment, and it can contain `//`.**
+        //
+        // `'https://example.test'` would otherwise make the rest of the line invisible --
+        // and what goes invisible is the misplaced-`raw()` check, whose whole purpose is
+        // that the exception list cannot grow quietly. So the literal is copied through
+        // verbatim and the comment scan resumes after it.
+        if chars[i] == '\'' || chars[i] == '"' || chars[i] == '`' {
+            let quote = chars[i];
+            out.push(chars[i]);
+            i += 1;
+            while i < chars.len() && chars[i] != quote {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    out.push(chars[i]);
+                    out.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                out.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() {
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
         if is_svelte && chars[i] == '<' {
             let tail: String = chars[i..(i + 4).min(chars.len())].iter().collect();
             if tail.starts_with("<!--") {
@@ -825,13 +851,19 @@ fn template_strings(text: &str) -> Vec<(usize, String)> {
 fn spoken_attributes(tag: &str, line: usize) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     for name in SPOKEN_ATTRIBUTES {
-        let needle = format!("{name}=\"");
-        let mut rest = tag;
-        while let Some(at) = rest.find(&needle) {
-            rest = &rest[at + needle.len()..];
-            let Some(end) = rest.find('"') else { break };
-            out.push((line, rest[..end].to_string()));
-            rest = &rest[end..];
+        // **Both quote characters.** Svelte accepts either, and a gate that reads only one
+        // of them is a gate an author bypasses by pressing a different key -- which is the
+        // shape of hole that makes a lint worse than no lint, because everyone believes it
+        // is holding.
+        for quote in ['"', '\''] {
+            let needle = format!("{name}={quote}");
+            let mut rest = tag;
+            while let Some(at) = rest.find(&needle) {
+                rest = &rest[at + needle.len()..];
+                let Some(end) = rest.find(quote) else { break };
+                out.push((line, rest[..end].to_string()));
+                rest = &rest[end..];
+            }
         }
     }
     out
@@ -1054,6 +1086,40 @@ mod tests {
         // And a real use still is one.
         let real = "const t = `${raw('Spool')}`;\n";
         assert_eq!(raw_terms(&strip_comments(real, false)), vec!["Spool"]);
+    }
+
+    /// A `//` inside a string literal must not blind the rest of the line. The hole it
+    /// opened was specific: the misplaced-`raw()` check, which is the only thing keeping
+    /// the exception list from growing quietly.
+    #[test]
+    fn a_url_in_a_string_is_not_a_comment() {
+        let ts = "const a = 'see https://example.test' + raw('ReadingStore');\n";
+        assert_eq!(
+            raw_terms(&strip_comments(ts, false)),
+            vec!["ReadingStore"],
+            "the `//` in the url swallowed the rest of the line"
+        );
+        // And a real comment on the same shape is still stripped.
+        let commented = "// see https://example.test and raw('Spool')\n";
+        assert!(raw_terms(&strip_comments(commented, false)).is_empty());
+    }
+
+    /// Svelte accepts either quote character, so the lint has to read both -- otherwise it
+    /// is bypassed by pressing a different key.
+    #[test]
+    fn a_single_quoted_spoken_attribute_is_read_too() {
+        let double = "<button aria-label=\"Restart the component\">Go</button>";
+        let single = "<button aria-label='Restart the component'>Go</button>";
+        for text in [double, single] {
+            let joined: String = template_strings(text)
+                .iter()
+                .map(|(_, s)| s.as_str())
+                .collect();
+            assert!(
+                joined.contains("Restart the component"),
+                "missed the label in {text:?}"
+            );
+        }
     }
 
     /// The initial route is what `index.html` tells the browser to fetch, which is the

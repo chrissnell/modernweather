@@ -121,9 +121,42 @@ jobs:
           echo "matrix=$(cargo xtask targets)" >> "$GITHUB_OUTPUT"
           echo "linux_matrix=$(cargo xtask targets --linux-only)" >> "$GITHUB_OUTPUT"
 
+  # **D-58**: the bundle is built ONCE, natively, BEFORE the cross matrix.
+  #
+  # It is architecture-independent static files, so building it inside each `cross`
+  # container would mean a Node toolchain per target for byte-identical output -- which
+  # D-58 calls "strictly harder" and is. This job is the "once"; the matrix below carries
+  # the result in and `cargo xtask dist` refuses to package without it.
+  ui:
+    name: management UI bundle
+    needs: config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Build the bundle
+        working-directory: ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-bundle
+          path: ui/build
+          # The matrix needs it and nothing else does; it is reproducible from the tag.
+          retention-days: 1
+          if-no-files-found: error
+
   build:
     name: ${{ matrix.label }}
-    needs: config
+    needs: [config, ui]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -138,6 +171,18 @@ jobs:
         with:
           key: release-${{ matrix.triple }}
       - uses: taiki-e/install-action@cross
+      # The bundle this target's binary embeds, built once by the `ui` job above. Restored
+      # before the Rust build because `rust-embed` resolves its folder at compile time.
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-bundle
+          path: ui/build
+      # `dist` compares the bundle's timestamp against the UI sources and refuses a stale
+      # one (D-58). A restored artefact has the checkout's mtimes, which are the clone's
+      # rather than the commit's, so the bundle is touched to make the ordering explicit
+      # instead of accidental.
+      - name: Mark the restored bundle as current
+        run: find ui/build -exec touch {} +
       - name: Explain the no-op
         if: needs.config.outputs.daemon_present != 'true'
         run: |

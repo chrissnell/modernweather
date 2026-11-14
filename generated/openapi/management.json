@@ -3657,6 +3657,14 @@
             "description": "W7 D-40's `IngestBatch.sender_depth`: how many readings the **peer says** it still\nhas unsent.\n\n**Peer-reported, and the field name says so**, because W7 D-40 requires W5 to label\nit as such wherever it appears and a field called `depth` would make that a\nconvention the next page could forget. It is what lets this node render fleet-wide\nlag without scraping a satellite whose link is down -- and it is the satellite's\nown claim, not a measurement.",
             "minimum": 0
           },
+          "revoked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When its enrolment was revoked, if it was.\n\nRevocation is a timestamp rather than a deletion precisely so that \"this peer was\ntrusted until Tuesday\" is readable off this page -- so a view that dropped it would\nrender a refused peer as a working one, which is the most expensive direction for a\nfleet page to be wrong in."
+          },
           "stations": {
             "type": "array",
             "items": {

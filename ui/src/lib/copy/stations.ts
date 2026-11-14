@@ -8,26 +8,50 @@ export interface StationKindCopy {
 }
 
 /**
- * The kinds, in the order §0.7 lists them. `kind` is the value `StationInput.kind`
- * takes; the label and the "how" line are what the operator reads.
+ * The kinds, in the order §0.7 lists them.
+ *
+ * `kind` is `stations.type`, and the **six** values its `CHECK` constraint admits -- in
+ * the frozen contract's spelling, which is what makes `weatherlink-live` hyphenated and
+ * `ambient-customized` and `campbellscientific` not. A seventh spelling here is a 422 on
+ * every create, and the schema's own comment says why the names cannot be tidied: writing
+ * `campbell` would make M7-4's configuration migration a silent contract break.
+ *
+ * §0.7's chooser has a seventh row, "Another RemoteWeather", and it is **not** a station
+ * type: a received station is an `ingest` row plus whatever a peer registers, which is why
+ * the schema's `CHECK` excludes `grpcreceiver` by name. The row is still offered, because
+ * it is what the operator is looking for -- it just goes to the page that configures the
+ * pairing, which is where §0.6 puts it.
  */
 export const stationKinds: readonly StationKindCopy[] = [
   { kind: 'davis', label: 'Davis Vantage Pro or Vue', how: 'Connects by cable or network' },
-  { kind: 'weatherlinklive', label: 'Davis WeatherLink Live', how: 'Connects over your network' },
+  { kind: 'weatherlink-live', label: 'Davis WeatherLink Live', how: 'Connects over your network' },
   {
     kind: 'campbellscientific',
     label: 'Campbell Scientific logger',
     how: 'Connects by cable or network'
   },
   { kind: 'ambient-customized', label: 'Ambient Weather station', how: 'Sends readings to us' },
-  { kind: 'airgradient', label: 'AirGradient air-quality sensor', how: 'Connects over your network' },
-  { kind: 'snowgauge', label: 'Snow depth sensor', how: 'Connects over your network' },
   {
-    kind: 'grpcreceiver',
-    label: 'Another RemoteWeather',
-    how: 'Receives readings from a peer'
-  }
+    kind: 'airgradient',
+    label: 'AirGradient air-quality sensor',
+    how: 'Connects over your network'
+  },
+  { kind: 'snowgauge', label: 'Snow depth sensor', how: 'Connects over your network' }
 ];
+
+/**
+ * §0.7's seventh row, which is a link rather than a type.
+ *
+ * Offered in the chooser because "another RemoteWeather" is a thing an operator has and
+ * looks for here. It is configured as a pairing, not as a station, so the row navigates
+ * instead of selecting.
+ */
+export const receivedFromPeer = {
+  label: 'Another RemoteWeather',
+  how: 'Receives readings from a peer',
+  href: '/data-storage/receive',
+  note: 'A peer link is set up under Data storage. The stations it sends appear here on their own.'
+} as const;
 
 export const stations = {
   list: {

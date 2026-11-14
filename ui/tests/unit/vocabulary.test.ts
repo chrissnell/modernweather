@@ -5,6 +5,7 @@ import {
   needsAttention,
   spins,
   stationKinds,
+  receivedFromPeer,
   stations,
   storage,
   system,
@@ -192,5 +193,56 @@ describe('§7.1’s page inventory', () => {
     // Every parameterised route is absent too: "Station — Settings" is not a destination
     // until there is a station.
     expect(palette.filter((r) => r.includes('['))).toEqual([]);
+  });
+});
+
+describe('the values the server actually admits', () => {
+  /**
+   * These are **enums the schema enforces and the API does not describe**: the OpenAPI
+   * document types them as `string`, so §4.3's two drift mechanisms cannot see a wrong
+   * spelling -- mechanism 1 compares the schema to the handlers and mechanism 2 compares
+   * the UI to the schema, and the value is in neither. A wrong one is a 422 on every save
+   * of that page, and nothing fails until somebody opens it.
+   *
+   * So the spellings are pinned here, next to the two places that own them:
+   *
+   *   stations.type       `STATION_KINDS` in crates/mw-api-mgmt/src/change.rs, and the
+   *                       `CHECK (transport_kind IS NULL OR type IN (...))` constraint in
+   *                       migrations/config/20261102230000_config_schema_initial.sql
+   *   aprs_transport      the `CHECK (aprs_transport IS NULL OR aprs_transport IN (...))`
+   *                       constraint in the same migration
+   *
+   * The frozen contract is why they cannot be tidied: `campbellscientific` and
+   * `ambient-customized` are what docs/legacy-api-contract.md §3.1 freezes, and the
+   * migration's own comment says writing `campbell` would make M7-4's configuration
+   * migration a silent contract break.
+   */
+  it('offers only station types the schema admits', () => {
+    expect(stationKinds.map((k) => k.kind).sort()).toEqual([
+      'airgradient',
+      'ambient-customized',
+      'campbellscientific',
+      'davis',
+      'snowgauge',
+      'weatherlink-live'
+    ]);
+  });
+
+  it('does not offer a received station as a type', () => {
+    // `grpcreceiver` is an `ingest` row plus whatever a peer registers, and the schema's
+    // `CHECK` excludes it by name. §0.7's seventh chooser row is a link to the page that
+    // configures the pairing, which is `receivedFromPeer`.
+    expect(stationKinds.map((k) => k.kind)).not.toContain('grpcreceiver');
+    expect(receivedFromPeer.href).toBe('/data-storage/receive');
+  });
+
+  it('gives every offered type a shape, and every shape a streaming answer', () => {
+    for (const kind of stationKinds) {
+      const shape = shapeFor(kind.kind);
+      expect(knownKinds, kind.kind).toContain(kind.kind);
+      // `http_out` and `grpc_out` are refused without `transport.streaming`, so a shape
+      // that left it undefined would be a type that can never be saved.
+      expect(typeof shape.streams, kind.kind).toBe('boolean');
+    }
   });
 });

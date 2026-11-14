@@ -38,7 +38,13 @@
   ];
 
   let busy = $state<string | null>(null);
-  let confirmRestart = $state<string | null>(null);
+  // **Two pieces of state, not one.** `AlertDialog.Root` takes a bindable `open` and no
+  // change callback (§6.3 gap G16), so dismissing with Escape or the overlay sets `open`
+  // to false and nothing else. With a one-way `open={target !== null}` the target stayed
+  // set, the next click on the same row changed nothing, and that row's Restart button was
+  // dead for the rest of the page's life.
+  let restartOpen = $state(false);
+  let restartTarget = $state<string | null>(null);
 
   async function runNow(id: string) {
     busy = id;
@@ -55,7 +61,7 @@
   }
 
   async function restart(id: string) {
-    confirmRestart = null;
+    restartOpen = false;
     busy = id;
     try {
       unwrap(
@@ -141,7 +147,10 @@
               <Button
                 size="sm"
                 variant="default"
-                onclick={() => (confirmRestart = c.id)}
+                onclick={() => {
+                  restartTarget = c.id;
+                  restartOpen = true;
+                }}
                 disabled={busy === c.id}
               >
                 {copy.diagnostics.restart}
@@ -155,15 +164,22 @@
   <p class="blurb">{copy.diagnostics.noStopNote}</p>
 </Box>
 
-<AlertDialog.Root open={confirmRestart !== null}>
+<AlertDialog.Root bind:open={restartOpen}>
   <AlertDialog.Content>
     <AlertDialog.Title>{copy.diagnostics.restartTitle}</AlertDialog.Title>
-    <AlertDialog.Description>{copy.diagnostics.restartBody}</AlertDialog.Description>
-    <Button variant="default" onclick={() => (confirmRestart = null)}>{common.cancel}</Button>
-    <Button
-      variant="danger"
-      onclick={() => confirmRestart && restart(confirmRestart)}
-    >
+    <AlertDialog.Description>
+      {copy.diagnostics.restartBody}
+      {#if restartTarget}
+        {@const target = stream.components.find((c) => c.id === restartTarget)}
+        {#if target}
+          <strong>{target.display.name}{target.display.qualifier
+              ? ` (${target.display.qualifier})`
+              : ''}</strong>
+        {/if}
+      {/if}
+    </AlertDialog.Description>
+    <Button variant="default" onclick={() => (restartOpen = false)}>{common.cancel}</Button>
+    <Button variant="danger" onclick={() => restartTarget && restart(restartTarget)}>
       {copy.diagnostics.restart}
     </Button>
   </AlertDialog.Content>

@@ -31,6 +31,8 @@ export const storage = {
     },
     connectivityNote:
       'Saving a connection the database refuses is still a legitimate save — it may be down, or about to be set up. The save succeeds and the status above says what happened.',
+    credentialsNeeded:
+      'The user and password are needed to change any of this. RemoteWeather never sends a stored password back to this page, so there is nothing a blank box could keep.',
     unavailable:
       'Database size and oldest reading are not in this version. The status above is what the running system reports.'
   },

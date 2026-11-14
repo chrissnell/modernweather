@@ -240,6 +240,7 @@ impl Fleet for FleetNumbers {
                         name: row.name,
                         node_id: hex(&row.node_id),
                         last_seen: row.last_seen,
+                        revoked_at: row.revoked_at,
                         stations: row.stations,
                     });
                 }

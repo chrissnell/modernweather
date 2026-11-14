@@ -1,6 +1,21 @@
 /**
  * Which fields a station's form shows, decided by its kind.
  *
+ * **The authority is `crates/mw-station/src/plan.rs`'s own table**, which maps
+ * `(type, transport_kind)` to the components it plans, and anything outside it is
+ * `PlanError` -- "station `x` is a `y` with a `z` transport, which that driver has no mode
+ * for". It is reproduced here because a form that offers a transport the driver has no
+ * mode for is a Save that cannot succeed:
+ *
+ * | `type` | `transport_kind` |
+ * |---|---|
+ * | `weatherlink-live` | `udp_in`, or `http_out` polling `/v1/current_conditions` |
+ * | `davis` | `serial` or `tcp_out` |
+ * | `campbellscientific` | `serial` or `tcp_out` |
+ * | `airgradient` | `http_out`, polling `/measures/current` |
+ * | `ambient-customized` | `http_in` |
+ * | `snowgauge` | `grpc_out` |
+ *
  * §7.3's worst offender: today's form shows **every** field of `DeviceData` -- 50-plus
  * columns spanning Davis serial settings, PWS credentials, APRS KISS TNC paths and
  * WeatherLink sensor mappings -- for every station type, so an AirGradient sensor's form
@@ -11,7 +26,7 @@
  * with one answer in one place.
  */
 
-export type ConnectionShape = 'serial-or-network' | 'network' | 'inbound' | 'peer';
+export type ConnectionShape = 'serial-or-network' | 'network' | 'inbound';
 
 export interface KindShape {
   /** How this hardware is reached, which decides the connection fields. */
@@ -30,6 +45,15 @@ export interface KindShape {
   readonly located: boolean;
   /** The transport `kind` a create defaults to. */
   readonly defaultTransport: string;
+  /**
+   * Whether this hardware's outbound transport streams rather than polls.
+   *
+   * **Not optional, and not cosmetic.** `http_out` and `grpc_out` are refused without
+   * `transport.streaming` -- W2a §4a.3's trigger-implication table reads it at plan time
+   * to decide whether the component is `OnReading` or `Every` -- so a form that leaves it
+   * unset can never save a WeatherLink Live or a snow gauge at all.
+   */
+  readonly streams: boolean;
   /** The baud rate this hardware actually uses, offered as the default. */
   readonly defaultBaud?: number;
 }
@@ -44,7 +68,8 @@ const SHAPES: Record<string, KindShape> = {
     presentsIdentity: false,
     located: true,
     defaultTransport: 'serial',
-    defaultBaud: 19200
+    defaultBaud: 19200,
+    streams: false
   },
   campbellscientific: {
     connection: 'serial-or-network',
@@ -55,9 +80,10 @@ const SHAPES: Record<string, KindShape> = {
     presentsIdentity: false,
     located: true,
     defaultTransport: 'tcp_out',
-    defaultBaud: 115200
+    defaultBaud: 115200,
+    streams: false
   },
-  weatherlinklive: {
+  'weatherlink-live': {
     connection: 'network',
     wind: true,
     snow: false,
@@ -65,7 +91,11 @@ const SHAPES: Record<string, KindShape> = {
     sensorMapping: true,
     presentsIdentity: false,
     located: true,
-    defaultTransport: 'http_out'
+    defaultTransport: 'http_out',
+    // A WeatherLink Live is polled over http: the unit answers a request, it does not
+    // push. `streaming: false` is therefore a fact about the hardware rather than a
+    // default, and the plan reads it to make this an `Every` component.
+    streams: false
   },
   'ambient-customized': {
     connection: 'inbound',
@@ -75,37 +105,37 @@ const SHAPES: Record<string, KindShape> = {
     sensorMapping: false,
     presentsIdentity: true,
     located: true,
-    defaultTransport: 'http_in'
+    defaultTransport: 'http_in',
+    streams: false
   },
   airgradient: {
-    connection: 'inbound',
-    wind: false,
-    snow: false,
-    polled: false,
-    sensorMapping: false,
-    presentsIdentity: true,
-    located: true,
-    defaultTransport: 'http_in'
-  },
-  snowgauge: {
+    // `http_out`, not inbound: this node polls `/measures/current`. An outbound transport
+    // therefore means a `fixed` identity, which the schema requires of it.
     connection: 'network',
     wind: false,
-    snow: true,
+    snow: false,
     polled: true,
     sensorMapping: false,
     presentsIdentity: false,
     located: true,
-    defaultTransport: 'http_out'
+    defaultTransport: 'http_out',
+    streams: false
   },
-  grpcreceiver: {
-    connection: 'peer',
-    wind: true,
+  snowgauge: {
+    // `grpc_out`, which `mw-grpc` plans -- `mw-station` validates the row and emits
+    // nothing, because that crate may not name `tonic`. It is the one kind whose transport
+    // carries `streaming`, and `mw_station::plan` requires it **set**: "a snow gauge
+    // streams readings, so the flag has to be set; `transport_streaming = 0` would declare
+    // one request per occurrence and no stream". Not polled, therefore, and not a choice.
+    connection: 'network',
+    wind: false,
     snow: true,
     polled: false,
     sensorMapping: false,
-    presentsIdentity: true,
-    located: false,
-    defaultTransport: 'grpc_out'
+    presentsIdentity: false,
+    located: true,
+    defaultTransport: 'grpc_out',
+    streams: true
   }
 };
 
@@ -126,7 +156,8 @@ export function shapeFor(kind: string): KindShape {
       sensorMapping: false,
       presentsIdentity: false,
       located: true,
-      defaultTransport: 'tcp_out'
+      defaultTransport: 'tcp_out',
+      streams: false
     }
   );
 }

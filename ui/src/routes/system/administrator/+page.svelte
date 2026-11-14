@@ -148,7 +148,7 @@
         />
       {/snippet}
     </Field>
-    {#if failure && failure.fields.size === 0}
+    {#if failure}
       <p class="error" role="alert">{failure.summary}</p>
     {/if}
     <Button type="submit" variant="primary" disabled={busy || !current || !next || mismatch}>

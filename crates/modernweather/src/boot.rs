@@ -1966,16 +1966,17 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     // cannot start before the admin does.
     let rings: Arc<dyn mw_api_mgmt::LogSource> = Arc::new(crate::hostinfo::Rings::new(obs.rings()));
     let hub = mw_api_mgmt::Hub::new();
-    let live = Arc::new(mw_api_mgmt::Live {
-        hub: Arc::clone(&hub),
-        logs: Arc::clone(&rings),
-    });
     let latest: Arc<dyn mw_api_mgmt::host::Readings> = match &fanout {
         Some(fanout) => crate::live::Latest::over(&fanout.spool),
         // A node with no spool produces no readings of its own, and the tiles say "no
         // readings yet" rather than showing a figure from nowhere.
         None => Arc::new(crate::live::NoReadings),
     };
+    let live = Arc::new(mw_api_mgmt::Live {
+        hub: Arc::clone(&hub),
+        logs: Arc::clone(&rings),
+        readings: Arc::clone(&latest),
+    });
     let fleet = crate::live::FleetNumbers::new(
         fanout.as_ref().map(|f| Arc::clone(&f.spool)),
         peer_store.clone(),

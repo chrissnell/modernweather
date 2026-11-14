@@ -252,7 +252,7 @@
   {#if moves}
     <p class="warn">{copy.advanced.portChangeWarning(newUrl)}</p>
   {/if}
-  {#if failure && failure.fields.size === 0}
+  {#if failure}
     <p class="error" role="alert">{failure.summary}</p>
   {/if}
 

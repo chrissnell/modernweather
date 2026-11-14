@@ -102,31 +102,32 @@ pub fn main(args: &[String]) -> Result<(), String> {
         ));
     }
 
-    // **D-58**: the management UI's bundle is built once, natively, BEFORE the Rust
-    // build -- not inside each `cross` container. The bundle is architecture-independent
-    // static files, so building it per target would mean a Node toolchain in every
-    // container for byte-identical output; and because `mw-api-mgmt` embeds it with
-    // `rust-embed`, the Rust build is what consumes it, so it has to exist first.
+    // **D-58**: the management UI's bundle is built **once, natively, before** the cross
+    // matrix, and this command fails if it is missing or stale.
     //
-    // `--skip-ui` exists for the one case that is not a release: a developer who has just
-    // built the bundle by hand and wants the Rust half again. It is not what CI runs.
-    if args.iter().any(|a| a == "--skip-ui") {
-        match crate::ui::stale(&root) {
-            Ok(None) => println!("ui: the committed bundle is current"),
-            Ok(Some(source)) => {
-                return Err(format!(
-                    "the UI bundle is stale: {} is newer than ui/build/index.html.\n                       A release artefact that contains a stale bundle is the defect D-58                      exists to prevent, so this fails rather than packaging it. Run                      `cargo xtask ui`, or drop --skip-ui.",
-                    source.display()
-                ))
-            }
-            Err(e) => {
-                return Err(format!(
-                    "{e}.\n  --skip-ui requires a bundle to skip building. Run                      `cargo xtask ui`, or drop --skip-ui."
-                ))
-            }
+    // It is deliberately not built here. `dist` runs once per target, so building the
+    // bundle inside it would build architecture-independent static files N times -- and it
+    // would put a Node toolchain in every `cross` container, which is the thing D-58 calls
+    // "strictly harder". `cargo xtask ui` is the one place that builds it, the release
+    // workflow runs that once and carries the result into the matrix, and what is enforced
+    // here is the invariant: a release artefact can never contain a stale bundle.
+    match crate::ui::stale(&root) {
+        Ok(None) => println!("ui: the committed bundle is current"),
+        Ok(Some(source)) => {
+            return Err(format!(
+                "the UI bundle is stale: {} is newer than ui/build/index.html.\n  \
+                 A release artefact containing a stale bundle is the defect D-58 exists to \
+                 prevent, so this fails rather than packaging it. Run `cargo xtask ui`.",
+                source.display()
+            ))
         }
-    } else {
-        crate::ui::build(&root)?;
+        Err(e) => {
+            return Err(format!(
+                "{e}.\n  `cargo xtask dist` embeds the management UI, so the bundle has to \
+                 exist first. Run `cargo xtask ui` -- once, natively, before the matrix \
+                 (D-58)."
+            ))
+        }
     }
 
     let builder = builder_for(&triple);

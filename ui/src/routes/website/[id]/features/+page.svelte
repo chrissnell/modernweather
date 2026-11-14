@@ -97,7 +97,7 @@
     {/snippet}
   </Field>
 
-  {#if failure && failure.fields.size === 0}
+  {#if failure}
     <p class="error" role="alert">{copy.extras.registerFailed} {failure.summary}</p>
   {/if}
 

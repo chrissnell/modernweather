@@ -28,7 +28,7 @@
   let symbolCode = $state('_');
   let comment = $state('');
   let interval = $state('');
-  let transport = $state('aprsis');
+  let transport = $state('aprs-is');
   let server = $state('');
   let kissDevice = $state('');
   let kissBaud = $state('');
@@ -54,7 +54,7 @@
     symbolCode = view.aprs_symbol_code ?? '_';
     comment = view.aprs_comment ?? '';
     interval = view.interval_seconds?.toString() ?? '';
-    transport = view.aprs_transport ?? 'aprsis';
+    transport = view.aprs_transport ?? 'aprs-is';
     server = view.aprs_server ?? '';
     kissDevice = view.aprs_kiss_serial_device ?? '';
     kissBaud = view.aprs_kiss_serial_baud?.toString() ?? '';
@@ -67,7 +67,7 @@
   });
 
   $effect(() => {
-    if (transport !== 'tnc') return;
+    if (transport !== 'kiss-serial') return;
     void (async () => {
       try {
         ports = unwrap(await api.GET('/api/v1/system/serial-ports')).ports;
@@ -99,10 +99,11 @@
       aprs_symbol_code: symbolCode || null,
       aprs_comment: comment || null,
       aprs_transport: transport,
-      aprs_server: transport === 'aprsis' ? server || null : null,
-      aprs_kiss_serial_device: transport === 'tnc' ? kissDevice || null : null,
-      aprs_kiss_serial_baud: transport === 'tnc' && kissBaud ? Number(kissBaud) : null,
-      aprs_kiss_tcp_address: transport === 'tnc' ? kissTcp || null : null,
+      aprs_server: transport === 'aprs-is' ? server || null : null,
+      aprs_kiss_serial_device: transport === 'kiss-serial' ? kissDevice || null : null,
+      aprs_kiss_serial_baud:
+        transport === 'kiss-serial' && kissBaud ? Number(kissBaud) : null,
+      aprs_kiss_tcp_address: transport === 'kiss-tcp' ? kissTcp || null : null,
       aprs_kiss_path: kissPath || null,
       aprs_kiss_destination: kissDestination || null,
       stations: Object.entries(pairings)
@@ -251,14 +252,15 @@
         value={transport}
         onValueChange={(v) => (transport = v)}
         options={[
-          { value: 'aprsis', label: 'APRS-IS (over the internet)' },
-          { value: 'tnc', label: 'A TNC radio' }
+          { value: 'aprs-is', label: 'APRS-IS (over the internet)' },
+          { value: 'kiss-serial', label: 'A TNC radio, by cable' },
+          { value: 'kiss-tcp', label: 'A TNC radio, over the network' }
         ]}
       />
     {/snippet}
   </Field>
 
-  {#if transport === 'aprsis'}
+  {#if transport === 'aprs-is'}
     <Field copy={copy.fields.aprsServer} error={err('aprs_server')}>
       {#snippet children({ id, describedBy })}
         <Input
@@ -269,7 +271,7 @@
         />
       {/snippet}
     </Field>
-  {:else}
+  {:else if transport === 'kiss-serial'}
     <Field copy={copy.fields.kissSerialDevice} error={err('aprs_kiss_serial_device')}>
       {#snippet children({ id, describedBy, invalid })}
         {#if ports.length > 0}
@@ -307,13 +309,35 @@
         />
       {/snippet}
     </Field>
-    <Field copy={copy.fields.kissTcpAddress} error={err('aprs_kiss_tcp_address')}>
+    <Field copy={copy.fields.kissPath} error={err('aprs_kiss_path')}>
       {#snippet children({ id, describedBy })}
+        <Input
+          {id}
+          value={kissPath}
+          oninput={(e) => (kissPath = (e.currentTarget as HTMLInputElement).value)}
+          aria-describedby={describedBy}
+        />
+      {/snippet}
+    </Field>
+    <Field copy={copy.fields.kissDestination} error={err('aprs_kiss_destination')}>
+      {#snippet children({ id, describedBy })}
+        <Input
+          {id}
+          value={kissDestination}
+          oninput={(e) => (kissDestination = (e.currentTarget as HTMLInputElement).value)}
+          aria-describedby={describedBy}
+        />
+      {/snippet}
+    </Field>
+  {:else}
+    <Field copy={copy.fields.kissTcpAddress} error={err('aprs_kiss_tcp_address')}>
+      {#snippet children({ id, describedBy, invalid })}
         <Input
           {id}
           value={kissTcp}
           oninput={(e) => (kissTcp = (e.currentTarget as HTMLInputElement).value)}
           aria-describedby={describedBy}
+          aria-invalid={invalid}
         />
       {/snippet}
     </Field>
@@ -370,7 +394,10 @@
   {/if}
 </Box>
 
-{#if failure && failure.fields.size === 0}
+{#if failure}
+  <!-- Always, not only when no field error came with it: a `plan()` error about an
+       exclusive serial port names a path this form has no control for, and suppressing the
+       summary would make Save look like it did nothing. -->
   <p class="error" role="alert">{failure.summary}</p>
 {/if}
 

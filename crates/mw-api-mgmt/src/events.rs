@@ -202,6 +202,12 @@ pub struct Hub {
     /// Per-connection channel subscriptions, so §5.1's in-stream change needs no reconnect.
     subscriptions: Mutex<BTreeMap<String, BTreeSet<Channel>>>,
     connections: AtomicU64,
+    /// Ids handed out, ever. **Separate from `connections`, which goes down.**
+    ///
+    /// Deriving an id from the open-connection count means two live connections can hold
+    /// the same one as soon as a third closes -- and the id keys the subscription map, so
+    /// one connection's teardown would silently take the other's channels with it.
+    issued: AtomicU64,
     generation: AtomicU64,
     /// Bumped when every open connection should end and reconnect.
     ///
@@ -243,6 +249,7 @@ impl Hub {
             evicted: AtomicU64::new(0),
             subscriptions: Mutex::new(BTreeMap::new()),
             connections: AtomicU64::new(0),
+            issued: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
         })
@@ -654,6 +661,8 @@ pub struct Live {
     pub hub: Arc<Hub>,
     /// The log rings, for the backfill.
     pub logs: Arc<dyn LogSource>,
+    /// The latest reading per station, for the backfill.
+    pub readings: Arc<dyn Readings>,
 }
 
 impl std::fmt::Debug for Live {
@@ -699,15 +708,24 @@ pub fn connect(
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let generation = rendering.generation;
     let hub = Arc::clone(&live.hub);
+    // **Subscribed before the backfill is taken**, not after.
+    //
+    // A frame published between the snapshot and the subscribe would otherwise be lost --
+    // and lost *silently*, because the client's `last_event_id` jumps straight over it and
+    // no `gap` is emitted. The receiver buffers from this moment, so the window closes;
+    // the cost is that a frame already reflected in the snapshot may arrive again, which
+    // is a delta applied twice over the same value and therefore a no-op.
+    let live_rx = hub.tx.subscribe();
     // An opaque, per-connection id. Not a secret and not a UUID: it names one open
-    // connection to the client that opened it, so the only property it needs is that two
-    // live connections do not collide -- which the counter gives and the mix makes
-    // unguessable enough that a stale client cannot stumble onto another's.
+    // connection to the client that opened it, so the one property it needs is that two
+    // live connections never collide. `issued` only ever goes up, which is what gives
+    // that; `connections` goes down as connections close and would not.
+    hub.connections.fetch_add(1, Ordering::Relaxed);
     let stream_id = format!(
         "{:x}",
-        (hub.connections
+        hub.issued
             .fetch_add(1, Ordering::Relaxed)
-            .wrapping_mul(2_654_435_761))
+            .wrapping_mul(2_654_435_761)
             ^ hub.next_id.load(Ordering::Relaxed)
     );
     hub.lock_subs()
@@ -760,7 +778,7 @@ pub fn connect(
         channel: Channel::Components,
     });
 
-    let live = BroadcastStream::new(hub.tx.subscribe());
+    let live = BroadcastStream::new(live_rx);
     let hub_for_filter = Arc::clone(&hub);
     let hub_for_filter2 = Arc::clone(&hub);
     let id_for_filter = stream_id;
@@ -844,6 +862,23 @@ fn backfill(
                 data,
                 channel: Channel::Components,
             });
+        }
+    }
+    if request.channels.contains(&Channel::Readings) {
+        // Without this, every page load shows "no readings yet" on the Home tiles and on
+        // §0.7 step 3 until the *next* reading arrives -- up to a station's whole poll
+        // interval of looking at a blank panel, which is exactly the "is this working?"
+        // question §2 exists to answer.
+        for mut reading in live.readings.latest() {
+            reading.station_name = rendering.vocab.station_name(&reading.station_key);
+            if let Ok(data) = serde_json::to_string(&reading) {
+                out.push(Frame {
+                    id: None,
+                    event: "reading",
+                    data,
+                    channel: Channel::Readings,
+                });
+            }
         }
     }
     if request.channels.contains(&Channel::Logs) {

@@ -19,7 +19,7 @@ export { raw } from './raw';
 export { nav, appName, common, pages, type NavItem } from './nav';
 export { home, list } from './home';
 export { auth } from './auth';
-export { stations, stationKinds, type StationKindCopy } from './stations';
+export { stations, stationKinds, receivedFromPeer, type StationKindCopy } from './stations';
 export { share, destinations, type DestinationCopy } from './share';
 export { website } from './website';
 export { storage } from './storage';

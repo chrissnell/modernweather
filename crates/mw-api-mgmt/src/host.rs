@@ -362,6 +362,14 @@ pub struct PeerView {
     pub last_seen: Option<chrono::DateTime<chrono::Utc>>,
     /// Which stations it has registered, by key.
     pub stations: Vec<String>,
+    /// When its enrolment was revoked, if it was.
+    ///
+    /// Revocation is a timestamp rather than a deletion precisely so that "this peer was
+    /// trusted until Tuesday" is readable off this page -- so a view that dropped it would
+    /// render a refused peer as a working one, which is the most expensive direction for a
+    /// fleet page to be wrong in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
     /// W7 D-40's `IngestBatch.sender_depth`: how many readings the **peer says** it still
     /// has unsent.
     ///

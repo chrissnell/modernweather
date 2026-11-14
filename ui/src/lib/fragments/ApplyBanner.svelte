@@ -18,13 +18,17 @@
 
   const phase = $derived(saves.phase);
 
-  // ③ holds for three seconds and then goes, per §2.4. An effect rather than a timer in
-  // the store, because the fade is a property of this banner being on screen.
+  // ③ holds for three seconds and then goes, per §2.4.
+  //
+  // **Keyed on the phase's kind, not on the phase.** `saves.phase` is derived from
+  // `stream.now`, which ticks every second -- so an effect that read the phase itself was
+  // torn down and re-armed before its own three seconds could elapse, and the banner
+  // never went away. The one thing this effect may depend on is the string.
+  const kind = $derived(phase.kind);
   $effect(() => {
-    if (phase.kind === 'live') {
-      const t = setTimeout(() => saves.clear(), 3_000);
-      return () => clearTimeout(t);
-    }
+    if (kind !== 'live') return;
+    const t = setTimeout(() => saves.clear(), 3_000);
+    return () => clearTimeout(t);
   });
 
   async function undo() {

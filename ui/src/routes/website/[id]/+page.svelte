@@ -297,7 +297,7 @@
     </Field>
   </Box>
 
-  {#if failure && failure.fields.size === 0}
+  {#if failure}
     <p class="error" role="alert">{failure.summary}</p>
   {/if}
 

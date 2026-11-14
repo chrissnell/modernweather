@@ -98,12 +98,39 @@ export async function startDaemon(): Promise<Daemon> {
   };
 
   child = launch();
-  await waitForReady(url, () => collected);
 
-  const setupCode = parseSetupCode(collected);
-  if (!setupCode) {
-    throw new Error(`no setup code in the daemon's output.\n\n${collected}`);
-  }
+  // **Every failure from here on has to take the daemon down with it.** The process is
+  // already spawned and already holding the port, so a readiness timeout or a wrong answer
+  // that merely threw would leave it there -- and every later test then failed against
+  // somebody else's already-claimed daemon, which is one real failure reported as five.
+  const setupCode = await (async () => {
+    await waitForReady(url, () => collected);
+
+    // **Whose daemon answered?** A leftover process from an interrupted run holds the same
+    // port, is already claimed, and serves every request perfectly -- so the only symptom
+    // would be "no setup code", which sends the reader looking at the banner instead of at
+    // `pgrep`. Checked explicitly, and named.
+    const state = await (
+      await fetch(`${url}/api/v1/auth/session`, { headers: { 'X-MW-Request': '1' } })
+    ).json();
+    if (state.claimed) {
+      throw new Error(
+        `something else is already listening on ${url} and it is already set up. ` +
+          `A daemon from an interrupted run is the usual cause: ` +
+          `pkill -f mw-e2e- and try again.`
+      );
+    }
+
+    const code = parseSetupCode(collected);
+    if (!code) {
+      throw new Error(`no setup code in the daemon's output.\n\n${collected}`);
+    }
+    return code;
+  })().catch(async (e: unknown) => {
+    await stop();
+    await rm(dir, { recursive: true, force: true });
+    throw e;
+  });
 
   return {
     url,

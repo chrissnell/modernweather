@@ -3834,3 +3834,73 @@ silently does nothing would be worse than its absence.
 | Reading a certificate back for its subject and expiry | Needs a handler that parses the PEM, which M7-1's surface does not have | `/website/{id}/certificate` says so; the paths are saved and used |
 | Database size and oldest reading | Not on M7-1's surface | `/data-storage/database` says so; the live status above it is what the running system reports |
 | Editing the CORS allowlist | **A-M7-2-6**: the list is read at startup and no route edits it | `/system/advanced` says an added origin takes effect at the next start, which is the thing an operator needs to know |
+
+### What M7-3's code review found
+
+Fifteen findings, each verified against the surrounding code before being acted on rather
+than implemented on trust — two of them by injecting a violation and watching the gate.
+They are recorded because four of them are the same mistake and the fix for that class is
+a test rather than a patch.
+
+**The class: values the schema enforces and the API does not describe.** `stations.type`,
+`uploader.aprs_transport` and the per-transport required fields are `CHECK` constraints
+and Rust `const` lists; the OpenAPI document types every one of them as `string`. So
+§4.3's two drift mechanisms are both blind to a wrong spelling — mechanism 1 compares the
+schema to the handlers and mechanism 2 compares the UI to the schema, and the value is in
+neither. A wrong one is a `422` on every save of that page and **nothing fails until
+somebody opens it**, which is exactly how four of these got past a green build:
+
+| Found | Consequence |
+|---|---|
+| the kind chooser sent `weatherlinklive` | the schema admits `weatherlink-live`; create always `422`d |
+| the chooser offered `grpcreceiver` as a type | it is an `ingest` row; the `CHECK` excludes it by name |
+| APRS sent `aprsis` / `tnc` | the schema admits `aprs-is`, `kiss-serial`, `kiss-tcp`; the page could never be saved |
+| `airgradient` and `snowgauge` named the wrong transport | `mw-station`'s driver table has no mode for them, so `plan()` refused |
+
+Guarded now by three things rather than by care: a unit test that pins each list beside a
+comment naming the Rust constant and the SQL constraint that own it; a second Playwright
+flow over a kind whose transport the plan validates differently, which is what a
+Davis-only flow could not see; and the error-summary fix below, without which none of the
+four was visible on screen at all.
+
+**The amplifier, and the most useful finding of the fifteen.** Every form suppressed its
+error summary whenever any field error came with it (`{#if failure && failure.fields.size
+=== 0}`), on the assumption that §7.2's field paths always have a control on the page to
+land on. They do not: `transport.*` on a kind whose form omits that field, and a `plan()`
+error about a different station, both name paths with nowhere to go. The result was a Save
+button that did nothing at all and said nothing at all — the defect §2 exists against,
+reintroduced by the code meant to implement §8.5. Every form now shows the summary
+whenever there is a failure, and lists the field messages under it.
+
+**One pre-existing defect in M7-1's surface, found by building a client for it.**
+`TransportInput::problems` required `transport.streaming` for `http_out` **and**
+`grpc_out`, while the configuration database carries `CHECK (transport_streaming IS NULL
+OR COALESCE(transport_kind, '') = 'grpc_out')`. The two rules contradict each other, so an
+`http_out` station was **unsatisfiable through the management API**: omitting the field was
+a `422` naming it, and supplying it was that `CHECK` failing with SQLite's own wording.
+Two of the six types the schema admits — `weatherlink-live` and `snowgauge` — are reached
+that way, so neither could be created or edited at all. W2a §4a.3 is the authority and is
+unambiguous (`HttpOut { auth }`, `GrpcOut { streaming: bool }`); the validation now matches
+it, refuses a `streaming` on an `http_out` with a sentence rather than a constraint name,
+and `change::tests::streaming_belongs_to_grpc_out_and_not_to_http_out` is the regression
+test. Nothing had created an `http_out` station through the API before this work item.
+
+**The rest, each with the reason it mattered rather than the patch:**
+
+| Where | Why it was wrong |
+|---|---|
+| `xtask/src/dist.rs` | `dist` built the bundle itself, so it ran once per target and put pnpm in every `cross` container — the opposite of what D-58 says. It now **requires** the bundle; a `ui` job in `release.yml` builds it once, natively, and the matrix carries it in |
+| `events::connect` | the broadcast was subscribed **after** the backfill snapshot, so a frame published in that window was lost *silently* — the client's `last_event_id` jumped over it and no `gap` was emitted |
+| `events::backfill` | the readings channel had no backfill, so every page load showed "no readings yet" until the next reading — up to a whole poll interval of a blank panel, which is the question §2 exists to answer |
+| `events::connect` | `stream_id` derived from the open-connection count, which `Drop` decrements — so two live connections could share an id, and one's teardown would take the other's channels with it |
+| `live::FleetNumbers` | `revoked_at` was read from the database and dropped, so a peer whose enrolment was revoked rendered as a working one. Revocation is a timestamp rather than a deletion *precisely* so that page can say "trusted until Tuesday" |
+| `fragments/ApplyBanner.svelte` | the three-second dismissal effect depended on `stream.now`, so the one-second clock tore it down and re-armed it before it could fire: "Saved and live" never went away |
+| `routes/data-storage/database` | the save rebuilt the whole connection string from the form and omitted the credentials when their write-only boxes were empty — so a save silently destroyed the password the page said it would keep. D-67 means there is nothing to merge a blank box into, so the page now refuses and says why |
+| `routes/system/diagnostics` | one-way `open` on `AlertDialog.Root`, which has no change callback (gap G16) — dismissing with Escape left the target set, so that row's Restart button was dead for the rest of the page's life |
+| `xtask/src/ui.rs` | `strip_comments` treated a `//` inside a string literal as a comment, so a `raw()` after a URL on the same line escaped the misplaced-escape-hatch check — the one thing keeping the exception list from growing quietly |
+| `xtask/src/ui.rs` | the lint read only `name="`, so a single-quoted `aria-label` was never scanned: a vocabulary gate bypassed by pressing a different key |
+| `tests/e2e/daemon.ts` | a failed start orphaned a daemon on the port and leaked its tempdir, so one real failure arrived as five — every later test measured against somebody else's already-claimed daemon |
+
+The two `xtask` findings were confirmed the only way a gate's hole can be: by writing the
+violation, running the gate, and watching it exit `0`. Both now exit `1` and `3`
+respectively, and both have a unit test.

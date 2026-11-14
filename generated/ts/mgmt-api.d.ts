@@ -1068,6 +1068,15 @@ export interface components {
        */
       peer_reported_depth_envelopes?: (number | null);
       /**
+       * When its enrolment was revoked, if it was.
+       *
+       * Revocation is a timestamp rather than a deletion precisely so that "this peer was
+       * trusted until Tuesday" is readable off this page -- so a view that dropped it would
+       * render a refused peer as a working one, which is the most expensive direction for a
+       * fleet page to be wrong in.
+       */
+      revoked_at?: (string | null);
+      /**
        * Which stations it has registered, by key.
        */
       stations: string[];

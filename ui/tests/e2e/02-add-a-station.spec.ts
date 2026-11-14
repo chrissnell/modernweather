@@ -97,3 +97,60 @@ test('the form is built from the type, and the calibration fields persist', asyn
   await expect(page.getByLabel('Wind direction correction')).toHaveValue('-94');
   await expect(page.getByLabel('Altitude')).toHaveValue('1902');
 });
+
+/**
+ * A second type, and the reason it is a second test rather than a second paragraph.
+ *
+ * The first flow exercises a Davis, whose transport is `serial` or `tcp_out`. A snow gauge
+ * is `http_out`, and `http_out` is the branch the plan **refuses without
+ * `transport.streaming`** -- a field no control offers, because whether a WeatherLink Live
+ * pushes or is polled is a fact about the hardware rather than a choice. A form that left
+ * it unset could save a Davis perfectly and never save a gauge at all, which is precisely
+ * what the first version of this did and what no other check could see.
+ *
+ * It also pins the type's spelling. `stations.type`'s values are enforced by a SQL `CHECK`
+ * and typed as `string` in the OpenAPI document, so §4.3's drift mechanisms are blind to a
+ * wrong one: it is a 422 on every save of that page and nothing fails until it is opened.
+ */
+test('a type whose transport the plan validates differently also saves', async ({
+  signedIn,
+  page
+}) => {
+  expect(signedIn.url).toContain('127.0.0.1');
+  await page.goto('/stations/new');
+  await page.getByRole('radio', { name: /Snow depth sensor/ }).click();
+
+  // Only this type's fields: a gauge has a snow base distance and no wind vane.
+  await expect(page.getByLabel('Base snow distance')).toBeVisible();
+  await expect(page.getByLabel('Wind direction correction')).toHaveCount(0);
+
+  await page.getByLabel('Name', { exact: true }).fill('Driveway');
+  await page.getByLabel('Short name').fill('driveway');
+  // A snow gauge is `grpc_out` -- `mw-station/src/plan.rs`'s table is the authority on
+  // which transport each driver has a mode for, and offering one it does not is a Save
+  // that cannot succeed.
+  await page.getByLabel('Address to read from').fill('http://127.0.0.1:9000');
+  await page.getByLabel('Base snow distance').fill('1422');
+  await page.getByLabel('Latitude').fill('40.47571');
+  await page.getByLabel('Longitude').fill('-111.84543');
+  await page.getByLabel('Altitude').fill('1902');
+
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page).toHaveURL(/\/stations\/driveway\/status$/);
+
+  await waitUntilReady(signedIn);
+  const stored = await page.request.get('/api/v1/stations/driveway', {
+    headers: { 'X-MW-Request': '1' }
+  });
+  expect(stored.ok(), `the gauge was refused: ${await stored.text()}`).toBe(true);
+  const station = await stored.json();
+  expect(station.kind).toBe('snowgauge');
+  expect(station.snow_base_distance_mm).toBeCloseTo(1422, 1);
+  expect(station.transport.kind).toBe('grpc_out');
+  expect(station.transport.url).toBe('http://127.0.0.1:9000');
+  // **The field no control offers.** W2a §4a.3 gives `streaming` to `GrpcOut` and not to
+  // `HttpOut`, and the configuration database enforces exactly that -- so this kind must
+  // carry one and an `http_out` kind must not. Asserted because the API used to demand it
+  // of both, which made the two `http_out` station types impossible to store at all.
+  expect(station.transport.streaming).toBe(true);
+});

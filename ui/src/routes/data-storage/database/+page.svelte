@@ -67,6 +67,12 @@
    * fields, because "host", "port" and "SSL mode" are what an operator has in front of
    * them -- and a single box that must be in libpq's URL syntax is a transcription error
    * waiting to happen.
+   *
+   * **Which is why the password cannot be optional on a change.** A save replaces the
+   * whole connection string, and D-67 means this page is never sent the stored one -- so
+   * there is nothing to merge a blank box into. A form that accepted one would write a URL
+   * with no credentials and report success, which is the save silently destroying the
+   * thing it was asked to keep. `blocked` below is what refuses instead, and it says why.
    */
   function url(): string {
     const auth = user ? `${encodeURIComponent(user)}${password ? `:${encodeURIComponent(password)}` : ''}@` : '';
@@ -104,6 +110,21 @@
   }
 
   const err = (p: string) => failure?.fields.get(p);
+
+  /**
+   * Why Save is refused, or `null`.
+   *
+   * The one case is the honest one: a stored connection, and an empty password box. Every
+   * other page in this application treats an empty secret as "leave it alone", and this is
+   * the one where it cannot mean that -- so the difference is stated on screen rather than
+   * left for the operator to discover from a database that stopped connecting.
+   */
+  const blocked = $derived.by(() => {
+    if (!host || !database) return 'Enter a host and a database name.';
+    if (!user) return copy.database.credentialsNeeded;
+    if (!password) return copy.database.credentialsNeeded;
+    return null;
+  });
 </script>
 
 <h1>{copy.database.title}</h1>
@@ -185,7 +206,7 @@
   </Field>
   <Field
     copy={copy.fields.user}
-    note={current?.connection.is_set ? 'A connection is stored. Leave these empty to keep it.' : undefined}
+    note={current?.connection.is_set ? 'Stored, but never sent back to this page.' : undefined}
     error={err('user')}
   >
     {#snippet children({ id, describedBy })}
@@ -228,8 +249,11 @@
   </Field>
 
   <p class="blurb">{copy.database.connectivityNote}</p>
+  {#if current?.connection.is_set}
+    <p class="blurb">{copy.database.credentialsNeeded}</p>
+  {/if}
 
-  {#if failure && failure.fields.size === 0}
+  {#if failure}
     <p class="error" role="alert">{failure.summary}</p>
   {/if}
 
@@ -243,10 +267,13 @@
     </div>
   {:else}
     <div class="actions">
-      <Button variant="primary" onclick={propose} disabled={busy || !host || !database}>
+      <Button variant="primary" onclick={propose} disabled={busy || blocked !== null}>
         {common.save}
       </Button>
     </div>
+    {#if blocked}
+      <p class="blurb">{blocked}</p>
+    {/if}
   {/if}
 </Box>
 

@@ -23,7 +23,7 @@
   import { untrack } from 'svelte';
   import { api, asFailure, unwrap, type ApiFailure } from '$lib/api/client';
   import type { Schemas } from '$lib/api/client';
-  import { common, stationKinds, stations as copy } from '$lib/copy';
+  import { common, receivedFromPeer, stationKinds, stations as copy } from '$lib/copy';
   import Field from '$lib/components/Field.svelte';
   import { shapeFor } from '$lib/live/stationform';
 
@@ -58,6 +58,16 @@
   let baud = $state(seed?.transport.baud?.toString() ?? '');
   let url = $state(seed?.transport.url ?? '');
   let mount = $state(seed?.transport.mount ?? '');
+  // The three `TransportInput` fields a form has no control for, carried through a save
+  // so that an edit does not null them. A `PUT` replaces the station, so a field this
+  // form does not send is a field the store loses -- which for `topic` on an MQTT
+  // station is the whole connection.
+  let topic = $state(seed?.transport.topic ?? '');
+  let group = $state(seed?.transport.group ?? '');
+  let tlsCa = $state(seed?.transport.tls_ca_path ?? '');
+  let tlsCert = $state(seed?.transport.tls_cert_path ?? '');
+  let tlsKey = $state(seed?.transport.tls_key_path ?? '');
+  let method = $state(seed?.transport.method ?? '');
   let latitude = $state(seed?.latitude?.toString() ?? '');
   let longitude = $state(seed?.longitude?.toString() ?? '');
   let altitude = $state(seed?.altitude_m?.toString() ?? '');
@@ -137,7 +147,21 @@
         device: device || null,
         baud: num(baud),
         url: url || null,
-        mount: mount || null
+        mount: mount || null,
+        // `streaming` belongs to **`grpc_out` alone**. W2a §4a.3 is `HttpOut { auth }` and
+        // `GrpcOut { streaming: bool }`, and the configuration database enforces exactly
+        // that -- so sending it with an `http_out` station is a refusal, not a default.
+        // The value is a fact about the hardware rather than a choice, which is why it
+        // comes from the kind table and not from a control.
+        streaming: transportKind === 'grpc_out' ? shape.streams : null,
+        // The rest are carried rather than offered: this form has no control for them, and
+        // a `PUT` that omitted them would null whatever is stored.
+        topic: topic || null,
+        group: group || null,
+        method: method || null,
+        tls_ca_path: tlsCa || null,
+        tls_cert_path: tlsCert || null,
+        tls_key_path: tlsKey || null
       }
     };
   }
@@ -161,6 +185,17 @@
           </div>
         {/each}
       </RadioGroup>
+      <!--
+        §0.7's seventh row, which is a link rather than a type: a received station is a
+        pairing plus whatever a peer registers, and the schema's `stations.type` constraint
+        excludes it by name. Offered here because it is what the operator is looking for,
+        and it goes to the page §0.6 puts the pairing on.
+      -->
+      <div class="kind">
+        <a href={receivedFromPeer.href}>{receivedFromPeer.label}</a>
+        <span class="how">{receivedFromPeer.how}</span>
+      </div>
+      <p class="note">{receivedFromPeer.note}</p>
       <p class="note">{copy.add.discoveryUnavailable}</p>
     </Box>
   {/if}
@@ -283,7 +318,7 @@
         </Field>
       {/if}
 
-      {#if transportKind === 'tcp_out' || shape.connection === 'network' || shape.connection === 'peer'}
+      {#if transportKind === 'tcp_out'}
         <Field copy={copy.fields.host} error={err('transport.host')}>
           {#snippet children({ id, describedBy, invalid })}
             <Input
@@ -328,7 +363,7 @@
         </Field>
       {/if}
 
-      {#if shape.connection === 'network' && transportKind === 'http_out'}
+      {#if transportKind === 'http_out' || transportKind === 'grpc_out' || transportKind === 'mqtt_sub'}
         <Field
           copy={{ label: 'Address to read from', hint: 'The full address this sensor answers on.' }}
           error={err('transport.url')}
@@ -509,8 +544,23 @@
       </Box>
     {/if}
 
-    {#if failure && failure.fields.size === 0}
+    <!--
+      **Shown whenever there is a failure, not only when no field error came with it.**
+      Suppressing it when `fields` is non-empty assumes every field path has a control on
+      this form to land on, and §7.2's paths include ones that do not -- `transport.*` on a
+      kind whose form omits the field, or a `plan()` error about a different station. The
+      operator then sees a Save that does nothing at all, which is the exact defect §2
+      exists against.
+    -->
+    {#if failure}
       <p class="error" role="alert">{failure.summary}</p>
+      {#if failure.fields.size > 0}
+        <ul class="error">
+          {#each [...failure.fields] as [field, message] (field)}
+            <li>{message}</li>
+          {/each}
+        </ul>
+      {/if}
     {/if}
 
     <div class="actions">
