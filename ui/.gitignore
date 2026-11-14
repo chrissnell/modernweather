@@ -1,0 +1,13 @@
+node_modules/
+.svelte-kit/
+test-results/
+playwright-report/
+
+# The built bundle is not committed -- `cargo xtask ui` produces it and `cargo xtask dist`
+# requires it. The directory itself is, with nothing in it: `rust-embed` resolves its
+# folder at compile time, so `cargo build` on a tree that has never run `pnpm build` needs
+# the path to exist. It then embeds nothing, the management UI route says so in one
+# sentence, and the gate that would have caught it stays the gate rather than becoming a
+# confusing linker error.
+build/*
+!build/.gitkeep

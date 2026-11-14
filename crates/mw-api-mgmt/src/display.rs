@@ -159,7 +159,12 @@ impl Vocabulary {
     /// The fallback is reachable and is not a defect: a component whose station was deleted
     /// in this same generation is still `Stopping` while the plan diff is applied, and
     /// "Backyard" having become `backyard` for two seconds is better than a blank.
-    fn station_name(&self, key: &str) -> String {
+    ///
+    /// `pub` since M7-3, because the live reading frames need it too: **D-36** puts the
+    /// translation on the server in one place, so a station renamed through the API
+    /// changes the name on every connected browser's tile at the next tick, and the half
+    /// of the system that produces readings never has to know what a station is called.
+    pub fn station_name(&self, key: &str) -> String {
         self.stations
             .get(key)
             .cloned()

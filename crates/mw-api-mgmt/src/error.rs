@@ -62,10 +62,10 @@ pub struct ErrorBody {
 
 /// Why a management request could not be carried out.
 ///
-/// Six variants, each with its own status, because each one has a different audience: the
+/// Seven variants, each with its own status, because each one has a different audience: the
 /// operator's values, a name they used that is not there, a configuration the plan refuses,
-/// the server's own problem, a request with no live session, and a login the progressive
-/// delay is still holding off.
+/// the server's own problem, a request with no live session, a login the progressive
+/// delay is still holding off, and a capability this build does not have.
 ///
 /// The last two arrived with implementation-plan.md **M7-2**, and both are deliberately
 /// *not* [`ApiError::Conflict`]. A `401` is the one status a client reacts to structurally --
@@ -130,6 +130,24 @@ pub enum ApiError {
         summary: String,
     },
 
+    /// This build or this node does not have the capability the route needs. `501`.
+    ///
+    /// Added by implementation-plan.md **M7-3**, and deliberately neither
+    /// [`ApiError::Conflict`] nor [`ApiError::Internal`]: nothing the operator types
+    /// differently fixes it, which rules out `422`; it is not a state they can change,
+    /// which rules out `409`; and nothing went wrong, which rules out `500`. A client
+    /// reacts to it structurally -- it stops asking -- which is the same reason W5 §8.8
+    /// wanted `401` to be its own status rather than a banner.
+    ///
+    /// The two routes that can answer it are `GET /api/v1/events` on a build with no live
+    /// stream behind it and `GET /api/v1/fleet` on a node with no unsent-readings buffer
+    /// and no peers.
+    #[error("{summary}")]
+    Unsupported {
+        /// One plain line, in the operator's words.
+        summary: String,
+    },
+
     /// The progressive delay is still holding this login off. `429`.
     ///
     /// W5 §3.5's `min(2^(n-3), 30)` seconds. The number is on the response as a
@@ -169,6 +187,7 @@ impl ApiError {
             ApiError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::Unauthenticated { .. } => StatusCode::UNAUTHORIZED,
             ApiError::Throttled { .. } => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::Unsupported { .. } => StatusCode::NOT_IMPLEMENTED,
         }
     }
 
@@ -192,13 +211,13 @@ impl ApiError {
                     errors: Vec::new(),
                 }
             }
-            ApiError::Unauthenticated { summary } | ApiError::Throttled { summary, .. } => {
-                ErrorBody {
-                    summary: summary.clone(),
-                    detail: None,
-                    errors: Vec::new(),
-                }
-            }
+            ApiError::Unauthenticated { summary }
+            | ApiError::Throttled { summary, .. }
+            | ApiError::Unsupported { summary } => ErrorBody {
+                summary: summary.clone(),
+                detail: None,
+                errors: Vec::new(),
+            },
         }
     }
 }

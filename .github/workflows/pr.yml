@@ -919,6 +919,53 @@ jobs:
       - name: Run the tests that need a database
         run: cargo xtask gate db-tests
 
+  ui:
+    name: management UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          # Pinned, because `pnpm install --frozen-lockfile` is only a contract while the
+          # tool reading the lockfile is the one that wrote it.
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      # W5 §6.4's list, in its order, and each line earns its place:
+      #
+      #   install  --frozen-lockfile, so a release cannot resolve a dependency tree nobody
+      #            reviewed
+      #   check    `svelte-check` over the committed generated/ts/mgmt-api.d.ts, which is
+      #            §4.3's mechanism 2 and the highest-value check in §6.7's list: a UI that
+      #            reads a field the server renamed does not compile
+      #   lint     the things a type checker does not see
+      #   test     Vitest over the four things §6.7 names as worth testing in isolation
+      #   build    the bundle `cargo xtask gate-ui-bundle` then measures
+      - name: Install, check, lint, test and build
+        working-directory: ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run check
+          pnpm run lint
+          pnpm run test
+          pnpm run build
+      # Wrapped as an xtask gate so there is one gate vocabulary across the repository
+      # (W8's pattern), and declared in ci/gates.toml so its armed state is printed into
+      # every run's summary by the `gates` job. Both of these arm on files this work item
+      # created, which is what turned them on.
+      #
+      # No `| tee`: the exit code is the result, and the gate's three codes mean three
+      # different things (over budget / no verdict / a violated prohibition).
+      - run: cargo xtask gate ui-bundle
+      - run: cargo xtask gate ui-copy
+
   coverage:
     name: coverage ratchet
     runs-on: ubuntu-latest
@@ -1003,6 +1050,7 @@ jobs:
       - loom
       - gates
       - layout
+      - ui
       - codegen-drift
       - legacy-import-drift
       - mgmt-schema-drift

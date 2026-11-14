@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>RemoteWeather</title>
+    <script>
+      // An explicit choice, and **nothing at all otherwise**.
+      //
+      // chonky's `tokens.css` already tracks the device with no JavaScript:
+      // `:root` is light, `[data-theme="dark"]` is dark, and
+      // `@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) }` is the
+      // device. Writing an attribute here when the operator has not chosen one would
+      // **pin** the answer and stop that media query ever applying again -- which is how
+      // the first version of this shipped a UI that was dark on a light laptop and had no
+      // way back.
+      //
+      // So the attribute is written only for a stored choice. `theme` is chonky's own key
+      // and not one of ours: its `ThemeToggle` reads and writes that key, and a second key
+      // meant the toggle's choice was invisible to this script on the next load.
+      //
+      // Inline and synchronous on purpose -- a module script would paint one theme and
+      // then flip, which is the flash this exists to avoid.
+      (function () {
+        try {
+          var stored = localStorage.getItem('theme');
+          if (stored === 'dark' || stored === 'light') {
+            document.documentElement.setAttribute('data-theme', stored);
+          }
+        } catch (e) {
+          // Storage denied. Leave the attribute off and let the device decide, which is
+          // the better failure than defaulting everyone to one theme.
+        }
+      })();
+    </script>
+    %sveltekit.head%
+  </head>
+  <body data-sveltekit-preload-data="hover">
+    <div style="display: contents">%sveltekit.body%</div>
+  </body>
+</html>

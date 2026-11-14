@@ -1,0 +1,74 @@
+/* chonky's tokens first, then its component styles, then this application's few rules. */
+@import '@chrissnell/chonky-ui/tokens';
+@import '@chrissnell/chonky-ui/css';
+
+/* W5 §6.3 gap G9: the toolkit names the family and ships no font. Two weights, woff2
+   only, Latin subset -- src/lib/fonts/README.md has the whole argument. Relative urls so
+   Vite hashes them into /assets/ with the rest of the bundle. */
+@font-face {
+  font-family: 'Inconsolata';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url('./lib/fonts/inconsolata-latin-400-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Inconsolata';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 700;
+  src: url('./lib/fonts/inconsolata-latin-700-normal.woff2') format('woff2');
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-size: var(--text-base);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+a {
+  color: var(--color-primary);
+}
+
+/* §7.4: every control is at least a 44px touch target, because checking a station from
+   the garden on a phone is the real case. */
+@media (pointer: coarse) {
+  button,
+  a[role='button'],
+  input,
+  select {
+    min-height: 44px;
+  }
+}
+
+/* §7.4: prefers-reduced-motion stops the Backoff countdown's and the live Dot's
+   animation. The countdown still counts; it just does not pulse. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+.mw-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}

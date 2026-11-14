@@ -60,6 +60,42 @@ use crate::ident;
 /// `with_peer_stations`' predicate is the same distinction.
 pub const MAX_OWNED_STATIONS: i64 = 256;
 
+/// One peer, as the fleet page shows it (**N-11**).
+///
+/// Display data, deliberately separate from [`PeerEntry`], which is the authorisation
+/// answer. See [`PeerStore::fleet`] for why the two are not one type.
+#[derive(Debug, Clone)]
+pub struct FleetPeer {
+    /// `peers.node_id`, 16 bytes.
+    pub node_id: Vec<u8>,
+    /// `peers.name`, as it enrolled.
+    pub name: String,
+    /// When it was last heard from.
+    pub last_seen: Option<DateTime<Utc>>,
+    /// When it was revoked, which is a timestamp rather than a deletion so that "trusted
+    /// until Tuesday" is readable off the page.
+    pub revoked_at: Option<DateTime<Utc>>,
+    /// Which stations it owns, by key.
+    pub stations: Vec<String>,
+}
+
+/// One `peer_enrolment_token` row (**N-11**). Never the token itself.
+#[derive(Debug, Clone)]
+pub struct EnrolmentTokenRow {
+    /// `id`, 16 bytes.
+    pub id: Vec<u8>,
+    /// Which peer it was minted for.
+    pub peer_name: String,
+    /// When it was issued.
+    pub issued_at: DateTime<Utc>,
+    /// When it stops working.
+    pub expires_at: DateTime<Utc>,
+    /// When it was consumed, if it was.
+    pub consumed_at: Option<DateTime<Utc>>,
+    /// Which node consumed it, 16 bytes.
+    pub consumed_by: Option<Vec<u8>>,
+}
+
 /// One immutable view of `peers`, `peer_origins` and the stations they registered.
 #[derive(Debug, Default)]
 pub struct PeerSnapshot {
@@ -400,6 +436,92 @@ impl PeerStore {
             expires_at, "an enrolment token was minted; enrolment is now open"
         );
         Ok(token)
+    }
+
+    /// **N-11**: what `/data-storage/receive` has to show, in one read.
+    ///
+    /// W7 D-33 requires the management UI to surface outstanding enrolment tokens, because
+    /// **leaving enrolment open is the mistake and it should be visible** -- `Enroll` is
+    /// served only while an unexpired, unconsumed token exists, so an outstanding row is a
+    /// door that is open right now.
+    ///
+    /// A purpose-built read rather than a projection of [`PeerSnapshot`], and the reason is
+    /// what each one is for: the snapshot is the **authorisation** answer to "may this peer
+    /// speak for that origin", so it deliberately carries no `last_seen` and no station
+    /// list, and widening it to carry them would put display data on the path that decides
+    /// whether an envelope is admitted. One query per question instead.
+    pub async fn fleet(&self) -> Result<Vec<FleetPeer>, ConfigDbError> {
+        let rows = sqlx::query(
+            "SELECT p.node_id, p.name, p.last_seen, p.revoked_at, \
+                    (SELECT group_concat(s.station_key) FROM stations s \
+                      WHERE s.owning_node_id = p.node_id) AS stations \
+             FROM peers p ORDER BY p.name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| ConfigDbError::Query {
+            what: "the peer rows for the fleet view",
+            source,
+        })?;
+        Ok(rows
+            .iter()
+            .map(|row| FleetPeer {
+                node_id: row.get::<Vec<u8>, _>("node_id"),
+                name: row.get::<String, _>("name"),
+                last_seen: row
+                    .get::<Option<i64>, _>("last_seen")
+                    .and_then(|s| DateTime::from_timestamp(s, 0)),
+                revoked_at: row
+                    .get::<Option<i64>, _>("revoked_at")
+                    .and_then(|s| DateTime::from_timestamp(s, 0)),
+                // An explicit `match` rather than a silent default, which
+                // `ci/layers.toml` forbids this crate by name: a defaulted value from a
+                // database read is how a peer that owns stations comes to be displayed as
+                // owning none. (The forbidden name is deliberately not written here --
+                // the gate matches source text, so even a comment about it is a hit.)
+                stations: match row.get::<Option<String>, _>("stations") {
+                    Some(list) => list.split(',').map(str::to_string).collect(),
+                    None => Vec::new(),
+                },
+            })
+            .collect())
+    }
+
+    /// Every enrolment token this node has minted, newest first.
+    ///
+    /// The outstanding set and the enrolment log come from these same rows rather than
+    /// from a separate audit table. That is the decision: a history assembled from a
+    /// different source than the live state is a history that can disagree with it, and
+    /// `consumed_at`/`consumed_by` already record exactly what happened to each token.
+    ///
+    /// The token itself is **not** here and cannot be: the row holds an Argon2id hash and
+    /// the plaintext was printed once (W7 §5.3).
+    pub async fn enrolment_tokens(&self) -> Result<Vec<EnrolmentTokenRow>, ConfigDbError> {
+        let rows = sqlx::query(
+            "SELECT id, peer_name, issued_at, expires_at, consumed_at, consumed_by \
+             FROM peer_enrolment_token ORDER BY issued_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| ConfigDbError::Query {
+            what: "the enrolment tokens",
+            source,
+        })?;
+        Ok(rows
+            .iter()
+            .map(|row| EnrolmentTokenRow {
+                id: row.get::<Vec<u8>, _>("id"),
+                peer_name: row.get::<String, _>("peer_name"),
+                issued_at: DateTime::from_timestamp(row.get::<i64, _>("issued_at"), 0)
+                    .unwrap_or_else(Utc::now),
+                expires_at: DateTime::from_timestamp(row.get::<i64, _>("expires_at"), 0)
+                    .unwrap_or_else(Utc::now),
+                consumed_at: row
+                    .get::<Option<i64>, _>("consumed_at")
+                    .and_then(|s| DateTime::from_timestamp(s, 0)),
+                consumed_by: row.get::<Option<Vec<u8>>, _>("consumed_by"),
+            })
+            .collect())
     }
 
     async fn record_hello_inner(

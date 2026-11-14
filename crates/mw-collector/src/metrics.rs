@@ -284,6 +284,7 @@ pub fn uplink_state(peer: &PeerName, state: UplinkState) {
 /// gauge written only on success stays at its last good value for ever instead.
 pub fn ack_lag(peer: &PeerName, seconds: f64) {
     metrics::gauge!("mw_uplink_ack_lag_seconds", "peer" => peer.as_str().to_string()).set(seconds);
+    retain(&ACK_LAGS, peer.as_str(), seconds);
 }
 
 /// The in-flight window plus the unsent remainder.
@@ -291,6 +292,8 @@ pub fn unacked(peer: &PeerName, envelopes: u64) {
     #[allow(clippy::cast_precision_loss)]
     metrics::gauge!("mw_uplink_unacked_envelopes", "peer" => peer.as_str().to_string())
         .set(envelopes as f64);
+    #[allow(clippy::cast_precision_loss)]
+    retain(&UNACKED, peer.as_str(), envelopes as f64);
 }
 
 /// One batch handed over, and the envelopes in it.
@@ -451,6 +454,59 @@ pub fn peer_last_seen(peer: &PeerName, seconds: f64) {
     metrics::gauge!("mw_peer_last_seen_seconds", "peer" => peer.as_str().to_string()).set(seconds);
 }
 
+// -------------------------------------------------------------------------------------
+// N-11: the three per-peer numbers the management UI renders, retained as well as
+// exported.
+//
+// The `metrics` facade is **write-only by design** -- there is no way to read a gauge back
+// out of a recorder -- and W5's `/data-storage/send` and `/data-storage/receive` have to
+// render three of these gauges as numbers on a page (docs/reconciliation.md C-W7-29).
+// Retaining the last value beside the gauge keeps **one** writer per number, which is the
+// property that matters: a second owner computing the same figure its own way is how a
+// page and a dashboard come to disagree about whether an operator is losing readings.
+//
+// Each map is bounded by the peer count, which is bounded by the `peers` table. A name
+// that is no longer a peer keeps a few words until the process restarts, which is cheaper
+// than this module having to learn when a peer was revoked.
+// -------------------------------------------------------------------------------------
+
+/// One retained gauge value, with when it was recorded.
+#[derive(Debug, Clone, Copy)]
+pub struct Retained {
+    /// The value.
+    pub value: f64,
+    /// When it was written, so an age can be turned back into an instant.
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
+type Retention =
+    std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeMap<String, Retained>>>;
+
+fn retain(map: &Retention, peer: &str, value: f64) {
+    map.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            peer.to_string(),
+            Retained {
+                value,
+                at: chrono::Utc::now(),
+            },
+        );
+}
+
+fn retained(map: &Retention) -> std::collections::BTreeMap<String, Retained> {
+    map.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+static PEER_DEPTHS: Retention =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+static ACK_LAGS: Retention =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+static UNACKED: Retention =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+
 /// `IngestBatch.sender_depth`. **Peer-reported** — W5 must label it as such.
 pub fn peer_depth(peer: &PeerName, envelopes: u64) {
     #[allow(clippy::cast_precision_loss)]
@@ -459,6 +515,32 @@ pub fn peer_depth(peer: &PeerName, envelopes: u64) {
         "peer" => peer.as_str().to_string()
     )
     .set(envelopes as f64);
+    #[allow(clippy::cast_precision_loss)]
+    retain(&PEER_DEPTHS, peer.as_str(), envelopes as f64);
+}
+
+/// What each peer last reported about its own unsent readings (**N-11**).
+///
+/// **Peer-reported**, and every consumer is required to say so: W7 D-40 makes the label
+/// part of the number, because this is a satellite's claim about itself and not a
+/// measurement this node made.
+pub fn peer_reported_depths() -> std::collections::BTreeMap<String, Retained> {
+    retained(&PEER_DEPTHS)
+}
+
+/// How long ago each uplink's cursor was last advanced by an acknowledgement (**N-11**).
+///
+/// The age rather than the instant, because that is what the gauge is: reported on every
+/// `readings` call whether it succeeded or not, so a link that has been down for six hours
+/// reads six hours instead of staying at its last good value for ever. The absolute
+/// instant W5's "last successful delivery" shows is `at - value seconds`.
+pub fn ack_lags() -> std::collections::BTreeMap<String, Retained> {
+    retained(&ACK_LAGS)
+}
+
+/// The in-flight window plus the unsent remainder, per peer, in envelopes (**N-11**).
+pub fn unacked_envelopes() -> std::collections::BTreeMap<String, Retained> {
+    retained(&UNACKED)
 }
 
 /// What a peer whose `software` is NULL is labelled with.

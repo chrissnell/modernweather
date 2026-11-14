@@ -685,11 +685,40 @@ impl TransportInput {
                     ));
                 }
             }
-            "http_out" | "grpc_out" => {
+            // **`streaming` belongs to `grpc_out` alone**, and the two are separated here
+            // rather than shared because the schema separates them: W2a §4a.3 is
+            // `HttpOut { auth }` and `GrpcOut { streaming: bool }`, and the configuration
+            // database carries that as `CHECK (transport_streaming IS NULL OR
+            // COALESCE(transport_kind, '') = 'grpc_out')`.
+            //
+            // Requiring it for `http_out` as well made every `http_out` station
+            // **unsatisfiable through this API**: omitting it was a 422 naming
+            // `transport.streaming`, and supplying it was that `CHECK` failing with
+            // SQLite's own wording. Two of the six station types the schema admits --
+            // `weatherlink-live` and `snowgauge` -- are `http_out`, so neither could be
+            // created or edited at all. Found by implementation-plan.md M7-3's second
+            // Playwright flow, which is the first thing to create one.
+            "http_out" => {
                 if self.url.as_deref().unwrap_or("").is_empty() {
                     v.push(FieldError::new(
                         "transport.url",
                         "Enter the address to poll.",
+                    ));
+                }
+                if self.streaming.is_some() {
+                    // Refused here rather than left to the `CHECK`, so the operator reads
+                    // a sentence about their form instead of a constraint name.
+                    v.push(FieldError::new(
+                        "transport.streaming",
+                        "A connection over the web is always polled, so this does not apply.",
+                    ));
+                }
+            }
+            "grpc_out" => {
+                if self.url.as_deref().unwrap_or("").is_empty() {
+                    v.push(FieldError::new(
+                        "transport.url",
+                        "Enter the address to connect to.",
                     ));
                 }
                 if self.streaming.is_none() {
@@ -980,6 +1009,57 @@ impl ListenerInput {
 
 #[cfg(test)]
 mod tests {
+    /// The defect this test exists for made two of the six station types the schema
+    /// admits -- `weatherlink-live` and `snowgauge`, both `http_out` -- impossible to
+    /// create or edit through this API: omitting `streaming` was a `422` and supplying it
+    /// was the configuration database's `CHECK (transport_streaming IS NULL OR
+    /// COALESCE(transport_kind, '') = 'grpc_out')` failing with SQLite's own wording.
+    ///
+    /// W2a §4a.3 is the authority and is unambiguous: `HttpOut { auth }` has no streaming
+    /// field and `GrpcOut { streaming: bool }` does.
+    #[test]
+    fn streaming_belongs_to_grpc_out_and_not_to_http_out() {
+        let polled = TransportInput {
+            kind: Some("http_out".to_string()),
+            url: Some("http://192.168.1.51".to_string()),
+            ..TransportInput::default()
+        };
+        assert!(
+            polled.problems().is_empty(),
+            "an http_out station with a url is storable: {:?}",
+            polled.problems()
+        );
+
+        let with_streaming = TransportInput {
+            streaming: Some(false),
+            ..polled.clone()
+        };
+        let problems = with_streaming.problems();
+        let fields: Vec<&str> = problems.iter().map(|e| e.field.as_str()).collect();
+        assert_eq!(
+            fields,
+            vec!["transport.streaming"],
+            "an http_out station carrying `streaming` is refused HERE, with a sentence, \
+             rather than by the CHECK with a constraint name"
+        );
+
+        // And the converse: `grpc_out` still requires it, which is what §4a.3's
+        // trigger-implication table reads at plan time.
+        let grpc = TransportInput {
+            kind: Some("grpc_out".to_string()),
+            url: Some("https://peer.example:443".to_string()),
+            ..TransportInput::default()
+        };
+        let problems = grpc.problems();
+        let fields: Vec<&str> = problems.iter().map(|e| e.field.as_str()).collect();
+        assert_eq!(fields, vec!["transport.streaming"]);
+        let grpc = TransportInput {
+            streaming: Some(true),
+            ..grpc
+        };
+        assert!(grpc.problems().is_empty());
+    }
+
     use super::*;
 
     fn station() -> StationInput {

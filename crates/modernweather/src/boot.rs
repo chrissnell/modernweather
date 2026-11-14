@@ -1020,7 +1020,7 @@ async fn attach_peers(
     fanout: &spool::Fanout,
     pool: &sqlx::SqlitePool,
     registry: Arc<mw_store::ConfigRegistry>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Arc<mw_store::PeerStore>> {
     let identity = node_identity(cfg);
     // This node's own id separates a **local** station from one a peer owns, which is the
     // predicate the peer snapshot's station map is read with
@@ -1045,11 +1045,11 @@ async fn attach_peers(
         }
     }
     cfg.set_collector(
-        store as Arc<dyn mw_component::PeerRegistry>,
+        Arc::clone(&store) as Arc<dyn mw_component::PeerRegistry>,
         Arc::clone(&fanout.spool),
         identity,
     );
-    Ok(())
+    Ok(store)
 }
 
 /// Fold the shared root state's epoch into every component's `ConfigDigest`.
@@ -1829,6 +1829,9 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     mw_output::metrics::register();
     mw_collector::metrics::register();
     let mut slots = Slots::new();
+    // **N-11**: the peer store, kept past `attach_peers` because the management API's
+    // fleet view reads it. `None` on a node with no spool, which is a node with no peers.
+    let mut peer_store: Option<Arc<mw_store::PeerStore>> = None;
     let registry =
         attach_registry(&mut cfg, &mut slots).context("publishing the station registry")?;
     if let Some(fanout) = &fanout {
@@ -1842,9 +1845,11 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
         let live = slots
             .registry()
             .context("the station registry is published before the peer half")?;
-        attach_peers(&mut cfg, fanout, &pool, live)
-            .await
-            .context("publishing the peer registry")?;
+        peer_store = Some(
+            attach_peers(&mut cfg, fanout, &pool, live)
+                .await
+                .context("publishing the peer registry")?,
+        );
     }
 
     // Step 4e: the route tables, the host table, the certificate store and the one
@@ -1954,15 +1959,50 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
         // handler says which socket the bytes arrived on.
         mgmt_sni.is_some(),
     ));
-    let mgmt_router = mw_api_mgmt::router(
-        Arc::new(mw_api_mgmt::Mgmt::new(
-            Arc::clone(&admin) as Arc<dyn mw_api_mgmt::ConfigAdmin>,
-            Arc::clone(&control),
-            Arc::new(crate::hostinfo::Rings::new(obs.rings())),
-            Arc::new(crate::hostinfo::Host::new()),
-        )),
-        guard,
+    // §5's live stream, and N-11's fleet numbers.
+    //
+    // The hub is built here and the observation future is joined below, after the router
+    // exists: it reads `ConfigAdmin` for the vocabulary D-36 puts on the server, so it
+    // cannot start before the admin does.
+    let rings: Arc<dyn mw_api_mgmt::LogSource> = Arc::new(crate::hostinfo::Rings::new(obs.rings()));
+    let hub = mw_api_mgmt::Hub::new();
+    let latest: Arc<dyn mw_api_mgmt::host::Readings> = match &fanout {
+        Some(fanout) => crate::live::Latest::over(&fanout.spool),
+        // A node with no spool produces no readings of its own, and the tiles say "no
+        // readings yet" rather than showing a figure from nowhere.
+        None => Arc::new(crate::live::NoReadings),
+    };
+    let live = Arc::new(mw_api_mgmt::Live {
+        hub: Arc::clone(&hub),
+        logs: Arc::clone(&rings),
+        readings: Arc::clone(&latest),
+    });
+    let fleet = crate::live::FleetNumbers::new(
+        fanout.as_ref().map(|f| Arc::clone(&f.spool)),
+        peer_store.clone(),
     );
+    let mut mgmt = mw_api_mgmt::Mgmt::new(
+        Arc::clone(&admin) as Arc<dyn mw_api_mgmt::ConfigAdmin>,
+        Arc::clone(&control),
+        Arc::clone(&rings),
+        Arc::new(crate::hostinfo::Host::new()),
+    )
+    .with_live(Arc::clone(&live));
+    // A node with neither a spool nor peers has nothing to report, and the route says so
+    // rather than answering an object whose every field is absent.
+    if fanout.is_some() || peer_store.is_some() {
+        mgmt = mgmt.with_fleet(Arc::clone(&fleet) as Arc<dyn mw_api_mgmt::Fleet>);
+    }
+    let mgmt_router = mw_api_mgmt::router(Arc::new(mgmt), guard, mw_api_mgmt::Assets::embedded());
+    // Awaited beside `supervisor.run` below, not spawned: §3.2 puts every task in
+    // `mw_supervisor::task`'s table, and this daemon already runs its process-level loops
+    // as futures in one `join!` for exactly that reason.
+    let live_sources = mw_api_mgmt::Sources {
+        admin: Arc::clone(&admin) as Arc<dyn mw_api_mgmt::ConfigAdmin>,
+        control: Arc::clone(&control),
+        logs: Arc::clone(&rings),
+        readings: Arc::clone(&latest),
+    };
     admin.install_router(mgmt_router.clone());
     cfg.set_management(mw_http::Management {
         addr: cfg
@@ -1999,10 +2039,16 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     // no table is a component that reaches `Running` while its paths 404.
     assert_route_tables_match_the_plan(&cfg, plan.specs())?;
 
-    let (report, (), ()) = tokio::join!(
+    let (report, (), (), ()) = tokio::join!(
         supervisor.run(plan),
         notify::run(readiness, &obs, &shutdown),
         signals.wait(&shutdown),
+        // §5's live stream. A process-level future rather than a task, and it returns when
+        // the shutdown token is cancelled so this join can finish.
+        mw_api_mgmt::events::observe(Arc::clone(&hub), live_sources, {
+            let shutdown = shutdown.clone();
+            async move { shutdown.cancelled().await }
+        }),
     );
     // The spool is `main`'s too, and closing it is just dropping it: every cursor is
     // released with the component that held it, and every append was `fsync`ed before its

@@ -56,10 +56,12 @@ use crate::change::{
 };
 use crate::display::{Badge, Display, Section, Vocabulary};
 use crate::error::{ApiError, Body, ErrorBody, FieldError};
+use crate::events::{self, ChannelsInput, ChannelsView, Live};
 use crate::guard::{Current, Guard, Peer};
 use crate::host::{
-    LogEntry, LogField, LogLevelInput, LogLevelsView, LogSource, LogsView, Machine, SerialPort,
-    SerialPortsView, Stream, SystemInfoView,
+    EnrolmentToken, EnrolmentView, Fleet, FleetView, LatestReading, LogEntry, LogField,
+    LogLevelInput, LogLevelsView, LogSource, LogsView, Machine, PeerView, SerialPort,
+    SerialPortsView, SpoolView, Stream, SystemInfoView,
 };
 use crate::runtime::{self, ComponentView, ComponentsView, SummaryView};
 use crate::view::{
@@ -80,6 +82,12 @@ pub struct Mgmt {
     control: Arc<dyn ComponentControl>,
     logs: Arc<dyn LogSource>,
     machine: Arc<dyn Machine>,
+    /// §5's live stream. `None` in a build with no runtime behind it -- every `oneshot`
+    /// test -- and the route then answers `501` rather than this process carrying a tick
+    /// nothing reads.
+    live: Option<Arc<Live>>,
+    /// **N-11**'s fleet numbers. `None` on a node with no spool and no peers.
+    fleet: Option<Arc<dyn Fleet>>,
 }
 
 impl std::fmt::Debug for Mgmt {
@@ -105,7 +113,24 @@ impl Mgmt {
             control,
             logs,
             machine,
+            live: None,
+            fleet: None,
         }
+    }
+
+    /// Attach §5's live stream. Separate from [`Mgmt::new`] because a router without one
+    /// is a valid router: forty of the forty-three operations do not need it.
+    #[must_use]
+    pub fn with_live(mut self, live: Arc<Live>) -> Self {
+        self.live = Some(live);
+        self
+    }
+
+    /// Attach **N-11**'s fleet numbers.
+    #[must_use]
+    pub fn with_fleet(mut self, fleet: Arc<dyn Fleet>) -> Self {
+        self.fleet = Some(fleet);
+        self
     }
 }
 
@@ -131,13 +156,27 @@ const LOG_PAGE_MAX: usize = 2000;
 /// instance being **unclaimed** (W5 §3.4) rather than unconditional, which is the column
 /// `listener.management_listen_addr` meaning what it says for the first time; the schema's
 /// default for it is `127.0.0.1` either way (**A-W5-3**).
-pub fn router(state: Arc<Mgmt>, guard: Arc<Guard>) -> Router {
-    configured(state)
+pub fn router(state: Arc<Mgmt>, guard: Arc<Guard>, assets: crate::assets::Assets) -> Router {
+    let api = configured(state)
         .merge(authentication(Arc::clone(&guard)))
         .layer(axum::middleware::from_fn_with_state(
             guard,
             crate::guard::enforce,
-        ))
+        ));
+    // **The bundle is served outside the guard, and that is the decision rather than an
+    // oversight.** The sign-in page is part of the bundle, so a guard in front of it would
+    // refuse the very document whose job is to collect the credentials -- a redirect loop
+    // with no way out. What the bundle contains is the same for every installation and is
+    // compiled into a binary anybody can download, so there is nothing in it to protect;
+    // every byte that is specific to *this* installation comes through the API behind the
+    // guard. `crate::assets::serve` refuses `/api/` so the guard's own 404 and 401 still
+    // reach the client (§8.8's signed-out state depends on the 401 arriving).
+    api.fallback(
+        move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
+            let assets = assets.clone();
+            async move { crate::assets::serve(&assets, &uri, &headers) }
+        },
+    )
 }
 
 /// The configuration and runtime surface — M7-1's forty operations.
@@ -213,6 +252,14 @@ fn configured(state: Arc<Mgmt>) -> Router {
         // §1.9 -- System → This machine, and the serial-port picker.
         .route("/api/v1/system/info", get(get_system_info))
         .route("/api/v1/system/serial-ports", get(get_serial_ports))
+        // §5 -- the one live connection, and its in-stream channel change.
+        .route("/api/v1/events", get(get_events))
+        .route(
+            "/api/v1/events/{stream_id}/channels",
+            post(post_event_channels),
+        )
+        // N-11 -- W7's fleet numbers, on the two pages W5 already designed.
+        .route("/api/v1/fleet", get(get_fleet))
         .with_state(state)
 }
 
@@ -268,6 +315,9 @@ fn configured(state: Arc<Mgmt>) -> Router {
         get_logs,
         get_system_info,
         get_serial_ports,
+        get_events,
+        post_event_channels,
+        get_fleet,
         post_login,
         post_claim,
         get_auth_state,
@@ -323,6 +373,14 @@ fn configured(state: Arc<Mgmt>) -> Router {
         StorageView,
         SummaryView,
         SystemInfoView,
+        ChannelsInput,
+        ChannelsView,
+        EnrolmentToken,
+        EnrolmentView,
+        FleetView,
+        LatestReading,
+        PeerView,
+        SpoolView,
         TransportInput,
         WebsiteInput,
         WebsiteView,
@@ -337,6 +395,8 @@ fn configured(state: Arc<Mgmt>) -> Router {
         (name = "services", description = "Share my data"),
         (name = "runtime", description = "Configured versus running"),
         (name = "system", description = "System"),
+        (name = "events", description = "Live data: one endpoint, several channels"),
+        (name = "fleet", description = "Unsent readings, peers and enrolment"),
     )
 )]
 pub struct ApiDoc;
@@ -1300,7 +1360,161 @@ async fn get_serial_ports(State(s): State<Arc<Mgmt>>) -> Reply<SerialPortsView> 
 }
 
 // ---------------------------------------------------------------------------------------
+// §5 -- live data, and N-11's fleet numbers
+// ---------------------------------------------------------------------------------------
+
+/// What `GET /api/v1/events` accepts.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct EventsQuery {
+    /// `components`, `logs`, `readings`, comma-separated. Absent is `components`.
+    #[serde(default)]
+    channels: Option<String>,
+    /// Which log ring to backfill and follow: `app`, `access` or both.
+    #[serde(default)]
+    log_stream: Option<String>,
+    /// The resume point, for a client that re-creates the connection itself.
+    ///
+    /// Accepted **as well as** the `Last-Event-ID` header, not instead of it: a browser's
+    /// own `EventSource` reconnect sends the header and cannot be made to send a query
+    /// parameter, and §5.2's backoff schedule requires the client to reconnect on its own
+    /// behalf -- at which point the header is gone. Supporting both is what makes the
+    /// resume rules identical either way.
+    #[serde(default)]
+    last_event_id: Option<String>,
+}
+
+/// §5's one live connection.
+///
+/// Not declared with a response body: the body is an unbounded `text/event-stream`, and
+/// describing it as a schema would invite a generated client to `await` it as JSON. The
+/// frame shapes are in `crate::events`' module documentation, which is where a client
+/// author should read them.
+#[utoipa::path(
+    get,
+    path = "/api/v1/events",
+    tag = "events",
+    params(
+        ("channels" = Option<String>, Query,
+         description = "Comma-separated: components, logs, readings. Default components."),
+        ("log_stream" = Option<String>, Query, description = "app, access, or both."),
+        ("last_event_id" = Option<String>, Query, description = "Resume point; see also Last-Event-ID."),
+    ),
+    responses(
+        (status = 200, description = "An event stream, typed by the SSE event field",
+         content_type = "text/event-stream"),
+        (status = 422, description = "A channel or stream this build does not know", body = ErrorBody),
+        (status = 501, description = "This build serves no live data", body = ErrorBody),
+    )
+)]
+async fn get_events(
+    State(s): State<Arc<Mgmt>>,
+    Query(q): Query<EventsQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    let Some(live) = s.live.clone() else {
+        return Err(ApiError::Unsupported {
+            summary: "This build of RemoteWeather does not send live updates.".to_string(),
+        });
+    };
+    let channels = crate::events::Channel::parse_list(q.channels.as_deref().unwrap_or(""))
+        .map_err(|name| ApiError::Invalid {
+            summary: format!("There is no live channel called \u{201c}{name}\u{201d}."),
+            errors: vec![FieldError {
+                field: "channels".to_string(),
+                message: "Ask for components, logs or readings.".to_string(),
+            }],
+        })?;
+    let log_stream = Stream::parse(q.log_stream.as_deref()).ok_or_else(|| ApiError::Invalid {
+        summary: "There is no log called that.".to_string(),
+        errors: vec![FieldError {
+            field: "log_stream".to_string(),
+            message: "Ask for app, access, or leave it out for both.".to_string(),
+        }],
+    })?;
+    // The header wins over the query parameter: a browser reconnecting on its own behalf
+    // sends the header, and it is the more recent of the two by construction -- the query
+    // parameter was written when the URL was built.
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or(q.last_event_id)
+        .and_then(|v| v.trim().parse::<u64>().ok());
+
+    let rendering = events::Rendering::gather(s.admin.as_ref()).await?;
+    let request = events::Request {
+        channels,
+        log_stream,
+        last_event_id,
+    };
+    Ok(events::connect(&live, s.control.as_ref(), &rendering, request).into_response())
+}
+
+/// §5.1's in-stream channel change, so a route change does not drop the connection.
+#[utoipa::path(
+    post,
+    path = "/api/v1/events/{stream_id}/channels",
+    tag = "events",
+    params(("stream_id" = String, Path, description = "The id the stream's `hello` frame carried")),
+    request_body = ChannelsInput,
+    responses(
+        (status = 200, description = "The channels now in force", body = ChannelsView),
+        (status = 404, description = "No such connection", body = ErrorBody),
+        (status = 422, description = "A channel this build does not know", body = ErrorBody),
+        (status = 501, description = "This build serves no live data", body = ErrorBody),
+    )
+)]
+async fn post_event_channels(
+    State(s): State<Arc<Mgmt>>,
+    Path(stream_id): Path<String>,
+    Json(input): Json<ChannelsInput>,
+) -> Reply<ChannelsView> {
+    let Some(live) = s.live.clone() else {
+        return Err(ApiError::Unsupported {
+            summary: "This build of RemoteWeather does not send live updates.".to_string(),
+        });
+    };
+    match live.hub.set_channels(&stream_id, &input.channels) {
+        Ok(channels) => Ok(Json(ChannelsView { channels })),
+        // The empty string is the hub's "no such connection", which is a stale client
+        // rather than a bad request: it reconnects and gets a new id.
+        Err(name) if name.is_empty() => Err(ApiError::NotFound {
+            what: "live connection",
+            id: stream_id,
+        }),
+        Err(name) => Err(ApiError::Invalid {
+            summary: format!("There is no live channel called \u{201c}{name}\u{201d}."),
+            errors: vec![FieldError {
+                field: "channels".to_string(),
+                message: "Ask for components, logs or readings.".to_string(),
+            }],
+        }),
+    }
+}
+
+/// **N-11**: the unsent-readings buffer, the peers, and what enrolment is open.
+#[utoipa::path(
+    get,
+    path = "/api/v1/fleet",
+    tag = "fleet",
+    responses(
+        (status = 200, description = "Unsent readings, peers and enrolment", body = FleetView),
+        (status = 500, description = "The peer rows could not be read", body = ErrorBody),
+        (status = 501, description = "This node has no spool and no peers", body = ErrorBody),
+    )
+)]
+async fn get_fleet(State(s): State<Arc<Mgmt>>) -> Reply<FleetView> {
+    let Some(fleet) = s.fleet.clone() else {
+        return Err(ApiError::Unsupported {
+            summary: "This node keeps no unsent readings and has no peers.".to_string(),
+        });
+    };
+    Ok(Json(fleet.view().await?))
+}
+
+// ---------------------------------------------------------------------------------------
 // The shared halves
+
 // ---------------------------------------------------------------------------------------
 
 /// Validate a change in the operator's words, then commit it.

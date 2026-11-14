@@ -34,6 +34,7 @@ mod mgmt;
 mod migrate;
 mod registry;
 mod snapshot;
+mod ui;
 mod validate;
 
 use registry::Registry;
@@ -71,6 +72,16 @@ fn main() -> ExitCode {
         // The `layout` gate's command. Separate from `gate layout`, which is the
         // runner: `cargo xtask gate layout` consults ci/gates.toml and then runs this.
         "gate-layout" => layout::main(&owned),
+        // The `ui-bundle` and `ui-copy` gates' commands, and the same split as
+        // `gate-layout`: `cargo xtask gate ui-bundle` consults ci/gates.toml and then runs
+        // this. Their exit codes are their own -- 1 is over budget or a term on screen, 2
+        // is "no verdict", 3 is a prohibition or a misplaced escape hatch -- for C-W2-20's
+        // reason: the three have different fixes.
+        "gate-ui-bundle" => Ok(ui::bundle(&root)),
+        "gate-ui-copy" => Ok(ui::copy(&root)),
+        // Builds the bundle. Not a gate: it is what `dist` calls and what a person runs
+        // before `gate-ui-bundle`.
+        "ui" => ui::build(&root).map(|()| ExitCode::SUCCESS),
         // Not mapped to a code of its own: the gate's command has already decided what
         // its failure means, and collapsing that was C-W2-20.
         "gate" => gates::run(&owned),
