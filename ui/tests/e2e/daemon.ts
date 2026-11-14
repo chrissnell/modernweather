@@ -161,6 +161,35 @@ export async function waitUntilReady(daemon: Daemon): Promise<void> {
   await waitForReady(daemon.url, daemon.output, 30_000);
 }
 
+/**
+ * Read a resource, surviving a listener restart.
+ *
+ * Any save that adds, removes or switches a station restarts **every** component including
+ * the one listener (M7-1's stated cost), and the socket is rebound more than once while a
+ * plan settles. A single `waitUntilReady` catches the first of those and not the second,
+ * so a read taken between them is refused for a reason that has nothing to do with what is
+ * being tested. A person retries; so does this.
+ */
+export async function readJson(
+  request: { get: (url: string, options: object) => Promise<{ ok(): boolean; json(): Promise<unknown> }> },
+  daemon: Daemon,
+  path: string
+): Promise<Record<string, unknown>> {
+  let last: unknown = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    await waitUntilReady(daemon);
+    try {
+      const response = await request.get(path, { headers: { 'X-MW-Request': '1' } });
+      if (response.ok()) return (await response.json()) as Record<string, unknown>;
+      last = `status ${JSON.stringify(await response.json())}`;
+    } catch (e) {
+      last = e;
+    }
+    await new Promise((r) => setTimeout(r, 1_000));
+  }
+  throw new Error(`could not read ${path} across the restart: ${String(last)}`);
+}
+
 /** The administrator these flows create. */
 export const ADMIN = { username: 'owner', password: 'a-long-enough-passphrase' };
 

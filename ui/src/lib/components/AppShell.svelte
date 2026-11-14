@@ -28,7 +28,7 @@
   } from '@chrissnell/chonky-ui';
   import type { Snippet } from 'svelte';
   import { page } from '$app/state';
-  import { appName, nav, statusCopy } from '$lib/copy';
+  import { appName, common, nav, statusCopy } from '$lib/copy';
   import { stream } from '$lib/sse/stream.svelte';
   import { secondsUntil } from '$lib/sse/machine';
   import { allPages } from '$lib/pages';
@@ -43,22 +43,80 @@
 
   let drawerOpen = $state(false);
   let paletteOpen = $state(false);
-  let theme = $state<'dark' | 'light'>('dark');
 
-  $effect(() => {
-    const attr = document.documentElement.getAttribute('data-theme');
-    theme = attr === 'light' ? 'light' : 'dark';
-  });
+  /**
+   * The theme, and the three states it actually has.
+   *
+   * chonky's `tokens.css` tracks the device on its own -- `:root` is light,
+   * `[data-theme="dark"]` is dark, and `@media (prefers-color-scheme: dark)
+   * :root:not([data-theme="light"])` is the device -- so **"no explicit choice" is a
+   * state**, not a synonym for one of the other two. Collapsing it to "dark" is how this
+   * shipped looking wrong on a light laptop with no way back.
+   *
+   * `theme` is chonky's own storage key. The first version used a key of ours, so the
+   * toggle wrote one key and the boot script read another: the choice was lost on every
+   * reload and `ThemeToggle`'s own mount-time initialiser re-pinned whatever it liked.
+   */
+  const STORAGE_KEY = 'theme';
 
-  function setTheme(next: 'dark' | 'light') {
+  function stored(): 'dark' | 'light' | null {
+    try {
+      const value = localStorage.getItem(STORAGE_KEY);
+      return value === 'dark' || value === 'light' ? value : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function device(): 'dark' | 'light' {
+    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+
+  /** The explicit choice, or `null` while the device decides. */
+  let chosen = $state<'dark' | 'light' | null>(stored());
+  /** What is actually on screen. */
+  let theme = $state<'dark' | 'light'>(stored() ?? device());
+
+  function apply(next: 'dark' | 'light') {
     theme = next;
     document.documentElement.setAttribute('data-theme', next);
+  }
+
+  function setTheme(next: 'dark' | 'light') {
+    chosen = next;
     try {
-      localStorage.setItem('chonky-theme', next);
+      localStorage.setItem(STORAGE_KEY, next);
     } catch {
       // A browser with storage denied still gets the theme for this visit.
     }
+    apply(next);
   }
+
+  /** Back to tracking the device, which is otherwise a one-way door. */
+  function followDevice() {
+    chosen = null;
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      // Nothing to remove.
+    }
+    apply(device());
+  }
+
+  $effect(() => {
+    // **`ThemeToggle` writes `data-theme` on mount from whatever it was passed**, which
+    // pins the attribute even when nobody has chosen -- so the media query that would have
+    // tracked the device never applies again. Listening here is what puts the tracking
+    // back: while there is no explicit choice, an OS change is followed live, without a
+    // reload. Reported upstream as gap G17.
+    const media = window.matchMedia('(prefers-color-scheme: dark)');
+    const follow = () => {
+      if (chosen === null) apply(device());
+    };
+    follow();
+    media.addEventListener('change', follow);
+    return () => media.removeEventListener('change', follow);
+  });
 
   function onkeydown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
@@ -107,6 +165,16 @@
     <Separator />
     <div class="asidefoot">
       <ThemeToggle {theme} onThemeChange={setTheme} />
+      <!--
+        Without this the toggle is a one-way door: chonky's control is binary, so the first
+        click replaces "follow my device" with a fixed choice and there is no way back to
+        it. A device that switches theme at sunset is the ordinary case, not an exotic one.
+      -->
+      {#if chosen !== null}
+        <button class="btn btn-sm btn-ghost" type="button" onclick={followDevice}>
+          {common.followSystem}
+        </button>
+      {/if}
     </div>
   </aside>
 
@@ -254,6 +322,10 @@
 
   .asidefoot {
     padding: 0.75rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
   }
 
   .main {

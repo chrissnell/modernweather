@@ -67,6 +67,10 @@ export const stations = {
     },
     receivedFrom: (peer: string) => `Received from ${peer}`,
     receivedNote: 'Sent to us by another RemoteWeather. Edit it where it is configured.',
+    stopTitle: 'Stop collecting readings?',
+    stopBody: (name: string) =>
+      `${name} stays configured and the readings already saved are kept. Nothing new arrives from it until you turn it back on.`,
+    stopConfirm: 'Stop collecting',
     empty: {
       heading: 'No weather stations yet',
       body: 'Nothing is sending readings to this machine. Adding a station is the first step.',

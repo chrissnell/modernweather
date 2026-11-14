@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { waitUntilReady } from './daemon';
+import { readJson, waitUntilReady } from './daemon';
 
 /**
  * Flow 2 of §6.7's five: **add a station**.
@@ -153,4 +153,72 @@ test('a type whose transport the plan validates differently also saves', async (
   // carry one and an `http_out` kind must not. Asserted because the API used to demand it
   // of both, which made the two `http_out` station types impossible to store at all.
   expect(station.transport.streaming).toBe(true);
+});
+
+/**
+ * The toggle that stopped a station on the preview, and said nothing.
+ *
+ * It was the one unconfirmed, immediately-committed configuration change in the whole
+ * application: a switch in a table row whose label text was part of its hit area, with no
+ * preview, no confirmation and no undo. One stray click stopped three components --
+ * including the public website and the frozen API the phone app uses -- and the operator
+ * was left looking at a station that had simply stopped working.
+ *
+ * §8.7's rule is that a change which breaks something else says so first, and §2.4's
+ * preview is how every other save on this surface already does that.
+ */
+test('stopping a station is previewed and confirmed; starting one is not', async ({
+  signedIn,
+  page
+}) => {
+  await page.request.post('/api/v1/stations', {
+    headers: { 'X-MW-Request': '1' },
+    data: {
+      name: 'Backyard',
+      key: 'backyard',
+      kind: 'campbellscientific',
+      identity_kind: 'fixed',
+      collecting: true,
+      wind_dir_correction_degrees: 0,
+      transport: { kind: 'tcp_out', host: '127.0.0.1', port: 7001 }
+    }
+  });
+  await waitUntilReady(signedIn);
+
+  await page.goto('/stations');
+  const toggle = page.getByRole('switch', { name: /Collecting readings for Backyard/ });
+  await expect(toggle).toBeVisible();
+
+  // Turning it OFF asks first, and names the consequence.
+  await toggle.click();
+  const dialog = page.getByRole('alertdialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText('Stop collecting readings?');
+
+  // Cancelling changes nothing -- which is the half that makes a confirmation worth
+  // having, and the half a dialog with a one-way `open` gets wrong.
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  await expect(dialog).toHaveCount(0);
+  // **The switch goes back.** chonky's `Toggle` owns its own checked state, so a click
+  // moves it whatever the caller does next -- and a switch left showing "off" over a
+  // station that is still on turns the *next* click into "turn on", which is how a
+  // confirmation becomes a way to silently do the opposite of what it asked.
+  await expect(
+    page.getByRole('switch', { name: /Collecting readings for Backyard/ })
+  ).toBeChecked();
+  let station = await readJson(page.request, signedIn, '/api/v1/stations/backyard');
+  expect(station.collecting, 'cancelling must not have written anything').toBe(true);
+
+  // Confirming does it.
+  await page.getByRole('switch', { name: /Collecting readings for Backyard/ }).click();
+  await page.getByRole('alertdialog').getByRole('button', { name: 'Stop collecting' }).click();
+  station = await readJson(page.request, signedIn, '/api/v1/stations/backyard');
+  expect(station.collecting).toBe(false);
+
+  // Turning it back ON is additive and reversible by the same click, so it does not ask.
+  await page.goto('/stations');
+  await page.getByRole('switch', { name: /Collecting readings for Backyard/ }).click();
+  await expect(page.getByRole('alertdialog')).toHaveCount(0);
+  station = await readJson(page.request, signedIn, '/api/v1/stations/backyard');
+  expect(station.collecting).toBe(true);
 });

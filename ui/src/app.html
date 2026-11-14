@@ -7,18 +7,31 @@
     <meta name="robots" content="noindex, nofollow" />
     <title>RemoteWeather</title>
     <script>
-      // chonky honours the OS preference before JS runs, which means before this
-      // document paints: a stored choice wins, the OS preference is the fallback.
-      // Inline and synchronous on purpose -- a module script would paint light first
-      // and then flip, which is the flash this exists to avoid.
+      // An explicit choice, and **nothing at all otherwise**.
+      //
+      // chonky's `tokens.css` already tracks the device with no JavaScript:
+      // `:root` is light, `[data-theme="dark"]` is dark, and
+      // `@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) }` is the
+      // device. Writing an attribute here when the operator has not chosen one would
+      // **pin** the answer and stop that media query ever applying again -- which is how
+      // the first version of this shipped a UI that was dark on a light laptop and had no
+      // way back.
+      //
+      // So the attribute is written only for a stored choice. `theme` is chonky's own key
+      // and not one of ours: its `ThemeToggle` reads and writes that key, and a second key
+      // meant the toggle's choice was invisible to this script on the next load.
+      //
+      // Inline and synchronous on purpose -- a module script would paint one theme and
+      // then flip, which is the flash this exists to avoid.
       (function () {
         try {
-          var stored = localStorage.getItem('chonky-theme');
-          var dark = stored ? stored === 'dark'
-            : window.matchMedia('(prefers-color-scheme: dark)').matches;
-          document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+          var stored = localStorage.getItem('theme');
+          if (stored === 'dark' || stored === 'light') {
+            document.documentElement.setAttribute('data-theme', stored);
+          }
         } catch (e) {
-          document.documentElement.setAttribute('data-theme', 'dark');
+          // Storage denied. Leave the attribute off and let the device decide, which is
+          // the better failure than defaulting everyone to one theme.
         }
       })();
     </script>

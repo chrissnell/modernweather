@@ -90,7 +90,13 @@ export const common = {
   lastUpdated: (when: string) => `last updated ${when}`,
   notAvailableYet: 'Not available in this version.',
   themeLight: 'Light',
-  themeDark: 'Dark'
+  themeDark: 'Dark',
+  // Not "device": §0.2 bans the word because the current UI alternates it with "station"
+  // within one screen, and the lint is what stops that recurring. Here it would have meant
+  // the operator's laptop rather than their weather station -- a real collision, and the
+  // answer is a different word rather than an exception, because an exception outside
+  // `advanced.ts` is the hole the rule has no way to close.
+  followSystem: 'Match my system'
 } as const;
 
 export const pages: Record<string, PageCopy> = {

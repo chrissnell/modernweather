@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  common,
   destinations,
   nav,
   needsAttention,
@@ -48,6 +49,16 @@ describe('the user-facing vocabulary', () => {
   it('names no internal term in the navigation', () => {
     for (const item of nav) {
       expect(offenders(`${item.label} ${item.summary}`)).toEqual([]);
+    }
+  });
+
+  it('names no internal term in the shared labels', () => {
+    // `common` is where a word slips in: it is read by every page and reviewed as part of
+    // none of them. "Follow my device" lived here, and `device` is banned precisely
+    // because the current UI alternates it with "station" inside one screen.
+    for (const [name, value] of Object.entries(common)) {
+      if (typeof value !== 'string') continue;
+      expect(offenders(value), `common.${name}: "${value}"`).toEqual([]);
     }
   });
 
