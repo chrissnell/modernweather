@@ -43,7 +43,15 @@ awk '
   /schema := `/ { inside = 1; next }
   inside && /^`$/ { exit }
   inside { print }
-' "$SRC" > "$WORK/ddl.sql"
+' "$SRC" > "$WORK/raw-ddl.sql"
+
+# `sun_times` is dropped from the capture, and that omission is the point rather than an
+# accident. W2a Decision 36 deletes that table in favour of a per-request evaluation, and
+# crates/mw-store/src/config_db.rs's `the_sun_times_table_is_not_carried_forward` scans every
+# tracked `.sql` under ci/db/ to make sure it does not come back -- so a capture carrying it
+# would turn that guard red over a table nothing here applies. The configuration migration
+# does not read it either: there is no successor column, because there is no stored successor.
+sed '/^-- Sun times table/,/^);$/d' "$WORK/raw-ddl.sql" > "$WORK/ddl.sql"
 
 # It carries two INSERTs of its own -- the `default` configuration row and a disabled
 # snowcache controller. They are the Go daemon's own first-run state, so they belong in a

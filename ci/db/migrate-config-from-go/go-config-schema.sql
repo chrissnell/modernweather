@@ -259,14 +259,6 @@ CREATE TABLE IF NOT EXISTS remote_stations (
 
 CREATE INDEX idx_remote_stations_last_seen ON remote_stations(last_seen);
 
--- Sun times table for pre-calculated sunrise/sunset times
-CREATE TABLE IF NOT EXISTS sun_times (
-    station_name TEXT NOT NULL,
-    day_of_year INTEGER NOT NULL CHECK (day_of_year >= 1 AND day_of_year <= 366),
-    sunrise_minutes INTEGER NOT NULL,
-    sunset_minutes INTEGER NOT NULL,
-    PRIMARY KEY (station_name, day_of_year)
-);
 
 -- Trigger to update updated_at timestamp
 CREATE TRIGGER update_configs_timestamp 

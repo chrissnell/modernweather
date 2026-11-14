@@ -85,6 +85,14 @@ use crate::config_admin::{
 /// the binary, which may name both.
 pub const RADIO_FLOOR_SECONDS: i64 = 600;
 
+/// `stations.wll_poll_interval_seconds`' own floor, which is a `CHECK` on the column.
+///
+/// Unlike the RF floor this one *is* in the schema, so a sub-floor value is not a row this
+/// migration may write at all -- it is raised here with a line, because the Go column has no
+/// floor and an operator who typed `10` would otherwise have the migration stop on a
+/// constraint.
+pub const WLL_POLL_FLOOR_SECONDS: i64 = 30;
+
 /// The characters `mw_component::ComponentId` permits, which is what makes a `station_key`
 /// usable: lower-case ASCII, digits, `-`, `_`, `.` and `:`.
 fn id_safe(c: char) -> bool {
@@ -324,6 +332,22 @@ pub enum ConfigGoError {
         second: String,
         /// Its client id.
         second_id: String,
+    },
+
+    /// Two devices naming one Aeris account with two different secrets.
+    #[error(
+        "`{first}` and `{second}` are both configured with the Aeris client id \
+         `{client_id}` and two different client secrets. One of them is wrong and this \
+         migration cannot tell which, so clear the secret on the station that should not \
+         carry it and run this again."
+    )]
+    AerisSecretsDisagree {
+        /// The first station.
+        first: String,
+        /// The station that disagreed.
+        second: String,
+        /// The client id they share.
+        client_id: String,
     },
 
     /// A website naming a station that is not there.
@@ -688,10 +712,23 @@ pub struct GoConfig {
     pub timescale: Option<GoTimescale>,
     /// Every `storage_configs.backend_type` that is not `timescaledb`, for the report.
     pub other_backends: Vec<String>,
+    /// Every `storage_configs.backend_type` that IS `timescaledb` and is switched off, for
+    /// the report. Separate from [`GoConfig::timescale`] being `None` because the two mean
+    /// different things to the operator: "you have no weather database" and "you have one
+    /// and it was off".
+    pub disabled_backends: Vec<String>,
     /// The merged `controller_configs`.
     pub controllers: GoControllers,
     /// Every `remote_stations` row.
     pub remote_stations: Vec<GoRemoteStation>,
+    /// Every `controller_configs.controller_type` this code has no arm for.
+    pub unknown_controllers: Vec<String>,
+    /// How many `configs` rows are NOT the one being migrated.
+    ///
+    /// Zero in every deployment the Go management API produced, because it only ever writes
+    /// `default`. Non-zero means rows nothing has ever loaded, and the report says so rather
+    /// than silently leaving them behind.
+    pub unused_configurations: i64,
     /// `table.column` for every column this code wanted and the source does not have.
     pub absent_columns: Vec<String>,
     /// `table.column` for every column the source has and this code does not read.
@@ -733,6 +770,7 @@ fn select(
     wanted: &[&str],
     available: &BTreeSet<String>,
     order: &str,
+    scope: &Scope,
     absent: &mut Vec<String>,
     unread: &mut Vec<String>,
 ) -> String {
@@ -759,7 +797,34 @@ fn select(
     if list.is_empty() {
         list.push_str("NULL AS \"empty\"");
     }
-    format!("SELECT {list} FROM \"{table}\" ORDER BY {order}")
+    format!(
+        "SELECT {list} FROM \"{table}\"{} ORDER BY {order}",
+        scope.clause(available)
+    )
+}
+
+/// Which `configs` row every other table is read under.
+///
+/// **Every read in `provider_sqlite.go` is scoped the same way** --
+/// `WHERE config_id = (SELECT id FROM configs WHERE name = 'default')` -- so the Go daemon
+/// has never loaded a second named configuration, and a migration that merged two would
+/// produce a deployment nothing was running. The id is resolved once and applied to every
+/// table that has the column.
+#[derive(Debug, Clone, Copy, Default)]
+struct Scope {
+    config_id: Option<i64>,
+}
+
+impl Scope {
+    /// ` WHERE config_id = <id>`, or nothing when there is no id or the table has no column
+    /// to apply it to. `remote_stations` is the table with no column: it is keyed by the
+    /// station's own UUID and is not per-configuration.
+    fn clause(&self, available: &BTreeSet<String>) -> String {
+        match self.config_id {
+            Some(id) if available.contains("config_id") => format!(" WHERE config_id = {id}"),
+            _ => String::new(),
+        }
+    }
 }
 
 /// One column as text, with `NULL`, an absent column and `''` all reading as `None`.
@@ -841,19 +906,44 @@ pub async fn read(conn: &mut SqliteConnection) -> Result<GoConfig, ConfigGoError
         });
     }
 
-    // `configs` is the Go schema's one-row-per-named-configuration table. The daemon loads
-    // the first one and the management API only ever writes `default`, so the name is read
-    // for the node name and the rest of the row -- two timestamps -- is not interesting.
+    // `configs` is the Go schema's one-row-per-named-configuration table, and **every read
+    // in `provider_sqlite.go` is scoped to the row named `default`**. So that is the
+    // configuration the Go daemon has been running, and it is the one migrated: a second
+    // named configuration is rows nothing has ever loaded, and merging it in would produce a
+    // deployment that was never deployed.
+    //
+    // `ORDER BY name = 'default' DESC, id` rather than `WHERE name = 'default'`: a database
+    // whose configuration has been renamed still has exactly one, and refusing to migrate it
+    // over a name would be a refusal with no defect behind it. The preference is explicit so
+    // that the common case is exact and the odd case still works.
     let config_cols = columns(&mut *conn, "configs").await?;
+    let mut scope = Scope::default();
     if config_cols.contains("name") {
-        let row = sqlx::query("SELECT CAST(name AS TEXT) AS name FROM configs ORDER BY id LIMIT 1")
-            .fetch_optional(&mut *conn)
+        let row = sqlx::query(
+            // `CAST(... AS TEXT)` on both, like every other read here: `text()` and `int()`
+            // are one parse path over strings, so an integer column read without the cast
+            // decodes to nothing at all.
+            "SELECT CAST(id AS TEXT) AS id, CAST(name AS TEXT) AS name FROM configs \
+             ORDER BY name = 'default' DESC, id LIMIT 1",
+        )
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|source| ConfigGoError::Query {
+            what: "reading the configuration's name",
+            source,
+        })?;
+        go.config_name = row.as_ref().and_then(|r| text(r, "name"));
+        scope.config_id = row.as_ref().and_then(|r| int(r, "id"));
+        let others: i64 = sqlx::query_scalar("SELECT count(*) - 1 FROM configs")
+            .fetch_one(&mut *conn)
             .await
             .map_err(|source| ConfigGoError::Query {
-                what: "reading the configuration's name",
+                what: "counting the named configurations",
                 source,
             })?;
-        go.config_name = row.as_ref().and_then(|r| text(r, "name"));
+        if others > 0 {
+            go.unused_configurations = others;
+        }
     }
 
     const DEVICE_WANTED: &[&str] = &[
@@ -912,7 +1002,15 @@ pub async fn read(conn: &mut SqliteConnection) -> Result<GoConfig, ConfigGoError
         "aeris_api_endpoint",
         "aeris_refresh_interval",
     ];
-    let sql = select("devices", DEVICE_WANTED, &device_cols, "id", absent, unread);
+    let sql = select(
+        "devices",
+        DEVICE_WANTED,
+        &device_cols,
+        "id",
+        &scope,
+        absent,
+        unread,
+    );
     let rows = sqlx::query(&sql)
         .fetch_all(&mut *conn)
         .await
@@ -1008,6 +1106,7 @@ pub async fn read(conn: &mut SqliteConnection) -> Result<GoConfig, ConfigGoError
         WEBSITE_WANTED,
         &website_cols,
         "id",
+        &scope,
         absent,
         unread,
     );
@@ -1040,9 +1139,9 @@ pub async fn read(conn: &mut SqliteConnection) -> Result<GoConfig, ConfigGoError
         });
     }
 
-    read_storage(&mut *conn, &mut go).await?;
-    read_controllers(&mut *conn, &mut go).await?;
-    read_remote_stations(&mut *conn, &mut go).await?;
+    read_storage(&mut *conn, &mut go, &scope).await?;
+    read_controllers(&mut *conn, &mut go, &scope).await?;
+    read_remote_stations(&mut *conn, &mut go, &scope).await?;
     Ok(go)
 }
 
@@ -1053,7 +1152,11 @@ pub async fn read(conn: &mut SqliteConnection) -> Result<GoConfig, ConfigGoError
 /// that is really an egress is an `uploader` row or an `uplink` row" -- so they are named in
 /// the report and not translated. The four health columns go with
 /// `storage.GlobalHealthManager`: component state is the health surface now.
-async fn read_storage(conn: &mut SqliteConnection, go: &mut GoConfig) -> Result<(), ConfigGoError> {
+async fn read_storage(
+    conn: &mut SqliteConnection,
+    go: &mut GoConfig,
+    scope: &Scope,
+) -> Result<(), ConfigGoError> {
     let cols = columns(&mut *conn, "storage_configs").await?;
     if cols.is_empty() {
         go.absent_columns.push("storage_configs.*".to_string());
@@ -1091,6 +1194,7 @@ async fn read_storage(conn: &mut SqliteConnection, go: &mut GoConfig) -> Result<
         WANTED,
         &cols,
         "id",
+        scope,
         &mut go.absent_columns,
         &mut go.unread_columns,
     );
@@ -1103,7 +1207,13 @@ async fn read_storage(conn: &mut SqliteConnection, go: &mut GoConfig) -> Result<
         })?;
     for r in &rows {
         let kind = or_empty(text(r, "backend_type"));
-        if kind == "timescaledb" {
+        // `enabled` is checked rather than merely selected, because the absence of a
+        // `weather_database` row is MEANINGFUL here (D-44) and a disabled backend is a
+        // deployment Go was not writing to: migrating it as the live database would give
+        // the new daemon a `writer:timescale` against a server the old one was not using.
+        // The Go DDL is `enabled BOOLEAN DEFAULT TRUE`, so an unreadable value is enabled.
+        let enabled = flag(r, "enabled").unwrap_or(true);
+        if kind == "timescaledb" && enabled {
             go.timescale = Some(GoTimescale {
                 host: text(r, "timescale_host"),
                 port: int(r, "timescale_port"),
@@ -1113,6 +1223,8 @@ async fn read_storage(conn: &mut SqliteConnection, go: &mut GoConfig) -> Result<
                 ssl_mode: text(r, "timescale_ssl_mode"),
                 timezone: text(r, "timescale_timezone"),
             });
+        } else if kind == "timescaledb" {
+            go.disabled_backends.push(kind);
         } else if !kind.is_empty() {
             go.other_backends.push(kind);
         }
@@ -1125,6 +1237,7 @@ async fn read_storage(conn: &mut SqliteConnection, go: &mut GoConfig) -> Result<
 async fn read_controllers(
     conn: &mut SqliteConnection,
     go: &mut GoConfig,
+    scope: &Scope,
 ) -> Result<(), ConfigGoError> {
     let cols = columns(&mut *conn, "controller_configs").await?;
     if cols.is_empty() {
@@ -1180,6 +1293,7 @@ async fn read_controllers(
         WANTED,
         &cols,
         "id",
+        scope,
         &mut go.absent_columns,
         &mut go.unread_columns,
     );
@@ -1192,44 +1306,65 @@ async fn read_controllers(
         })?;
     let c = &mut go.controllers;
     for r in &rows {
-        let first_text = |slot: &mut Option<String>, col: &str| {
-            if slot.is_none() {
-                *slot = text(r, col);
+        // **A field belongs to the row whose `controller_type` owns it, and only to an
+        // ENABLED row.** `provider_sqlite.go` switches on `controller_type` and reads each
+        // group of columns in exactly one arm, under `WHERE ... enabled = 1`. Reading "the
+        // first non-NULL across rows" instead looks equivalent and is not: every row carries
+        // every column, and three of them have non-NULL DEFAULTS -- `grpc_port DEFAULT
+        // 50051`, `grpc_listen_addr DEFAULT '0.0.0.0'`, `management_enable_cors DEFAULT
+        // FALSE`. The first-run DDL also inserts a `snowcache` row, so that row's default
+        // `grpc_port` would win over the `rest` row's real one on every database the Go
+        // daemon ever created.
+        if !flag(r, "enabled").unwrap_or(true) {
+            continue;
+        }
+        match or_empty(text(r, "controller_type")).as_str() {
+            // `RESTServerData`, which carries the gRPC server's columns too: one listener
+            // configures both in the Go tree.
+            "rest" => {
+                c.rest_port = int(r, "rest_port");
+                c.rest_listen_addr = text(r, "rest_listen_addr");
+                c.grpc_port = int(r, "grpc_port");
+                c.grpc_listen_addr = text(r, "grpc_listen_addr");
+                c.grpc_cert = text(r, "grpc_cert");
+                c.grpc_key = text(r, "grpc_key");
             }
-        };
-        let first_int = |slot: &mut Option<i64>, col: &str| {
-            if slot.is_none() {
-                *slot = int(r, col);
+            "management" => {
+                c.management_port = int(r, "management_port");
+                c.management_listen_addr = text(r, "management_listen_addr");
+                c.management_cert = text(r, "management_cert");
+                c.management_key = text(r, "management_key");
+                c.management_auth_token_present = text(r, "management_auth_token").is_some();
+                c.management_enable_cors = flag(r, "management_enable_cors").unwrap_or(false);
             }
-        };
-        first_int(&mut c.rest_port, "rest_port");
-        first_text(&mut c.rest_listen_addr, "rest_listen_addr");
-        first_int(&mut c.grpc_port, "grpc_port");
-        first_text(&mut c.grpc_listen_addr, "grpc_listen_addr");
-        first_text(&mut c.grpc_cert, "grpc_cert");
-        first_text(&mut c.grpc_key, "grpc_key");
-        first_int(&mut c.management_port, "management_port");
-        first_text(&mut c.management_listen_addr, "management_listen_addr");
-        first_text(&mut c.management_cert, "management_cert");
-        first_text(&mut c.management_key, "management_key");
-        first_text(&mut c.aprs_server, "aprs_server");
-        first_text(&mut c.pws_api_endpoint, "pws_api_endpoint");
-        first_text(&mut c.wu_api_endpoint, "wu_api_endpoint");
-        first_text(&mut c.aeris_api_endpoint, "aeris_api_endpoint");
-        first_text(&mut c.aeris_api_client_id, "aeris_api_client_id");
-        first_text(&mut c.aeris_api_client_secret, "aeris_api_client_secret");
-        c.management_auth_token_present |= text(r, "management_auth_token").is_some();
-        c.management_enable_cors |= flag(r, "management_enable_cors").unwrap_or(false);
-        for col in [
-            "snow_station_name",
-            "snow_base_distance",
-            "snow_smoothing_window",
-            "snow_penalty",
-            "snow_min_accumulation",
-            "snow_min_segment_size",
-        ] {
-            if let Some(v) = text(r, col) {
-                c.snow.entry(col.to_string()).or_insert(v);
+            "aprs" => c.aprs_server = text(r, "aprs_server"),
+            "pwsweather" => c.pws_api_endpoint = text(r, "pws_api_endpoint"),
+            "weatherunderground" => c.wu_api_endpoint = text(r, "wu_api_endpoint"),
+            "aerisweather" => {
+                c.aeris_api_endpoint = text(r, "aeris_api_endpoint");
+                // Removed from this table by `013_remove_controller_configs`, so these two
+                // are read only for a database created before that migration ran.
+                c.aeris_api_client_id = text(r, "aeris_api_client_id");
+                c.aeris_api_client_secret = text(r, "aeris_api_client_secret");
+            }
+            "snowcache" => {
+                for col in [
+                    "snow_station_name",
+                    "snow_base_distance",
+                    "snow_smoothing_window",
+                    "snow_penalty",
+                    "snow_min_accumulation",
+                    "snow_min_segment_size",
+                ] {
+                    if let Some(v) = text(r, col) {
+                        c.snow.insert(col.to_string(), v);
+                    }
+                }
+            }
+            other => {
+                if !other.is_empty() {
+                    go.unknown_controllers.push(other.to_string());
+                }
             }
         }
     }
@@ -1240,6 +1375,7 @@ async fn read_controllers(
 async fn read_remote_stations(
     conn: &mut SqliteConnection,
     go: &mut GoConfig,
+    scope: &Scope,
 ) -> Result<(), ConfigGoError> {
     let cols = columns(&mut *conn, "remote_stations").await?;
     if cols.is_empty() {
@@ -1270,6 +1406,7 @@ async fn read_remote_stations(
         WANTED,
         &cols,
         "station_name",
+        scope,
         &mut go.absent_columns,
         &mut go.unread_columns,
     );
@@ -1478,6 +1615,56 @@ fn userinfo(raw: &str) -> String {
         }
     }
     out
+}
+
+/// One port, avoiding the ones already chosen.
+///
+/// The configured value when it is usable and free; otherwise the default when that is free;
+/// otherwise the first free port above the default, with a line saying so. Searching upward
+/// rather than refusing because the alternative is a migration that stops on a port number,
+/// which an operator can change in one field afterwards -- and because the *reason* it had
+/// to move is a sentence this can produce and a `CHECK` cannot.
+fn pick_port(
+    configured: Option<i64>,
+    default: i64,
+    column: &'static str,
+    taken: &mut Vec<i64>,
+    report: &mut Report,
+) -> i64 {
+    let free = |p: i64, taken: &[i64]| (1..=65535).contains(&p) && !taken.contains(&p);
+    let chosen = match configured {
+        Some(p) if free(p, taken) => p,
+        other => {
+            let mut p = default;
+            while !free(p, taken) {
+                p += 1;
+            }
+            match other {
+                Some(was) => report.push(
+                    NoteKind::Raised,
+                    format!("listener.{column}"),
+                    format!(
+                        "port {was} is already in use by another of this listener's four \
+                         sockets, which this schema requires to differ (W3 D-92, as four \
+                         CHECKs); migrated as {p}. Change it on System -> Advanced if that \
+                         is not the port you want."
+                    ),
+                ),
+                None if p != default => report.push(
+                    NoteKind::Raised,
+                    format!("listener.{column}"),
+                    format!(
+                        "this column had no value and its default of {default} is taken by \
+                         another of this listener's sockets; migrated as {p}."
+                    ),
+                ),
+                None => {}
+            }
+            p
+        }
+    };
+    taken.push(chosen);
+    chosen
 }
 
 /// The `postgresql://` URL the Go DSN's seven parts describe.
@@ -1721,6 +1908,16 @@ fn wire(
     }
 }
 
+/// One device's Aeris columns, kept together so the credential PAIR cannot be assembled from
+/// two different rows.
+#[derive(Debug, Clone)]
+struct GoAeris {
+    client_id: String,
+    secret: Option<String>,
+    endpoint: Option<String>,
+    refresh: Option<i64>,
+}
+
 /// The `ingest` row, which is the only thing that makes a node a collector (**D-44**).
 #[derive(Debug, Clone)]
 pub struct IngestRow {
@@ -1776,6 +1973,27 @@ pub fn translate(
         .and_then(|t| t.timezone.clone())
         .unwrap_or_else(|| "UTC".to_string());
 
+    if go.unused_configurations > 0 {
+        report.push(
+            NoteKind::NotCarried,
+            "configs",
+            format!(
+                "this database holds {} other named configuration(s), and they are not \
+                 migrated. Every read in the Go daemon is scoped to the one named \
+                 `default`, so those rows have never been loaded by anything.",
+                go.unused_configurations
+            ),
+        );
+    }
+    for kind in &go.unknown_controllers {
+        report.push(
+            NoteKind::NotCarried,
+            format!("controller_configs.{kind}"),
+            "this controller type is enabled in the Go configuration and this migration \
+             has no arm for it, so nothing is written for it."
+                .to_string(),
+        );
+    }
     for col in &go.absent_columns {
         report.push(
             NoteKind::NotCarried,
@@ -1907,18 +2125,28 @@ pub fn translate(
             (8080, None)
         }
     };
-    let grpc_port = go
-        .controllers
-        .grpc_port
-        .filter(|p| (1..=65535).contains(p) && *p != http_port && Some(*p) != https_port)
-        .unwrap_or(50051);
-    let management_port = go
-        .controllers
-        .management_port
-        .filter(|p| {
-            (1..=65535).contains(p) && *p != http_port && *p != grpc_port && Some(*p) != https_port
-        })
-        .unwrap_or(8081);
+    // **The collision avoidance has to cover the DEFAULTS, not only the configured
+    // values.** The `listener` table requires all four ports to differ -- W3 D-92's shipped
+    // validation, as four `CHECK`s -- and a Go deployment that put the REST server on 8081
+    // would otherwise be migrated with `management_port` falling back to its default of
+    // 8081 and refused by the schema. So each port is chosen against the ones already
+    // taken, in the order the operator is most likely to care about.
+    let mut taken: Vec<i64> = vec![http_port];
+    taken.extend(https_port);
+    let grpc_port = pick_port(
+        go.controllers.grpc_port,
+        50051,
+        "grpc_port",
+        &mut taken,
+        &mut report,
+    );
+    let management_port = pick_port(
+        go.controllers.management_port,
+        8081,
+        "management_port",
+        &mut taken,
+        &mut report,
+    );
     // **A-W5-3: the management bind becomes loopback, and the Go value is deliberately not
     // carried.** `0.0.0.0` is half of what makes W5 §3.4's unclaimed-instance takeover
     // window reachable, and a migration that preserved it would carry the vulnerability
@@ -1996,6 +2224,16 @@ pub fn translate(
                 .to_string(),
         ),
     }
+    for backend in &go.disabled_backends {
+        report.push(
+            NoteKind::NotCarried,
+            format!("storage_configs.{backend}"),
+            "this backend is configured and DISABLED in the Go configuration, so no \
+             weather database row is written. Nothing was being written to it; if that is \
+             not what you meant, set the connection on the storage page."
+                .to_string(),
+        );
+    }
     for backend in &go.other_backends {
         report.push(
             NoteKind::NotCarried,
@@ -2041,6 +2279,23 @@ pub fn translate(
                 tz
             }
         };
+        // **The Ambient station is the second DEV-9 case, and the Go schema has neither
+        // half of what it needs.** `plan()` requires an `ingest_secret_hash` -- `?PASSWORD=`
+        // is the only credential that transport has -- and a `presented_key`, the `?ID=` the
+        // console sends; in the Go daemon the station's identity was the PORT the request
+        // arrived on and neither value is stored anywhere. So the row is migrated off with
+        // both fields named, rather than written enabled for the daemon to refuse at its
+        // next start.
+        if *kind == "ambient-customized" {
+            pending_disable.push((
+                key.clone(),
+                "an Ambient console identifies itself with the `ID` it sends and \
+                 authenticates with the `PASSWORD` beside it, and the Go daemon used the \
+                 port the request arrived on instead -- so it stored neither, and there is \
+                 nothing to put in `presented_key` or the station's protocol secret"
+                    .to_string(),
+            ));
+        }
         if w.needs_presented_key {
             pending_disable.push((
                 key.clone(),
@@ -2050,6 +2305,25 @@ pub fn translate(
                     .to_string(),
             ));
         }
+        // The column's own floor is 30 s, and the Go column has no floor at all. A
+        // sub-floor value is raised with a line rather than aborting the migration on the
+        // `CHECK`, which is the same answer O-8 gives one table over.
+        let wll_poll = match d.wll_poll_interval.filter(|v| *v > 0) {
+            Some(secs) if secs < WLL_POLL_FLOOR_SECONDS => {
+                report.push(
+                    NoteKind::Raised,
+                    key.clone(),
+                    format!(
+                        "`wll_poll_interval` of {secs} s raised to this column's \
+                         {WLL_POLL_FLOOR_SECONDS} s floor: a WeatherLink Live's HTTP \
+                         interface is a small embedded web server and the Go column had no \
+                         floor at all."
+                    ),
+                );
+                Some(WLL_POLL_FLOOR_SECONDS)
+            }
+            other => other,
+        };
         if *kind == "weatherlink-live" && d.wll_sensor_mapping.is_none() {
             pending_disable.push((
                 key.clone(),
@@ -2058,15 +2332,36 @@ pub fn translate(
                     .to_string(),
             ));
         }
-        if d.tls_cert_file.is_some() || d.tls_key_file.is_some() {
-            report.push(
-                NoteKind::Derived,
-                key.clone(),
-                "`tls_cert_file`/`tls_key_file` on the device row are carried to this \
-                 station's transport TLS columns."
-                    .to_string(),
-            );
-        }
+        // A certificate without its key is not a TLS configuration, and the column pair
+        // carries `CHECK ((cert IS NULL) = (key IS NULL))` -- so a one-sided Go pair has to
+        // be resolved here rather than aborting the migration on a constraint. Dropping
+        // both is the only representable reading, and it is reported.
+        let transport_tls = match (d.tls_cert_file.clone(), d.tls_key_file.clone()) {
+            (Some(cert), Some(tls_key)) => {
+                report.push(
+                    NoteKind::Derived,
+                    key.clone(),
+                    "`tls_cert_file`/`tls_key_file` on the device row are carried to this \
+                     station's transport TLS columns."
+                        .to_string(),
+                );
+                (Some(cert), Some(tls_key))
+            }
+            (cert, tls_key) => {
+                if cert.is_some() || tls_key.is_some() {
+                    report.push(
+                        NoteKind::NotCarried,
+                        key.clone(),
+                        "this device has one half of a TLS pair -- a certificate with no \
+                         key, or a key with no certificate -- which is not a TLS \
+                         configuration. Neither is carried; set both on the station's page \
+                         if the transport needs them."
+                            .to_string(),
+                    );
+                }
+                (None, None)
+            }
+        };
         changes.push(Change::PutStation(StationWrite {
             station_key: key.clone(),
             // The Go surrogate, kept: `/stationinfo` emits `stations[].id` as an integer
@@ -2106,10 +2401,10 @@ pub fn translate(
             transport_group: None,
             transport_topic: None,
             transport_tls_ca_path: None,
-            transport_tls_cert_path: d.tls_cert_file.clone(),
-            transport_tls_key_path: d.tls_key_file.clone(),
+            transport_tls_cert_path: transport_tls.0,
+            transport_tls_key_path: transport_tls.1,
             wll_sensor_mapping: d.wll_sensor_mapping.clone(),
-            wll_poll_interval_seconds: d.wll_poll_interval.filter(|v| *v > 0),
+            wll_poll_interval_seconds: wll_poll,
         }));
     }
 
@@ -2297,6 +2592,22 @@ pub fn translate(
                 );
             }
         }
+        let website_tls = match (w.tls_cert_path.clone(), w.tls_key_path.clone()) {
+            (Some(cert), Some(key)) => (Some(cert), Some(key)),
+            (cert, key) => {
+                if cert.is_some() || key.is_some() {
+                    report.push(
+                        NoteKind::NotCarried,
+                        w.name.clone(),
+                        "this website has one half of a TLS pair, which is not a TLS \
+                         configuration: neither is carried, and the site is served over \
+                         plaintext until both are set."
+                            .to_string(),
+                    );
+                }
+                (None, None)
+            }
+        };
         changes.push(Change::PutWebsite(WebsiteWrite {
             id: w.id,
             name: w.name.clone(),
@@ -2314,8 +2625,11 @@ pub fn translate(
             air_quality_station_key: air.clone(),
             is_portal: w.is_portal,
             apple_app_id: or_empty(w.apple_app_id.clone()),
-            tls_cert_path: w.tls_cert_path.clone(),
-            tls_key_path: w.tls_key_path.clone(),
+            // Paired, for the station transport's reason and against the same `CHECK`.
+            // `any_cert` and `default_tls` above already require both halves, so this is
+            // the one place the pairing has to be applied rather than assumed.
+            tls_cert_path: website_tls.0,
+            tls_key_path: website_tls.1,
             is_default_tls: default_tls.is_some() && default_tls == w.id,
         }));
         if w.snow_enabled && snow.is_none() {
@@ -2421,13 +2735,45 @@ pub fn translate(
             }
             claimed.insert(kind, key.clone());
 
+            // **`uploader.name` is UNIQUE across kinds**, so the station key alone is not
+            // a name: a station with both Weather Underground and PWS Weather enabled
+            // would make the second insert fail and abort the whole migration. The prefix
+            // is `ci/db/config-seed.sql`'s own convention -- `wu-backyard`,
+            // `aprs-backyard` -- and it is also the component id's stable suffix, so
+            // `wu:wu-csi` survives a rename of anything else.
+            let prefix = match kind {
+                "wunderground" => "wu",
+                "pwsweather" => "pws",
+                _ => "aprs",
+            };
+            let name = format!("{prefix}-{key}");
+            // **`enabled` is whether the GO DAEMON WAS ACTUALLY UPLOADING**, which is its
+            // own readiness test per service and not the `*_enabled` column alone:
+            //
+            //   `aprsDeviceReady`  enabled, a callsign, AND a non-zero position
+            //   pwsweather         enabled, a station id AND a password
+            //   wunderground       enabled, a station id AND a password
+            //
+            // Both halves of that matter. A row Go was skipping, migrated as enabled, would
+            // START a beacon or an upload that was not happening -- a behaviour change, and
+            // for a radio an unattended one. And `mw_output::plan` refuses an enabled
+            // uploader with a blank credential, and refuses an APRS one with no coordinates
+            // ("an APRS weather report IS a position report"), so an enabled row Go was not
+            // using is also a daemon that does not start. A disabled `uploader` row is not
+            // planned at all, so the pairing survives and one toggle turns it on.
+            let ready = match kind {
+                "wunderground" => d.wu_station_id.is_some() && d.wu_password.is_some(),
+                "pwsweather" => d.pws_station_id.is_some() && d.pws_password.is_some(),
+                _ => {
+                    d.aprs_callsign.is_some()
+                        && d.latitude.is_some_and(|v| v != 0.0)
+                        && d.longitude.is_some_and(|v| v != 0.0)
+                }
+            };
             let mut s = ServiceWrite {
                 kind: kind.to_string(),
-                // The component id's stable suffix, so `wu:csi` survives a rename of
-                // anything else. The station's key, which is unique and component-safe by
-                // construction.
-                name: key.clone(),
-                enabled: true,
+                name: name.clone(),
+                enabled: ready,
                 pairings: vec![Pairing {
                     station_key: key.clone(),
                     remote_station_id: None,
@@ -2443,15 +2789,6 @@ pub fn translate(
                         .or_else(|| go.controllers.wu_api_endpoint.clone());
                     s.api_key = d.wu_password.clone();
                     s.pairings[0].remote_station_id = d.wu_station_id.clone();
-                    if s.api_key.is_none() {
-                        report.push(
-                            NoteKind::Action,
-                            format!("wu:{key}"),
-                            "Weather Underground is on and `wu_password` is empty, so the \
-                             account has no key. Enter it on the service's page."
-                                .to_string(),
-                        );
-                    }
                 }
                 "pwsweather" => {
                     s.interval_seconds = d.pws_upload_interval.filter(|v| *v > 0);
@@ -2461,15 +2798,6 @@ pub fn translate(
                         .or_else(|| go.controllers.pws_api_endpoint.clone());
                     s.api_key = d.pws_password.clone();
                     s.pairings[0].remote_station_id = d.pws_station_id.clone();
-                    if s.api_key.is_none() {
-                        report.push(
-                            NoteKind::Action,
-                            format!("pws:{key}"),
-                            "PWS Weather is on and `pws_password` is empty, so the account \
-                             has no key. Enter it on the service's page."
-                                .to_string(),
-                        );
-                    }
                 }
                 _ => {
                     // The callsign is the station's (public identity, printed on every
@@ -2485,14 +2813,14 @@ pub fn translate(
                         d.aprs_symbol_table.as_deref(),
                         "/",
                         &mut report,
-                        key,
+                        &name,
                         "aprs_symbol_table",
                     );
                     s.aprs_symbol_code = one_char(
                         d.aprs_symbol_code.as_deref(),
                         "_",
                         &mut report,
-                        key,
+                        &name,
                         "aprs_symbol_code",
                     );
                     let transport = match d.aprs_transport.as_deref() {
@@ -2537,7 +2865,7 @@ pub fn translate(
                             {
                                 report.push(
                                     NoteKind::NotCarried,
-                                    format!("aprs:{key}"),
+                                    format!("aprs:{name}"),
                                     "this station beacons over APRS-IS, and its KISS \
                                      columns are not carried: the table's per-transport \
                                      exclusions make configuration nothing reads \
@@ -2561,7 +2889,7 @@ pub fn translate(
                                 s.interval_seconds = Some(RADIO_FLOOR_SECONDS);
                                 report.push(
                                     NoteKind::Raised,
-                                    format!("aprs:{key}"),
+                                    format!("aprs:{name}"),
                                     format!(
                                         "KISS beacon interval raised from {secs} s to the \
                                          {RADIO_FLOOR_SECONDS} s RF floor (O-8). A radio \
@@ -2574,16 +2902,28 @@ pub fn translate(
                             }
                         }
                     }
-                    if s.aprs_passcode.is_none() {
-                        report.push(
-                            NoteKind::Action,
-                            format!("aprs:{key}"),
-                            "APRS is on and `aprs_passcode` is empty. Enter the passcode \
-                             for this callsign on the service's page."
-                                .to_string(),
-                        );
-                    }
                 }
+            }
+            if !ready {
+                let because = match kind {
+                    "wunderground" => "`wu_station_id` or `wu_password` is empty",
+                    "pwsweather" => "`pws_station_id` or `pws_password` is empty",
+                    _ => {
+                        "there is no callsign, or the station has no coordinates -- and an \
+                         APRS weather report IS a position report"
+                    }
+                };
+                report.push(
+                    NoteKind::Action,
+                    format!("{prefix}:{name}"),
+                    format!(
+                        "{service} is switched on for this station in the Go configuration \
+                         and {because}, so the Go daemon was NOT uploading: its own \
+                         readiness test skips a station like this. Migrated with sharing \
+                         OFF and the pairing kept, so filling in what is missing and \
+                         turning it on is two fields and no re-pairing."
+                    ),
+                );
             }
             changes.push(Change::PutService(s));
         }
@@ -2597,45 +2937,82 @@ pub fn translate(
     // than a silently-chosen winner." Aeris is not an uploader -- it is four fetching
     // components (W2a D-33) -- so the pairing carries no `uploader_id`, which is also what
     // makes W3 §7's `aerisWeatherEnabled` derivable.
-    let mut aeris_id: Option<(String, String)> = None;
-    let mut aeris_secret: Option<String> = None;
-    let mut aeris_endpoint: Option<String> = None;
-    let mut aeris_refresh: Option<i64> = None;
+    // **The credential pair travels together, from one device.** Taking the id from the
+    // first device that has one and the secret from the first device that has one -- which
+    // need not be the same device -- is how a mismatched pair gets written `enabled = 1`,
+    // and a silently-chosen winner is the outcome `AerisAccountsDisagree` exists to
+    // prevent. So the first device with a client id DEFINES the account, and every other
+    // device is compared against it.
+    let mut account: Option<(String, GoAeris)> = None;
     let mut paired: Vec<String> = Vec::new();
     for (d, _, key) in &local {
         if let Some(id) = &d.aeris_api_client_id {
-            match &aeris_id {
-                None => aeris_id = Some((key.clone(), id.clone())),
-                Some((first, first_id)) if first_id != id => {
+            let mine = GoAeris {
+                client_id: id.clone(),
+                secret: d.aeris_api_client_secret.clone(),
+                endpoint: d.aeris_api_endpoint.clone(),
+                refresh: d.aeris_refresh_interval.filter(|v| *v > 0),
+            };
+            match &account {
+                None => account = Some((key.clone(), mine)),
+                Some((first, theirs)) if theirs.client_id != mine.client_id => {
                     return Err(ConfigGoError::AerisAccountsDisagree {
                         first: first.clone(),
-                        first_id: first_id.clone(),
+                        first_id: theirs.client_id.clone(),
                         second: key.clone(),
-                        second_id: id.clone(),
+                        second_id: mine.client_id.clone(),
                     })
+                }
+                // The same account named twice with two secrets: one of them is wrong and
+                // this migration cannot tell which.
+                Some((first, theirs))
+                    if mine.secret.is_some()
+                        && theirs.secret.is_some()
+                        && theirs.secret != mine.secret =>
+                {
+                    return Err(ConfigGoError::AerisSecretsDisagree {
+                        first: first.clone(),
+                        second: key.clone(),
+                        client_id: mine.client_id,
+                    })
+                }
+                // The same account, and this device has the secret the first one lacked.
+                Some((first, theirs)) if theirs.secret.is_none() && mine.secret.is_some() => {
+                    account = Some((
+                        first.clone(),
+                        GoAeris {
+                            secret: mine.secret,
+                            ..theirs.clone()
+                        },
+                    ));
                 }
                 Some(_) => {}
             }
-        }
-        if aeris_secret.is_none() {
-            aeris_secret = d.aeris_api_client_secret.clone();
-        }
-        if aeris_endpoint.is_none() {
-            aeris_endpoint = d.aeris_api_endpoint.clone();
-        }
-        // `0` is Go's "derive from the forecast period", which is this column's NULL.
-        if aeris_refresh.is_none() {
-            aeris_refresh = d.aeris_refresh_interval.filter(|v| *v > 0);
         }
         if d.aeris_enabled {
             paired.push(key.clone());
         }
     }
-    let client_id = aeris_id
-        .map(|(_, id)| id)
-        .or_else(|| go.controllers.aeris_api_client_id.clone());
-    let endpoint = aeris_endpoint.or_else(|| go.controllers.aeris_api_endpoint.clone());
-    let aeris_secret = aeris_secret.or_else(|| go.controllers.aeris_api_client_secret.clone());
+    let account = account.map(|(_, a)| a).or_else(|| {
+        // Pre-`013_remove_controller_configs`: the account was on `controller_configs` and
+        // nowhere else, so a database that never ran that migration has it only there.
+        go.controllers
+            .aeris_api_client_id
+            .clone()
+            .map(|client_id| GoAeris {
+                client_id,
+                secret: go.controllers.aeris_api_client_secret.clone(),
+                endpoint: go.controllers.aeris_api_endpoint.clone(),
+                refresh: None,
+            })
+    });
+    let client_id = account.as_ref().map(|a| a.client_id.clone());
+    let aeris_secret = account.as_ref().and_then(|a| a.secret.clone());
+    let aeris_refresh = account.as_ref().and_then(|a| a.refresh);
+    let endpoint = account
+        .as_ref()
+        .and_then(|a| a.endpoint.clone())
+        .or_else(|| go.controllers.aeris_api_endpoint.clone());
     if !paired.is_empty() || client_id.is_some() {
         let complete = client_id.is_some() && aeris_secret.is_some();
         if !paired.is_empty() && !complete {
@@ -3393,7 +3770,7 @@ mod tests {
         assert_eq!(interval, Some(RADIO_FLOOR_SECONDS));
         let raised: Vec<&Note> = migrated.report.of(NoteKind::Raised).collect();
         assert_eq!(raised.len(), 1, "one line, not a paragraph: {raised:#?}");
-        assert_eq!(raised[0].subject, "aprs:roof");
+        assert_eq!(raised[0].subject, "aprs:aprs-roof");
         assert!(raised[0].message.contains("300 s"), "{}", raised[0].message);
         assert!(raised[0].message.contains("600 s"), "{}", raised[0].message);
 
@@ -3467,7 +3844,7 @@ mod tests {
         assert!(migrated
             .report
             .of(NoteKind::NotCarried)
-            .any(|n| n.subject == "aprs:roof"));
+            .any(|n| n.subject == "aprs:aprs-roof"));
         pool.close().await;
     }
 
@@ -4014,16 +4391,41 @@ mod tests {
     }
 
     /// The snow controller's tuning has no column here, and that is reported rather than
-    /// dropped: the first-run DDL inserts a `snowcache` row, so every Go database has one.
+    /// dropped -- but only when the controller is switched ON.
+    ///
+    /// The first-run DDL inserts a `snowcache` row with `enabled = 0`, and the Go daemon
+    /// reads only enabled rows, so a default disabled row is tuning nothing is using and
+    /// there is nothing to say about it. An operator who tuned the detector enabled it.
     #[tokio::test]
     async fn the_snow_controllers_tuning_is_reported_as_having_no_successor() {
+        let device = "INSERT INTO devices (id, config_id, name, type, enabled, serial_device,
+                                           baud, timezone)
+                      VALUES (1, 1, 'roof', 'davis', 1, '/dev/ttyUSB0', 19200,
+                              'America/Denver');";
+
+        // The DDL's own disabled row: nothing to report.
+        let scratch = Scratch::new("snowoff");
+        let migrated = translated(&scratch, &[device])
+            .await
+            .expect("the translation");
+        assert!(
+            migrated
+                .report
+                .of(NoteKind::NotCarried)
+                .all(|n| n.subject != "controller_configs.snow_*"),
+            "a disabled controller is not tuning in use: {:#?}",
+            migrated.report.notes
+        );
+
+        // Tuned and switched on: named, with where the constants now live.
         let scratch = Scratch::new("snowtune");
         let migrated = translated(
             &scratch,
             &[
-                "INSERT INTO devices (id, config_id, name, type, enabled, serial_device, baud,
-                                    timezone)
-               VALUES (1, 1, 'roof', 'davis', 1, '/dev/ttyUSB0', 19200, 'America/Denver');",
+                device,
+                "UPDATE controller_configs SET enabled = 1, snow_penalty = 4.5,
+                        snow_min_accumulation = 7.5, snow_station_name = 'roof'
+                 WHERE controller_type = 'snowcache';",
             ],
         )
         .await
@@ -4033,7 +4435,11 @@ mod tests {
             .of(NoteKind::NotCarried)
             .find(|n| n.subject == "controller_configs.snow_*")
             .expect("the tuning is named");
-        assert!(note.message.contains("snow_penalty=3"), "{}", note.message);
+        assert!(
+            note.message.contains("snow_penalty=4.5"),
+            "{}",
+            note.message
+        );
         assert!(
             note.message.contains("mw_pipeline::snow::pelt"),
             "{}",
@@ -4363,10 +4769,14 @@ mod tests {
         .await
         .expect("the uploader");
         assert_eq!(row.0, "pwsweather");
-        // `pws:<name>` is the component id, so the name has to be component-safe: the
-        // station key is, by construction.
-        assert_eq!(row.1, "roof");
-        assert_eq!(row.2, 1);
+        // `pws:<name>` is the component id, so the name has to be component-safe -- and
+        // UNIQUE across kinds, which the kind prefix is what buys.
+        assert_eq!(row.1, "pws-roof");
+        // **OFF**, because `pws_password` is empty and the Go daemon's own readiness test
+        // was therefore skipping this station: migrating it on would start an upload that
+        // was not happening, and `mw_output::plan` refuses an enabled uploader with no
+        // credential anyway.
+        assert_eq!(row.2, 0);
         assert_eq!(row.3, Some(120));
         // The device's endpoint is empty, so the controller's global one is used.
         assert_eq!(
@@ -4382,10 +4792,419 @@ mod tests {
         .await
         .expect("the pairing");
         assert_eq!(pairing, ("roof".to_string(), Some("PWSROOF".to_string())));
-        assert!(migrated
+        let note = migrated
             .report
             .of(NoteKind::Action)
-            .any(|n| n.subject == "pws:roof"));
+            .find(|n| n.subject == "pws:pws-roof")
+            .expect("the owner is told what to fill in");
+        assert!(
+            note.message.contains("was NOT uploading"),
+            "{}",
+            note.message
+        );
         pool.close().await;
+    }
+
+    /// **One station with three services.** `uploader.name` is UNIQUE across kinds, so the
+    /// station key alone is not a name: the second insert would fail and abort the whole
+    /// migration. The prefix is `ci/db/config-seed.sql`'s own convention.
+    #[tokio::test]
+    async fn one_station_may_share_with_every_service_at_once() {
+        let scratch = Scratch::new("threeservices");
+        let (pool, _m) = migrate(
+            &scratch,
+            &[
+                "INSERT INTO devices (id, config_id, name, type, enabled, serial_device, baud,
+                                    timezone, wu_enabled, wu_station_id, wu_password,
+                                    pws_enabled, pws_station_id, pws_password,
+                                    aprs_enabled, aprs_callsign, aprs_passcode)
+               VALUES (1, 1, 'roof', 'davis', 1, '/dev/ttyUSB0', 19200, 'America/Denver',
+                       1, 'KONE', 'wukey', 1, 'PWSROOF', 'pwskey', 1, 'N0CALL-1', '12345');",
+            ],
+        )
+        .await;
+        let names: Vec<(String, String)> =
+            sqlx::query_as("SELECT kind, name FROM uploader ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .expect("three uploaders");
+        assert_eq!(
+            names,
+            vec![
+                ("aprs".to_string(), "aprs-roof".to_string()),
+                ("pwsweather".to_string(), "pws-roof".to_string()),
+                ("wunderground".to_string(), "wu-roof".to_string()),
+            ]
+        );
+        // One pairing per service, each naming an account of its own kind -- which is what
+        // `station_service`'s composite foreign key is for.
+        let pairings: Vec<(String, String)> = sqlx::query_as(
+            "SELECT s.service, u.name FROM station_service s JOIN uploader u \
+             ON u.id = s.uploader_id ORDER BY s.service",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("three pairings");
+        assert_eq!(
+            pairings,
+            vec![
+                ("aprs".to_string(), "aprs-roof".to_string()),
+                ("pwsweather".to_string(), "pws-roof".to_string()),
+                ("wunderground".to_string(), "wu-roof".to_string()),
+            ]
+        );
+        pool.close().await;
+    }
+
+    /// A **disabled** TimescaleDB backend is not the live weather database.
+    ///
+    /// Go was writing nothing to it, and migrating it as the connection would give this
+    /// daemon a `writer:timescale` against a server the old one was not using.
+    #[tokio::test]
+    async fn a_disabled_storage_backend_is_not_the_weather_database() {
+        let scratch = Scratch::new("storageoff");
+        let migrated = translated(
+            &scratch,
+            &[
+                "INSERT INTO devices (id, config_id, name, type, enabled, serial_device, baud,
+                                      timezone)
+                 VALUES (1, 1, 'roof', 'davis', 1, '/dev/ttyUSB0', 19200, 'America/Denver');",
+                "INSERT INTO storage_configs (config_id, backend_type, enabled,
+                                              timescale_host, timescale_database)
+                 VALUES (1, 'timescaledb', 0, 'pitcairn', 'weather');",
+            ],
+        )
+        .await
+        .expect("the translation");
+        assert!(
+            !migrated
+                .changes
+                .iter()
+                .any(|c| matches!(c, Change::PutWeatherDatabase(_))),
+            "a disabled backend became the live connection"
+        );
+        let note = migrated
+            .report
+            .of(NoteKind::NotCarried)
+            .find(|n| n.subject == "storage_configs.timescaledb")
+            .expect("the disabled backend is named");
+        assert!(note.message.contains("DISABLED"), "{}", note.message);
+    }
+
+    /// **The listener's four ports have to differ, and the DEFAULTS are part of that.**
+    ///
+    /// A Go deployment whose REST server is on 8081 would otherwise be migrated with
+    /// `management_port` falling back to its own default of 8081, and refused by the schema.
+    #[tokio::test]
+    async fn a_port_that_collides_with_a_default_is_moved_rather_than_refused() {
+        let scratch = Scratch::new("ports");
+        let (pool, migrated) = migrate(
+            &scratch,
+            &[
+                "INSERT INTO devices (id, config_id, name, type, enabled, serial_device, baud,
+                                      timezone)
+                 VALUES (1, 1, 'roof', 'davis', 1, '/dev/ttyUSB0', 19200, 'America/Denver');",
+                // The REST server on the management API's default port, and the gRPC server
+                // on it too, which is the worst case the four CHECKs can see.
+                "INSERT INTO controller_configs (config_id, controller_type, enabled,
+                                                 rest_port, grpc_port)
+                 VALUES (1, 'rest', 1, 8081, 8081);",
+            ],
+        )
+        .await;
+        let row: (i64, Option<i64>, i64, i64) = sqlx::query_as(
+            "SELECT http_port, https_port, grpc_port, management_port FROM listener",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the listener row was accepted");
+        assert_eq!(row.0, 8081, "the port Go was serving on is kept");
+        assert_eq!(row.1, None);
+        assert_ne!(row.2, row.0);
+        assert_ne!(row.3, row.0);
+        assert_ne!(row.3, row.2);
+        // And each move is a line, because an operator looking for the management API at
+        // 8081 needs to know where it went.
+        assert!(
+            migrated
+                .report
+                .of(NoteKind::Raised)
+                .filter(|n| n.subject.starts_with("listener."))
+                .count()
+                >= 2,
+            "{:#?}",
+            migrated.report.notes
+        );
+        pool.close().await;
+    }
+
+    /// `wll_poll_interval_seconds` has a 30 s floor as a `CHECK` and the Go column has none,
+    /// so a sub-floor value is raised with a line rather than aborting the migration.
+    #[tokio::test]
+    async fn a_sub_floor_weatherlink_poll_interval_is_raised() {
+        let scratch = Scratch::new("wllfloor");
+        let (pool, migrated) = migrate(
+            &scratch,
+            &[
+                "INSERT INTO devices (id, config_id, name, type, enabled, wll_host,
+                                    wll_broadcast, wll_sensor_mapping, wll_poll_interval,
+                                    timezone)
+               VALUES (1, 1, 'roof', 'weatherlink-live', 1, '192.168.1.50', 0,
+                       'th:1, rain:1', 10, 'America/Denver');",
+            ],
+        )
+        .await;
+        let secs: Option<i64> =
+            sqlx::query_scalar("SELECT wll_poll_interval_seconds FROM stations")
+                .fetch_one(&pool)
+                .await
+                .expect("the station");
+        assert_eq!(secs, Some(WLL_POLL_FLOOR_SECONDS));
+        assert!(migrated
+            .report
+            .of(NoteKind::Raised)
+            .any(|n| n.subject == "roof" && n.message.contains("30 s floor")));
+        pool.close().await;
+    }
+
+    /// Half a TLS pair is not a TLS configuration, and the column pair's `CHECK` says so --
+    /// so a one-sided Go pair is resolved here rather than aborting on a constraint.
+    #[tokio::test]
+    async fn half_a_tls_pair_is_carried_as_neither_half() {
+        let scratch = Scratch::new("halftls");
+        let (pool, migrated) = migrate(
+            &scratch,
+            &[
+                "INSERT INTO devices (id, config_id, name, type, enabled, hostname, port,
+                                      timezone, tls_cert_file)
+                 VALUES (1, 1, 'roof', 'davis', 1, '10.0.0.9', '6785', 'America/Denver',
+                         '/etc/only-a-cert.pem');",
+                "INSERT INTO weather_websites (id, config_id, name, device_id, hostname,
+                                               tls_key_path)
+                 VALUES (1, 1, 'site', 1, 'example.test', '/etc/only-a-key.pem');",
+            ],
+        )
+        .await;
+        let station: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT transport_tls_cert_path, transport_tls_key_path FROM stations")
+                .fetch_one(&pool)
+                .await
+                .expect("the station");
+        assert_eq!(station, (None, None));
+        let site: (Option<String>, Option<String>, i64) =
+            sqlx::query_as("SELECT tls_cert_path, tls_key_path, is_default_tls FROM website")
+                .fetch_one(&pool)
+                .await
+                .expect("the website");
+        assert_eq!(site, (None, None, 0));
+        // The listener therefore has no TLS port either, which is the consequence that
+        // matters: `any_cert` reads the same pairing.
+        let https: Option<i64> = sqlx::query_scalar("SELECT https_port FROM listener")
+            .fetch_one(&pool)
+            .await
+            .expect("the listener");
+        assert_eq!(https, None);
+        assert_eq!(
+            migrated
+                .report
+                .of(NoteKind::NotCarried)
+                .filter(|n| n.message.contains("half of a TLS pair"))
+                .count(),
+            2
+        );
+        pool.close().await;
+    }
+
+    /// The Aeris credential pair travels from ONE device, and two secrets for one client id
+    /// is a refusal rather than a silently-chosen winner.
+    #[tokio::test]
+    async fn the_forecast_credential_pair_comes_from_one_device() {
+        // The id is on the first device and the secret on the second. Assembling the pair
+        // from two rows is how a mismatched credential gets written `enabled = 1`.
+        let scratch = Scratch::new("aerispair");
+        let migrated = translated(
+            &scratch,
+            &[
+                "INSERT INTO devices (id, config_id, name, type, enabled, serial_device, baud,
+                                      timezone, aeris_enabled, aeris_api_client_id)
+                 VALUES (1, 1, 'roof', 'davis', 1, '/dev/ttyUSB0', 19200, 'America/Denver',
+                         1, 'cid');",
+                "INSERT INTO devices (id, config_id, name, type, enabled, serial_device, baud,
+                                      timezone, aeris_enabled, aeris_api_client_id,
+                                      aeris_api_client_secret)
+                 VALUES (2, 1, 'ridge', 'davis', 1, '/dev/ttyUSB1', 19200, 'America/Denver',
+                         1, 'cid', 'the-secret');",
+            ],
+        )
+        .await
+        .expect("one account named twice, with one secret between them");
+        let write = migrated
+            .changes
+            .iter()
+            .find_map(|c| match c {
+                Change::PutAeris(a) => Some(a),
+                _ => None,
+            })
+            .expect("the account");
+        assert_eq!(write.client_id.as_deref(), Some("cid"));
+        assert_eq!(write.client_secret.as_deref(), Some("the-secret"));
+        assert!(write.enabled, "the pair is complete, so it is on");
+
+        // Two secrets for one id: one of them is wrong and this cannot tell which.
+        let scratch = Scratch::new("aerissecrets");
+        let e = translated(
+            &scratch,
+            &[
+                "INSERT INTO devices (id, config_id, name, type, enabled, serial_device, baud,
+                                      timezone, aeris_enabled, aeris_api_client_id,
+                                      aeris_api_client_secret)
+                 VALUES (1, 1, 'roof', 'davis', 1, '/dev/ttyUSB0', 19200, 'America/Denver',
+                         1, 'cid', 'secret-one');",
+                "INSERT INTO devices (id, config_id, name, type, enabled, serial_device, baud,
+                                      timezone, aeris_enabled, aeris_api_client_id,
+                                      aeris_api_client_secret)
+                 VALUES (2, 1, 'ridge', 'davis', 1, '/dev/ttyUSB1', 19200, 'America/Denver',
+                         1, 'cid', 'secret-two');",
+            ],
+        )
+        .await
+        .expect_err("two secrets for one account");
+        assert!(
+            matches!(e, ConfigGoError::AerisSecretsDisagree { .. }),
+            "{e}"
+        );
+        assert!(e.to_string().contains("cannot tell which"), "{e}");
+    }
+
+    /// **The Ambient station is migrated off**, because the Go schema holds neither half of
+    /// what it needs: `plan()` requires the `?PASSWORD=` as a stored hash and the `?ID=` as
+    /// the presented claim, and the Go daemon used the port the request arrived on instead.
+    #[tokio::test]
+    async fn an_ambient_station_is_migrated_switched_off() {
+        let scratch = Scratch::new("ambientoff");
+        let (pool, migrated) = migrate(
+            &scratch,
+            &[
+                "INSERT INTO devices (id, config_id, name, type, enabled, port, path, timezone)
+               VALUES (1, 1, 'console', 'ambient-customized', 1, '8081', '/weatherstation',
+                       'America/Denver');",
+            ],
+        )
+        .await;
+        let row: (i64, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT enabled, presented_key, ingest_secret_hash FROM stations")
+                .fetch_one(&pool)
+                .await
+                .expect("the station");
+        assert_eq!(row.0, 0, "switched off rather than unplannable");
+        assert_eq!(row.1, None);
+        assert_eq!(row.2, None);
+        let note = migrated
+            .report
+            .of(NoteKind::Action)
+            .find(|n| n.subject == "console" && n.message.contains("PASSWORD"))
+            .expect("both fields are named");
+        assert!(note.message.contains("presented_key"), "{}", note.message);
+        pool.close().await;
+    }
+
+    /// **A controller field belongs to the row whose type owns it, and only to an enabled
+    /// row.**
+    ///
+    /// Every `controller_configs` row carries every column, and three have non-NULL
+    /// DEFAULTS -- so "the first non-NULL across rows" would read the DDL-inserted
+    /// `snowcache` row's default `grpc_port` of 50051 in preference to the `rest` row's real
+    /// one, on every database the Go daemon has ever created.
+    #[tokio::test]
+    async fn a_controller_field_comes_from_its_own_enabled_row() {
+        let scratch = Scratch::new("controllers");
+        let migrated = translated(
+            &scratch,
+            &[
+                "INSERT INTO devices (id, config_id, name, type, enabled, serial_device, baud,
+                                      timezone)
+                 VALUES (1, 1, 'roof', 'davis', 1, '/dev/ttyUSB0', 19200, 'America/Denver');",
+                // The `rest` row owns the gRPC columns, and its id is ABOVE the
+                // DDL-inserted `snowcache` row's.
+                "INSERT INTO controller_configs (config_id, controller_type, enabled,
+                                                 rest_port, grpc_port)
+                 VALUES (1, 'rest', 1, 9090, 9091);",
+                // A DISABLED management row: Go reads only enabled ones, so its port is not
+                // the management port.
+                "INSERT INTO controller_configs (config_id, controller_type, enabled,
+                                                 management_port, management_auth_token)
+                 VALUES (1, 'management', 0, 9099, 'a-token');",
+                // And a controller type this migration has no arm for.
+                "INSERT INTO controller_configs (config_id, controller_type, enabled)
+                 VALUES (1, 'somethingelse', 1);",
+            ],
+        )
+        .await
+        .expect("the translation");
+        let listener = migrated
+            .changes
+            .iter()
+            .find_map(|c| match c {
+                Change::PutListener(l) => Some(l),
+                _ => None,
+            })
+            .expect("the listener");
+        assert_eq!(listener.http_port, 9090);
+        assert_eq!(
+            listener.grpc_port, 9091,
+            "the `snowcache` row's default must not win"
+        );
+        assert_eq!(
+            listener.management_port, 8081,
+            "the disabled management row is not read"
+        );
+        assert!(
+            !migrated
+                .report
+                .of(NoteKind::Action)
+                .any(|n| n.subject == "management"),
+            "a disabled row's auth token is not a dead credential to warn about"
+        );
+        assert!(migrated
+            .report
+            .of(NoteKind::NotCarried)
+            .any(|n| n.subject == "controller_configs.somethingelse"));
+    }
+
+    /// **Every Go read is scoped to the `default` configuration**, so a second named one is
+    /// rows nothing has ever loaded -- and migrating them would produce a deployment that
+    /// was never deployed.
+    #[tokio::test]
+    async fn only_the_default_configuration_is_migrated() {
+        let scratch = Scratch::new("configs");
+        let migrated = translated(
+            &scratch,
+            &[
+                "INSERT INTO configs (id, name) VALUES (2, 'an-old-experiment');",
+                "INSERT INTO devices (id, config_id, name, type, enabled, serial_device, baud,
+                                      timezone)
+                 VALUES (1, 1, 'roof', 'davis', 1, '/dev/ttyUSB0', 19200, 'America/Denver');",
+                "INSERT INTO devices (id, config_id, name, type, enabled, serial_device, baud,
+                                      timezone)
+                 VALUES (2, 2, 'ghost', 'davis', 1, '/dev/ttyUSB9', 19200, 'America/Denver');",
+                "INSERT INTO weather_websites (id, config_id, name) VALUES (1, 2, 'ghost-site');",
+            ],
+        )
+        .await
+        .expect("the translation");
+        assert_eq!(migrated.station_keys(), vec!["roof"]);
+        assert!(
+            !migrated
+                .changes
+                .iter()
+                .any(|c| matches!(c, Change::PutWebsite(_))),
+            "the other configuration's website is not migrated"
+        );
+        let note = migrated
+            .report
+            .of(NoteKind::NotCarried)
+            .find(|n| n.subject == "configs")
+            .expect("the unused configuration is named");
+        assert!(note.message.contains('1'), "{}", note.message);
     }
 }
