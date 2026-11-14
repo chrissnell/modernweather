@@ -7,11 +7,24 @@
 //! with this work item. It has: the rule now names this file, so `println!` anywhere else
 //! in the binary is a gate failure rather than a convention.
 //!
-//! **Hand-rolled rather than `clap`.** Four options, one of them required, and DESIGN.md
-//! D-32's table is the list of crates this program may use for an idiom it needs -- "a
-//! substitution is an amendment, not a manifest edit". An argument parser is not in it,
-//! and `--config <path>` is W8 assumption 2's entire requirement: the systemd unit and the
-//! Dockerfile both spell it that way, so what matters is that the spelling is exact.
+//! **Hand-rolled rather than `clap`.** A handful of options, one of them required, and
+//! DESIGN.md D-32's table is the list of crates this program may use for an idiom it needs
+//! -- "a substitution is an amendment, not a manifest edit". An argument parser is not in
+//! it, and `--config <path>` is W8 assumption 2's entire requirement: the systemd unit and
+//! the Dockerfile both spell it that way, so what matters is that the spelling is exact.
+//!
+//! **The three subcommands of W5 §3.6** arrived with implementation-plan.md **M7-2** and are
+//! the reason there is a [`Command`] at all: a credential store with no backdoor needs a
+//! recovery path, and the right trust boundary for it is local filesystem access. If you can
+//! run `modernweather reset-password`, you can already read the configuration database --
+//! which holds the weather database's password, the Weather Underground password and the
+//! APRS passcode. A recovery path weaker than the thing it protects would be a hole; one
+//! that is stronger would be theatre.
+//!
+//! Each of them takes `--config <path>`, which W5 §3.6 does not write. It is required for
+//! the daemon's own reason, stated at `a_missing_configuration_is_refused_rather_than_defaulted`
+//! below: a program that invents a path creates a database somewhere nobody looked and then
+//! reports that it has no administrator.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -30,6 +43,39 @@ pub struct Args {
     /// `--log-level <directive>`, in `RUST_LOG` syntax. Overrides `RUST_LOG` itself,
     /// because an explicit flag is more specific than an inherited environment.
     pub directive: Option<String>,
+    /// `--setup-listen <address>`, W5 §3.4's explicit opt-out for a headless install.
+    ///
+    /// The management API binds loopback until an administrator account exists. This widens
+    /// that window deliberately, which is the property §3.4 asks for: it logs a `WARN`
+    /// naming the risk, and it is **ignored once the instance is claimed**, because from
+    /// then on `listener.management_listen_addr` is the answer.
+    pub setup_listen: Option<std::net::IpAddr>,
+}
+
+/// One of W5 §3.6's recovery commands, run on the host rather than through the API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    /// `reset-password [--username <name>]` — the locked-out answer.
+    ///
+    /// Revokes **every** session, because the case it exists for is usually accompanied by
+    /// not knowing what else is signed in.
+    ResetPassword {
+        /// The configuration database.
+        config: PathBuf,
+        /// Rename the administrator while resetting, or `None` to leave the name alone.
+        username: Option<String>,
+    },
+    /// `reset-setup-token` — re-issue the one-time claim code for an instance that was never
+    /// claimed and whose console output has scrolled away.
+    ResetSetupToken {
+        /// The configuration database.
+        config: PathBuf,
+    },
+    /// `sessions revoke --all` — "I left myself signed in somewhere".
+    RevokeSessions {
+        /// The configuration database.
+        config: PathBuf,
+    },
 }
 
 /// What a parse produced.
@@ -37,6 +83,8 @@ pub struct Args {
 pub enum Parsed {
     /// Run the daemon.
     Run(Args),
+    /// Run one of W5 §3.6's commands and exit.
+    Command(Command),
     /// `--help` or `--version` was asked for and has been printed.
     Printed,
 }
@@ -63,21 +111,63 @@ pub enum ArgsError {
         /// What was given.
         arg: String,
     },
+    /// A flag that only applies to one command was used with another, or with the daemon.
+    #[error("{flag} is only for `{command}`")]
+    WrongCommand {
+        /// The flag.
+        flag: &'static str,
+        /// Where it belongs.
+        command: &'static str,
+    },
+    /// `{words}` is not a command this binary has.
+    #[error(
+        "`{words}` is not a command; expected reset-password, reset-setup-token or \
+             `sessions revoke --all`"
+    )]
+    NoSuchCommand {
+        /// What was typed.
+        words: String,
+    },
+    /// `sessions revoke` without `--all`.
+    #[error("`sessions revoke` needs --all; there is no way to name one session from here")]
+    NeedsAll,
+    /// `--setup-listen` was given something that is not an address.
+    #[error("`{value}` is not an address to listen on")]
+    BadAddress {
+        /// What was given.
+        value: String,
+    },
 }
 
 const USAGE: &str = "\
 modernweather - weather station data collection and distribution
 
 Usage: modernweather --config <path> [options]
+       modernweather reset-password --config <path> [--username <name>]
+       modernweather reset-setup-token --config <path>
+       modernweather sessions revoke --all --config <path>
 
 Options:
   --config <path>          The SQLite configuration database. Created if absent;
-                           migrations are applied on every start.
+                           migrations are applied on every start. Required.
   --log-format <format>    pretty | json. Default: pretty on a terminal, JSON otherwise.
   --log-level <directive>  RUST_LOG syntax, e.g. `info,mw_station=debug`. Overrides
                            RUST_LOG. Adjustable at run time through the management API.
+  --setup-listen <addr>    Bind the management API here while this daemon has no
+                           administrator account, instead of 127.0.0.1. For a headless
+                           install with no SSH access. Widens the first-run window
+                           deliberately and logs a warning; ignored once an account exists.
   -h, --help               Print this and exit.
   -V, --version            Print the version and exit.
+
+Commands, all run on this machine and all needing only read/write access to the
+configuration database:
+  reset-password           Set a new administrator password and sign out everywhere.
+                           Prompts twice on a terminal; otherwise reads the new password
+                           from standard input. --username also renames the account.
+  reset-setup-token        Print a new one-time setup code for an instance that has no
+                           administrator account yet.
+  sessions revoke --all    Sign out of every browser.
 ";
 
 /// Parse the arguments, with `--help` and `--version` handled here.
@@ -90,6 +180,12 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, ArgsEr
     let mut config = None;
     let mut format = None;
     let mut directive = None;
+    let mut setup_listen = None;
+    let mut username = None;
+    let mut all = false;
+    // The subcommand, as the words that were not flags. `sessions revoke` is two, which is
+    // why this is a list rather than an `Option<String>`.
+    let mut words: Vec<String> = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         // `--flag=value` and `--flag value` both, because the systemd unit writes the
@@ -122,6 +218,22 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, ArgsEr
                 })?);
             }
             "--log-level" => directive = Some(value()?.to_string_lossy().into_owned()),
+            "--setup-listen" => {
+                let v = value()?.to_string_lossy().into_owned();
+                // The bare address, not `addr:port`: the port is `listener.management_port`
+                // and this flag widens the *bind*, it does not move the service. Accepting a
+                // port here would be a second place the port is configured.
+                let bare = v
+                    .strip_prefix('[')
+                    .and_then(|h| h.strip_suffix(']'))
+                    .unwrap_or(&v);
+                setup_listen = Some(
+                    bare.parse()
+                        .map_err(|_| ArgsError::BadAddress { value: v.clone() })?,
+                );
+            }
+            "--username" => username = Some(value()?.to_string_lossy().into_owned()),
+            "--all" => all = true,
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return Ok(Parsed::Printed);
@@ -130,6 +242,10 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, ArgsEr
                 println!("modernweather {}", env!("CARGO_PKG_VERSION"));
                 return Ok(Parsed::Printed);
             }
+            // A word rather than a flag: part of a subcommand. Collected rather than
+            // matched here so that `--config` may appear on either side of it, which is what
+            // every operator will type without thinking about it.
+            word if !word.starts_with('-') => words.push(word.to_string()),
             _ => {
                 return Err(ArgsError::Unknown {
                     arg: arg.to_string_lossy().into_owned(),
@@ -137,11 +253,82 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, ArgsEr
             }
         }
     }
-    Ok(Parsed::Run(Args {
-        config: config.ok_or(ArgsError::NoConfig)?,
-        format,
-        directive,
-    }))
+    let config = config.ok_or(ArgsError::NoConfig)?;
+    let joined = words.join(" ");
+    match joined.as_str() {
+        "" => {
+            // The daemon. The command-only flags are rejected rather than ignored: silently
+            // accepting `--username` here would read as having renamed something.
+            if username.is_some() {
+                return Err(ArgsError::WrongCommand {
+                    flag: "--username",
+                    command: "reset-password",
+                });
+            }
+            if all {
+                return Err(ArgsError::WrongCommand {
+                    flag: "--all",
+                    command: "sessions revoke",
+                });
+            }
+            Ok(Parsed::Run(Args {
+                config,
+                format,
+                directive,
+                setup_listen,
+            }))
+        }
+        "reset-password" => {
+            reject_daemon_flags(setup_listen.is_some(), all)?;
+            Ok(Parsed::Command(Command::ResetPassword { config, username }))
+        }
+        "reset-setup-token" => {
+            reject_daemon_flags(setup_listen.is_some(), all)?;
+            if username.is_some() {
+                return Err(ArgsError::WrongCommand {
+                    flag: "--username",
+                    command: "reset-password",
+                });
+            }
+            Ok(Parsed::Command(Command::ResetSetupToken { config }))
+        }
+        "sessions revoke" => {
+            if setup_listen.is_some() {
+                return Err(ArgsError::WrongCommand {
+                    flag: "--setup-listen",
+                    command: "modernweather --config <path>",
+                });
+            }
+            if username.is_some() {
+                return Err(ArgsError::WrongCommand {
+                    flag: "--username",
+                    command: "reset-password",
+                });
+            }
+            if !all {
+                return Err(ArgsError::NeedsAll);
+            }
+            Ok(Parsed::Command(Command::RevokeSessions { config }))
+        }
+        _ => Err(ArgsError::NoSuchCommand { words: joined }),
+    }
+}
+
+/// Refuse the flags that belong to the daemon, or to another command, on a command.
+fn reject_daemon_flags(setup_listen: bool, all: bool) -> Result<(), ArgsError> {
+    if setup_listen {
+        return Err(ArgsError::WrongCommand {
+            flag: "--setup-listen",
+            command: "modernweather --config <path>",
+        });
+    }
+    if all {
+        return Err(ArgsError::WrongCommand {
+            flag: "--all",
+            command: "sessions revoke",
+        });
+    }
+    Ok(())
 }
 
 /// Report a failure that happened before -- or instead of -- the subscriber.
@@ -298,6 +485,133 @@ mod tests {
                 arg: "--verbose".into()
             }
         );
+    }
+
+    fn parse_command(args: &[&str]) -> Command {
+        match parse(args.iter().map(OsString::from)) {
+            Ok(Parsed::Command(c)) => c,
+            other => panic!("expected a command, got {other:?}"),
+        }
+    }
+
+    /// W5 §3.6's three commands, with `--config` on either side of the words -- which is
+    /// what an operator types without thinking about it.
+    #[test]
+    fn the_three_recovery_commands_parse_with_the_config_on_either_side() {
+        assert_eq!(
+            parse_command(&["reset-password", "--config", "/tmp/a.db"]),
+            Command::ResetPassword {
+                config: PathBuf::from("/tmp/a.db"),
+                username: None
+            }
+        );
+        assert_eq!(
+            parse_command(&[
+                "--config",
+                "/tmp/a.db",
+                "reset-password",
+                "--username",
+                "chris"
+            ]),
+            Command::ResetPassword {
+                config: PathBuf::from("/tmp/a.db"),
+                username: Some("chris".into())
+            }
+        );
+        assert_eq!(
+            parse_command(&["reset-setup-token", "--config=/tmp/a.db"]),
+            Command::ResetSetupToken {
+                config: PathBuf::from("/tmp/a.db")
+            }
+        );
+        assert_eq!(
+            parse_command(&["sessions", "revoke", "--all", "--config", "/tmp/a.db"]),
+            Command::RevokeSessions {
+                config: PathBuf::from("/tmp/a.db")
+            }
+        );
+    }
+
+    /// Every way of getting a command wrong, including the two that would otherwise be
+    /// silently accepted and read as having done something.
+    #[test]
+    fn a_misspelled_command_or_a_misplaced_flag_is_refused_rather_than_ignored() {
+        assert_eq!(
+            parse_err(&["reset-passwd", "--config", "/tmp/a.db"]),
+            ArgsError::NoSuchCommand {
+                words: "reset-passwd".into()
+            }
+        );
+        // `sessions revoke` with no `--all` does nothing, so it is an error rather than a
+        // command that revoked nothing and said so.
+        assert_eq!(
+            parse_err(&["sessions", "revoke", "--config", "/tmp/a.db"]),
+            ArgsError::NeedsAll
+        );
+        // A command-only flag on the daemon.
+        assert_eq!(
+            parse_err(&["--config", "/tmp/a.db", "--username", "chris"]),
+            ArgsError::WrongCommand {
+                flag: "--username",
+                command: "reset-password"
+            }
+        );
+        assert_eq!(
+            parse_err(&["--config", "/tmp/a.db", "--all"]),
+            ArgsError::WrongCommand {
+                flag: "--all",
+                command: "sessions revoke"
+            }
+        );
+        // A daemon-only flag on a command.
+        assert_eq!(
+            parse_err(&[
+                "reset-password",
+                "--config",
+                "/tmp/a.db",
+                "--setup-listen",
+                "0.0.0.0"
+            ]),
+            ArgsError::WrongCommand {
+                flag: "--setup-listen",
+                command: "modernweather --config <path>"
+            }
+        );
+        // And a command still needs the database.
+        assert_eq!(parse_err(&["reset-password"]), ArgsError::NoConfig);
+    }
+
+    /// `--setup-listen` takes a bare address, in both families, and refuses anything else.
+    ///
+    /// Bare rather than `addr:port`, because the port is `listener.management_port` and this
+    /// flag widens the bind rather than moving the service -- accepting one here would be a
+    /// second place the port is configured.
+    #[test]
+    fn setup_listen_takes_a_bare_address_in_either_family() {
+        for (given, expected) in [
+            ("0.0.0.0", "0.0.0.0"),
+            ("192.168.1.10", "192.168.1.10"),
+            ("::", "::"),
+            ("[::1]", "::1"),
+        ] {
+            let args = parse_ok(&["--config", "/tmp/a.db", "--setup-listen", given]);
+            assert_eq!(
+                args.setup_listen.map(|a| a.to_string()).as_deref(),
+                Some(expected),
+                "{given}"
+            );
+        }
+        for bad in ["weatherbox", "0.0.0.0:8081", ""] {
+            assert_eq!(
+                parse_err(&["--config", "/tmp/a.db", "--setup-listen", bad]),
+                ArgsError::BadAddress {
+                    value: bad.to_string()
+                },
+                "{bad}"
+            );
+        }
+        // Absent is the normal case and is not a widened window.
+        assert_eq!(parse_ok(&["--config", "/tmp/a.db"]).setup_listen, None);
     }
 
     #[test]

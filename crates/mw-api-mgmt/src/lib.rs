@@ -10,11 +10,13 @@
 //! Forbidden to depend on `mw-store` directly -- it writes through `ConfigAdmin` -- or on
 //! `mw-pipeline`. Designed by W5.
 //!
-//! # The three things this crate is, in one sentence each
+//! # The five things this crate is, in one sentence each
 //!
 //! | | |
 //! |---|---|
 //! | [`routes`] | the handler set, the router, and [`routes::ApiDoc`], which **is** the schema |
+//! | [`auth`] | W5 §3 as code: the hashes, the policy, the encodings and [`auth::AuthStore`] |
+//! | [`guard`] | what happens to a request before a handler sees it, in the order it happens |
 //! | [`admin`] | `ConfigAdmin`: the trait this crate needs from the binary, and the preview/save pair that is one code path |
 //! | [`display`] | **D-36** as code: the one place the component model's vocabulary is translated, on the server |
 //!
@@ -38,6 +40,16 @@
 //! restart" -- M7-1's done-criterion -- is a property of there being one code path rather
 //! than an agreement two of them have to keep.
 //!
+//! # The surface is authenticated, and the loopback narrowing now means what it says
+//!
+//! M7-1 shipped this crate with no authentication at all and an unconditional narrowing of
+//! the management bind address to loopback to make that safe to ship. **M7-2 replaces both
+//! halves of that.** [`auth`] is W5 §3 -- Argon2id at m=64 MiB/t=3/p=4, 32-byte session
+//! secrets stored as SHA-256, the single-use setup code -- and [`guard`] is the gate in front
+//! of every one of M7-1's forty operations. The narrowing is now conditional on the instance
+//! being **unclaimed** (W5 §3.4), with `--setup-listen` as the headless escape hatch, which
+//! is the binary's to apply because the binary is what binds.
+//!
 //! # What is here already, and why one module arrived before the others
 //!
 //! [`freshness`] renders W2a **Decision 20**'s data-presence declaration -- "Forecast last
@@ -56,6 +68,8 @@
 
 /// `ConfigAdmin`, the preview/save pair, and the plan outline a change answers with.
 pub mod admin;
+/// W5 §3 as code: Argon2id, the session, the setup claim, and `AuthStore` (**M7-2**).
+pub mod auth;
 /// What a write sends, and the validation that answers in the operator's words (§7.2, §8.5).
 pub mod change;
 /// **D-36** as code: §0.2's table and §0.4's state, trigger and counter rendering.
@@ -64,6 +78,8 @@ pub mod display;
 pub mod error;
 /// W2a Decision 20's data presence, rendered separately from component state (§0.4).
 pub mod freshness;
+/// The CSRF pair, the CORS allowlist, the security headers and the session gate (**M7-2**).
+pub mod guard;
 /// The log rings and the machine, as traits rather than dependencies.
 pub mod host;
 /// The handler set, the router, and the schema derived from it.
@@ -74,10 +90,12 @@ pub mod runtime;
 pub mod view;
 
 pub use admin::{Applied, Commit, ConfigAdmin, PlanOutline};
+pub use auth::{AuthStore, Minted, NewAccount, NewSession, SetupCode, StoredCredential};
 pub use change::Change;
 pub use display::{Display, Section, Vocabulary};
 pub use error::{ApiError, Body, ErrorBody, FieldError};
 pub use freshness::{render, FreshnessView, Subject};
+pub use guard::{Current, Guard, Peer};
 pub use host::{
     LogEntry, LogField, LogSource, LogsView, Machine, SerialPort, SerialPortsView, Stream,
 };

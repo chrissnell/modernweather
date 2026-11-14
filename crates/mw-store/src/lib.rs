@@ -13,6 +13,8 @@
 //! zeros are produced one layer later, at the DTO in `mw-api-legacy`; the two facts live
 //! in two crates and cannot be confused (§1.7).
 
+/// The three administrative-authentication tables, as statements (W5 §3, **M7-2**).
+pub mod admin_auth;
 /// `ConfigAdmin`'s write half: one statement set per thing an operator can change (M7-1).
 pub mod config_admin;
 /// The configuration store and its migrations (D-8, A-W6-2).
@@ -41,6 +43,7 @@ pub mod version;
 /// `writer:timescale`'s batch `INSERT` and **D-56**'s read-side projections.
 pub mod writer;
 
+pub use crate::admin_auth::{AuthStoreError, Claimed, Credential, NewAccount, SessionRow};
 pub use crate::config_admin::{
     restore, snapshot, AerisWrite, Change, ConfigAdminError, ListenerWrite, Pairing, ServiceWrite,
     StationWrite, WebsiteWrite,

@@ -3499,3 +3499,191 @@ be §4.4's "object with named fields" turned into an object where every field is
 which is the shape §4.4 exists to avoid. There is no `/services/snowcache`, because there is
 nothing to configure. The **page** is one page under "Share my data" either way, which is
 what §1.4's mapping is actually about.
+
+**A-M7-2-1 — `D-32`'s crate table has no general-purpose hash, and two of W5 §3's secrets
+need a fast one.**
+*Proposed by implementation-plan.md **M7-2**, 2026-11-13. Not applied: see above.*
+
+*What was found.* D-32 names `argon2` for password hashing, `subtle` for constant-time
+comparison and `secrecy` for secret wrappers, and no digest. W5 §3.3 and §3.4 both need
+**SHA-256**: the session secret is stored as its SHA-256 and so is the setup code, and
+`migrations/config/20261102230000_config_schema_initial.sql` has already fixed that answer in
+two `CHECK (length(token_hash) = 32)` constraints.
+
+*What was chosen.* `sha2 = "0.10"` is added to `[workspace.dependencies]`, nameable by
+`mw-api-mgmt` only. Argon2id is the wrong primitive for both of these twice over. It is
+**unnecessary**, because the input is 32 bytes of CSPRNG output and there is nothing to
+brute-force; and it is **actively wrong**, because `AuthStore::resolve` runs on every
+management request, so m=64 MiB/t=3 would make one page load allocate 64 MiB three times over
+on the 512 MB target W3 §5.7 sizes against.
+
+`sha2` rather than a second candidate for the reason that makes this amendment cheap: it is
+**already in this dependency graph at this version** — `sqlx-core` depends on 0.10 — so the
+lock file and the shipped binary gain nothing at all, and nothing new enters the audit
+surface. The two `CHECK`s above also rule out Blake2 and Blake3 at their default digest
+lengths, so the schema had already made the choice.
+
+Two smaller feature changes travel with it and are not separate amendments, because neither
+adds a crate. `secrecy` gains `features = ["serde"]`, without which W5 §3.2's "a
+`SecretString` from the moment it is deserialised" cannot be a `#[derive(Deserialize)]`; and
+`argon2` gains `features = ["std"]`, without which `OsRng` — the CSPRNG every secret in §3
+comes out of — is not in scope. The second resolved anyway through another crate's feature
+unification, which is exactly the kind of accident that breaks on an unrelated dependency
+bump, so it is asked for explicitly.
+
+**A-M7-2-2 — a 10,000-entry list of the most common passwords is almost entirely
+unreachable behind a twelve-character minimum.**
+*Raised and resolved by implementation-plan.md **M7-2**, 2026-11-13.*
+
+*What was found.* **O-10** accepts W5 OQ-W5-2's recommendation (b): "ship a ~10k-entry list
+(~80 KB in the binary) as a non-blocking warning". The list that recommendation was written
+against is `SecLists/Passwords/Common-Credentials/10k-most-common.txt`. §3.5 — the *same
+section* — also sets a **minimum length of 12**, enforced before the warning can be reached.
+
+Of the 10,001 entries in that file, **ten** are twelve characters or longer. The other 9,991
+describe passwords the length rule has already refused, so shipping it as written would have
+put 72 KB in a binary that ships to a Raspberry Pi in order to warn about ten passwords.
+Nothing in the design is wrong; the two paragraphs were written to be read separately.
+
+*What was chosen.* The same decision, over a list that can actually be reached: the
+**10,000 most common passwords that are at least twelve characters long**, taken in frequency
+order from `xato-net-10-million-passwords-1000000.txt`, lowercased and deduplicated.
+`crates/mw-api-mgmt/data/README.md` carries the provenance and the exact derivation, and
+`auth::tests` asserts both invariants the lookup depends on — sorted bytewise, and every entry
+within the length policy — so a replacement list that breaks either fails the build rather
+than silently matching nothing.
+
+**Two measured costs, stated rather than estimated.** The file is **137 KB**, not the ~80 KB
+OQ-W5-2 estimated, because the entries that can be reached are the long ones. And the lookup
+is a bisection over the embedded bytes with **no index built and nothing retained**, because
+the shapes that would have been easier — a `HashSet<&str>`, or a `Vec<&str>` in a `OnceLock` —
+are ~500 KB and ~160 KB of heap held for the life of the process, which is a worse trade than
+the file itself on the machine §3.2's parameter choice was sized for.
+
+**A-M7-2-3 — W5 §3.4's setup code is 32 random bytes in its sentence and 160 bits in its
+worked example.**
+*Raised and resolved by implementation-plan.md **M7-2**, 2026-11-13.*
+
+*What was found.* §3.4 step 1 says "**32 random bytes**, base32-encoded without ambiguous
+characters". Step 2's worked example shows `K7QF-2MXB-9HTD-4RWP-6JSA-1NVC-8YEK-3LZU` — eight
+groups of four, which is 32 *characters* and 160 bits, not 32 bytes. Thirty-two bytes is 52
+base32 characters. The two cannot both be right.
+
+*What was chosen.* **The sentence**, because two places state a byte count and they agree with
+each other: §3.4's own step 1, and `admin_setup_token`'s column comment in the initial
+migration ("SHA-256 of 32 random bytes, base32-encoded without ambiguous characters for
+retyping"). The example is illustrative and its characters are not in any base32 alphabet
+anyway — it contains `L` and `U`, which Crockford's excludes. So the code is 52 characters in
+thirteen groups of four rather than eight, and the banner is correspondingly wider.
+
+The alphabet is **Crockford's** (`0123456789ABCDEFGHJKMNPQRSTVWXYZ`), which is the published
+answer to "without ambiguous characters", and the typed code is canonicalised before it is
+hashed: hyphens dropped, lower case folded up, `I` and `l` folded to `1` and `O` to `0`. `U`
+is **not** folded to `V` — it is excluded from the alphabet rather than confused with
+anything, so a `U` is a typo the operator should see fail rather than a character the server
+guesses at.
+
+**A-M7-2-4 — §3.4's automation path is not built, and the reason is that the deployment it
+exists for reads the console.**
+*Proposed by implementation-plan.md **M7-2**, 2026-11-13. Not applied: see above.*
+
+*What was found.* §3.4 offers a third first-run path beside the console code and the CLI:
+`MW_INITIAL_ADMIN_USERNAME` / `MW_INITIAL_ADMIN_PASSWORD`, or the preferred
+`MW_INITIAL_ADMIN_PASSWORD_FILE`, consumed once at first start. It is marked **optional**, and
+the design states its own trade-off plainly: an environment variable ends up in shell history,
+in the compose file, in `docker inspect` and in `/proc/<pid>/environ`.
+
+*What was chosen.* **Not built.** Two reasons, and the second is the one that matters.
+
+It is explicitly optional, so not building it is inside the design rather than a deviation
+from it — this entry exists so that it is a decision somebody can reverse rather than an
+omission somebody has to notice.
+
+And the deployment it exists for already has the console path. The code goes to **stderr**
+(W5 **D-27**), and in a container stderr *is* the aggregated log: `kubectl logs` and
+`docker logs` show the banner. The trust boundary that makes the console path sound — "only
+someone with console or service-log access has the code" — is exactly the boundary a
+`kubectl exec`/`kubectl logs` grant already crosses, so a provisioning tool that can set an
+environment variable can also read the code it would have replaced. What the environment
+variable would add is not reachability but **unattended** first run, and nothing in this
+programme needs one: `modernweather reset-setup-token` covers the case where the banner has
+scrolled away, and M7-5's cutover is one host with an operator in front of it.
+
+If it is wanted later, the shape is fixed by §3.4 and the work is small: read the `_FILE`
+variant preferentially, consume it in the same transaction `claim` already uses, and log the
+trade-off on the startup line.
+
+**A-M7-2-5 — `created_ip` and the claim's audited source IP need the serving path to supply
+a peer address, which `mw-http` was not doing.**
+*Raised and resolved by implementation-plan.md **M7-2**, 2026-11-13.*
+
+*What was found.* W5 §3.3 puts `created_ip` on every administrator session and §3.4 point 5
+requires the successful claim to be logged with its source IP. `mw_http::socket::serve_one`
+served `axum::serve(listener, router)`, which installs no connect information — so no handler
+could learn the peer's address, and both columns would have been permanently `NULL`.
+
+*What was chosen.* `serve_one` serves
+`router.into_make_service_with_connect_info::<SocketAddr>()`, on **every** socket rather than
+only the management one: the alternative is two serving paths that differ in what a handler
+may ask for, and the cost is one `ConnectInfo<SocketAddr>` in each request's extension map.
+
+One implementation detail is worth recording because it looks like a workaround and is not.
+`axum` implements `Connected<IncomingStream<_, TcpListener>>` for `SocketAddr` only for its
+own `TcpListener`, and this module's TLS listener is its own type; the orphan rule forbids
+adding that impl in `mw-http`, because both the trait and `SocketAddr` are foreign. The hook
+`axum` provides for exactly this case is its blanket impl over `TapIo<L, F>`, which holds for
+any listener whose `Addr` is already the connect info — so the listener is tapped with a
+no-op closure. That is the supported path, not a trick, and it costs one indirect call per
+accepted connection.
+
+**A-M7-2-6 — the CORS allowlist is read at startup, and no route edits it.**
+*Raised and resolved by implementation-plan.md **M7-2**, 2026-11-13.*
+
+*What was found.* §3.5 replaces `Access-Control-Allow-Origin: *` with an exact-match
+allowlist, default empty, and says "a configurable allowlist exists under
+`System → Advanced`". `management_cors_origin` is in the schema and has been since M2-2.
+**No route in M7-1's surface writes it**, and `mw_api_mgmt::Change` has no variant for it, so
+there is nothing for this item to wire a form to.
+
+*What was chosen.* The allowlist is read once, by the boot sequence, and handed to the gate.
+The consequence is stated rather than hidden: **an origin added to the table takes effect at
+the next start.** That is already the whole of an operator's path — there is no endpoint, so
+it is "edit the row and restart" either way — and it follows from the management router being
+a root resource that every re-plan puts back rather than rebuilds (`crate::admin::plan_from`).
+Adding the endpoint is additive under §4.4 and belongs with the `System → Advanced` page,
+which is **M7-3**'s.
+
+The default is the absence of data rather than a sentinel, which is what makes "empty means
+same-origin only" true of a fresh install without anything having to seed it. The value that
+reaches `Access-Control-Allow-Origin` is **the entry from the list**, never the presented
+`Origin` header: a reflected origin is the defect §3.1 lists with more steps.
+
+**Two smaller calls taken by M7-2 and recorded here rather than as their own amendments**,
+because neither contradicts a design document.
+
+**`modernweather reset-password` requires `--config <path>`.** §3.6 writes the command
+without it. It is required for the reason the daemon's own `--config` is required and that
+`crates/modernweather/src/args.rs` already states as a test: a program that invents a path
+creates a configuration database somewhere nobody looked, and then reports that it has no
+administrator.
+
+**Terminal echo is turned off with `stty`, not with a terminal crate.** D-32's table is the
+list of crates this program may use and no terminal crate is in it, and the alternative is an
+`ioctl` — which means `libc` and `unsafe` in a workspace whose lints warn on both. `stty` is
+in `coreutils` and is present on every machine where a person is sitting at a console, which
+is the only situation that code path runs in. **If it is missing, the password is echoed and
+the operator is told so**, rather than the command refusing: §3.6's whole purpose is that the
+locked-out case has an answer, and a recovery command that will not run on a minimal system
+does not have one.
+
+### O-10's four calls, as implemented
+
+Recorded together because **O-10** was one review rather than four, and because the
+implementation of each is where a reader will look for it.
+
+| | Question | Answered | Where it is |
+|---|---|---|---|
+| OQ-W5-1 | loopback until claimed? | **(a) yes**, widening after | `crate::config::Config::management_addr`, with `--setup-listen` as §3.4's headless opt-out. The widening is a **re-plan**: `claimed` is an input to the bind address, so a successful claim produces a plan whose `http:listener` fingerprint differs and the socket moves without a restart |
+| OQ-W5-2 | a breached-password list? | **(b)** ship one, warn, never block | `mw_api_mgmt::auth::is_breached`, over the list A-M7-2-2 describes. The warning lands in §8.5's `warnings` array on the claim and the password change, and in a console line on `reset-password` — both surfaces, so the rule cannot be evaded by using the other one |
+| OQ-W5-3 | any API token in v1? | **(a) none** | Nothing. There is no token table, no `Authorization` parsing and no bearer path; §3.7 fixes the shape in advance so adding one later cannot regress into "the cookie is the token" |
+| OQ-W5-5 | how much configuration history? | **(a) one step** | `POST /api/v1/config/revert`, which **M7-1 already shipped**, scoped to this process rather than to a session because a session-scoped one could not be written before sessions existed. M7-2 changes nothing here; the entry is kept so the answer is not looked for twice |

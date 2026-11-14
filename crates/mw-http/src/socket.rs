@@ -618,6 +618,25 @@ where
     .map_err(|source| HttpError::Serve { addr, source })
 }
 
+/// Serve one socket until the shutdown future completes.
+///
+/// **With connect info**, which is `into_make_service_with_connect_info` rather than the
+/// bare router and is the one thing in this function worth a sentence. W5 §3.3 puts
+/// `created_ip` on every administrator session and §3.4 requires the first-run claim to be
+/// audited with its source IP, and a handler can only learn that address if the serving path
+/// inserts it -- `axum::serve(listener, router)` does not. It is set on **every** socket
+/// rather than only the management one, because the alternative is two serving paths that
+/// differ in what a handler can ask for, and the cost is one `ConnectInfo<SocketAddr>` in
+/// each request's extension map.
+///
+/// **Why `tap_io` with a closure that does nothing.** `axum` implements
+/// `Connected<IncomingStream<_, TcpListener>>` for `SocketAddr` only for its own
+/// `TcpListener`, and [`TlsListener`] below is this module's. The orphan rule forbids adding
+/// that impl here -- both the trait and `SocketAddr` are foreign -- so the hook `axum`
+/// provides for exactly this case is its blanket impl over `TapIo<L, F>`, which holds for
+/// **any** listener whose `Addr` is already what the connect info should be. Tapping with a
+/// no-op closure is how that blanket impl is reached, and it costs one indirect call per
+/// accepted connection.
 async fn serve_one<L, F>(
     listener: L,
     router: Router,
@@ -625,14 +644,18 @@ async fn serve_one<L, F>(
     shutdown: F,
 ) -> Result<(), HttpError>
 where
-    L: axum::serve::Listener,
-    L::Addr: std::fmt::Debug,
+    L: axum::serve::Listener<Addr = SocketAddr>,
+    L::Io: Send,
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .map_err(|source| HttpError::Serve { addr, source })
+    use axum::serve::ListenerExt as _;
+    axum::serve(
+        listener.tap_io(|_io| {}),
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .map_err(|source| HttpError::Serve { addr, source })
 }
 
 /// The plaintext port's whole job when a TLS port is configured: send the client to it.

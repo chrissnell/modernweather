@@ -102,6 +102,15 @@ impl Host {
     }
 }
 
+/// This machine's name, or `"unknown"`.
+///
+/// `pub` because the first-run banner needs it too — W5 §3.4 prints the `ssh -L` line "with
+/// the host's own name substituted" — and two readings of `/proc/sys/kernel/hostname` would
+/// be two answers to the same question.
+pub fn hostname() -> String {
+    read_trimmed(Path::new("/proc/sys/kernel/hostname")).unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Where the kernel lists serial devices, and where it lists stable names for them.
 ///
 /// Two directories because they answer two different questions. `/sys/class/tty` is every
@@ -120,8 +129,7 @@ impl Machine for Host {
             // The triple this binary was built for, which is the one number that tells an
             // operator whether they are running the musl artefact or the gnu one.
             target: target(),
-            hostname: read_trimmed(Path::new("/proc/sys/kernel/hostname"))
-                .unwrap_or_else(|| "unknown".to_string()),
+            hostname: hostname(),
             os: os_release(),
             started_at: self.started_at,
             uptime_seconds: (now - self.started_at).num_seconds().max(0) as u64,
