@@ -887,6 +887,16 @@ impl Slots {
         self.epoch
     }
 
+    /// The live station registry, for the half of it that is not a `StationRegistry`.
+    ///
+    /// `mw_store::PeerStore` publishes the **peer** half of the same object through an
+    /// inherent method, so it needs the concrete type rather than the trait (W7 §5.1: one
+    /// capability, two accessor sets). `None` before the first build, which is the one call
+    /// that has a snapshot and no registry to put it in.
+    pub(crate) fn registry(&self) -> Option<Arc<mw_store::ConfigRegistry>> {
+        self.registry.clone()
+    }
+
     /// Replace the station registry's snapshot. **After a commit only.**
     ///
     /// This is what makes a rotated ingest secret, a renamed station, a corrected altitude
@@ -939,10 +949,6 @@ pub(crate) fn assert_mounted_tables_match(
         planned.difference(&owners).collect::<Vec<_>>()
     );
     Ok(())
-}
-
-    cfg.set_legacy(Arc::new(mw_api_legacy::RouteState::new()), renderer);
-    Ok(registry)
 }
 
 /// Allocate this node's identity, once, at first start (W7 **D-5**).
@@ -1190,6 +1196,13 @@ pub(crate) struct Mounted {
     /// `None` on the first build, where there was no registry to publish into and the
     /// snapshot went straight into it.
     registry: Option<mw_store::RegistrySnapshot>,
+    /// The collector's state slot, when this node has a `config.ingest` row.
+    ///
+    /// Carried out rather than stored on the configuration here, because the other half of
+    /// what `Config::set_ingest` takes -- the ingest socket's TLS -- is assembled from the
+    /// SNI resolver this function has only just built, and the resolver belongs to the
+    /// caller's step. `None` is every satellite (W7 **D-44**).
+    collector: Option<Arc<mw_collector::ServiceState>>,
 }
 
 /// Build the route tables, the host table and the certificate store.
@@ -1378,6 +1391,7 @@ fn build_route_tables(
         certs: sni,
         hostnames,
         registry,
+        collector: collector_state,
     })
 }
 
@@ -1477,6 +1491,7 @@ fn attach_listener(
     // because that is the certificate an operator already configures and renews -- so a
     // node with no TLS port has nothing to present and the socket stays plaintext, which
     // `ingest:grpc`'s own plan check is what refuses.
+    let collector_state = built.collector.clone();
     let ingest_tls = match (&collector_state, &sni, &cfg.peer_registry) {
         // The **gRPC** row, because the TLS this configures is the gRPC socket's: a node
         // whose only ingest row is `rest` is served on the main socket's own certificate
@@ -1688,8 +1703,13 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     // Returned to the pool before anything else runs: every read above is done, and SQLite
     // in WAL mode has a bounded connection budget that a held handle spends for nothing.
     drop(conn);
-    match &cfg.node {
-        Some(node) => info!(
+    // **Always `Some` from here on**, which is the change this work item made. The migration
+    // deliberately seeds no `node` row -- a `node_id` a migration invented would make every
+    // fresh install claim the same identity -- so until M6-4 this branch had a `None` arm
+    // saying "no node identity yet; this is a first start". `allocate_node` above is what
+    // mints it, and it is also the only thing that knows where the spool lives (**D-10**).
+    if let Some(node) = &cfg.node {
+        info!(
             node = %node.node_name,
             timezone = %node.timezone,
             spool = %node.spool_path,
@@ -1789,7 +1809,13 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
         // Step 4d: the peer half of the same capability (W7 §5.1), and the two numbers the
         // collector and the uplink read off the spool. After the ingress, because the
         // collector needs both.
-        attach_peers(&mut cfg, fanout, &pool, registry)
+        // The live registry object rather than the snapshot: the peer half is published
+        // into the same `ConfigRegistry` the station half resolves through, which is what
+        // makes "a `Hello` registered this station" and "the gate can resolve it" one fact.
+        let live = slots
+            .registry()
+            .context("the station registry is published before the peer half")?;
+        attach_peers(&mut cfg, fanout, &pool, live)
             .await
             .context("publishing the peer registry")?;
     }

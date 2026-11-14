@@ -2262,13 +2262,17 @@ pub struct PeerRow {
 /// and the peer's own columns repeated, which then has to be folded back -- and the fold is
 /// the part that gets a peer with no origins wrong. Ordered by name so that a digest over
 /// the result is a function of the table's contents.
-pub async fn peers(pool: &SqlitePool) -> Result<Vec<PeerRow>, ConfigDbError> {
+/// **A connection rather than the pool**, for [`crate::Config::load`]'s reason: the
+/// management API's save preview re-reads inside its own uncommitted transaction, and a
+/// call on a pool would take a second connection and see the pre-change rows. Two queries,
+/// so a reborrowable `&mut` rather than the generic executor one `fetch_all` consumes.
+pub async fn peers(conn: &mut sqlx::SqliteConnection) -> Result<Vec<PeerRow>, ConfigDbError> {
     let rows = sqlx::query(
         "SELECT node_id, name, auth_kind, auth_material, relay, software, last_seen, \
                 revoked_at \
          FROM peers ORDER BY name",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|source| ConfigDbError::Query {
         what: "the peer rows",
@@ -2277,7 +2281,7 @@ pub async fn peers(pool: &SqlitePool) -> Result<Vec<PeerRow>, ConfigDbError> {
     let origins = sqlx::query(
         "SELECT node_id, origin_node_id FROM peer_origins ORDER BY node_id, origin_node_id",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|source| ConfigDbError::Query {
         what: "the peer origin grants",
@@ -2332,7 +2336,10 @@ pub struct UplinkRow {
 }
 
 /// Every `uplink` row, in peer-name order.
-pub async fn uplinks(pool: &SqlitePool) -> Result<Vec<UplinkRow>, ConfigDbError> {
+pub async fn uplinks<'e, E>(pool: E) -> Result<Vec<UplinkRow>, ConfigDbError>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let rows = sqlx::query(
         "SELECT peer_name, endpoint, auth_kind, tls_cert_path, tls_key_path, tls_ca_path, \
                 psk \

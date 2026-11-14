@@ -114,6 +114,8 @@ async fn free_ports() -> (u16, u16, u16) {
             router: axum::Router::new(),
             tls: None,
         }),
+        // No ingest TLS: this probe wants the ports the kernel chose and nothing else.
+        None,
     )
     .await
     .expect("three loopback ports are available");

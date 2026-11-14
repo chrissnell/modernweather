@@ -349,10 +349,18 @@ impl PeerStore {
     pub async fn republish(&self) -> Result<Arc<PeerSnapshot>, ConfigDbError> {
         // Held across the read, the build and the store, so a snapshot can never be
         // published over a newer one (see the field's own documentation).
-        // Held across the read, the build and the store, so a snapshot can never be
-        // published over a newer one (see the field's own documentation).
         let _ordered = self.publishing.lock().await;
-        let rows = config_db::peers(&self.pool).await?;
+        // A connection off the pool, because `config_db::peers` runs two queries and takes
+        // one it can reborrow (the management API's preview reads inside a transaction).
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|source| ConfigDbError::Query {
+                what: "a connection to read the peer rows",
+                source,
+            })?;
+        let rows = config_db::peers(&mut conn).await?;
         let snapshot = PeerSnapshot::new(&rows)
             .with_peer_stations(&self.pool, self.me)
             .await?;
