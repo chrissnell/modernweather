@@ -3904,3 +3904,44 @@ test. Nothing had created an `http_out` station through the API before this work
 The two `xtask` findings were confirmed the only way a gate's hole can be: by writing the
 violation, running the gate, and watching it exit `0`. Both now exit `1` and `3`
 respectively, and both have a unit test.
+
+### Three more `chonky` findings, and the defects they produced here
+
+Found by the owner using the preview, which is the half of "done" a gate does not cover.
+Each one is a component owning a piece of state it gives the consumer no way to correct.
+
+| # | Gap | What it produced |
+|---|---|---|
+| **G17** | **`ThemeToggle` writes `data-theme` on mount**, from whatever `theme` it was passed, even when the operator has chosen nothing. | `tokens.css` tracks the device with `@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) }`, and an attribute defeats that query — so the toggle **pins** the theme at mount and the device setting stops meaning anything. It also reads and writes `localStorage['theme']` while offering no way to say "no choice", so there is no value a consumer can store for "follow the system". |
+| **G18** | **`Toggle` owns its `checked` state** and gives the consumer no way to reject a change. | The switch moves on click whatever the handler does next. A confirmation the operator declines leaves the switch showing the new position over unchanged configuration — and the *next* click then reads as the opposite instruction. |
+| **G16** (restated) | `AlertDialog.Root` has a bindable `open` and no change callback. | A one-way `open={target !== null}` and the component's own internal state drift apart the moment it is dismissed by anything other than `AlertDialog.Cancel`, and the dialog then refuses to reopen for the rest of the page's life. It bit twice. |
+
+The answers here are the same shape in all three cases: **own the state outside the
+component and key the component on it**. `AppShell` owns the theme's three states and
+re-applies the system value on a `matchMedia` change; the station list keys its switch on
+the configuration plus a counter it bumps when a change is declined or refused; every
+`AlertDialog` uses `bind:open` over a boolean of its own.
+
+### What the owner's three reports actually were
+
+Recorded because two of the three were one root cause and the third was the most serious
+defect in the work item.
+
+1. **"The light/dark mode does not track device preferences"** and **"there is no light
+   mode"** — one cause. The inline boot script wrote `data-theme` unconditionally, so the
+   media query that does the tracking could never apply; its `catch` defaulted to `dark`;
+   and it used a storage key of our own rather than the one `ThemeToggle` reads, so an
+   explicit choice was lost on reload and the toggle re-pinned the attribute from a prop
+   `AppShell` had hard-coded to `'dark'`. On a light laptop that is a dark UI with no way
+   back, which is exactly what was reported. `tests/unit/theme.test.ts` pins the rule by
+   reading the script out of `app.html` — it runs before the first paint, so it is the one
+   piece of this application no type checker and no component test can see.
+
+2. **"Station doesn't appear to be working"** — the station's "Collecting readings" toggle
+   had been switched off. The pod's audit log dates it to fifty seconds after the owner
+   signed in: a `put_station` that stopped three components, including the public website
+   and the frozen API the phone app uses. It was the one unconfirmed, immediately-committed
+   configuration change on the whole surface, its label text was part of its hit area, and
+   **nothing on screen said what it had done**. That is §2.1's defect — "saved means
+   running" inverted into "one click means stopped" — reintroduced by the one control that
+   skipped §2.4's sequence.
