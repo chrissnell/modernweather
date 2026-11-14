@@ -1413,6 +1413,27 @@ Kubernetes, so Campbell must work over `TcpOut` against a `ser2net` bridge as we
 W2a §4a.5 already maps it as `Serial | TcpOut` and the Go version already dials TCP when
 `SerialDevice` is empty, so this is a test case rather than a new capability — but it is the one
 driver where the TCP path is load-bearing in production rather than a convenience.
+**The serial line rate is set as of 2026-11-14** — see `docs/reconciliation.md`'s **A-M6-1-1**, which
+this item filed as *proposed* on 2026-11-11 and GRA-788 accepted and applied. The `socat` pty pair
+this item builds could never have caught the gap it recorded: `transport_baud` was carried into
+`Transport::Serial { baud }` and never put on the line, so a directly attached Davis or Campbell
+console worked only where a `udev` rule or an `stty` had already configured it, and failed by
+producing frames that all fail CRC rather than by going quiet. D-32's crate table gains
+`tokio-serial`, confined to `mw-station` by `ci/layers.toml`. Two things a reader of this item should
+carry forward: the pty tests here are now **Linux-only** (macOS sets the rate with an ioctl that
+refuses a pseudo terminal), and the change is **unproven against hardware** — the owner's Campbell is
+served over the `ser2net` bridge, which does not exercise it.
+
+Two operational consequences the amendment did not predict, both recorded in full at A-M6-1-1. The
+serial open is now **exclusive** (`TIOCEXCL` + `flock`), which is kept deliberately — one line has
+one reader, and two readers split the stream rather than each getting it — but **nothing refuses two
+components naming one `transport_dev` at plan time**, so that configuration now fails at startup
+non-deterministically instead of silently splitting. Refusing it in `plan` is **GRA-796**. And
+`transport_baud` was decorative and is now **authoritative**, so a deployment whose `udev` rule or
+`stty` set the line correctly while the column was stale worked before this change and fails after;
+`uploader.aprs_kiss_serial_baud` is the sharper case, because `mw_output::plan` defaults a NULL to
+9600 and now puts that on the radio. **Release note, not a code fix.**
+
 **Decision point that lands here, not before:** **OQ-W4-3** — whether the registry gains a `jsonb`
 type so `observations.extra` can be a registry entry. W4's note is explicit that this is "worth
 deciding before W7 writes its first driver that receives an unknown field", and this is that moment.

@@ -17,10 +17,11 @@ mw-component.workspace = true
 mw-types.workspace = true
 mw-aprs.workspace = true
 # `Transport`, `ByteStream` and `stream::open` -- and nothing else. The two KISS transports
-# are a character device and a socket, and the serial open is the one `unsafe` block in this
-# workspace (`mw_station::stream::serial`, an `AsyncFd` over an owned `File`); a second copy
-# of it here would be a second safety argument to audit. `crate::frame`'s module
-# documentation has the whole of that reasoning.
+# are a character device and a socket, and the serial open is the one place in this workspace
+# that configures a line: `mw_station::stream::serial` sets 8N1 and the rate through
+# `tokio-serial`, which `ci/layers.toml` confines to that crate. A second copy here would be
+# a second idea of what 9600 8N1 means. `crate::frame`'s module documentation has the whole
+# of that reasoning.
 mw-station.workspace = true
 
 tower.workspace = true
