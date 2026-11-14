@@ -14,7 +14,7 @@
 //! - **1** -- the daemon could not start, or could not stay started. The reason is on
 //!   stderr either way: through the subscriber if there was one, and through
 //!   [`args::fatal`] if installing the subscriber is what failed.
-//! - **0** -- it ran and stopped cleanly.
+//! - **0** -- it ran and stopped cleanly, or one of W5 §3.6's recovery commands did its job.
 //!
 //! `Restart=always` in W8's unit means systemd restarts on all three, which is correct for
 //! 1 and would be an infinite loop for 2 -- except that 2 can only come from the unit's
@@ -22,11 +22,13 @@
 
 mod admin;
 mod args;
+mod authstore;
 mod boot;
 mod config;
 mod hostinfo;
 mod logctl;
 mod notify;
+mod recover;
 mod signals;
 mod spool;
 mod view;
@@ -40,6 +42,19 @@ async fn main() -> ExitCode {
     let args = match args::parse(std::env::args_os().skip(1)) {
         Ok(args::Parsed::Run(args)) => args,
         Ok(args::Parsed::Printed) => return ExitCode::SUCCESS,
+        // W5 §3.6's recovery commands. They run **instead of** the daemon and before any
+        // subscriber exists, which is why their own output goes to the console directly and
+        // why a failure here is reported through `args::fatal` rather than through
+        // `tracing`: there is nothing to log with.
+        Ok(args::Parsed::Command(command)) => {
+            return match recover::run(&command).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    args::fatal(&format!("{e:#}"));
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Err(e) => {
             args::fatal(&e.to_string());
             args::usage();

@@ -62,9 +62,16 @@ pub struct ErrorBody {
 
 /// Why a management request could not be carried out.
 ///
-/// Four variants, each with its own status, because each one has a different audience: the
+/// Six variants, each with its own status, because each one has a different audience: the
 /// operator's values, a name they used that is not there, a configuration the plan refuses,
-/// and the server's own problem.
+/// the server's own problem, a request with no live session, and a login the progressive
+/// delay is still holding off.
+///
+/// The last two arrived with implementation-plan.md **M7-2**, and both are deliberately
+/// *not* [`ApiError::Conflict`]. A `401` is the one status a client reacts to structurally --
+/// W5 §8.8's signed-out state is "show the login screen", not "show a banner" -- and a `429`
+/// carries a `Retry-After` the client renders as W5 **D-46**'s countdown. Folding either into
+/// a `409` would make the SPA parse prose to decide what screen to show.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     /// The submitted values are wrong, and each problem names its field. `422`.
@@ -110,6 +117,31 @@ pub enum ApiError {
         /// The cause chain, rendered at the point it was caught (**D-34**).
         detail: Option<String>,
     },
+
+    /// There is no live session, so there is nothing to answer with. `401`.
+    ///
+    /// **Carries no detail about why**, and that is the decision rather than laziness: "no
+    /// cookie", "unknown session", "wrong secret", "expired" and "idle too long" are five
+    /// facts an unauthenticated caller has no business learning, and the client's response
+    /// to all five is the same screen.
+    #[error("{summary}")]
+    Unauthenticated {
+        /// One plain line, in the operator's words.
+        summary: String,
+    },
+
+    /// The progressive delay is still holding this login off. `429`.
+    ///
+    /// W5 §3.5's `min(2^(n-3), 30)` seconds. The number is on the response as a
+    /// `Retry-After` header as well as in the sentence, because **D-46** makes the only
+    /// client-side timer a countdown over a server-supplied value.
+    #[error("{summary}")]
+    Throttled {
+        /// One plain line, naming the wait.
+        summary: String,
+        /// How many seconds until the next attempt is accepted.
+        retry_after_seconds: u64,
+    },
 }
 
 impl ApiError {
@@ -135,6 +167,8 @@ impl ApiError {
             ApiError::NotFound { .. } => StatusCode::NOT_FOUND,
             ApiError::Conflict { .. } => StatusCode::CONFLICT,
             ApiError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::Unauthenticated { .. } => StatusCode::UNAUTHORIZED,
+            ApiError::Throttled { .. } => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -158,13 +192,37 @@ impl ApiError {
                     errors: Vec::new(),
                 }
             }
+            ApiError::Unauthenticated { summary } | ApiError::Throttled { summary, .. } => {
+                ErrorBody {
+                    summary: summary.clone(),
+                    detail: None,
+                    errors: Vec::new(),
+                }
+            }
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status(), Json(self.body())).into_response()
+        // `Retry-After` on the one error that has a number in it, so the client renders a
+        // countdown from the header rather than parsing the sentence (**D-46**). A
+        // `WWW-Authenticate` header is deliberately **not** set on the `401`: it would make a
+        // browser open its own basic-auth dialog over an SPA that has a login screen.
+        let retry_after = match &self {
+            ApiError::Throttled {
+                retry_after_seconds,
+                ..
+            } => Some(*retry_after_seconds),
+            _ => None,
+        };
+        let mut response = (self.status(), Json(self.body())).into_response();
+        if let Some(seconds) = retry_after {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string()) {
+                response.headers_mut().insert("retry-after", value);
+            }
+        }
+        response
     }
 }
 

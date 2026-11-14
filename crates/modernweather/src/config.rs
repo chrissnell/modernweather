@@ -260,6 +260,28 @@ pub struct Config {
     /// row, because the forecast API is queried by `latitude,longitude`.
     pub(crate) declared_aeris: Vec<mw_output::AerisStation>,
 
+    /// Whether an administrator account exists — W5 §3.4's claimed/unclaimed distinction.
+    ///
+    /// Read here rather than asked of the `AuthStore` because it is an input to
+    /// [`Config::management_addr`], and that is called from inside the save transaction:
+    /// `crate::admin`'s re-plan reads the whole configuration out of an open transaction, so
+    /// a second read through a pool handle would be a different snapshot. **Not a secret and
+    /// not a credential** — it is one boolean, and the unauthenticated
+    /// `GET /api/v1/auth/session` already reports it, because a UI with no way to ask would
+    /// have no way to show a setup screen.
+    pub claimed: bool,
+
+    /// `--setup-listen <address>`, W5 §3.4's explicit opt-out for a headless install.
+    ///
+    /// `None` is the normal case. When set **and the instance is unclaimed**, it replaces
+    /// loopback as the address the management API binds; once claimed it is ignored, because
+    /// the configured `management_listen_addr` is the answer from then on.
+    ///
+    /// A field set by a setter rather than a column, because it is a property of **this
+    /// invocation** and not of the installation: a headless first run passes it once and a
+    /// stored one would be a permanently widened unclaimed window that nobody chose twice.
+    pub(crate) setup_listen: Option<std::net::IpAddr>,
+
     /// The generation these rows were read at (**D-53**).
     ///
     /// `ZERO` until something can bump it: a generation is assigned by `ConfigAdmin` on
@@ -320,8 +342,24 @@ impl Config {
             mount: None,
             sni: None,
             mgmt: None,
+            claimed: mw_store::admin_auth::is_claimed(&mut *conn)
+                .await
+                .map_err(|source| ConfigDbError::Query {
+                    what: "whether an administrator account exists",
+                    source,
+                })?,
+            setup_listen: None,
             generation: Generation::ZERO,
         })
+    }
+
+    /// Hand the configuration `--setup-listen`, for an unclaimed headless install.
+    ///
+    /// Set by the boot sequence from the command line, and re-set on every re-plan by
+    /// `crate::admin::Shared`, so that a claim taken in this process plans against the same
+    /// invocation's flags.
+    pub fn set_setup_listen(&mut self, addr: Option<std::net::IpAddr>) {
+        self.setup_listen = addr;
     }
 
     /// Hand the configuration the write end of the pipeline, once the spool is open.
@@ -436,17 +474,33 @@ impl Config {
     /// Where the management API binds, from `listener.management_listen_addr` and
     /// `management_port`.
     ///
-    /// **Loopback unless the instance has been claimed.** `A-W5-3` makes the column's
-    /// default `127.0.0.1`, and W5 §3.5 keeps the management API on loopback until an
-    /// administrator account exists -- which is implementation-plan.md **M7-2**'s work. This
-    /// item ships the surface without authentication, so the rule is enforced here rather
-    /// than left to the operator: a configured non-loopback address is **refused** and
-    /// narrowed to loopback with a warning naming what was configured, until M7-2 can tell
-    /// a claimed instance from an unclaimed one.
+    /// **Loopback while the instance is unclaimed** — W5 §3.4, answered as **O-10 /
+    /// OQ-W5-1 (a)**. The hazard is stated there and is worth restating here, because this
+    /// function is where it is closed: an unclaimed instance reachable from the network means
+    /// whoever opens the setup page first owns the install, and the window is "from first
+    /// start until the owner gets round to it", which on a headless Pi is days. The setup
+    /// code gates that window; binding loopback makes it empty.
     ///
-    /// Narrowed rather than refused outright, because the alternative is a daemon that will
-    /// not start on the owner's existing configuration -- and the thing the operator needs
-    /// is the management UI, reachable over an SSH tunnel in the meantime.
+    /// Three cases, in this order:
+    ///
+    /// | | |
+    /// |---|---|
+    /// | claimed | the configured address, which is what `A-W5-3` defaults to `127.0.0.1` anyway |
+    /// | unclaimed, `--setup-listen` given | that address, with a `WARN` naming what it widens |
+    /// | unclaimed | loopback, with an `INFO` naming the configured address it is narrowing |
+    ///
+    /// **The order of the last two is load-bearing.** `A-W5-3` makes the configured address
+    /// default to `127.0.0.1`, so the flag has to be consulted *before* the loopback case --
+    /// otherwise it does nothing at all on a fresh install, which is the only kind of install
+    /// it exists for.
+    ///
+    /// **M7-1 shipped the middle and bottom rows unconditionally** and warned that the
+    /// management API had no authentication. That is no longer true, so the narrowing is now
+    /// conditional on the one fact that makes it necessary.
+    ///
+    /// Narrowed rather than refused outright, for the reason M7-1 gave and which still
+    /// holds: the alternative is a daemon that will not start on the owner's existing
+    /// configuration.
     pub fn management_addr(&self) -> Result<std::net::SocketAddr, AddressError> {
         let configured = &self.listener.management_listen_addr;
         let port = self.listener.management_port;
@@ -458,14 +512,47 @@ impl Config {
             addr: configured.clone(),
             port,
         })?;
+        if self.claimed {
+            return Ok(std::net::SocketAddr::new(addr, port));
+        }
+        // **Before the loopback check, not after.** `A-W5-3` makes the column's default
+        // `127.0.0.1`, so on a fresh install the configured address is *already* loopback --
+        // and a `--setup-listen` consulted only after an `is_loopback()` early return would
+        // be a silent no-op on exactly the headless install the flag, and the first-run
+        // banner that advertises it, exist for.
+        if let Some(opted) = self.setup_listen {
+            if opted.is_loopback() {
+                // Asked for, and narrower than or equal to the configured address: there is
+                // nothing to warn about.
+                tracing::info!(
+                    configured = %configured,
+                    setup_listen = %opted,
+                    port,
+                    "--setup-listen binds the management API to a loopback address, which \
+                     widens nothing"
+                );
+            } else {
+                tracing::warn!(
+                    configured = %configured,
+                    setup_listen = %opted,
+                    port,
+                    "--setup-listen widens the management API before this daemon has an \
+                     administrator account; anyone who reaches it and has the setup code \
+                     printed on this machine's console can create that account"
+                );
+            }
+            return Ok(std::net::SocketAddr::new(opted, port));
+        }
         if addr.is_loopback() {
             return Ok(std::net::SocketAddr::new(addr, port));
         }
-        tracing::warn!(
+        tracing::info!(
             configured = %configured,
             port,
-            "the management API has no authentication until M7-2, so it is bound to \
-             127.0.0.1 rather than the configured address; reach it over an SSH tunnel"
+            "this daemon has no administrator account yet, so the management API is bound to \
+             127.0.0.1 rather than the configured address; reach it over an SSH tunnel, or \
+             start with --setup-listen, and it will bind the configured address once the \
+             account exists"
         );
         Ok(std::net::SocketAddr::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -1222,8 +1309,102 @@ mod tests {
             },
             weather_database: None,
             node: None,
+            claimed: false,
+            setup_listen: None,
             generation: Generation::ZERO,
         }
+    }
+
+    /// **W5 §3.4 / O-10's OQ-W5-1 (a)**, as the three cases the function has.
+    ///
+    /// The one worth asserting is the middle row: `--setup-listen` is the only thing that
+    /// widens an *unclaimed* instance, and it is **ignored once claimed**, because from then
+    /// on `listener.management_listen_addr` is the answer and a flag that outlived the window
+    /// it exists for would be a permanently widened bind nobody chose twice.
+    #[test]
+    fn the_management_api_binds_loopback_until_the_instance_is_claimed() {
+        let widened = std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0));
+
+        // Unclaimed, no flag: narrowed to loopback, whatever was configured.
+        let mut cfg = config("127.0.0.1", 8080);
+        cfg.listener.management_listen_addr = "0.0.0.0".into();
+        assert_eq!(
+            cfg.management_addr().expect("an address").to_string(),
+            "127.0.0.1:8081"
+        );
+
+        // Unclaimed, with the flag: the flag's address.
+        cfg.set_setup_listen(Some(widened));
+        assert_eq!(
+            cfg.management_addr().expect("an address").to_string(),
+            "0.0.0.0:8081"
+        );
+
+        // **And with the flag against the schema's own default**, which is the case the flag
+        // exists for and the one an `is_loopback()` check placed first would silently ignore:
+        // a fresh install has `management_listen_addr = '127.0.0.1'`, so a headless operator
+        // passing `--setup-listen` has to get the widened address rather than loopback.
+        let mut fresh = config("127.0.0.1", 8080);
+        assert_eq!(fresh.listener.management_listen_addr, "127.0.0.1");
+        fresh.set_setup_listen(Some(widened));
+        assert_eq!(
+            fresh.management_addr().expect("an address").to_string(),
+            "0.0.0.0:8081"
+        );
+        // A loopback `--setup-listen` is honoured too, and widens nothing.
+        fresh.set_setup_listen(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            127, 0, 0, 2,
+        ))));
+        assert_eq!(
+            fresh.management_addr().expect("an address").to_string(),
+            "127.0.0.2:8081"
+        );
+
+        // Claimed: the configured address, and the flag no longer applies.
+        cfg.claimed = true;
+        assert_eq!(
+            cfg.management_addr().expect("an address").to_string(),
+            "0.0.0.0:8081"
+        );
+        cfg.set_setup_listen(None);
+        assert_eq!(
+            cfg.management_addr().expect("an address").to_string(),
+            "0.0.0.0:8081"
+        );
+
+        // A configured loopback address is returned as-is in both states, so the narrowing
+        // is invisible on the schema's own default (**A-W5-3**).
+        let mut cfg = config("127.0.0.1", 8080);
+        assert_eq!(
+            cfg.management_addr().expect("an address").to_string(),
+            "127.0.0.1:8081"
+        );
+        cfg.claimed = true;
+        assert_eq!(
+            cfg.management_addr().expect("an address").to_string(),
+            "127.0.0.1:8081"
+        );
+
+        // A bracketed IPv6 address survives the strip in both states.
+        let mut cfg = config("127.0.0.1", 8080);
+        cfg.listener.management_listen_addr = "[::]".into();
+        assert_eq!(
+            cfg.management_addr().expect("an address").to_string(),
+            "127.0.0.1:8081",
+            "an unclaimed instance narrows an IPv6 any-address too"
+        );
+        cfg.claimed = true;
+        assert_eq!(
+            cfg.management_addr().expect("an address").to_string(),
+            "[::]:8081"
+        );
+
+        // And something that is not an address is still a refusal naming what was typed.
+        let mut cfg = config("127.0.0.1", 8080);
+        cfg.listener.management_listen_addr = "weatherbox".into();
+        cfg.claimed = true;
+        let e = cfg.management_addr().expect_err("not an address");
+        assert!(e.to_string().contains("weatherbox"), "{e}");
     }
 
     #[test]

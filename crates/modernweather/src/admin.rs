@@ -79,6 +79,13 @@ pub struct Shared {
     /// management socket back into every re-plan's configuration. A `OnceLock` rather than a
     /// `Mutex` because it is written once, by `main`, before anything can read it.
     pub router: std::sync::OnceLock<axum::Router>,
+    /// `--setup-listen`, so every re-plan sees the same invocation's flags.
+    ///
+    /// Carried here rather than read from the configuration because it is a property of this
+    /// invocation: `crate::config::Config::load` reads columns and this is not one.
+    /// Without it, the first save after a headless first run would plan a management socket
+    /// on loopback while the one being served was the widened address.
+    pub setup_listen: Option<std::net::IpAddr>,
 }
 
 /// The shape of the plan in force: every component's id against its declarative
@@ -245,15 +252,58 @@ impl SqliteConfigAdmin {
         });
     }
 
+    /// Re-plan the configuration exactly as it is, and apply the diff.
+    ///
+    /// **One caller: a successful setup claim** (`crate::authstore`). W5 §3.4 widens the
+    /// management socket from loopback to the configured address once an administrator
+    /// exists, and `crate::config::Config::claimed` is an input to
+    /// `Config::management_addr` -- so the widening is a plan whose `http:listener`
+    /// fingerprint differs, and this is how that plan is taken.
+    ///
+    /// `run(None, ..)` rather than a second copy of the save sequence, which is the whole
+    /// reason [`SqliteConfigAdmin::run`] takes an `Option`: a re-plan that drifted from the
+    /// save path would be a second answer to "what happens when the plan changes", and the
+    /// ordering in this module's documentation is the thing that must not have two answers.
+    ///
+    /// It **bumps the generation**, like any other plan change, because a component that
+    /// restarts has to report a generation a client can compare against (**D-53**).
+    pub async fn replan(&self, reason: &'static str) -> Result<(), ApiError> {
+        let applied = self.run(None, Commit::Save).await?;
+        info!(
+            reason,
+            generation = applied.generation,
+            restart = applied.diff.restart.len(),
+            "the configuration was re-planned"
+        );
+        Ok(())
+    }
+
     /// Try or make one change — the whole of the sequence in this module's documentation.
-    async fn run(&self, change: mw_api_mgmt::Change, commit: Commit) -> Result<Applied, ApiError> {
-        let warnings = change.warnings();
-        let store_change = view::into_store_change(&change, &self.shared.pool)
-            .await
-            .map_err(|e| ApiError::Invalid {
-                summary: "That change cannot be applied to this configuration.".to_string(),
-                errors: e,
-            })?;
+    ///
+    /// `None` is a re-plan of the configuration as it stands: no statement is applied, and
+    /// everything else -- the transaction, the re-read, `plan()`, the diff, the publish and
+    /// the sink -- is identical. See [`SqliteConfigAdmin::replan`] for the one caller and
+    /// why it is this function rather than its own.
+    async fn run(
+        &self,
+        change: Option<mw_api_mgmt::Change>,
+        commit: Commit,
+    ) -> Result<Applied, ApiError> {
+        let warnings = change
+            .as_ref()
+            .map(mw_api_mgmt::Change::warnings)
+            .unwrap_or_default();
+        let store_change = match change.as_ref() {
+            Some(change) => Some(
+                view::into_store_change(change, &self.shared.pool)
+                    .await
+                    .map_err(|e| ApiError::Invalid {
+                        summary: "That change cannot be applied to this configuration.".to_string(),
+                        errors: e,
+                    })?,
+            ),
+            None => None,
+        };
         let mut w = self.writable.lock().await;
         let current = self.generation.load(Ordering::Acquire);
         let generation = if commit.is_save() {
@@ -277,9 +327,11 @@ impl SqliteConfigAdmin {
             .await
             .map_err(|e| internal("The configuration could not be read.", &e))?;
 
-        mw_store::config_admin::apply(&mut tx, &store_change)
-            .await
-            .map_err(refused)?;
+        if let Some(store_change) = store_change.as_ref() {
+            mw_store::config_admin::apply(&mut tx, store_change)
+                .await
+                .map_err(refused)?;
+        }
 
         // **The slots are rolled back with the transaction.** `assemble` rebuilds the shared
         // root state and bumps the epoch when the proposed configuration's fingerprint
@@ -358,7 +410,9 @@ impl SqliteConfigAdmin {
             });
         }
         info!(
-            change = change.as_str(),
+            change = change
+                .as_ref()
+                .map_or("re-plan", mw_api_mgmt::Change::as_str),
             generation,
             start = applied.diff.start.len(),
             stop = applied.diff.stop.len(),
@@ -380,6 +434,8 @@ impl SqliteConfigAdmin {
             .await
             .map_err(|e| internal("The configuration could not be read.", &e))?;
         cfg.generation = Generation::new(generation);
+        // The invocation's own flag, not a column: see `Shared::setup_listen`.
+        cfg.set_setup_listen(self.shared.setup_listen);
 
         let mounted = boot::assemble(
             &mut cfg,
@@ -660,7 +716,7 @@ impl ConfigAdmin for SqliteConfigAdmin {
         change: mw_api_mgmt::Change,
         commit: Commit,
     ) -> BoxFuture<'_, Result<Applied, ApiError>> {
-        Box::pin(self.run(change, commit))
+        Box::pin(self.run(Some(change), commit))
     }
 
     fn revert(&self, to_generation: u64) -> BoxFuture<'_, Result<Applied, ApiError>> {

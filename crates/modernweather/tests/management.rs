@@ -86,6 +86,29 @@ async fn free_ports() -> (u16, u16, u16) {
     )
 }
 
+/// The session every request below carries, as `mw_session=<id>.<secret>`.
+///
+/// **Fixed bytes, seeded by [`configure`]**, which is what keeps implementation-plan.md
+/// **M7-2**'s gate out of the way of M7-1's subject. Every management route is authenticated
+/// now, so a test that asserted on `/api/v1/config` without a session would assert on a
+/// `401` -- and signing in per test would put an Argon2id hash at m=64 MiB in front of each
+/// of the eleven tests below for no gain, because what they are about is the plan diff.
+///
+/// The authentication itself is asserted in `tests/auth.rs`, against the real handler set
+/// and the real `claim`/`login` path.
+const SESSION_ID: [u8; 16] = [0xa5; 16];
+const SESSION_SECRET: [u8; 32] = [0x5c; 32];
+
+/// Lowercase hex, for the two halves of the cookie.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The `Cookie` header value for [`SESSION_ID`].
+fn session_cookie() -> String {
+    format!("mw_session={}.{}", hex(&SESSION_ID), hex(&SESSION_SECRET))
+}
+
 /// A configuration with one station and one website, which is the smallest shape in which
 /// every component family this item can restart is actually planned.
 ///
@@ -152,6 +175,34 @@ async fn configure(path: &Path, http: u16, grpc: u16, management: u16) {
     .await
     .expect("the website row is insertable");
 
+    // **An administrator and a live session**, because M7-2 put a gate in front of every
+    // route these tests read. Two consequences, both wanted: the instance is *claimed*, so
+    // the management socket binds the configured `127.0.0.1` rather than being narrowed to
+    // it, and `session_cookie()` resolves.
+    //
+    // The hash is produced by the same function login verifies against, so this fixture
+    // cannot drift from the policy; the password is never used, because these tests present
+    // the session rather than signing in.
+    sqlx::query("INSERT INTO admin_credential (id, username, password_phc) VALUES (1, 'test', ?1)")
+        .bind(
+            mw_api_mgmt::auth::hash_password(&secrecy::SecretString::from(
+                "correct horse battery staple",
+            ))
+            .expect("the policy parameters hash"),
+        )
+        .execute(&pool)
+        .await
+        .expect("the administrator row is insertable");
+    sqlx::query(
+        "INSERT INTO admin_session (id, token_hash, expires_at) \
+         VALUES (?1, ?2, unixepoch() + 86400)",
+    )
+    .bind(SESSION_ID.to_vec())
+    .bind(mw_api_mgmt::auth::digest(&SESSION_SECRET).to_vec())
+    .execute(&pool)
+    .await
+    .expect("the session row is insertable");
+
     pool.close().await;
 }
 
@@ -191,11 +242,19 @@ fn spawn(config: &Path, notify: &Path) -> Child {
         .expect("the binary runs")
 }
 
-fn terminate(child: &Child) {
+/// Ask the daemon to stop, and **wait for it to**.
+///
+/// Waited for rather than left to `kill_on_drop`, for two reasons. An ordered exit is what
+/// this daemon's `Type=notify` contract promises, and a `SIGKILL` on drop would stop
+/// asserting it. And under `cargo llvm-cov` a child that is killed never writes its profile,
+/// so every path these tests exercised inside the subprocess -- which is most of what they
+/// are about -- would be missing from the coverage ratchet's measurement.
+async fn terminate(child: &mut Child) {
     let pid = child.id().expect("the child has not been reaped");
     let _ = std::process::Command::new("kill")
         .args(["-TERM", &pid.to_string()])
         .status();
+    let _ = tokio::time::timeout(PATIENCE, child.wait()).await;
 }
 
 /// One request against the management API, as a status and a parsed body.
@@ -208,9 +267,14 @@ async fn request(port: u16, method: &str, path: &str, body: Option<Value>) -> (u
         .await
         .expect("the management API is listening");
     let payload = body.map(|b| b.to_string()).unwrap_or_default();
+    // The session and the CSRF header on every request, including the reads. §3.3 requires
+    // `X-MW-Request` on state-changing methods only, and sending it on a `GET` as well keeps
+    // this helper to one shape -- the gate ignores it there.
     let head = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+         Cookie: {}\r\nX-MW-Request: 1\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        session_cookie(),
         payload.len()
     );
     socket
@@ -317,7 +381,7 @@ async fn a_saves_preview_names_exactly_the_components_that_then_restart() {
     let (http, grpc, mgmt) = free_ports().await;
     configure(&config, http, grpc, mgmt).await;
     let socket = notify_socket(&notify);
-    let child = spawn(&config, &notify);
+    let mut child = spawn(&config, &notify);
     wait_ready(&socket).await;
 
     // The website as it is, so the edit changes one field and nothing else.
@@ -396,7 +460,7 @@ async fn a_saves_preview_names_exactly_the_components_that_then_restart() {
     let (_, after) = request(mgmt, "GET", "/api/v1/websites/1", None).await;
     assert_eq!(after["page_title"], "Weather at the Back Yard");
 
-    terminate(&child);
+    terminate(&mut child).await;
 }
 
 /// Adding a station restarts **everything**, and the preview says so in advance.
@@ -414,7 +478,7 @@ async fn adding_a_station_restarts_the_whole_plan_and_the_preview_says_so() {
     let (http, grpc, mgmt) = free_ports().await;
     configure(&config, http, grpc, mgmt).await;
     let socket = notify_socket(&notify);
-    let child = spawn(&config, &notify);
+    let mut child = spawn(&config, &notify);
     wait_ready(&socket).await;
 
     let before = request(mgmt, "GET", "/api/v1/runtime/components", None)
@@ -474,7 +538,7 @@ async fn adding_a_station_restarts_the_whole_plan_and_the_preview_says_so() {
     expected.sort();
     assert_eq!(built_from(mgmt, generation).await, expected);
 
-    terminate(&child);
+    terminate(&mut child).await;
 }
 
 /// **An abandoned preview leaves nothing behind.**
@@ -493,7 +557,7 @@ async fn an_abandoned_preview_does_not_disturb_the_next_save() {
     let (http, grpc, mgmt) = free_ports().await;
     configure(&config, http, grpc, mgmt).await;
     let socket = notify_socket(&notify);
-    let child = spawn(&config, &notify);
+    let mut child = spawn(&config, &notify);
     wait_ready(&socket).await;
 
     // ① Preview a change that *would* rebuild the shared state — then abandon it.
@@ -541,7 +605,7 @@ async fn an_abandoned_preview_does_not_disturb_the_next_save() {
         "the abandoned preview restarted the whole plan: {saved}"
     );
 
-    terminate(&child);
+    terminate(&mut child).await;
 }
 
 /// Rotating a station's protocol secret takes effect **without a restart**.
@@ -557,7 +621,7 @@ async fn rotating_a_protocol_secret_restarts_nothing_and_still_takes_effect() {
     let (http, grpc, mgmt) = free_ports().await;
     configure(&config, http, grpc, mgmt).await;
     let socket = notify_socket(&notify);
-    let child = spawn(&config, &notify);
+    let mut child = spawn(&config, &notify);
     wait_ready(&socket).await;
 
     let (_, before) = request(mgmt, "GET", "/api/v1/stations/backyard", None).await;
@@ -592,7 +656,7 @@ async fn rotating_a_protocol_secret_restarts_nothing_and_still_takes_effect() {
     let (_, after) = request(mgmt, "GET", "/api/v1/stations/backyard", None).await;
     assert_eq!(after["protocol_secret"]["is_set"], true);
 
-    terminate(&child);
+    terminate(&mut child).await;
 }
 
 /// A station's APRS callsign survives a read-modify-write.
@@ -618,7 +682,7 @@ async fn a_round_trip_keeps_the_aprs_callsign() {
     pool.close().await;
 
     let socket = notify_socket(&notify);
-    let child = spawn(&config, &notify);
+    let mut child = spawn(&config, &notify);
     wait_ready(&socket).await;
 
     let (_, station) = request(mgmt, "GET", "/api/v1/stations/backyard", None).await;
@@ -678,7 +742,7 @@ async fn a_round_trip_keeps_the_aprs_callsign() {
         "{refused}"
     );
 
-    terminate(&child);
+    terminate(&mut child).await;
 }
 
 /// A service the operator switched off is still readable, and says it is off.
@@ -706,7 +770,7 @@ async fn a_switched_off_service_is_still_readable() {
     pool.close().await;
 
     let socket = notify_socket(&notify);
-    let child = spawn(&config, &notify);
+    let mut child = spawn(&config, &notify);
     wait_ready(&socket).await;
 
     let (status, service) = request(mgmt, "GET", "/api/v1/services/pwsweather", None).await;
@@ -714,7 +778,7 @@ async fn a_switched_off_service_is_still_readable() {
     assert_eq!(service["enabled"], false);
     assert_eq!(service["api_key"]["is_set"], true);
 
-    terminate(&child);
+    terminate(&mut child).await;
 }
 
 /// A refusal lands on the **field** that caused it, which is §7.2's rule and the thing a
@@ -731,7 +795,7 @@ async fn a_bad_value_is_refused_on_its_own_field() {
     let (http, grpc, mgmt) = free_ports().await;
     configure(&config, http, grpc, mgmt).await;
     let socket = notify_socket(&notify);
-    let child = spawn(&config, &notify);
+    let mut child = spawn(&config, &notify);
     wait_ready(&socket).await;
 
     let (status, body) = request(
@@ -768,7 +832,7 @@ async fn a_bad_value_is_refused_on_its_own_field() {
     let (_, website) = request(mgmt, "GET", "/api/v1/websites/1", None).await;
     assert_eq!(website["page_title"], "Backyard Weather");
 
-    terminate(&child);
+    terminate(&mut child).await;
 }
 
 /// A `PUT` to a website id nothing has is a `404`, and does **not** create one.
@@ -784,7 +848,7 @@ async fn a_put_to_an_unknown_website_does_not_create_one() {
     let (http, grpc, mgmt) = free_ports().await;
     configure(&config, http, grpc, mgmt).await;
     let socket = notify_socket(&notify);
-    let child = spawn(&config, &notify);
+    let mut child = spawn(&config, &notify);
     wait_ready(&socket).await;
 
     let (status, body) = request(
@@ -805,7 +869,7 @@ async fn a_put_to_an_unknown_website_does_not_create_one() {
         .collect();
     assert_eq!(ids, [1], "a refused PUT invented a website");
 
-    terminate(&child);
+    terminate(&mut child).await;
 }
 
 /// **Undo save** puts the previous configuration back, and only the one step it kept.
@@ -817,7 +881,7 @@ async fn one_step_back_restores_the_previous_configuration() {
     let (http, grpc, mgmt) = free_ports().await;
     configure(&config, http, grpc, mgmt).await;
     let socket = notify_socket(&notify);
-    let child = spawn(&config, &notify);
+    let mut child = spawn(&config, &notify);
     wait_ready(&socket).await;
 
     let (_, before) = request(mgmt, "GET", "/api/v1/config", None).await;
@@ -881,7 +945,7 @@ async fn one_step_back_restores_the_previous_configuration() {
     .await;
     assert_eq!(status, 409, "{exhausted}");
 
-    terminate(&child);
+    terminate(&mut child).await;
 }
 
 /// Changing the management port actually moves the socket.
@@ -900,7 +964,7 @@ async fn changing_the_management_port_moves_the_socket() {
     let (_, _, moved) = free_ports().await;
     configure(&config, http, grpc, mgmt).await;
     let socket = notify_socket(&notify);
-    let child = spawn(&config, &notify);
+    let mut child = spawn(&config, &notify);
     wait_ready(&socket).await;
 
     let (status, listener) = request(mgmt, "GET", "/api/v1/website-server", None).await;
@@ -946,7 +1010,7 @@ async fn changing_the_management_port_moves_the_socket() {
     assert_eq!(status, 200, "{listener}");
     assert_eq!(listener["management_port"].as_u64(), Some(u64::from(moved)));
 
-    terminate(&child);
+    terminate(&mut child).await;
 }
 
 /// Every secret is **omitted**, on every route that could carry one.
@@ -1004,7 +1068,7 @@ async fn no_response_carries_a_credential() {
     pool.close().await;
 
     let socket = notify_socket(&notify);
-    let child = spawn(&config, &notify);
+    let mut child = spawn(&config, &notify);
     wait_ready(&socket).await;
 
     for path in [
@@ -1038,5 +1102,5 @@ async fn no_response_carries_a_credential() {
     let (_, station) = request(mgmt, "GET", "/api/v1/stations/polled", None).await;
     assert_eq!(station["transport"]["credential"]["is_set"], true);
 
-    terminate(&child);
+    terminate(&mut child).await;
 }
