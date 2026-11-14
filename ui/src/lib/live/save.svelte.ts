@@ -85,7 +85,14 @@ export async function previewChange(change: Schemas['Change']): Promise<Schemas[
  */
 export function previewSentence(applied: Schemas['Applied']): string {
   const d = applied.diff;
-  const names = (xs: Schemas['Named'][]) => xs.map((n) => n.display);
+  // **Deduplicated.** Several components share one operator-facing name on purpose --
+  // `api:legacy` and `http:listener` are both "Website & API", `snapshot:latest` and
+  // `snapshot:warm` are both "Current conditions" -- which is §0.2 working as intended for
+  // a badge and reads as a stutter in a sentence: "restart Website & API, the weather
+  // database, Website & API, Current conditions, Current conditions…". The internal ids
+  // that distinguish them are exactly what D-36 keeps off the screen, so the sentence
+  // names each thing once.
+  const names = (xs: Schemas['Named'][]) => [...new Set(xs.map((n) => n.display))];
   const parts: string[] = [];
   if (d.restart.length > 0) parts.push(home.preview.willRestart(names(d.restart)));
   if (d.start.length > 0) parts.push(home.preview.willStart(names(d.start)));
