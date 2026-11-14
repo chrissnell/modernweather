@@ -2841,7 +2841,9 @@ parity, raw mode — and reaching it needs either `libc` or a serial-port crate.
 table, and `[workspace.lints.rust]` sets `unsafe_code = "warn"`, which `-D warnings` makes an error,
 so hand-rolling the `ioctl` is not available either.
 
-*What this build does instead.* `crates/mw-station/src/stream.rs` opens the character device with
+*What this build does instead.* **(Superseded 2026-11-14 — see "What was built", below. The three
+bullets that follow describe the build up to that date and are kept because the protocol does not
+edit a record in place.)** `crates/mw-station/src/stream.rs` opens the character device with
 `O_NONBLOCK | O_NOCTTY` and polls it through `tokio::io::unix::AsyncFd`, which needs no new
 dependency. **`transport_baud` is therefore recorded and not applied**: the line discipline is
 whatever the device already has. Three consequences, each stated at that module rather than left to
@@ -2881,7 +2883,7 @@ from there. `stream.rs`'s `serial` now opens through `tokio_serial`, which is `t
 deleted, and what replaced it reads the rate back out of the line with `tcgetattr` and logs that,
 because "`tcsetattr` returned" and "the line is at 115200" are not the same claim.
 
-*Four corrections to this entry's own claims, now that they have been measured rather than read.*
+*Seven corrections to this entry's own claims, now that they have been measured rather than read.*
 
 - **The fix is not one line.** The *open* is, near enough; the `ByteStream` impl is **not**
   unchanged. `SerialStream` is `AsyncRead + AsyncWrite`, so `read`/`write_all` go through
@@ -2900,6 +2902,39 @@ because "`tcsetattr` returned" and "the line is at 115200" are not the same clai
   before they ran. macOS is supported so that the crate builds on a developer's machine and is not
   in `ci/release.toml`; a real `/dev/cu.*` is unaffected. Linux uses `BOTHER` with `TCSETS2` and
   takes arbitrary rates.
+- **The open is now EXCLUSIVE, which this entry never mentioned and is the largest behavioural
+  change in the diff.** `serialport`'s builder defaults to `exclusive: true`, so the open takes
+  `TIOCEXCL` **and** an exclusive `flock` (`posix/tty.rs:134-137`) where `OpenOptions::open` took
+  neither. It is kept — written out as `.exclusive(true)` rather than inherited — because one
+  serial line has one reader and two readers *split* the stream rather than each getting it, which
+  is the failure `tests/serial_bridge.rs` exists to prove `ser2net` does not have. The cost is
+  that **two components naming one `transport_dev` no longer both start**, and nothing refuses that
+  at plan time: neither `mw_station::plan` nor `mw_output::plan` compares device paths, so a station
+  and an APRS `kiss-serial` sink may both name `/dev/ttyUSB0` and whichever is built second gets
+  `EBUSY` and `Backoff`s. **Build order decides which**, so the failure is not deterministic. That
+  is worse than it should be and better than the silent split it replaced; refusing it at plan time
+  is a separate work item and is raised as one.
+- **Applying the rate is an upgrade hazard in the inverse direction, and this entry argued only one
+  way.** `transport_baud` has been *mandatory* for a serial station since
+  `migrations/config/20261102230000_config_schema_initial.sql`'s `CHECK`, and nothing ever compared
+  it against reality — so every existing row holds an unvalidated value. A deployment whose `udev`
+  rule or `stty` set the line **correctly** while the column was stale worked before and fails
+  after, with exactly the CRC symptom this change removes. The readback cannot catch it: the kernel
+  accepts a wrong rate as readily as a right one, so the mismatch arm never fires. Worse on the APRS
+  side, where the value may be absent — `mw_output::plan` turns a NULL `aprs_kiss_serial_baud` into
+  9600 and now puts that on the radio, so a TNC at 19200 on a `udev`-configured line was beaconing
+  correctly and transmits noise after the upgrade. **This belongs in the release note**: on upgrade,
+  confirm both columns against whatever was configuring the line.
+- **Two smaller facts about what the crate brought.** The `unsafe` block's own argument was that
+  `AsyncFd::{new, with_interest, try_new, try_with_interest}` are deprecated in `tokio` 1.54 as
+  "unsound due to lack of I/O safety"; `tokio-serial` 5.5 calls `AsyncFd::new`, so the deprecation
+  was **relocated to the dependency rather than resolved** — low risk, since `tokio` will not remove
+  a deprecated 1.x API, and still clearly worth the trade. And the dependency graph gained six
+  crates and **duplicated two majors**: `nix` 0.26.4 (via `serialport`) alongside `nix` 0.31.3 (via
+  `mio-serial`), and `bitflags` 1.3.2 alongside 2.13.2. No gate objects — `ci/gates.toml` has no
+  duplicate-version check — and `Cargo.toml`'s "one version of each crate across the workspace" is
+  about `[workspace.dependencies]` rather than the transitive graph, but the claim is now less true
+  than it was and saying so costs nothing.
 
 *The test, which is the part worth arguing about.* GRA-788's criterion 3 asked for a test that would
 have caught the old behaviour, and said in as many words that a `socat` pty cannot be it. **That is

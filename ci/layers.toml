@@ -333,7 +333,7 @@ docs/service-architecture.md §5.1: `tracing` macros only, nowhere a `log::` mac
 version has a package-global sugared logger AND an injected one, used interchangeably inside
 the same functions, which is why its output cannot be filtered per station. `mw-obs`
 installs `tracing_log::LogTracer` so that DEPENDENCY crates using `log` -- `sqlx`, `hyper`,
-`rustls` -- still land in the pipeline; a workspace crate declaring `log` itself is the
+`rustls`, `mio-serial` -- still land in the pipeline; a workspace crate declaring `log` itself is the
 second path reappearing."""
 
 # ---------------------------------------------------------------------------------------

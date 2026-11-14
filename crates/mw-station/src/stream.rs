@@ -10,7 +10,7 @@
 //!
 //! # The serial port, and the line rate it now sets
 //!
-//! **`transport_baud` is applied.** [`serial`] opens the character device through
+//! **`transport_baud` is applied.** `serial` opens the character device through
 //! `tokio_serial`, which is `tcgetattr`, `cfmakeraw`, 8N1 with no flow control, the rate,
 //! `tcsetattr` — and then the same `AsyncFd` registration this module used to perform by
 //! hand. It reads the rate back out of the line afterwards and logs it, because "we called
@@ -49,6 +49,28 @@
 //!   **What it does not prove is timing**, and no test in this repository does: that the
 //!   kernel accepted and recorded 115200 is not evidence that a UART clocked 115200, and
 //!   the only apparatus that could say so is hardware.
+//!
+//! # The upgrade hazard, which is the inverse of the defect
+//!
+//! **`transport_baud` was decorative and is now authoritative, and that can break a line
+//! that worked.** The column has been *mandatory* for a serial station since
+//! `migrations/config/20261102230000_config_schema_initial.sql`'s
+//! `CHECK (transport_kind <> 'serial' OR (transport_dev IS NOT NULL AND transport_baud IS
+//! NOT NULL))`, and until this change nothing ever compared it against reality. So every
+//! existing serial row carries a value that has never been validated. A deployment whose
+//! `udev` rule or `stty` set the line to the **correct** rate while the column holds a stale
+//! one worked before and fails after — with precisely the CRC-failure symptom this change
+//! exists to remove.
+//!
+//! The readback below does not catch that, and it is worth being clear about why: the kernel
+//! accepts a *wrong* rate as readily as a right one, so the mismatch arm never fires and the
+//! operator sees `undecodable` frames again. **The check is an operator's, not this
+//! module's**: on upgrade, confirm `transport_baud` — and `uploader.aprs_kiss_serial_baud`,
+//! which `mw_output::plan` defaults to 9600 when the column is NULL and now puts that on the
+//! radio — against whatever was configuring the line before.
+//!
+//! The open is also **exclusive** as of this change, which is a behaviour change in its own
+//! right; `serial`'s documentation has the three consequences.
 //!
 //! **One platform cost, and it is `serialport`'s own recorded note.** On macOS the rate is
 //! set with the `IOSSIOSPEED` ioctl, which **refuses a pseudo terminal with `ENOTTY`**
@@ -94,10 +116,13 @@ pub enum OpenError {
     /// `transport_dev` names a path that exists and is a regular file.
     ///
     /// Worth its own variant because the path exists, so `Device`'s "could not be opened"
-    /// reads like a cable fault. What actually happens is that `tcgetattr` answers `ENOTTY`
-    /// -- there is no line to read the state of -- and `serialport` reports that in its
-    /// catch-all `ErrorKind::Unknown`, which is why [`classify`] decides this from the file
-    /// type rather than from the errno.
+    /// reads like a cable fault. What actually happens is that the **`TIOCEXCL` ioctl**
+    /// answers `ENOTTY` -- it runs before the `tcgetattr` (`posix/tty.rs:134-141`), so it is
+    /// the first call to notice there is no line here -- and `serialport` reports that in
+    /// its catch-all `ErrorKind::Unknown`, which is why `classify` decides this from the
+    /// file type rather than from the errno. Measured rather than inferred from the source:
+    /// on a regular file the open succeeds, `TIOCEXCL` returns `ENOTTY`, and the `tcgetattr`
+    /// behind it would have returned `ENOTTY` too.
     #[error(
         "the serial device {dev} is a regular file: `transport_dev` has to name a character \
          device -- a serial port, or a `socat` pty"
@@ -171,9 +196,16 @@ impl mw_types::Classify for OpenError {
     /// so the cost of being wrong in this direction is one log line per minute and the cost
     /// of being wrong in the other is a station that stays dead until the process restarts.
     ///
-    /// The two configuration mistakes -- [`OpenError::Tls`] and [`OpenError::NotAStream2`] --
-    /// are refused at **plan** time by `crate::plan`, so they are not reached here by any
-    /// plannable configuration and their classification changes nothing.
+    /// Two of the three configuration mistakes -- [`OpenError::Tls`] and
+    /// [`OpenError::NotAStream2`] -- are refused at **plan** time by `crate::plan`, so they
+    /// are not reached here by any plannable configuration and their classification changes
+    /// nothing. **[`OpenError::NotAStream`] is the third and is not refused anywhere**: a
+    /// `transport_dev` naming a regular file is plannable, so it reaches this and retries
+    /// forever under `Backoff` against a mistake no amount of waiting fixes. That is the
+    /// existing policy rather than a new one -- the alternative is a station that stays dead
+    /// across a `transport_dev` an operator is about to correct -- and `last_error` names the
+    /// file and the reason once a minute. Noted because this change sharpened the variant
+    /// into a pure configuration error, which is the moment it became worth saying.
     fn class(&self) -> mw_types::Class {
         mw_types::Class::RETRYABLE
     }
@@ -224,6 +256,40 @@ pub async fn open(transport: &Transport, station: &str) -> Result<Box<dyn ByteSt
 /// 8N1 (`davis/station.go`'s `serial.Config`) and so is a Campbell datalogger. They happen to
 /// be `serialport`'s defaults today; saying so means a change to those defaults is not a
 /// change to this program.
+///
+/// # The open is exclusive, which is a behaviour change and is the one intended
+///
+/// `.exclusive(true)` is `serialport`'s default and is written out here for the same reason
+/// 8N1 is: an inherited default that decides whether a second process can read the line is
+/// not a thing to leave implicit. It takes **`TIOCEXCL` and an exclusive `flock`**
+/// (`posix/tty.rs:134-137`), and the previous `OpenOptions::open` took neither.
+///
+/// **It is on purpose and it is the second defect this change fixes.** One serial line has
+/// one reader. Two readers do not each get the stream; they split it, and both ends then
+/// produce gap-ridden data that still parses — which is the exact failure
+/// `tests/serial_bridge.rs` exists to prove `ser2net` does *not* have, and the reason
+/// **N-20** terminates the line outside the pod rather than opening it twice. A refusal an
+/// operator can read in `ComponentStatus::last_error` is strictly better than two components
+/// silently halving each other's frames.
+///
+/// **Three consequences, all of them operator-visible, none of them silent:**
+///
+/// - **Two components on one `transport_dev` no longer both start.** Nothing refuses that
+///   configuration at plan time — `crate::plan` compares no device paths, and neither does
+///   `mw_output::plan`, so a station and an APRS `kiss-serial` sink may both name
+///   `/dev/ttyUSB0`. Whichever is built second now gets `EBUSY`
+///   (`ErrorKind::NoDevice` → [`OpenError::Device`], carrying "Device or resource busy")
+///   and `Backoff`s. **Which one loses depends on build order, so the failure is not
+///   deterministic** — that is worse than it should be and better than the split stream it
+///   replaced. Refusing it at plan time, where [`OpenError::Tls`] and
+///   [`OpenError::NotAStream2`] already are, is a separate work item.
+/// - **A device another process holds is refused**, where it previously opened. If `ser2net`
+///   or `gpsd` owns the line, this daemon's transport is `tcp_out` and not `serial`; that is
+///   N-20's path and it is unaffected.
+/// - **The reverse also holds**: this daemon now holds the `flock`, so a `ser2net` started
+///   afterwards against the same device answers `Device open failure: Object was already in
+///   use`. `packaging/serial-bridge/README.md` documents that symptom from the other
+///   direction; this is the new direction.
 fn serial(dev: &Path, baud: u32, station: &str) -> Result<SerialPort, OpenError> {
     // `to_string_lossy` because `serialport`'s builder takes a `str` and a device path is an
     // `OsStr`. A non-UTF-8 `transport_dev` therefore fails to open rather than opening the
@@ -234,6 +300,7 @@ fn serial(dev: &Path, baud: u32, station: &str) -> Result<SerialPort, OpenError>
         .parity(tokio_serial::Parity::None)
         .stop_bits(tokio_serial::StopBits::One)
         .flow_control(tokio_serial::FlowControl::None)
+        .exclusive(true)
         .open_native_async()
         .map_err(|e| classify(dev, e))?;
 
@@ -283,12 +350,22 @@ fn serial(dev: &Path, baud: u32, station: &str) -> Result<SerialPort, OpenError>
 /// Which [`OpenError`] a `tokio_serial` failure is.
 ///
 /// **Decided from the file type rather than from the error**, and that is the crate's
-/// limitation rather than a preference. `serialport` translates ten errnos and answers
+/// limitation rather than a preference. `serialport` translates **twelve** errnos and answers
 /// `ErrorKind::Unknown` for every other one (`posix/error.rs`), and the two this path can
-/// actually produce — `ENOTTY` from the `tcgetattr` that reads the line's current state, and
-/// `EINVAL` from the `tcsetattr` that writes the new one — are both in that catch-all,
-/// alongside errnos meaning the opposite. A `stat` is a direct measurement of the thing
-/// [`OpenError::NotAStream`] is about, so it is used instead of inferring it.
+/// actually produce — `ENOTTY` from the `TIOCEXCL` and the `tcgetattr` that read the line's
+/// current state, and `EINVAL` from the `tcsetattr` that writes the new one — are both in
+/// that catch-all, alongside errnos meaning the opposite. A `stat` is a direct measurement of
+/// the thing [`OpenError::NotAStream`] is about, so it is used instead of inferring it.
+///
+/// **What this predicate does and does not catch**, because `is_file` is narrower than the
+/// question. A regular file and a symlink to one are `NotAStream`, which is the only case
+/// reachable from a configuration somebody would write. A **FIFO** or a **block device**
+/// opens, fails `TIOCEXCL` the same way, and lands in `Device` with a "could not be opened"
+/// message about a path that opened — imprecise, and left that way deliberately:
+/// `FileType::is_char_device` would classify those two correctly and is
+/// `std::os::unix::fs::FileTypeExt`, which would make this module Unix-only again for a
+/// message on a path no configuration reaches. `Device` with the real `ENOTTY` attached is
+/// not a wrong answer there, just a less pointed one.
 ///
 /// The `stat` follows symlinks on purpose: `socat`'s `link=` is a symlink to a `/dev/pts/N`.
 /// A path that has gone away between the open and here is `Device`, which is what it would
@@ -354,19 +431,22 @@ impl fmt::Debug for SerialPort {
 }
 
 impl SerialPort {
-    /// The rate the line is actually at, read with `tcgetattr`.
+    /// The rate the line is actually at.
     ///
-    /// Not the configured value held in a field: this asks the kernel. That distinction is
-    /// the whole of amendment **A-M6-1-1** — the previous build had the configured value and
-    /// nothing else — so the accessor returns the measurement and there is no field for the
-    /// request to be confused with.
+    /// **On Linux this asks the kernel** — `TCGETS2`, not plain `tcgetattr`, which is the
+    /// mechanism that makes it able to report an arbitrary `BOTHER` rate at all
+    /// (`serialport`'s `posix/tty.rs:605`). That distinction is the whole of amendment
+    /// **A-M6-1-1**: the previous build had the configured value and nothing else, so this
+    /// accessor returns the measurement and there is no field for the request to be confused
+    /// with.
+    ///
+    /// **On macOS and iOS it is `Ok(self.baud_rate)`** — the value the port was opened with,
+    /// held in a field (`posix/tty.rs:654`). So there the readback in `serial` is a
+    /// tautology and its mismatch arm cannot fire. Said here because an accessor that is a
+    /// measurement on one platform and an echo on another is exactly the kind of thing a
+    /// reader is entitled to be told rather than left to find.
     pub fn baud_rate(&self) -> Result<u32, std::io::Error> {
         self.port.baud_rate().map_err(std::io::Error::from)
-    }
-
-    /// Which device this is, for a log line and an error message.
-    pub fn device(&self) -> &Path {
-        &self.dev
     }
 }
 
@@ -559,7 +639,6 @@ mod tests {
             "`transport_baud` reached the line: a fresh `socat` pty's own rate is 38400, so \
              this distinguishes a `tcsetattr` that happened from one that did not"
         );
-        assert_eq!(port.device(), pair.daemon_side());
 
         // The negative control, on the SAME device: drop the port -- which releases the
         // `TIOCEXCL` and the `flock` `serialport` takes -- and open it again at a different

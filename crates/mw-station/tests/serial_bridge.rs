@@ -25,7 +25,10 @@
 //!   go red;
 //! - [`two_readers_of_one_character_device_do_not_both_get_the_stream`] — the same
 //!   apparatus with the bridge taken out, which is the *real* failure mode and the reason
-//!   `packaging/serial-bridge/README.md`'s cutover order is what it is.
+//!   `packaging/serial-bridge/README.md`'s cutover order is what it is. It opens the device
+//!   with a plain `open(2)` rather than through `mw_station::stream::open`, which since
+//!   GRA-788 takes `TIOCEXCL` and would refuse the second open: what is under test is the
+//!   device, not this daemon's guard over it.
 //!
 //! # What runs these
 //!
@@ -245,8 +248,16 @@ async fn two_readers_of_one_character_device_do_not_both_get_the_stream() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // `crate::stream`'s flags, and for its reasons: `O_NONBLOCK` because `open(2)` on a tty
-    // blocks until carrier, `O_NOCTTY` because this must not acquire a controlling terminal.
+    // A plain `open(2)` with the flags any careful serial reader uses: `O_NONBLOCK` because
+    // `open(2)` on a tty blocks until carrier, `O_NOCTTY` because this must not acquire a
+    // controlling terminal. **Deliberately NOT `crate::stream::open`**, and that distinction
+    // is the point of this test since GRA-788: `stream::open` now takes `TIOCEXCL` and an
+    // exclusive `flock`, so it would refuse the second open and this test would measure its
+    // own caller rather than the hazard. What is being measured is the *device's* behaviour
+    // -- an unbridged character device admits a second reader and splits the stream -- which
+    // is why the cutover order in `packaging/serial-bridge/README.md` exists and is also what
+    // the Go daemon did. `stream::open`'s exclusivity is a second, independent guard over the
+    // same hazard, not a replacement for the bridge.
     const O_NONBLOCK_NOCTTY: i32 = 0o4000 | 0o400;
     let open_line = || {
         std::fs::OpenOptions::new()
@@ -454,7 +465,8 @@ async fn the_campbell_driver_reads_the_bridge_while_a_second_client_reads_the_sa
 /// [`two_readers_of_one_character_device_do_not_both_get_the_stream`] measures. Started in
 /// the right order, a daemon that is accidentally left pointing at the serial port logs
 /// `failed to open serial port … device or resource busy` and retries — loud, and not a
-/// split stream.
+/// split stream. Since GRA-788 that daemon would also have refused its own second opener,
+/// but this assertion is about the bridge holding the line and does not depend on it.
 #[tokio::test]
 #[ignore = "needs `ser2net` and `socat`; `ci/serial-bridge/prove.sh` runs it"]
 async fn the_bridge_owns_the_line_exclusively_once_it_has_a_client() {
@@ -468,6 +480,11 @@ async fn the_bridge_owns_the_line_exclusively_once_it_has_a_client() {
     // *other* half of this property, that an unbridged character device admits a second
     // plain `open(2)`, is what
     // `two_readers_of_one_character_device_do_not_both_get_the_stream` opens twice.
+    //
+    // `ser2net`'s `TIOCEXCL` and the one `mw_station::stream::open` has taken since GRA-788
+    // are the same mechanism pointed at the same hazard from the two ends. This test asserts
+    // the bridge's, which is the one that matters here: the bridge is what owns the line in
+    // N-20's deployment, and this daemon reaches it over `tcp_out`.
     const O_NONBLOCK_NOCTTY: i32 = 0o4000 | 0o400;
     let open_line = || {
         std::fs::OpenOptions::new()
