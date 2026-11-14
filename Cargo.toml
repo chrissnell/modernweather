@@ -143,9 +143,34 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 arc-swap = "1"
 
 # Secrets, constant-time comparison, password hashing (D-32).
-secrecy = "0.10"
+#
+# `features = ["serde"]` on `secrecy`, enabled by implementation-plan.md M7-2: W5 §3.2
+# requires the submitted password to be a `SecretString` "from the moment it is
+# deserialised, so a stray `{:?}` cannot print it", and a `#[derive(Deserialize)]` on the
+# login body cannot do that without this feature. Not a substitution -- `secrecy` is already
+# D-32's entry for this idiom -- and it adds one trait impl rather than a dependency.
+secrecy = { version = "0.10", features = ["serde"] }
 subtle = "2"
-argon2 = "0.5"
+# `features = ["std"]`, also M7-2's: the default feature set re-exports `rand_core` but not
+# its `getrandom` backend, so `OsRng` -- the CSPRNG every secret in W5 §3 comes out of -- is
+# not in scope. It resolved anyway through another crate's feature unification, which is
+# exactly the kind of accident that breaks on an unrelated dependency change, so it is
+# asked for here.
+argon2 = { version = "0.5", features = ["std"] }
+# The FAST hash, for the two secrets that have no low-entropy half to protect: the 32-byte
+# session secret and the setup code (W5 §3.3, §3.4). Amendment A-M7-2-1, recorded in
+# docs/reconciliation.md — D-32's table names `argon2` for password hashing and no general
+# digest, and Argon2id is the wrong primitive here twice over. It is unnecessary, because a
+# 32-byte CSPRNG secret has nothing to brute-force, and it is actively wrong: the session
+# hash is computed on EVERY management request, so m=64 MiB/t=3 would make a page load
+# allocate 64 MiB three times over on the 512 MB target W3 §5.7 sizes against.
+#
+# `sha2` rather than a second candidate because it is already in this graph at this version
+# -- `sqlx-core` depends on 0.10 -- so the lock file and the binary gain nothing, and
+# because `migrations/config/20261102230000_config_schema_initial.sql` already fixed the
+# answer: both `token_hash` columns are `CHECK (length(token_hash) = 32)`, which is SHA-256's
+# digest and not Blake2's or Blake3's default.
+sha2 = "0.10"
 
 # Fixed-layout binary packet decode -- the Davis LOOP packet is a struct (D-32).
 zerocopy = { version = "0.8", features = ["derive"] }

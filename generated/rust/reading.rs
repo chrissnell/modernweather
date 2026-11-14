@@ -46,9 +46,9 @@ pub struct Reading {
     pub time: DateTime<Utc>,
     /// Station (`station_id`)
     pub station_id: String,
-    /// Station name (`stationname`)
+    /// Station name (wire metadata, not a column)
     pub station_name: Option<String>,
-    /// Station type (`stationtype`)
+    /// Station type (wire metadata, not a column)
     pub station_type: Option<String>,
 
     /// Pressure — inHg (`barometer`)

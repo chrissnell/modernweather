@@ -51,6 +51,41 @@ export interface components {
       warnings: string[];
     };
     /**
+     * `GET /api/v1/auth/session` — the one unauthenticated read, and the first request the UI
+     * makes.
+     *
+     * Three states in one object, which is what §1.1 means by "also reports whether the
+     * instance has been claimed, which drives the first-run redirect":
+     *
+     * | `claimed` | `authenticated` | the client shows |
+     * |---|---|---|
+     * | `false` | `false` | §0.7's "Create your administrator account" |
+     * | `true` | `false` | the login screen (§8.8's signed-out state) |
+     * | `true` | `true` | the application |
+     *
+     * `claimed = false, authenticated = true` is unrepresentable in practice and is not
+     * special-cased: the claim creates the credential and the session in one transaction.
+     */
+    AuthStateView: {
+      /**
+       * Whether this request carried a live session.
+       */
+      authenticated: boolean;
+      /**
+       * Whether an administrator account exists.
+       */
+      claimed: boolean;
+      /**
+       * The password rule the forms should state.
+       */
+      password_policy: components["schemas"]["PasswordPolicyView"];
+      session?: (components["schemas"]["SessionView"] | null);
+      /**
+       * Who, when `authenticated`.
+       */
+      username?: (string | null);
+    };
+    /**
      * The badge a state gets, as §0.4's table names it.
      *
      * Note that the badge is **not** the state's own word: `Failed` is badged **Stopped** and
@@ -202,6 +237,31 @@ export interface components {
        */
       listener: components["schemas"]["ListenerInput"];
     });
+    /**
+     * What `POST /api/v1/auth/claim` submits — §3.4's one-time setup claim.
+     */
+    ClaimInput: {
+      /**
+       * The password to set.
+       */
+      password: string;
+      /**
+       * The same password again (§3.4 step 3: "a password (twice)").
+       */
+      password_again: string;
+      /**
+       * The code printed to the console at first start.
+       *
+       * Secret for the same reason the password is, and for one more: this is the value
+       * §3.5's "nothing secret in logs" rule makes the single deliberate exception for, and
+       * the exception is the **banner**, not a `{:?}`.
+       */
+      setup_code: string;
+      /**
+       * The username to create.
+       */
+      username: string;
+    };
     /**
      * One component, as §2.3 returns it.
      */
@@ -707,6 +767,23 @@ export interface components {
       directive: string;
     };
     /**
+     * What `POST /api/v1/auth/login` submits.
+     */
+    LoginInput: {
+      /**
+       * Their password.
+       *
+       * A `SecretString` from the moment it is deserialised (**D-33**, §3.2), so a `{:?}` on
+       * this struct anywhere downstream cannot print it. `value_type = String` because that
+       * is what is on the wire; the schema describes the JSON, not the Rust.
+       */
+      password: string;
+      /**
+       * The administrator's username.
+       */
+      username: string;
+    };
+    /**
      * What a read of the log rings returns.
      */
     LogsView: {
@@ -804,6 +881,41 @@ export interface components {
        * Which station.
        */
       station_key: string;
+    };
+    /**
+     * What `POST /api/v1/auth/password` submits.
+     */
+    PasswordInput: {
+      /**
+       * The current password. **Required** (§3.5): a session is not sufficient authority to
+       * replace the credential, because the session is what a borrowed laptop has.
+       */
+      current_password: string;
+      /**
+       * The new password.
+       */
+      new_password: string;
+      /**
+       * The new password again.
+       */
+      new_password_again: string;
+    };
+    /**
+     * The password rule, so the form states it rather than restating it.
+     *
+     * §0.5's inline-help standard applied to the one rule there is: a client that hardcoded
+     * "at least 12 characters" would be a second copy of [`crate::auth::POLICY_MIN_CHARS`],
+     * and the two would disagree the first time the policy moved.
+     */
+    PasswordPolicyView: {
+      /**
+       * The most bytes accepted.
+       */
+      maximum_bytes: number;
+      /**
+       * The fewest characters accepted.
+       */
+      minimum_characters: number;
     };
     /**
      * What a change does to the running component set.
@@ -1143,6 +1255,71 @@ export interface components {
        * Every upload service that has an account.
        */
       services: components["schemas"]["ServiceView"][];
+    };
+    /**
+     * One session, as the session list shows it.
+     */
+    SessionView: {
+      /**
+       * When it was created.
+       */
+      created_at: string;
+      /**
+       * Where it was created from.
+       */
+      created_ip?: (string | null);
+      /**
+       * Whether this is the session making the request, so the list can say "this browser"
+       * rather than offering to sign the operator out of the page they are looking at.
+       */
+      current: boolean;
+      /**
+       * When it stops working.
+       */
+      expires_at: string;
+      /**
+       * The public handle, hex. What `DELETE /api/v1/auth/sessions/{id}` names.
+       */
+      id: string;
+      /**
+       * When it was last used.
+       */
+      last_seen_at: string;
+      /**
+       * The browser that created it, if it said — §3.3's "which browser is this?".
+       */
+      user_agent?: (string | null);
+    };
+    /**
+     * `GET /api/v1/auth/sessions`.
+     */
+    SessionsView: {
+      /**
+       * Every live session, newest first.
+       */
+      sessions: components["schemas"]["SessionView"][];
+    };
+    /**
+     * What a successful login, claim or password change answers with.
+     *
+     * One type for all three because the client does the same thing with all three: it is
+     * signed in, as this person, on this session, with these things worth knowing. `warnings`
+     * is §8.5's non-blocking slot and is where **O-10**'s breached-password notice lands --
+     * which is the whole reason that decision is "warn" rather than "refuse".
+     */
+    SignedInView: {
+      /**
+       * The session this request is now on.
+       */
+      session: components["schemas"]["SessionView"];
+      /**
+       * The administrator's username.
+       */
+      username: string;
+      /**
+       * Consequences that do not block.
+       */
+      warnings: string[];
     };
     /**
      * A weather station, as the "Add a station" and "Station settings" forms submit it.
@@ -1728,6 +1905,158 @@ export interface components {
 }
 
 export interface paths {
+  "/api/v1/auth/claim": {
+    /**
+     * Create the administrator account — §3.4's one-time claim.
+     */
+    post: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody: {
+        content: {
+          "application/json": components["schemas"]["ClaimInput"];
+        };
+      };
+      responses: {
+        200: { content: { "application/json": components["schemas"]["SignedInView"] } };
+        409: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+        422: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+      };
+    };
+  };
+  "/api/v1/auth/login": {
+    /**
+     * Sign in.
+     */
+    post: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody: {
+        content: {
+          "application/json": components["schemas"]["LoginInput"];
+        };
+      };
+      responses: {
+        200: { content: { "application/json": components["schemas"]["SignedInView"] } };
+        401: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+        409: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+        429: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+      };
+    };
+  };
+  "/api/v1/auth/password": {
+    /**
+     * Change the password (§3.3, §3.5).
+     */
+    post: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody: {
+        content: {
+          "application/json": components["schemas"]["PasswordInput"];
+        };
+      };
+      responses: {
+        200: { content: { "application/json": components["schemas"]["SignedInView"] } };
+        422: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+        429: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+      };
+    };
+  };
+  "/api/v1/auth/session": {
+    /**
+     * Sign out of this browser — W5 §1.1's `POST /logout`, which now actually revokes.
+     */
+    delete: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        204: { content?: never };
+      };
+    };
+    /**
+     * Whether this instance is claimed, and whether this request is signed in.
+     */
+    get: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        200: { content: { "application/json": components["schemas"]["AuthStateView"] } };
+      };
+    };
+  };
+  "/api/v1/auth/sessions": {
+    /**
+     * Sign out everywhere (§3.3) — **including** the session making the request.
+     */
+    delete: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        204: { content?: never };
+      };
+    };
+    /**
+     * Every live session (§3.3).
+     */
+    get: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        200: { content: { "application/json": components["schemas"]["SessionsView"] } };
+      };
+    };
+  };
+  "/api/v1/auth/sessions/{id}": {
+    /**
+     * Revoke one session (§3.3).
+     */
+    delete: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path: { id: string };
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        204: { content?: never };
+        404: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+      };
+    };
+  };
   "/api/v1/config": {
     /**
      * The whole configuration, with every secret omitted.

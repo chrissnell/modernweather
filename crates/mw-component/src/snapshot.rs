@@ -420,8 +420,8 @@ pub struct WebsiteView {
 /// Everything a renderer needs to produce one key's payload.
 ///
 /// Owned rather than borrowed, because [`Snapshot`] keeps it for the lazy encodings. The
-/// fields are the four inputs W3 §2a.2's handler sketch implies and nothing else: a
-/// renderer that needed a fifth would be a renderer that queries.
+/// fields are the inputs W3 §2a.2's handler sketch implies and nothing else: a renderer
+/// that needed one this does not have would be a renderer that queries.
 #[derive(Debug, Clone)]
 pub struct SnapshotSource {
     /// Which website and station this is for.
@@ -440,6 +440,33 @@ pub struct SnapshotSource {
     /// station's latitude is configuration, and taking it from a frame would make it
     /// whatever the device last claimed.
     pub meta: StationMeta,
+    /// The station's configured **display name** — `config.stations.name`.
+    ///
+    /// Separate from [`SnapshotSource::meta`] rather than a field on it, because
+    /// [`StationMeta`] is deliberately four `Copy` `Option<f64>`s on `Ingress::admit`'s hot
+    /// path and a `String` there would widen what **R1** permits (see [`StationMeta`]'s own
+    /// documentation and `StationRegistry::projection`'s note on why the two lookups are
+    /// separate).
+    ///
+    /// Here because of **M5-5**: `station_name` is a `role = "metadata"` dimension, so a
+    /// reading read back from the database carries `None` for it and `/latest`'s
+    /// `stationname` — a key with no `omitempty` on the Go side and a non-optional iOS
+    /// property — needs a source that does not depend on what a device last claimed.
+    /// W4 assumption 24 named this one: *"`snapshot:latest` reads `stations` for display
+    /// name, type, latitude, longitude and timezone rather than reading
+    /// `stationname`/`stationtype` off a reading"*.
+    ///
+    /// **Resolved per fold rather than at construction**, which is the part that matters:
+    /// the registry is published into rather than rebuilt, so an operator renaming a
+    /// station is reflected on the next reading — as it already is on `/span`, which joins
+    /// the same configuration — without a plan restart. A construction-time copy would have
+    /// needed `name` in `shared_fingerprint`, and that fingerprint deliberately excludes it
+    /// so that a rename does not restart every component.
+    ///
+    /// `None` is a station the configuration has no row for, which is a peer's received
+    /// station until M6-4. The renderer falls back to what the frame claimed and then to
+    /// the station key, because the frozen key is not optional.
+    pub display_name: Option<String>,
     /// The window-derived values, as the provider last resolved them.
     ///
     /// Empty when `WindowedView` was unavailable at build — which is a node whose database
@@ -840,6 +867,7 @@ mod tests {
             website: website(),
             reading,
             meta: StationMeta::EMPTY,
+            display_name: None,
             windows: Resolved::new(at("2026-11-07T18:30:00Z"), []),
         }
     }

@@ -52,3 +52,29 @@ pub fn write_line(line: &str) {
     let _ = out.write_all(line.as_bytes());
     let _ = out.write_all(b"\n");
 }
+
+/// Write a block of lines straight to the console, bypassing the subscriber entirely.
+///
+/// **The one sanctioned bypass of §5.1's "`tracing` macros only"**, and it exists for exactly
+/// one caller: `docs/management-ui-design.md` §3.4's first-run banner, which prints the
+/// single-use setup code. W5 **D-27** requires that code to reach **stderr only and never the
+/// log ring**, because the ring is what `GET /api/v1/logs` displays -- a code that landed
+/// there would be readable through the surface it exists to protect.
+///
+/// So it cannot be a `tracing` event: every event this process emits passes through
+/// `RingLayer`. It is a block rather than a line so that the banner cannot be interleaved
+/// with a concurrent log line in the middle of the code the operator is reading.
+///
+/// Narrower than [`write_line`] on purpose, which is the subscriber's own writer and not
+/// something another crate should reach for. If a second caller ever appears here, it needs
+/// a decision of its own, not a second line in this doc comment.
+pub fn console_banner(lines: &[String]) {
+    use std::io::Write;
+    let out = std::io::stderr();
+    let mut out = out.lock();
+    for line in lines {
+        let _ = out.write_all(line.as_bytes());
+        let _ = out.write_all(b"\n");
+    }
+    let _ = out.flush();
+}

@@ -15,8 +15,6 @@
 CREATE TABLE observations (
     time                  timestamptz  NOT NULL,
     station_id            text         NOT NULL,
-    stationname           text         NULL,
-    stationtype           text         NULL,
     barometer             float4       NULL,
     intemp                float4       NULL,
     inhumidity            float4       NULL,

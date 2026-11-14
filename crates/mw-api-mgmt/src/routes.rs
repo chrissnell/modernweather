@@ -18,15 +18,11 @@
 //! and the point of that rule -- a hand-written module must not reach a generated type -- is
 //! worth more than the convenience of spelling a path in a comment.)
 //!
-//! # Four dispositions this module makes visible by not having a route
+//! # Three dispositions this module makes visible by not having a route
 //!
 //! Recorded here rather than left as an absence, because a reader counting routes against
 //! W5 §1 will look for them:
 //!
-//! - **`/api/v1/auth/*`** is implementation-plan.md **M7-2**'s: Argon2id at m=64 MiB/t=3/p=4,
-//!   sessions that are never the API credential, the `X-MW-Request` header, and the setup
-//!   code that goes to stderr only. Until it lands, [`router`] refuses to serve on anything
-//!   but loopback -- see its own documentation, which is where that refusal is enforced.
 //! - **`/api/v1/events`** is the SSE endpoint of §5 and belongs with the client that
 //!   consumes its channels (**M7-3**). There is no polling to replace yet.
 //! - **`/api/v1/checks/*`** -- all seven -- are `check:<name>` components with
@@ -40,13 +36,18 @@
 //!
 //! Adding each of them is additive under §4.4 and needs no version bump, which is why they
 //! are absent rather than stubbed.
+//!
+//! The fourth entry in that list used to be `/api/v1/auth/*`. **M7-2 has landed it** -- the
+//! eight operations at the bottom of this file -- so what was an absence is now a section.
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
+use axum::response::IntoResponse as _;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use mw_component::{ComponentControl, ComponentId, ControlError, LogControlError};
+use secrecy::SecretString;
 
 use crate::admin::{Applied, Commit, ConfigAdmin};
 use crate::change::{
@@ -55,6 +56,7 @@ use crate::change::{
 };
 use crate::display::{Badge, Display, Section, Vocabulary};
 use crate::error::{ApiError, Body, ErrorBody, FieldError};
+use crate::guard::{Current, Guard, Peer};
 use crate::host::{
     LogEntry, LogField, LogLevelInput, LogLevelsView, LogSource, LogsView, Machine, SerialPort,
     SerialPortsView, Stream, SystemInfoView,
@@ -118,17 +120,28 @@ const LOG_PAGE_MAX: usize = 2000;
 
 /// The management API's router.
 ///
-/// **It carries no authentication**, and that is M7-2's work rather than an omission here:
-/// §3 is a whole work item -- Argon2id parameters, hashed session secrets, CSRF as
-/// `SameSite=Strict` plus a required header, the single-use setup code. What this item owes
-/// that one is a surface to authenticate, which is this.
+/// **Authenticated, since implementation-plan.md M7-2.** Two sub-routers with different
+/// state -- [`authentication`] over the [`Guard`] and the configuration surface over
+/// [`Mgmt`] -- merged and then wrapped in **one** `crate::guard::enforce` layer, so there is
+/// a single place a request is admitted and a single list of the three routes that do not
+/// need a session (`crate::guard::UNAUTHENTICATED`).
 ///
-/// The consequence is handled where it is enforceable rather than left to a reader: the
-/// binary binds this router to the configured `management_listen_addr` and **refuses a
-/// non-loopback address while the instance is unclaimed**, which is M7-2's own
-/// loopback-until-claimed rule applied early. The schema's default for that column is
-/// already `127.0.0.1` (**A-W5-3**).
-pub fn router(state: Arc<Mgmt>) -> Router {
+/// M7-1 shipped this surface with no authentication and relied on the binary narrowing its
+/// bind address to loopback to make that safe. That narrowing is now conditional on the
+/// instance being **unclaimed** (W5 §3.4) rather than unconditional, which is the column
+/// `listener.management_listen_addr` meaning what it says for the first time; the schema's
+/// default for it is `127.0.0.1` either way (**A-W5-3**).
+pub fn router(state: Arc<Mgmt>, guard: Arc<Guard>) -> Router {
+    configured(state)
+        .merge(authentication(Arc::clone(&guard)))
+        .layer(axum::middleware::from_fn_with_state(
+            guard,
+            crate::guard::enforce,
+        ))
+}
+
+/// The configuration and runtime surface — M7-1's forty operations.
+fn configured(state: Arc<Mgmt>) -> Router {
     Router::new()
         // §1.10 -- the whole configuration, under System → Advanced only.
         .route("/api/v1/config", get(get_config))
@@ -255,11 +268,21 @@ pub fn router(state: Arc<Mgmt>) -> Router {
         get_logs,
         get_system_info,
         get_serial_ports,
+        post_login,
+        post_claim,
+        get_auth_state,
+        delete_session,
+        get_sessions,
+        delete_one_session,
+        delete_all_sessions,
+        post_password,
     ),
     components(schemas(
         Applied,
+        AuthStateView,
         Badge,
         Change,
+        ClaimInput,
         ComponentView,
         ComponentsView,
         ConfigView,
@@ -276,17 +299,23 @@ pub fn router(state: Arc<Mgmt>) -> Router {
         LogLevelInput,
         LogLevelsView,
         LogsView,
+        LoginInput,
         NodeView,
+        PasswordInput,
+        PasswordPolicyView,
         PairingInput,
         PairingView,
         RadarInput,
         RevertInput,
         Section,
         SerialPort,
+        SessionView,
+        SessionsView,
         SerialPortsView,
         ServiceInput,
         ServiceView,
         ServicesView,
+        SignedInView,
         StationInput,
         StationView,
         StationsView,
@@ -300,6 +329,7 @@ pub fn router(state: Arc<Mgmt>) -> Router {
         WebsitesView,
     )),
     tags(
+        (name = "auth", description = "Signing in, sessions, and the first-run claim"),
         (name = "config", description = "The configuration, the save preview and one step back"),
         (name = "stations", description = "My weather stations"),
         (name = "websites", description = "My website"),
@@ -1369,5 +1399,1540 @@ fn log_refusal(e: LogControlError) -> ApiError {
             summary: "This daemon's logging cannot be changed while it runs.".to_string(),
             detail: Some(mw_types::DisplayChain(&e).to_string()),
         },
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Authentication — implementation-plan.md M7-2
+//
+// W5 §1.1's three registrations, plus the four §3.3 and §3.4 need that the Go surface had
+// no equivalent of: the setup claim, the session list, the two revocations and the password
+// change. Eight operations over the one `admin_credential` row and the `admin_session`
+// table, with every secret comparison in `crate::auth` and every statement in the binary.
+//
+// **None of these is a configuration change.** They write `admin_credential` and
+// `admin_session`, which are not in `Config` and not in any plan, so nothing here bumps the
+// generation or restarts a component -- the single exception being the one widening the
+// binary performs when an instance is first claimed, which is the listener's bind address
+// and is handled there (`crate::admin`), not here.
+// ---------------------------------------------------------------------------------------
+
+/// What `POST /api/v1/auth/login` submits.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct LoginInput {
+    /// The administrator's username.
+    pub username: String,
+    /// Their password.
+    ///
+    /// A `SecretString` from the moment it is deserialised (**D-33**, §3.2), so a `{:?}` on
+    /// this struct anywhere downstream cannot print it. `value_type = String` because that
+    /// is what is on the wire; the schema describes the JSON, not the Rust.
+    #[schema(value_type = String)]
+    pub password: SecretString,
+}
+
+/// What `POST /api/v1/auth/claim` submits — §3.4's one-time setup claim.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct ClaimInput {
+    /// The code printed to the console at first start.
+    ///
+    /// Secret for the same reason the password is, and for one more: this is the value
+    /// §3.5's "nothing secret in logs" rule makes the single deliberate exception for, and
+    /// the exception is the **banner**, not a `{:?}`.
+    #[schema(value_type = String)]
+    pub setup_code: SecretString,
+    /// The username to create.
+    pub username: String,
+    /// The password to set.
+    #[schema(value_type = String)]
+    pub password: SecretString,
+    /// The same password again (§3.4 step 3: "a password (twice)").
+    #[schema(value_type = String)]
+    pub password_again: SecretString,
+}
+
+/// What `POST /api/v1/auth/password` submits.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct PasswordInput {
+    /// The current password. **Required** (§3.5): a session is not sufficient authority to
+    /// replace the credential, because the session is what a borrowed laptop has.
+    #[schema(value_type = String)]
+    pub current_password: SecretString,
+    /// The new password.
+    #[schema(value_type = String)]
+    pub new_password: SecretString,
+    /// The new password again.
+    #[schema(value_type = String)]
+    pub new_password_again: SecretString,
+}
+
+/// One session, as the session list shows it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct SessionView {
+    /// The public handle, hex. What `DELETE /api/v1/auth/sessions/{id}` names.
+    pub id: String,
+    /// When it was created.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// When it was last used.
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
+    /// When it stops working.
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    /// The browser that created it, if it said — §3.3's "which browser is this?".
+    pub user_agent: Option<String>,
+    /// Where it was created from.
+    pub created_ip: Option<String>,
+    /// Whether this is the session making the request, so the list can say "this browser"
+    /// rather than offering to sign the operator out of the page they are looking at.
+    pub current: bool,
+}
+
+/// `GET /api/v1/auth/sessions`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct SessionsView {
+    /// Every live session, newest first.
+    pub sessions: Vec<SessionView>,
+}
+
+/// The password rule, so the form states it rather than restating it.
+///
+/// §0.5's inline-help standard applied to the one rule there is: a client that hardcoded
+/// "at least 12 characters" would be a second copy of [`crate::auth::POLICY_MIN_CHARS`],
+/// and the two would disagree the first time the policy moved.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct PasswordPolicyView {
+    /// The fewest characters accepted.
+    pub minimum_characters: usize,
+    /// The most bytes accepted.
+    pub maximum_bytes: usize,
+}
+
+impl PasswordPolicyView {
+    /// The policy as the server enforces it.
+    fn current() -> Self {
+        Self {
+            minimum_characters: crate::auth::POLICY_MIN_CHARS,
+            maximum_bytes: crate::auth::POLICY_MAX_BYTES,
+        }
+    }
+}
+
+/// `GET /api/v1/auth/session` — the one unauthenticated read, and the first request the UI
+/// makes.
+///
+/// Three states in one object, which is what §1.1 means by "also reports whether the
+/// instance has been claimed, which drives the first-run redirect":
+///
+/// | `claimed` | `authenticated` | the client shows |
+/// |---|---|---|
+/// | `false` | `false` | §0.7's "Create your administrator account" |
+/// | `true` | `false` | the login screen (§8.8's signed-out state) |
+/// | `true` | `true` | the application |
+///
+/// `claimed = false, authenticated = true` is unrepresentable in practice and is not
+/// special-cased: the claim creates the credential and the session in one transaction.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct AuthStateView {
+    /// Whether an administrator account exists.
+    pub claimed: bool,
+    /// Whether this request carried a live session.
+    pub authenticated: bool,
+    /// Who, when `authenticated`.
+    pub username: Option<String>,
+    /// This request's session, when `authenticated`.
+    pub session: Option<SessionView>,
+    /// The password rule the forms should state.
+    pub password_policy: PasswordPolicyView,
+}
+
+/// What a successful login, claim or password change answers with.
+///
+/// One type for all three because the client does the same thing with all three: it is
+/// signed in, as this person, on this session, with these things worth knowing. `warnings`
+/// is §8.5's non-blocking slot and is where **O-10**'s breached-password notice lands --
+/// which is the whole reason that decision is "warn" rather than "refuse".
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct SignedInView {
+    /// The administrator's username.
+    pub username: String,
+    /// The session this request is now on.
+    pub session: SessionView,
+    /// Consequences that do not block.
+    pub warnings: Vec<String>,
+}
+
+/// The authentication routes.
+///
+/// A separate sub-router from the configuration one because they hold different state --
+/// these need the [`Guard`], those need [`Mgmt`] -- and because keeping them apart is what
+/// lets this crate's own tests exercise the gate over the real handler set without
+/// assembling a `ConfigAdmin`, a `ComponentControl`, a `LogSource` and a `Machine` first.
+///
+/// `crate::guard::enforce` wraps **both**, in [`router`], so there is still exactly one gate.
+fn authentication(guard: Arc<Guard>) -> Router {
+    Router::new()
+        // §1.1 -- the three registrations, rewritten.
+        .route("/api/v1/auth/login", post(post_login))
+        .route(
+            "/api/v1/auth/session",
+            get(get_auth_state).delete(delete_session),
+        )
+        // §3.4 -- the one-time setup claim.
+        .route("/api/v1/auth/claim", post(post_claim))
+        // §3.3 -- individually revocable sessions, and "sign out everywhere".
+        .route(
+            "/api/v1/auth/sessions",
+            get(get_sessions).delete(delete_all_sessions),
+        )
+        .route("/api/v1/auth/sessions/{id}", delete(delete_one_session))
+        // §3.5 -- changing the password requires the current one.
+        .route("/api/v1/auth/password", post(post_password))
+        .with_state(guard)
+}
+
+/// Render a session for the wire.
+fn session_view(session: &crate::auth::Session, current: Option<&[u8; 16]>) -> SessionView {
+    SessionView {
+        id: crate::auth::session_id(&session.id),
+        created_at: session.created_at,
+        last_seen_at: session.last_seen_at,
+        expires_at: session.expires_at,
+        user_agent: session.user_agent.clone(),
+        created_ip: session.created_ip.clone(),
+        current: current == Some(&session.id),
+    }
+}
+
+/// The `User-Agent`, truncated.
+///
+/// Truncated rather than rejected, because a long one is a browser quirk and not an attack,
+/// and this column is shown in a list: 256 bytes is more than any real agent string and
+/// bounds what one request can write into the configuration database.
+fn user_agent(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.chars().take(256).collect())
+}
+
+/// Sign in.
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/login",
+    tag = "auth",
+    request_body = LoginInput,
+    responses(
+        (status = 200, description = "Signed in; the session is in a Set-Cookie", body = SignedInView),
+        (status = 401, description = "The username and password do not match", body = ErrorBody),
+        (status = 409, description = "The instance has not been claimed yet", body = ErrorBody),
+        (status = 429, description = "The progressive delay is still holding this off", body = ErrorBody),
+    )
+)]
+async fn post_login(
+    State(guard): State<Arc<Guard>>,
+    Extension(peer): Extension<Peer>,
+    headers: axum::http::HeaderMap,
+    Body(input): Body<LoginInput>,
+) -> Result<axum::response::Response, ApiError> {
+    let store = guard.store();
+    let Some(credential) = store.credential().await? else {
+        return Err(ApiError::Conflict {
+            summary: "This daemon has not been set up yet. Create the administrator account \
+                      with the code printed on its console."
+                .to_string(),
+            detail: None,
+        });
+    };
+    let now = chrono::Utc::now().timestamp();
+
+    // **Before the hash, not after** (§3.5): applying the delay after verification would
+    // make its presence an oracle for whether the password was right.
+    if let Some(seconds) =
+        crate::auth::retry_after(credential.failed_attempts, credential.last_failed_at, now)
+    {
+        tracing::warn!(
+            target: crate::auth::AUDIT,
+            outcome = "throttled",
+            username = %input.username,
+            source_ip = peer.0.as_deref().unwrap_or("-"),
+            retry_after_seconds = seconds,
+            "login refused"
+        );
+        return Err(ApiError::Throttled {
+            summary: format!("Too many attempts. Try again in {seconds} seconds."),
+            retry_after_seconds: seconds,
+        });
+    }
+
+    // Both halves evaluated regardless, so the time this takes does not depend on whether
+    // the username was right. `&` rather than `&&` would not be enough on its own -- the
+    // verification is the expensive half and it has to actually run.
+    let verified = crate::auth::verify_password(&credential.password_phc, &input.password);
+    let named = credential.username == input.username;
+    if !verified.ok || !named {
+        store.record_failure().await?;
+        tracing::warn!(
+            target: crate::auth::AUDIT,
+            outcome = "refused",
+            username = %input.username,
+            source_ip = peer.0.as_deref().unwrap_or("-"),
+            "login refused"
+        );
+        // One message for both halves. Saying which was wrong tells an unauthenticated
+        // caller the administrator's username.
+        return Err(ApiError::Unauthenticated {
+            summary: "That username and password do not match.".to_string(),
+        });
+    }
+
+    let rehash = if verified.needs_rehash {
+        // §3.2's transparent upgrade, from the plaintext that was just verified. The store
+        // writes it in the same transaction as the session, so a failure leaves the old
+        // hash rather than no hash.
+        Some(crate::auth::hash_password(&input.password)?)
+    } else {
+        None
+    };
+    let (set_cookie, view) = open(guard.as_ref(), &credential, &headers, &peer, rehash).await?;
+    tracing::info!(
+        target: crate::auth::AUDIT,
+        outcome = "ok",
+        username = %credential.username,
+        source_ip = peer.0.as_deref().unwrap_or("-"),
+        session_id = %view.session.id,
+        rehashed = verified.needs_rehash,
+        "signed in"
+    );
+    Ok(signed_in(&set_cookie, view))
+}
+
+/// Create the administrator account — §3.4's one-time claim.
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/claim",
+    tag = "auth",
+    request_body = ClaimInput,
+    responses(
+        (status = 200, description = "The account exists and you are signed in", body = SignedInView),
+        (status = 409, description = "Already claimed, or there is no outstanding code", body = ErrorBody),
+        (status = 422, description = "The code or the password was refused", body = ErrorBody),
+    )
+)]
+async fn post_claim(
+    State(guard): State<Arc<Guard>>,
+    Extension(peer): Extension<Peer>,
+    headers: axum::http::HeaderMap,
+    Body(input): Body<ClaimInput>,
+) -> Result<axum::response::Response, ApiError> {
+    use secrecy::ExposeSecret as _;
+
+    let store = guard.store();
+    // **Before anything expensive.** The authoritative check is inside `claim`'s own
+    // transaction -- that is what makes the race resolve to exactly one claimant -- but this
+    // route is unauthenticated, and a caller who loops it against an instance that is
+    // *already* claimed would otherwise spend a 64 MiB Argon2id hash per request before
+    // being refused. Hashing is serialised process-wide (`auth::hash_password`), so that is a
+    // queue in front of every legitimate login rather than just wasted work.
+    if store.claimed().await? {
+        return Err(claim_refusal(crate::auth::ClaimRefusal::AlreadyClaimed));
+    }
+    let mut errors = crate::auth::password_problems(&input.password, "password");
+    if input.password.expose_secret() != input.password_again.expose_secret() {
+        errors.push(FieldError::new(
+            "password_again",
+            "Those two passwords are not the same.",
+        ));
+    }
+    if input.username.trim().is_empty() {
+        errors.push(FieldError::new("username", "Choose a username."));
+    }
+    if !errors.is_empty() {
+        return Err(ApiError::Invalid {
+            summary: "That account cannot be created.".to_string(),
+            errors,
+        });
+    }
+
+    let password_phc = crate::auth::hash_password(&input.password)?;
+    let username = input.username.trim().to_string();
+    let minted = crate::auth::Minted::new();
+    // Fourteen days, which is `admin_credential`'s own default and cannot be read off a row
+    // that does not exist yet -- this request is what creates it.
+    let lifetime = std::time::Duration::from_secs(crate::auth::DEFAULT_ABSOLUTE_SECONDS);
+    let set_cookie = crate::auth::set_cookie(&minted, lifetime, guard.secure());
+    let created_at = chrono::Utc::now().timestamp();
+    let new_session = crate::auth::NewSession {
+        minted,
+        created_at,
+        expires_at: created_at
+            + i64::try_from(crate::auth::DEFAULT_ABSOLUTE_SECONDS).unwrap_or(i64::MAX),
+        user_agent: user_agent(&headers),
+        created_ip: peer.0.clone(),
+    };
+    let session = new_session.as_session().ok_or_else(|| ApiError::Internal {
+        summary: "This machine's clock is outside the range this daemon can record.".to_string(),
+        detail: None,
+    })?;
+    let outcome = store
+        .claim(crate::auth::NewAccount {
+            typed_code: crate::auth::typed_setup_code(input.setup_code.expose_secret()),
+            username: username.clone(),
+            password_phc,
+            session: new_session,
+        })
+        .await?;
+    if let Err(refusal) = outcome {
+        tracing::warn!(
+            target: crate::auth::AUDIT,
+            outcome = "refused",
+            username = %username,
+            source_ip = peer.0.as_deref().unwrap_or("-"),
+            reason = refusal.as_str(),
+            "setup claim refused"
+        );
+        return Err(claim_refusal(refusal));
+    }
+    // §3.4 step 5: the claim is audited with its source IP. The code itself is not here and
+    // never will be -- the only place it is rendered is the console banner.
+    tracing::info!(
+        target: crate::auth::AUDIT,
+        outcome = "ok",
+        username = %username,
+        source_ip = peer.0.as_deref().unwrap_or("-"),
+        session_id = %crate::auth::session_id(&session.id),
+        "administrator account created"
+    );
+    Ok(signed_in(
+        &set_cookie,
+        SignedInView {
+            username,
+            session: session_view(&session, Some(&session.id)),
+            warnings: crate::auth::password_warnings(&input.password),
+        },
+    ))
+}
+
+/// Whether this instance is claimed, and whether this request is signed in.
+#[utoipa::path(
+    get,
+    path = "/api/v1/auth/session",
+    tag = "auth",
+    responses((status = 200, description = "The three states of §1.1's table", body = AuthStateView))
+)]
+async fn get_auth_state(
+    State(guard): State<Arc<Guard>>,
+    current: Option<Extension<Current>>,
+) -> Reply<AuthStateView> {
+    let current = current.map(|Extension(c)| c);
+    Ok(Json(AuthStateView {
+        claimed: guard.store().claimed().await?,
+        authenticated: current.is_some(),
+        username: current.as_ref().map(|c| c.username.clone()),
+        session: current
+            .as_ref()
+            .map(|c| session_view(&c.session, Some(&c.session.id))),
+        password_policy: PasswordPolicyView::current(),
+    }))
+}
+
+/// Sign out of this browser — W5 §1.1's `POST /logout`, which now actually revokes.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/auth/session",
+    tag = "auth",
+    responses((status = 204, description = "Signed out; the session row is gone"))
+)]
+async fn delete_session(
+    State(guard): State<Arc<Guard>>,
+    Extension(current): Extension<Current>,
+) -> Result<axum::response::Response, ApiError> {
+    guard.store().revoke(current.session.id).await?;
+    tracing::info!(
+        target: crate::auth::AUDIT,
+        outcome = "ok",
+        username = %current.username,
+        session_id = %crate::auth::session_id(&current.session.id),
+        "signed out"
+    );
+    Ok(signed_out())
+}
+
+/// Every live session (§3.3).
+#[utoipa::path(
+    get,
+    path = "/api/v1/auth/sessions",
+    tag = "auth",
+    responses((status = 200, description = "Every live session, newest first", body = SessionsView))
+)]
+async fn get_sessions(
+    State(guard): State<Arc<Guard>>,
+    Extension(current): Extension<Current>,
+) -> Reply<SessionsView> {
+    let sessions = guard.store().sessions().await?;
+    Ok(Json(SessionsView {
+        sessions: sessions
+            .iter()
+            .map(|s| session_view(s, Some(&current.session.id)))
+            .collect(),
+    }))
+}
+
+/// Revoke one session (§3.3).
+#[utoipa::path(
+    delete,
+    path = "/api/v1/auth/sessions/{id}",
+    tag = "auth",
+    params(("id" = String, Path, description = "The session's public handle")),
+    responses(
+        (status = 204, description = "Revoked"),
+        (status = 404, description = "There is no such session", body = ErrorBody),
+    )
+)]
+async fn delete_one_session(
+    State(guard): State<Arc<Guard>>,
+    Extension(current): Extension<Current>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, ApiError> {
+    let Some(target) = crate::auth::parse_session_id(&id) else {
+        return Err(ApiError::NotFound {
+            what: "session",
+            id,
+        });
+    };
+    if !guard.store().revoke(target).await? {
+        return Err(ApiError::NotFound {
+            what: "session",
+            id,
+        });
+    }
+    tracing::info!(
+        target: crate::auth::AUDIT,
+        outcome = "ok",
+        username = %current.username,
+        session_id = %id,
+        "session revoked"
+    );
+    // Revoking the session the request arrived on is a legitimate thing to do from the
+    // session list, and it has to clear the cookie or the browser keeps presenting a handle
+    // that no longer resolves.
+    if target == current.session.id {
+        return Ok(signed_out());
+    }
+    Ok(axum::http::StatusCode::NO_CONTENT.into_response())
+}
+
+/// Sign out everywhere (§3.3) — **including** the session making the request.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/auth/sessions",
+    tag = "auth",
+    responses((status = 204, description = "Every session is gone, this one included"))
+)]
+async fn delete_all_sessions(
+    State(guard): State<Arc<Guard>>,
+    Extension(current): Extension<Current>,
+) -> Result<axum::response::Response, ApiError> {
+    let revoked = guard.store().revoke_all().await?;
+    tracing::info!(
+        target: crate::auth::AUDIT,
+        outcome = "ok",
+        username = %current.username,
+        revoked,
+        "signed out everywhere"
+    );
+    Ok(signed_out())
+}
+
+/// Change the password (§3.3, §3.5).
+///
+/// **Revokes every other session and keeps this one**, which is implementation-plan.md
+/// **M7-2**'s done-criterion and what a person expects after "my laptop was stolen". The
+/// cookie is therefore *not* cleared and no new session is minted: the operator stays on
+/// the page they were on.
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/password",
+    tag = "auth",
+    request_body = PasswordInput,
+    responses(
+        (status = 200, description = "Changed; every other session is revoked", body = SignedInView),
+        (status = 422, description = "The current password was wrong, or the new one was refused", body = ErrorBody),
+        (status = 429, description = "The progressive delay is still holding this off", body = ErrorBody),
+    )
+)]
+async fn post_password(
+    State(guard): State<Arc<Guard>>,
+    Extension(current): Extension<Current>,
+    Extension(peer): Extension<Peer>,
+    Body(input): Body<PasswordInput>,
+) -> Reply<SignedInView> {
+    use secrecy::ExposeSecret as _;
+
+    let store = guard.store();
+    let credential = store
+        .credential()
+        .await?
+        .ok_or_else(|| ApiError::Internal {
+            summary: "The administrator account could not be read.".to_string(),
+            detail: None,
+        })?;
+    let now = chrono::Utc::now().timestamp();
+    // §3.5: "rate-limited on the same schedule as login". The same counter, because the
+    // thing being guessed is the same secret.
+    if let Some(seconds) =
+        crate::auth::retry_after(credential.failed_attempts, credential.last_failed_at, now)
+    {
+        return Err(ApiError::Throttled {
+            summary: format!("Too many attempts. Try again in {seconds} seconds."),
+            retry_after_seconds: seconds,
+        });
+    }
+    if !crate::auth::verify_password(&credential.password_phc, &input.current_password).ok {
+        store.record_failure().await?;
+        tracing::warn!(
+            target: crate::auth::AUDIT,
+            outcome = "refused",
+            username = %credential.username,
+            source_ip = peer.0.as_deref().unwrap_or("-"),
+            session_id = %crate::auth::session_id(&current.session.id),
+            "password change refused"
+        );
+        return Err(ApiError::field(
+            "That password change was refused.",
+            "current_password",
+            "That is not the current password.",
+        ));
+    }
+    let mut errors = crate::auth::password_problems(&input.new_password, "new_password");
+    if input.new_password.expose_secret() != input.new_password_again.expose_secret() {
+        errors.push(FieldError::new(
+            "new_password_again",
+            "Those two passwords are not the same.",
+        ));
+    }
+    if !errors.is_empty() {
+        return Err(ApiError::Invalid {
+            summary: "That password change was refused.".to_string(),
+            errors,
+        });
+    }
+
+    let phc = crate::auth::hash_password(&input.new_password)?;
+    store.change_password(phc, current.session.id).await?;
+    tracing::info!(
+        target: crate::auth::AUDIT,
+        outcome = "ok",
+        username = %credential.username,
+        source_ip = peer.0.as_deref().unwrap_or("-"),
+        session_id = %crate::auth::session_id(&current.session.id),
+        "password changed; every other session revoked"
+    );
+    Ok(Json(SignedInView {
+        username: credential.username,
+        session: session_view(&current.session, Some(&current.session.id)),
+        warnings: crate::auth::password_warnings(&input.new_password),
+    }))
+}
+
+/// Mint a session, write it, and build the `200` that carries it.
+///
+/// Shared by login and nothing else today; it is a function rather than inline because the
+/// ordering matters and is worth stating once: the row is written **before** the response is
+/// built, so a store failure is a `500` with no cookie rather than a cookie the server does
+/// not recognise.
+async fn open(
+    guard: &Guard,
+    credential: &crate::auth::StoredCredential,
+    headers: &axum::http::HeaderMap,
+    peer: &Peer,
+    rehash: Option<String>,
+) -> Result<(String, SignedInView), ApiError> {
+    let minted = crate::auth::Minted::new();
+    let lifetime = std::time::Duration::from_secs(
+        u64::try_from(credential.session_absolute_seconds).unwrap_or(0),
+    );
+    let set_cookie = crate::auth::set_cookie(&minted, lifetime, guard.secure());
+    let created_at = chrono::Utc::now().timestamp();
+    let new_session = crate::auth::NewSession {
+        minted,
+        created_at,
+        expires_at: created_at + credential.session_absolute_seconds,
+        user_agent: user_agent(headers),
+        created_ip: peer.0.clone(),
+    };
+    let session = new_session.as_session().ok_or_else(|| ApiError::Internal {
+        summary: "This machine's clock is outside the range this daemon can record.".to_string(),
+        detail: None,
+    })?;
+    guard.store().open_session(new_session, rehash).await?;
+    Ok((
+        set_cookie,
+        SignedInView {
+            username: credential.username.clone(),
+            session: session_view(&session, Some(&session.id)),
+            warnings: Vec::new(),
+        },
+    ))
+}
+
+/// A `200` with the session cookie on it.
+fn signed_in(set_cookie: &str, view: SignedInView) -> axum::response::Response {
+    let mut response = Json(view).into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(set_cookie) {
+        response
+            .headers_mut()
+            .append(axum::http::header::SET_COOKIE, value);
+    }
+    response
+}
+
+/// A `204` that clears the cookie under **both** names.
+///
+/// Both, because a daemon that has just had a management certificate configured will be
+/// presented the plaintext cookie a browser still holds, and clearing only the name this
+/// socket would set would leave it there.
+fn signed_out() -> axum::response::Response {
+    let mut response = axum::http::StatusCode::NO_CONTENT.into_response();
+    for clear in [
+        crate::auth::clear_cookie(true),
+        crate::auth::clear_cookie(false),
+    ] {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&clear) {
+            response
+                .headers_mut()
+                .append(axum::http::header::SET_COOKIE, value);
+        }
+    }
+    response
+}
+
+/// `ClaimRefusal`, as a status.
+///
+/// A wrong code is `422` on the field the operator typed it into; the other two are `409`,
+/// because nothing they type differently fixes an instance that is already claimed or has no
+/// outstanding code (`modernweather reset-setup-token` does, and the message says so).
+fn claim_refusal(refusal: crate::auth::ClaimRefusal) -> ApiError {
+    match refusal {
+        crate::auth::ClaimRefusal::WrongCode => ApiError::field(
+            "That setup code was refused.",
+            "setup_code",
+            "Check the code printed on this machine's console. It is shown once, at startup.",
+        ),
+        crate::auth::ClaimRefusal::AlreadyClaimed => ApiError::Conflict {
+            summary: "This daemon already has an administrator account. Sign in, or run \
+                      `modernweather reset-password` on the machine itself."
+                .to_string(),
+            detail: None,
+        },
+        crate::auth::ClaimRefusal::NoCodeOutstanding => ApiError::Conflict {
+            summary: "There is no setup code outstanding. Run `modernweather \
+                      reset-setup-token` on the machine itself to issue a new one."
+                .to_string(),
+            detail: None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::body::Body as AxumBody;
+    use axum::http::{header, Request as HttpRequest, StatusCode};
+    use serde_json::json;
+    use tower::ServiceExt as _;
+
+    use super::*;
+    use crate::auth::fake::Store;
+
+    /// The authentication half of [`router`] with the real gate over it.
+    ///
+    /// The configuration half needs a `ConfigAdmin`, a `ComponentControl`, a `LogSource` and
+    /// a `Machine`, none of which has anything to do with what is under test here -- and the
+    /// property that the gate covers *those* routes too is asserted against the real binary
+    /// in `crates/modernweather/tests/auth.rs`, where the router really is `router`.
+    fn app(store: Arc<Store>, origins: &[&str]) -> Router {
+        let guard = Arc::new(Guard::new(
+            store as Arc<dyn crate::auth::AuthStore>,
+            origins.iter().map(|o| (*o).to_string()).collect(),
+            false,
+        ));
+        authentication(Arc::clone(&guard)).layer(axum::middleware::from_fn_with_state(
+            guard,
+            crate::guard::enforce,
+        ))
+    }
+
+    /// One request, as a status, the parsed body and the response headers.
+    async fn call(
+        app: &Router,
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+        csrf: bool,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value, axum::http::HeaderMap) {
+        let mut request = HttpRequest::builder().method(method).uri(path);
+        if let Some(cookie) = cookie {
+            request = request.header(header::COOKIE, cookie);
+        }
+        if csrf {
+            request = request.header("x-mw-request", "1");
+        }
+        let request = match body {
+            Some(json) => request
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(AxumBody::from(json.to_string()))
+                .expect("the request is buildable"),
+            None => request
+                .body(AxumBody::empty())
+                .expect("the request is buildable"),
+        };
+        let response = app
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the router answers");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("the body is readable");
+        let parsed = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        (status, parsed, headers)
+    }
+
+    /// The `mw_session=<id>.<secret>` cookie out of a `Set-Cookie`.
+    fn cookie_from(headers: &axum::http::HeaderMap) -> String {
+        headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find_map(|v| v.split(';').next())
+            .expect("a Set-Cookie with a value")
+            .to_string()
+    }
+
+    /// **The gate.** Every route but the three is a `401` with no cookie, and the three
+    /// answer.
+    #[tokio::test]
+    async fn without_a_session_only_three_routes_answer() {
+        let app = app(Arc::new(Store::unclaimed()), &[]);
+        for (method, path, csrf) in [
+            ("DELETE", "/api/v1/auth/session", true),
+            ("GET", "/api/v1/auth/sessions", false),
+            ("DELETE", "/api/v1/auth/sessions", true),
+            (
+                "DELETE",
+                "/api/v1/auth/sessions/00000000000000000000000000000000",
+                true,
+            ),
+            ("POST", "/api/v1/auth/password", true),
+        ] {
+            let (status, body, _) = call(&app, method, path, None, csrf, Some(json!({}))).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}: {body}");
+        }
+        // And the one unauthenticated read answers with the state the UI branches on.
+        let (status, body, _) = call(&app, "GET", "/api/v1/auth/session", None, false, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["claimed"], false);
+        assert_eq!(body["authenticated"], false);
+        assert_eq!(body["password_policy"]["minimum_characters"], 12);
+    }
+
+    /// §3.3's CSRF pair: the header is required on every write, **including** the two writes
+    /// a caller with no session may make.
+    #[tokio::test]
+    async fn a_write_without_the_csrf_header_is_refused_before_anything_reads_a_cookie() {
+        let app = app(
+            Arc::new(Store::claimed(
+                "chris",
+                "correct horse battery staple",
+                None,
+            )),
+            &[],
+        );
+        let credentials = json!({"username": "chris", "password": "correct horse battery staple"});
+        let (status, body, headers) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            false,
+            Some(credentials.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(
+            headers.get_all(header::SET_COOKIE).iter().next().is_none(),
+            "a refused request must not mint a session"
+        );
+        // The same request with the header signs in.
+        let (status, _, headers) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            true,
+            Some(credentials),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.get_all(header::SET_COOKIE).iter().next().is_some());
+    }
+
+    /// Sign in, be recognised, and sign out — and the cookie's shape on the way through.
+    #[tokio::test]
+    async fn a_login_mints_a_session_that_a_logout_revokes() {
+        let store = Arc::new(Store::claimed(
+            "chris",
+            "correct horse battery staple",
+            None,
+        ));
+        let app = app(Arc::clone(&store), &[]);
+
+        let (status, body, headers) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            true,
+            Some(json!({"username": "chris", "password": "correct horse battery staple"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["username"], "chris");
+        assert_eq!(body["session"]["current"], true);
+        assert_eq!(store.session_count(), 1);
+        let set_cookie = headers[header::SET_COOKIE]
+            .to_str()
+            .expect("the cookie is text")
+            .to_string();
+        for attribute in ["HttpOnly", "SameSite=Strict", "Path=/"] {
+            assert!(set_cookie.contains(attribute), "{set_cookie}");
+        }
+        // **The cookie is not the credential.** Nothing in it is derived from the password,
+        // and the body never echoes either.
+        assert!(!set_cookie.contains("correct"), "{set_cookie}");
+        assert!(!body.to_string().contains("argon2"), "{body}");
+
+        let cookie = cookie_from(&headers);
+        let (status, body, _) = call(
+            &app,
+            "GET",
+            "/api/v1/auth/session",
+            Some(&cookie),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["authenticated"], true);
+        assert_eq!(body["username"], "chris");
+
+        let (status, _, headers) = call(
+            &app,
+            "DELETE",
+            "/api/v1/auth/session",
+            Some(&cookie),
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            store.session_count(),
+            0,
+            "the row is gone, not just the cookie"
+        );
+        // Both names are cleared, so a certificate added since the login does not leave one
+        // behind in the browser.
+        let cleared: Vec<String> = headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(str::to_string)
+            .collect();
+        assert_eq!(cleared.len(), 2, "{cleared:?}");
+        assert!(cleared.iter().any(|c| c.starts_with("mw_session=;")));
+        assert!(cleared.iter().any(|c| c.starts_with("__Host-mw_session=;")));
+
+        // And the cookie no longer resolves, which is the whole of §3.1's last defect: today
+        // a browser session cannot be revoked without rotating the API credential.
+        let (status, body, _) = call(
+            &app,
+            "GET",
+            "/api/v1/auth/sessions",
+            Some(&cookie),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    }
+
+    /// A wrong password and a wrong username are the same answer, and both count a failure.
+    #[tokio::test]
+    async fn a_refused_login_says_nothing_about_which_half_was_wrong() {
+        let store = Arc::new(Store::claimed(
+            "chris",
+            "correct horse battery staple",
+            None,
+        ));
+        let app = app(Arc::clone(&store), &[]);
+        let mut answers = Vec::new();
+        for body in [
+            json!({"username": "chris", "password": "wrong password here"}),
+            json!({"username": "someone", "password": "correct horse battery staple"}),
+            json!({"username": "someone", "password": "wrong password here"}),
+        ] {
+            let (status, parsed, _) =
+                call(&app, "POST", "/api/v1/auth/login", None, true, Some(body)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{parsed}");
+            answers.push(parsed["summary"].as_str().unwrap_or_default().to_string());
+        }
+        assert_eq!(answers[0], answers[1], "the two halves answer differently");
+        assert_eq!(answers[1], answers[2]);
+        assert_eq!(store.failures(), 3);
+        assert_eq!(store.session_count(), 0);
+    }
+
+    /// §3.5's progressive delay reaches the wire as a `429` with a `Retry-After`, and it is
+    /// applied **before** the hash — so a correct password is refused too.
+    #[tokio::test]
+    async fn the_progressive_delay_is_a_429_with_a_retry_after() {
+        let store = Arc::new(Store::claimed(
+            "chris",
+            "correct horse battery staple",
+            None,
+        ));
+        // Deep enough to be at the 30-second ceiling, which is what makes the assertion on
+        // the header a range rather than a value: this test shares eight cores with every
+        // other Argon2id hash in the suite, so the wait has visibly counted down by the time
+        // the request lands. §3.5's schedule itself is asserted exactly, without a clock, in
+        // `auth::tests::the_progressive_delay_is_free_three_times_then_doubles_to_a_ceiling`.
+        store.set_failures(12, chrono::Utc::now().timestamp());
+        let app = app(Arc::clone(&store), &[]);
+        let (status, body, headers) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            true,
+            Some(json!({"username": "chris", "password": "correct horse battery staple"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        let retry: u64 = headers["retry-after"]
+            .to_str()
+            .expect("the header is text")
+            .parse()
+            .expect("the header is a number of seconds");
+        assert!((1..=30).contains(&retry), "retry-after was {retry}");
+        // The right password did not get through, and the attempt is not counted twice:
+        // the delay short-circuits before the verification.
+        assert_eq!(store.session_count(), 0);
+        assert_eq!(store.failures(), 12);
+    }
+
+    /// §3.2's transparent upgrade, end to end: a hash stored below policy is replaced by the
+    /// login that verified against it.
+    #[tokio::test]
+    async fn a_login_rehashes_a_credential_stored_below_policy() {
+        let store = Arc::new(Store::claimed(
+            "chris",
+            "correct horse battery staple",
+            None,
+        ));
+        let weak = {
+            use argon2::password_hash::rand_core::OsRng;
+            use argon2::password_hash::{PasswordHasher as _, SaltString};
+            argon2::Argon2::new(
+                argon2::Algorithm::Argon2id,
+                argon2::Version::V0x13,
+                argon2::Params::new(19_456, 2, 1, None).expect("in range"),
+            )
+            .hash_password(
+                b"correct horse battery staple",
+                &SaltString::generate(&mut OsRng),
+            )
+            .expect("hashes")
+            .to_string()
+        };
+        store.set_phc(weak.clone());
+        let app = app(Arc::clone(&store), &[]);
+        let (status, body, _) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            true,
+            Some(json!({"username": "chris", "password": "correct horse battery staple"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let after = store.phc().expect("a credential");
+        assert_ne!(after, weak, "the weak hash survived a successful login");
+        assert!(
+            after.starts_with("$argon2id$v=19$m=65536,t=3,p=4$"),
+            "{after}"
+        );
+    }
+
+    /// The claim: the code is required, the password rule applies, and the breached list
+    /// **warns without blocking** — which is **O-10**'s answer to OQ-W5-2.
+    #[tokio::test]
+    async fn the_setup_claim_requires_the_code_and_warns_rather_than_blocking() {
+        let code = crate::auth::SetupCode::issue();
+        let store = Arc::new(Store::unclaimed().with_setup(code.token_hash()));
+        let app = app(Arc::clone(&store), &[]);
+
+        // A wrong code lands on the field the operator typed it into.
+        let (status, body, _) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/claim",
+            None,
+            true,
+            Some(json!({
+                "setup_code": "0000-0000-0000",
+                "username": "chris",
+                "password": "correct horse battery staple",
+                "password_again": "correct horse battery staple",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["errors"][0]["field"], "setup_code");
+        assert!(!store.claimed_now(), "a refused claim created an account");
+
+        // A short password, with the right code: refused on `password`, and the code is
+        // still outstanding afterwards.
+        let (status, body, _) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/claim",
+            None,
+            true,
+            Some(json!({
+                "setup_code": code.display(),
+                "username": "chris",
+                "password": "short",
+                "password_again": "short",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["errors"][0]["field"], "password");
+
+        // Two different passwords: refused on the confirmation.
+        let (status, body, _) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/claim",
+            None,
+            true,
+            Some(json!({
+                "setup_code": code.display(),
+                "username": "chris",
+                "password": "correct horse battery staple",
+                "password_again": "correct horse battery stapler",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["errors"][0]["field"], "password_again");
+
+        // A breached password: accepted, with a warning. The claim succeeds and the
+        // operator is signed in.
+        let (status, body, headers) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/claim",
+            None,
+            true,
+            Some(json!({
+                "setup_code": code.display().to_lowercase(),
+                "username": "  chris  ",
+                "password": "qwerty123456",
+                "password_again": "qwerty123456",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["username"], "chris", "the username is trimmed");
+        assert_eq!(body["warnings"].as_array().map(Vec::len), Some(1), "{body}");
+        assert!(store.claimed_now());
+        assert_eq!(store.session_count(), 1);
+
+        // **Single-use**: the same code again is a `409`, because the account now exists.
+        let (status, body, _) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/claim",
+            None,
+            true,
+            Some(json!({
+                "setup_code": code.display(),
+                "username": "someone-else",
+                "password": "another good passphrase",
+                "password_again": "another good passphrase",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+        // And the refusal comes **before** the password is validated or hashed, which is
+        // what keeps this unauthenticated route from being a 64 MiB Argon2id per request on
+        // an instance that is already claimed. A body whose password the policy would refuse
+        // still answers `409` rather than `422`: nothing looked at it.
+        let (status, body, _) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/claim",
+            None,
+            true,
+            Some(json!({
+                "setup_code": code.display(),
+                "username": "",
+                "password": "short",
+                "password_again": "different",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+        // And the claim's own session works.
+        let cookie = cookie_from(&headers);
+        let (status, body, _) = call(
+            &app,
+            "GET",
+            "/api/v1/auth/session",
+            Some(&cookie),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["claimed"], true);
+        assert_eq!(body["authenticated"], true);
+    }
+
+    /// **M7-2's done-criterion, at the handler level**: changing the password revokes every
+    /// other session and keeps the current one.
+    #[tokio::test]
+    async fn changing_the_password_revokes_every_other_session_and_keeps_this_one() {
+        let store = Arc::new(Store::claimed(
+            "chris",
+            "correct horse battery staple",
+            None,
+        ));
+        let app = app(Arc::clone(&store), &[]);
+        let sign_in = || async {
+            let (status, _, headers) = call(
+                &app,
+                "POST",
+                "/api/v1/auth/login",
+                None,
+                true,
+                Some(json!({"username": "chris", "password": "correct horse battery staple"})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            cookie_from(&headers)
+        };
+        // Three browsers.
+        let laptop = sign_in().await;
+        let phone = sign_in().await;
+        let desktop = sign_in().await;
+        assert_eq!(store.session_count(), 3);
+
+        // The wrong current password changes nothing.
+        let (status, body, _) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/password",
+            Some(&desktop),
+            true,
+            Some(json!({
+                "current_password": "not the current one",
+                "new_password": "a brand new passphrase",
+                "new_password_again": "a brand new passphrase",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["errors"][0]["field"], "current_password");
+        assert_eq!(store.session_count(), 3);
+
+        let (status, body, _) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/password",
+            Some(&desktop),
+            true,
+            Some(json!({
+                "current_password": "correct horse battery staple",
+                "new_password": "a brand new passphrase",
+                "new_password_again": "a brand new passphrase",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(store.session_count(), 1, "the other two survived");
+
+        // This browser is still signed in -- the operator stays on the page they were on.
+        let (status, _, _) = call(
+            &app,
+            "GET",
+            "/api/v1/auth/sessions",
+            Some(&desktop),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // The stolen laptop and the phone are not.
+        for gone in [&laptop, &phone] {
+            let (status, _, _) = call(
+                &app,
+                "GET",
+                "/api/v1/auth/sessions",
+                Some(gone),
+                false,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        // And the new password is the one that works now.
+        let (status, _, _) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            true,
+            Some(json!({"username": "chris", "password": "a brand new passphrase"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// The session list, one revocation, and "sign out everywhere".
+    #[tokio::test]
+    async fn sessions_are_individually_revocable_and_sign_out_everywhere_takes_this_one_too() {
+        let store = Arc::new(Store::claimed(
+            "chris",
+            "correct horse battery staple",
+            None,
+        ));
+        let app = app(Arc::clone(&store), &[]);
+        let sign_in = || async {
+            let (_, _, headers) = call(
+                &app,
+                "POST",
+                "/api/v1/auth/login",
+                None,
+                true,
+                Some(json!({"username": "chris", "password": "correct horse battery staple"})),
+            )
+            .await;
+            cookie_from(&headers)
+        };
+        let laptop = sign_in().await;
+        let phone = sign_in().await;
+
+        let (status, body, _) = call(
+            &app,
+            "GET",
+            "/api/v1/auth/sessions",
+            Some(&laptop),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let sessions = body["sessions"].as_array().expect("a list");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            sessions.iter().filter(|s| s["current"] == true).count(),
+            1,
+            "exactly one session is this browser's"
+        );
+        let other = sessions
+            .iter()
+            .find(|s| s["current"] == false)
+            .and_then(|s| s["id"].as_str())
+            .expect("the other session's handle")
+            .to_string();
+
+        // A handle that is not one is a 404 rather than a panic.
+        let (status, _, _) = call(
+            &app,
+            "DELETE",
+            "/api/v1/auth/sessions/not-a-handle",
+            Some(&laptop),
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _, _) = call(
+            &app,
+            "DELETE",
+            &format!("/api/v1/auth/sessions/{other}"),
+            Some(&laptop),
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(store.session_count(), 1);
+        let (status, _, _) = call(
+            &app,
+            "GET",
+            "/api/v1/auth/sessions",
+            Some(&phone),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the revoked cookie is dead"
+        );
+        // Revoking it again is a 404, not a silent success.
+        let (status, _, _) = call(
+            &app,
+            "DELETE",
+            &format!("/api/v1/auth/sessions/{other}"),
+            Some(&laptop),
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Sign out everywhere takes this one too, and clears the cookie.
+        let (status, _, headers) = call(
+            &app,
+            "DELETE",
+            "/api/v1/auth/sessions",
+            Some(&laptop),
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(store.session_count(), 0);
+        assert_eq!(headers.get_all(header::SET_COOKIE).iter().count(), 2);
+    }
+
+    /// The CORS allowlist on the wire: an allowlisted origin gets a preflight and the echo,
+    /// an unknown one gets neither — and the security headers are on both.
+    #[tokio::test]
+    async fn cors_is_an_exact_allowlist_and_the_security_headers_are_unconditional() {
+        let app = app(Arc::new(Store::unclaimed()), &["https://ui.example.com"]);
+
+        let preflight = |origin: &'static str| {
+            let app = app.clone();
+            async move {
+                let request = HttpRequest::builder()
+                    .method("OPTIONS")
+                    .uri("/api/v1/auth/login")
+                    .header(header::ORIGIN, origin)
+                    .header("access-control-request-method", "POST")
+                    .body(AxumBody::empty())
+                    .expect("buildable");
+                app.oneshot(request).await.expect("the router answers")
+            }
+        };
+
+        let allowed = preflight("https://ui.example.com").await;
+        assert_eq!(allowed.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            allowed.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://ui.example.com"
+        );
+        assert_eq!(
+            allowed.headers()[header::ACCESS_CONTROL_ALLOW_CREDENTIALS],
+            "true"
+        );
+        assert!(allowed.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
+            .to_str()
+            .expect("text")
+            .contains("x-mw-request"));
+
+        let refused = preflight("https://ui.example.com.evil.test").await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert!(!refused
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+        assert_eq!(refused.headers()[header::REFERRER_POLICY], "no-referrer");
+
+        // And on an ordinary answer.
+        let (_, _, headers) = call(&app, "GET", "/api/v1/auth/session", None, false, None).await;
+        assert_eq!(
+            headers[header::CONTENT_SECURITY_POLICY],
+            "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+        );
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    }
+
+    /// Login on an unclaimed instance is a `409` that says what to do, not a `401` that
+    /// leaves the operator guessing at a username they never set.
+    #[tokio::test]
+    async fn logging_in_before_the_claim_says_so() {
+        let app = app(Arc::new(Store::unclaimed()), &[]);
+        let (status, body, _) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            true,
+            Some(json!({"username": "chris", "password": "correct horse battery staple"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["summary"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not been set up"),
+            "{body}"
+        );
+    }
+
+    /// Claiming an instance that has no outstanding code points at the CLI that issues one.
+    #[tokio::test]
+    async fn claiming_with_no_outstanding_code_names_the_command_that_issues_one() {
+        let app = app(Arc::new(Store::unclaimed()), &[]);
+        let (status, body, _) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/claim",
+            None,
+            true,
+            Some(json!({
+                "setup_code": "0000-0000-0000",
+                "username": "chris",
+                "password": "correct horse battery staple",
+                "password_again": "correct horse battery staple",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["summary"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("reset-setup-token"),
+            "{body}"
+        );
     }
 }

@@ -25,7 +25,7 @@
 //! intersected with the registry's expectation, and reports both halves of the
 //! difference. One artefact is correct at either width.
 
-use crate::registry::{Registry, Role, Strategy};
+use crate::registry::{Dimension, Registry, Role, Strategy};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -461,8 +461,82 @@ fn staging(reg: &Registry, go: &GoViews) -> String {
          );\n\n\
          COMMENT ON TABLE w9.dropped_source_column IS\n\
          \x20   'Source columns consciously not carried over. Every row is a decision someone\n\
-         \x20    made; `reason` is not optional for that reason.';\n\n\
-         -- Fails the migration rather than importing into a column nobody chose.\n\
+         \x20    made; `reason` is not optional for that reason.';\n\n",
+    );
+
+    // The `metadata` dimensions, as a recorded decision rather than as a surprise.
+    //
+    // A dimension that used to be a column and is now `role = "metadata"` (N-14; M5-5's
+    // `stationname` and `stationtype`) is still a column of the OLD table, so it reaches
+    // w9.source_column with no w9.expected_column partner and
+    // `assert_no_unknown_source_columns()` would refuse the import -- correctly, because an
+    // unrouted source column is data with no destination. The resolution the table exists
+    // for is to record the decision; the decision was taken in metrics/registry.toml, so it
+    // is emitted from the registry rather than left as a step in somebody's shell history.
+    //
+    // **Joined to w9.source_column rather than inserted outright**, which is what makes it
+    // safe to emit for every `metadata` dimension including one the old table never had: a
+    // decision record for a column that does not exist is a claim about nothing, and this
+    // records a drop only where there is something to drop. It also means the procedure
+    // runs AFTER the source inventory loads -- migrate-from-go.sh's `gap` step calls it
+    // there, immediately before the assertion it exists to satisfy.
+    //
+    // **Emitted unconditionally, even by a registry with no `metadata` dimension at all**,
+    // and that is the whole reason it is plpgsql rather than the one-statement `LANGUAGE
+    // sql` it would otherwise be: `migrate-from-go.sh` calls it by name, and a procedure
+    // that exists only when the registry happens to have something to say would make that
+    // call fail with `undefined_function` on the next registry that does not. An INSERT over
+    // an empty VALUES list is not expressible, so the empty case is `NULL` -- a procedure
+    // that runs and records nothing, which is the honest shape of "nothing was retired".
+    let retired: Vec<&Dimension> = reg
+        .dimensions
+        .iter()
+        .filter(|d| d.role.retirable())
+        .collect();
+    s.push_str(
+        "CREATE PROCEDURE w9.record_retired_dimensions() LANGUAGE plpgsql AS $fn$\n\
+         BEGIN\n",
+    );
+    if retired.is_empty() {
+        s.push_str(
+            "    -- metrics/registry.toml declares no `metadata` dimension, so there is no\n\
+            \x20   -- decision to record. See xtask/src/legacy.rs for why this is a no-op\n\
+            \x20   -- rather than an absent procedure.\n\
+            \x20   NULL;\n",
+        );
+    } else {
+        s.push_str(
+            "    INSERT INTO w9.dropped_source_column (column_name, reason)\n\
+            \x20   SELECT r.column_name, r.reason\n\
+            \x20     FROM (VALUES\n",
+        );
+        for (i, d) in retired.iter().enumerate() {
+            let sep = if i + 1 == retired.len() { "" } else { "," };
+            let _ = writeln!(
+                s,
+                "            ('{}', '{} is role = \"metadata\" in metrics/registry.toml. It \
+                 reaches the daemon on the wire and is not a column of observations; the \
+                 display metadata it carried is in stations instead, written by \
+                 w9.populate_stations() from w9.station_map.'){sep}",
+                d.column, d.key
+            );
+        }
+        s.push_str(
+            "        ) AS r(column_name, reason)\n\
+            \x20     JOIN w9.source_column s USING (column_name)\n\
+            \x20   ON CONFLICT (column_name) DO NOTHING;\n",
+        );
+    }
+    s.push_str(
+        "END $fn$;\n\n\
+         COMMENT ON PROCEDURE w9.record_retired_dimensions() IS\n\
+        \x20   'Records the registry''s `metadata` dimensions as consciously dropped, for\n\
+        \x20    the ones the source actually declares. Call it after w9.source_column is\n\
+        \x20    loaded and before w9.assert_no_unknown_source_columns().';\n\n",
+    );
+
+    s.push_str(
+        "-- Fails the migration rather than importing into a column nobody chose.\n\
          CREATE FUNCTION w9.assert_no_unknown_source_columns() RETURNS void\n\
          LANGUAGE plpgsql AS $fn$\n\
          DECLARE bad text;\n\
@@ -479,16 +553,39 @@ fn staging(reg: &Registry, go: &GoViews) -> String {
          \x20   END IF;\n\
          END $fn$;\n\n\
          -- ------------------------------------------------------------------\n\
-         -- 3. stationname -> station_id. The one mapping a human has to supply.\n\
+         -- 3. stationname -> station_id, and why it cannot be the name.\n\
          -- ------------------------------------------------------------------\n\
          --\n\
          -- The old table keys readings by station *name* and the new one by `station_id`\n\
-         -- (W4 2.1). `/span?station=<device name>` is frozen and matches the name, so the\n\
-         -- safe default is station_id = stationname: it keeps every historical row\n\
-         -- addressable by the parameter both shipped clients already send. Choosing\n\
-         -- something else is allowed and means the history is reachable only under the new\n\
-         -- id, which is why this table is populated by hand and asserted non-empty rather\n\
-         -- than defaulted silently.\n\n\
+         -- (W4 2.1), and `station_id` is not free text. A station's key becomes a\n\
+         -- component id -- `station:campbell:<key>`, crates/mw-station/src/campbell.rs --\n\
+         -- and crates/mw-component/src/id.rs permits only lower-case ASCII, digits, `-`,\n\
+         -- `_`, `.` and `:`, with no empty `:`-delimited segment, inside 128 bytes. A key\n\
+         -- outside that set is StationPlanError::Key at startup, so the station never\n\
+         -- runs and its history is addressable by nothing.\n\
+         --\n\
+         -- `station_id = stationname` is therefore NOT a usable default, and M5-1b is\n\
+         -- what that cost: a Go `stationname` is a display name, and two of the three in\n\
+         -- production -- `CSI` and `Suncrest Air Quality` -- are refused by that type. The\n\
+         -- default is the DERIVED key `w9.station_key(stationname)`, and\n\
+         -- `w9.assert_station_map_usable()` refuses a map -- derived or hand-written --\n\
+         -- whose ids could not be configured afterwards.\n\
+         --\n\
+         -- The frozen contract is unaffected, and that is why `stationname` was the\n\
+         -- default to begin with: `/span?station=<device name>` matches a station's NAME\n\
+         -- and selects data by its KEY (`station_by_name`, crates/mw-api-legacy/src/span.rs),\n\
+         -- so a derived key changes nothing a shipped client already sends.\n\
+         --\n\
+         -- But be exact about where that name comes from, because getting it wrong is how\n\
+         -- `station_id = stationname` looked safe. It is the CONFIGURATION STORE's\n\
+         -- `stations.name`, not this database's: `w9.populate_stations()` writes\n\
+         -- `stationname` into `stations.name` for the read-side projection, which is what\n\
+         -- renders a station's name in the response, and the match itself never reads it.\n\
+         -- So the frozen parameter keeps working only if the configuration store's\n\
+         -- `station_key` equals the id written here. This migration cannot check that --\n\
+         -- that store is SQLite and M7-4 is what populates it -- and it is the one part of\n\
+         -- M5-1b these refusals do not close. Overriding a row here is still allowed and\n\
+         -- still means the history is reachable only under the id written in it.\n\n\
          CREATE TABLE w9.station_map (\n\
          \x20   stationname           text PRIMARY KEY,\n\
          \x20   station_id            text NOT NULL UNIQUE,\n\
@@ -514,6 +611,72 @@ fn staging(reg: &Registry, go: &GoViews) -> String {
          \x20                     FROM weather GROUP BY stationname ORDER BY stationname)\n\
          \x20             TO STDOUT (FORMAT csv)$q$\n\
          $fn$;\n\n\
+         -- A Go display name, lowered into something the component id type accepts.\n\
+         --\n\
+         -- A function and not three typed-in values, because the property that matters is\n\
+         -- that the NEXT run of this migration produces the same station ids as this one:\n\
+         -- a key is a component id, a metric label and a partition key, and a re-import\n\
+         -- that renamed them would make the history of a live station unreachable a\n\
+         -- second time.\n\
+         --\n\
+         -- Runs of anything outside the permitted set collapse to one `-`, and a leading\n\
+         -- or trailing `-` is trimmed. `:` is accepted by the component id type but is\n\
+         -- never produced here: it is that type's segment separator, so a key carrying\n\
+         -- one adds a segment to `station:<driver>:<key>` rather than naming a station.\n\
+         -- `COLLATE \"C\"` and not the database default, because the determinism above is\n\
+         -- the whole point and `lower()` follows the locale: in a Turkish one, `lower('CSI')`\n\
+         -- is `csı` and this would derive `cs`. It also keeps the pattern operators off a\n\
+         -- nondeterministic ICU collation, which they refuse to run against at all.\n\
+         CREATE FUNCTION w9.station_key(stationname text) RETURNS text\n\
+         LANGUAGE sql IMMUTABLE STRICT AS $fn$\n\
+         \x20   SELECT trim(both '-' from\n\
+         \x20               regexp_replace(\n\
+         \x20                   regexp_replace(lower($1 COLLATE \"C\"), '[^a-z0-9._-]+', '-', 'g'),\n\
+         \x20                   '-{2,}', '-', 'g'))\n\
+         $fn$;\n\n\
+         -- Why a station id is not usable as a station key, or NULL if it is. The\n\
+         -- character set, the empty-segment rule and the length limit of\n\
+         -- crates/mw-component/src/id.rs, restated here because this database is reached\n\
+         -- by psql and not only by the daemon, and in the same order so the message a\n\
+         -- reader gets is the message the daemon would have given.\n\
+         --\n\
+         -- 108 bytes and not 128: ComponentId::MAX_LEN is 128 and the longest wrapper any\n\
+         -- driver puts around a key is `station:airgradient:` at 20\n\
+         -- (crates/mw-station/src/airgradient.rs; `station:wll:<key>:rearm` is 18).\n\
+         -- mw_station::MAX_KEY_LEN carries the same number and\n\
+         -- crates/mw-station/tests/station_key_width.rs pins it from the Rust side.\n\
+         CREATE FUNCTION w9.station_key_problem(station_id text) RETURNS text\n\
+         LANGUAGE sql IMMUTABLE AS $fn$\n\
+         \x20   SELECT CASE\n\
+         \x20       WHEN $1 IS NULL OR $1 = '' THEN 'it is empty'\n\
+         \x20       WHEN octet_length($1) > 108\n\
+         \x20           THEN format('it is %s bytes; the limit is 108', octet_length($1))\n\
+         \x20       WHEN $1 ~ '[^a-z0-9._:-]'\n\
+         \x20           THEN format('it contains %L, which is not permitted '\n\
+         \x20                       '(lower-case ASCII, digits, -, _, . and :)',\n\
+         \x20                       (regexp_match($1, '[^a-z0-9._:-]'))[1])\n\
+         \x20       WHEN $1 ~ '(^:|:$|::)' THEN 'it has an empty :-delimited segment'\n\
+         \x20   END\n\
+         $fn$;\n\n\
+         CREATE FUNCTION w9.assert_station_map_usable() RETURNS void\n\
+         LANGUAGE plpgsql AS $fn$\n\
+         DECLARE bad text;\n\
+         BEGIN\n\
+         \x20   SELECT string_agg(format('%L -> %L: %s', stationname, station_id, problem),\n\
+         \x20                     '; ' ORDER BY stationname) INTO bad\n\
+         \x20     FROM (SELECT m.stationname, m.station_id,\n\
+         \x20                  w9.station_key_problem(m.station_id) AS problem\n\
+         \x20             FROM w9.station_map m) q\n\
+         \x20    WHERE problem IS NOT NULL;\n\
+         \x20   IF bad IS NOT NULL THEN\n\
+         \x20       RAISE EXCEPTION 'w9.station_map has station ids that cannot be station keys: %', bad\n\
+         \x20           USING HINT = 'a station_id becomes a component id (station:<driver>:<station_id>), '\n\
+         \x20                        'so the daemon would refuse the station at plan time; '\n\
+         \x20                        'w9.station_key(stationname) derives an id that is accepted, '\n\
+         \x20                        'except for the length -- that one needs a shorter id by hand, '\n\
+         \x20                        'because truncating would silently change which station an id names';\n\
+         \x20   END IF;\n\
+         END $fn$;\n\n\
          CREATE FUNCTION w9.assert_station_map_complete() RETURNS void\n\
          LANGUAGE plpgsql AS $fn$\n\
          DECLARE bad text;\n\
@@ -524,14 +687,58 @@ fn staging(reg: &Registry, go: &GoViews) -> String {
          \x20    WHERE m.stationname IS NULL;\n\
          \x20   IF bad IS NOT NULL THEN\n\
          \x20       RAISE EXCEPTION 'w9.station_map has no entry for: %', bad\n\
-         \x20           USING HINT = 'INSERT INTO w9.station_map (stationname, station_id, stationtype) '\n\
-         \x20                        'SELECT stationname, stationname, stationtype FROM w9.source_station '\n\
-         \x20                        'adopts the frozen-contract-preserving default';\n\
+         \x20           USING HINT = 'CALL w9.seed_station_map() adopts the derived default for '\n\
+         \x20                        'every name the source has';\n\
          \x20   END IF;\n\
          \x20   IF NOT EXISTS (SELECT 1 FROM w9.source_station) THEN\n\
          \x20       RAISE EXCEPTION 'w9.source_station is empty; load it before asserting'\n\
          \x20           USING HINT = 'migrate-from-go.sh inventory';\n\
          \x20   END IF;\n\
+         END $fn$;\n\n\
+         -- The default map, committed rather than typed at a prompt: every name the source\n\
+         -- has, keyed by its derived station id, leaving any row somebody has already\n\
+         -- written alone.\n\
+         CREATE PROCEDURE w9.seed_station_map() LANGUAGE plpgsql AS $fn$\n\
+         DECLARE bad text;\n\
+         BEGIN\n\
+         \x20   IF NOT EXISTS (SELECT 1 FROM w9.source_station) THEN\n\
+         \x20       RAISE EXCEPTION 'w9.source_station is empty; load it before seeding the map'\n\
+         \x20           USING HINT = 'migrate-from-go.sh stage';\n\
+         \x20   END IF;\n\
+         \x20   -- Two names that derive one id, or a derived id some other row already holds,\n\
+         \x20   -- would otherwise arrive as a unique violation naming a constraint instead of\n\
+         \x20   -- the two stations that collided. Nothing in production collides; a fourth\n\
+         \x20   -- station called `Suncrest air quality` would.\n\
+         \x20   SELECT string_agg(detail, '; ' ORDER BY detail) INTO bad FROM (\n\
+         \x20       SELECT format('%L would be derived from %s', g.station_id, g.names) AS detail\n\
+         \x20         FROM (SELECT w9.station_key(s.stationname) AS station_id,\n\
+         \x20                      string_agg(quote_literal(s.stationname), ' and '\n\
+         \x20                                 ORDER BY s.stationname) AS names,\n\
+         \x20                      count(*) AS n\n\
+         \x20                 FROM w9.source_station s\n\
+         \x20                WHERE NOT EXISTS (SELECT 1 FROM w9.station_map m\n\
+         \x20                                   WHERE m.stationname = s.stationname)\n\
+         \x20                GROUP BY 1) g\n\
+         \x20        WHERE g.n > 1\n\
+         \x20       UNION ALL\n\
+         \x20       SELECT format('%L would be derived from %L and already belongs to %L',\n\
+         \x20                     m.station_id, s.stationname, m.stationname) AS detail\n\
+         \x20         FROM w9.source_station s\n\
+         \x20         JOIN w9.station_map m ON m.station_id = w9.station_key(s.stationname)\n\
+         \x20                              AND m.stationname <> s.stationname\n\
+         \x20        WHERE NOT EXISTS (SELECT 1 FROM w9.station_map m2\n\
+         \x20                           WHERE m2.stationname = s.stationname)\n\
+         \x20   ) d;\n\
+         \x20   IF bad IS NOT NULL THEN\n\
+         \x20       RAISE EXCEPTION 'the derived station ids are not unique: %', bad\n\
+         \x20           USING HINT = 'INSERT a w9.station_map row for each colliding name first; '\n\
+         \x20                        'this procedure leaves an existing row alone';\n\
+         \x20   END IF;\n\
+         \x20   INSERT INTO w9.station_map (stationname, station_id, stationtype)\n\
+         \x20   SELECT s.stationname, w9.station_key(s.stationname), s.stationtype\n\
+         \x20     FROM w9.source_station s\n\
+         \x20   ON CONFLICT (stationname) DO NOTHING;\n\
+         \x20   PERFORM w9.assert_station_map_usable();\n\
          END $fn$;\n\n",
     );
 
@@ -700,10 +907,15 @@ fn import_raw(reg: &Registry) -> String {
          -- `stations` first. W4 2.1 makes it the reading-side projection every /span join\n\
          -- goes through, and the low-volume tables carry a foreign key to it, so a reading\n\
          -- whose station has no row is addressable by nothing.\n\
+         --\n\
+         -- Both assertions run here and not at the end, because this is the last point\n\
+         -- before 19 GB moves: a map that is incomplete, or whose ids could not be\n\
+         -- configured as station keys afterwards (M5-1b), costs an import either way.\n\
          -- ------------------------------------------------------------------\n\n\
          CREATE PROCEDURE w9.populate_stations() LANGUAGE plpgsql AS $fn$\n\
          BEGIN\n\
          \x20   PERFORM w9.assert_station_map_complete();\n\
+         \x20   PERFORM w9.assert_station_map_usable();\n\
          \x20   INSERT INTO stations (station_id, name, type, timezone, latitude, longitude,\n\
          \x20                         altitude_ft, snow_base_distance_mm, first_seen, last_seen)\n\
          \x20   SELECT m.station_id,\n\
@@ -1321,15 +1533,69 @@ mod tests {
         )
     }
 
-    /// The real registry has no `metadata` dimension, so every other test in this module
-    /// exercises the metadata branch of `expected_raw_columns` vacuously. This one takes
-    /// the real registry and splices one in, which is the only way to see that branch
-    /// run at all.
+    /// The shipped registry with both `metadata` dimensions put back to `attribute`, which
+    /// is what `main` looked like before M5-5 and is the only way to reach the empty branch
+    /// of the `w9.record_retired_dimensions()` emitter.
+    fn registry_with_no_metadata_dimension() -> Registry {
+        let root = crate::repo_root();
+        let text = std::fs::read_to_string(root.join(crate::REGISTRY))
+            .expect("registry is readable")
+            .replace("role = \"metadata\"", "role = \"attribute\"");
+        let reg: Registry = toml::from_str(&text).expect("fixture parses");
+        assert!(
+            !reg.dimensions.iter().any(|d| d.role.retirable()),
+            "the fixture is supposed to have no `metadata` dimension"
+        );
+        crate::validate::registry_internal(&reg).expect("fixture is a valid registry");
+        reg
+    }
+
+    /// **`w9.record_retired_dimensions()` is emitted whatever the registry says**, because
+    /// `migrate-from-go.sh` calls it by name.
     ///
-    /// It matters here more than it looks: `expected_raw_columns` drives the staging
-    /// table's `expected_column` rows, and a column named there that the destination
-    /// does not have fails the import mid-run, against production data, after the
-    /// archive has been taken.
+    /// A procedure that existed only when the registry happened to have a `metadata`
+    /// dimension would make that call fail with `undefined_function` on the next registry
+    /// that does not -- in the `gap` step, after the archive has been taken and before the
+    /// import. An `INSERT` over an empty `VALUES` list is not expressible, which is why the
+    /// empty case is a plpgsql `NULL` rather than a shorter `LANGUAGE sql` body.
+    #[test]
+    fn the_retired_dimension_recorder_is_emitted_even_with_nothing_to_record() {
+        let go = inputs().1;
+        let staging = |reg: &Registry| {
+            all(reg, &go)
+                .remove(&format!("{OUT_DIR}/00-staging.sql"))
+                .expect("staging is emitted")
+        };
+
+        let empty = staging(&registry_with_no_metadata_dimension());
+        assert!(
+            empty.contains("CREATE PROCEDURE w9.record_retired_dimensions()"),
+            "the procedure migrate-from-go.sh CALLs is missing: {empty}"
+        );
+        assert!(
+            empty.contains("    NULL;"),
+            "with nothing retired the body is a no-op, not an INSERT over an empty VALUES"
+        );
+        assert!(
+            !empty.contains("INSERT INTO w9.dropped_source_column"),
+            "and it records nothing"
+        );
+
+        // The shipped registry's version, for contrast: same procedure, real body.
+        let populated = staging(&inputs().0);
+        assert!(populated.contains("CREATE PROCEDURE w9.record_retired_dimensions()"));
+        assert!(populated.contains("INSERT INTO w9.dropped_source_column"));
+    }
+
+    /// A registry with a `metadata` dimension the OLD TABLE NEVER HAD, which the shipped
+    /// registry no longer provides: M5-5 retired `stationname` and `stationtype` to that
+    /// role, and both of those *are* columns of the old table. The two cases differ in
+    /// exactly one way that matters and the fixture is what separates them.
+    ///
+    /// It matters more than it looks: `expected_raw_columns` drives the staging table's
+    /// `expected_column` rows, and a column named there that the destination does not
+    /// have fails the import mid-run, against production data, after the archive has
+    /// been taken.
     fn registry_with_a_metadata_dimension() -> Registry {
         let root = crate::repo_root();
         let mut text =
@@ -1358,25 +1624,56 @@ mod tests {
             !cols.iter().any(|(c, _, _)| c == "origin"),
             "expected_raw_columns names it: {cols:?}"
         );
-        // The stored dimensions it must still expect are there, so this is not passing
-        // because the loop emitted nothing.
+        // What it must still expect is there, so this is not passing because the loops
+        // emitted nothing. `time` is the one stored dimension the old table has --
+        // `station_id` is the partition key and is skipped for its own reason, and the
+        // other two are M5-5's `metadata` dimensions -- and `outtemp` stands for the
+        // metrics, which is the other loop.
         assert!(cols.iter().any(|(c, _, k)| c == "time" && *k == "time"));
         assert!(cols
             .iter()
-            .any(|(c, _, k)| c == "stationname" && *k == "attribute"));
+            .any(|(c, _, k)| c == "outtemp" && *k == "metric"));
     }
 
+    /// A `metadata` dimension reaches the emitted SQL in **exactly one place**, and that
+    /// place is a decision record rather than a column list.
+    ///
+    /// The one place is `w9.record_retired_dimensions()`, which M5-5 added because taking
+    /// `stationname` out of `w9.expected_column` leaves it in the source with no
+    /// destination -- the state `w9.assert_no_unknown_source_columns()` refuses an import
+    /// over. Everywhere else the original property holds unchanged: a column the old table
+    /// does not have and the new one never will must not appear in an expected-column row,
+    /// a COPY list or any DDL, because a column named there fails the import mid-run,
+    /// against production data, after the archive has been taken.
+    ///
+    /// Asserted against a dimension the old table never had, so the decision record is
+    /// also shown to be inert for one: the procedure joins `w9.source_column`, so the row
+    /// only materialises for a column the source actually declares.
     #[test]
-    fn no_emitted_migration_sql_names_a_metadata_dimension() {
+    fn a_metadata_dimension_reaches_the_emitted_sql_only_as_a_recorded_decision() {
         let reg = registry_with_a_metadata_dimension();
         let go = inputs().1;
         for (path, body) in all(&reg, &go) {
-            assert!(
-                !body.contains("origin"),
-                "{path} names a column the old table does not have and the new one \
-                 never will"
-            );
+            for (i, line) in body.lines().enumerate() {
+                if !line.contains("origin") {
+                    continue;
+                }
+                assert!(
+                    path.ends_with("00-staging.sql") && line.contains("('origin', 'origin is"),
+                    "{path}:{} names a column the old table does not have and the new one \
+                     never will, outside w9.record_retired_dimensions(): {line}",
+                    i + 1
+                );
+            }
         }
+        // And the record is guarded, so it says nothing about a column that is not there.
+        let staging = all(&reg, &go)
+            .remove(&format!("{OUT_DIR}/00-staging.sql"))
+            .unwrap();
+        assert!(
+            staging.contains("JOIN w9.source_column s USING (column_name)"),
+            "the decision record is joined to what the source declares"
+        );
     }
 
     #[test]
@@ -1593,15 +1890,17 @@ mod tests {
         let (reg, go) = inputs();
         let files = all(&reg, &go);
         let staging = files.get(&format!("{OUT_DIR}/00-staging.sql")).unwrap();
-        // 215 columns: the Go table's own width, which is the registry's 216 minus
-        // station_id. Any drift here means the import would silently skip a column.
+        // 213 columns: the registry's 214 minus station_id, which the old table does not
+        // have. It was 215 against 216 until M5-5 retired `stationname` and `stationtype`
+        // to `role = "metadata"`. Any drift here means the import would silently skip a
+        // column.
         let n = staging
             .lines()
             .filter(|l| l.trim_start().starts_with("('") && l.contains("', '"))
             .count();
-        // 215 raw columns + 212 live metric keys in w9.metric_key would both match a
+        // 213 raw columns + 212 live metric keys in w9.metric_key would both match a
         // looser pattern, so count only the rows this file emits.
-        assert!(n >= 215, "expected_column rows: {n}");
+        assert!(n >= 213, "expected_column rows: {n}");
         assert!(
             !staging.contains("('station_id', 'text'"),
             "the old table has no station_id"
@@ -1614,6 +1913,83 @@ mod tests {
         }
         // Column order is load-bearing for the matched COPY pair.
         assert!(staging.contains("ord         int  NOT NULL UNIQUE"));
+    }
+
+    /// **A `metadata` dimension is routed, not merely absent.** M5-5 took `stationname`
+    /// and `stationtype` out of `w9.expected_column`, which leaves them in the source with
+    /// no destination -- and `w9.assert_no_unknown_source_columns()` refuses an import in
+    /// exactly that state, correctly. So the registry has to emit the decision as well as
+    /// the omission, and this is the pairing: out of the expected list, into
+    /// `w9.dropped_source_column` with a reason.
+    ///
+    /// The two halves are asserted together because each is harmless alone and the pair is
+    /// the thing that matters: an expected column that is also dropped would be imported
+    /// *and* recorded as abandoned, and a column that is neither is the raise.
+    #[test]
+    fn a_metadata_dimension_is_dropped_from_the_import_with_a_recorded_reason() {
+        let (reg, go) = inputs();
+        let files = all(&reg, &go);
+        let staging = files.get(&format!("{OUT_DIR}/00-staging.sql")).unwrap();
+        let retired: Vec<&Dimension> = reg
+            .dimensions
+            .iter()
+            .filter(|d| d.role.retirable())
+            .collect();
+        assert!(
+            !retired.is_empty(),
+            "the shipped registry has `metadata` dimensions, so this test has a subject"
+        );
+        for d in &retired {
+            assert!(
+                !staging.contains(&format!("('{}', 'text', ", d.column)),
+                "{} is a `metadata` dimension and must not be an expected_column",
+                d.column
+            );
+            assert!(
+                staging.contains("CREATE PROCEDURE w9.record_retired_dimensions()")
+                    && staging.contains(&format!("('{}', '{} is role = ", d.column, d.key)),
+                "{} is omitted from the import and the reason is not recorded, which is \
+                 what `w9.assert_no_unknown_source_columns()` raises on",
+                d.column
+            );
+        }
+        // The `stations` projection is where the display metadata went, and the reason
+        // says so -- so a reader who hits the raise is pointed at the replacement rather
+        // than at an absence.
+        let import = files.get(&format!("{OUT_DIR}/10-import-raw.sql")).unwrap();
+        assert!(
+            import.contains("m.stationname,"),
+            "w9.populate_stations() still writes the display name into `stations`"
+        );
+    }
+
+    #[test]
+    fn the_station_map_derives_its_keys_and_refuses_one_it_could_not_configure() {
+        // M5-1b. The first production run took station_id = stationname, and two of the
+        // three names it imported cannot be a component id, so the live station could not
+        // be configured against its own history. The default is derived now, and the
+        // derivation is in the committed SQL rather than in whoever runs it next.
+        let (reg, go) = inputs();
+        let files = all(&reg, &go);
+        let staging = files.get(&format!("{OUT_DIR}/00-staging.sql")).unwrap();
+        assert!(staging.contains("CREATE FUNCTION w9.station_key(stationname text)"));
+        assert!(staging.contains("CREATE PROCEDURE w9.seed_station_map()"));
+        // The derivation emits only characters mw_component::ComponentId permits, and `:`
+        // -- which it does permit -- is excluded because it is the segment separator.
+        assert!(staging.contains("'[^a-z0-9._-]+', '-', 'g'"));
+        // The refusal, and the limit mw_station::MAX_KEY_LEN carries.
+        assert!(staging.contains("CREATE FUNCTION w9.station_key_problem(station_id text)"));
+        assert!(staging.contains("octet_length($1) > 108"));
+        assert!(staging.contains("w9.assert_station_map_usable()"));
+        // And it gates the import: `stations` is the step before 19 GB moves.
+        let raw = files.get(&format!("{OUT_DIR}/10-import-raw.sql")).unwrap();
+        assert!(raw.contains("PERFORM w9.assert_station_map_usable();"));
+        // No station of the owner's is named in the emitted SQL as a mapping: the three
+        // keys production gets are derived, and a hard-coded scheme would survive here.
+        assert!(
+            !staging.contains("'suncrest-air-quality'"),
+            "the production keys must be derived, not listed"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! `--migrate-config-from`: the configuration migration (**M7-4**), as a command.
+//! `migrate-config`: the configuration migration (**M7-4**), as a command.
 //!
 //! `ci/db/migrate-from-go/` moves the *weather* database; this moves the *configuration*
 //! one. The translation is `mw_store::config_go` -- it is a set of statements against two
@@ -17,7 +17,7 @@
 //!      a daemon that does not start (docs/reconciliation.md **DEV-9**), so the migration
 //!      switches that station off and names the column rather than handing the daemon a
 //!      configuration it will refuse.
-//!   4. **Whether to commit.** `--migrate-config-dry-run` rolls the transaction back, and
+//!   4. **Whether to commit.** `--dry-run` rolls the transaction back, and
 //!      that is the only difference between the two paths -- the same relationship
 //!      `POST /api/v1/config/preview` has to a save (W5 §2.4).
 //!
@@ -184,10 +184,25 @@ fn node_name() -> String {
 /// Through `tracing` rather than the terminal, which `ci/layers.toml`'s `no-stdout-logging`
 /// rule reserves for the argument-parsing path -- and which is also right here, because this
 /// is the one record that the deployment was migrated.
+///
+/// # `target: AUDIT_TARGET`, and it is load-bearing rather than decorative
+///
+/// `mw_obs`'s dedupe layer is keyed on the **callsite**, not the message (§5.6), and the
+/// whole report comes out of the two `info!`/`warn!` calls below. With `burst: 3` that meant
+/// the first three lines of a thirty-line report were emitted and the rest were suppressed
+/// as if they were a flapping serial port -- measured on the owner's own configuration,
+/// where it swallowed the listener's new ports, two time-zone fallbacks and the O-8 raise.
+///
+/// `AUDIT_TARGET` is the exemption that exists for exactly this: "configuration mutations,
+/// authentication outcomes, certificate reloads -- an audit log with holes is not an audit
+/// log". A configuration migration is the largest configuration mutation this program
+/// performs, and it happens once per deployment, so there is nothing here for repetition
+/// control to protect anybody from.
 fn report(migrated: &config_go::Migrated, dry_run: bool) {
     for kind in [NoteKind::Derived, NoteKind::NotCarried, NoteKind::Raised] {
         for note in migrated.report.of(kind) {
             info!(
+                target: mw_obs::AUDIT_TARGET,
                 kind = kind.as_str(),
                 subject = %note.subject,
                 "{}",
@@ -198,6 +213,7 @@ fn report(migrated: &config_go::Migrated, dry_run: bool) {
     let actions: Vec<&config_go::Note> = migrated.report.of(NoteKind::Action).collect();
     for note in &actions {
         warn!(
+            target: mw_obs::AUDIT_TARGET,
             kind = NoteKind::Action.as_str(),
             subject = %note.subject,
             "{}",
@@ -206,6 +222,7 @@ fn report(migrated: &config_go::Migrated, dry_run: bool) {
     }
     let keys = migrated.station_keys();
     info!(
+        target: mw_obs::AUDIT_TARGET,
         stations = keys.len(),
         station_keys = %keys.join(", "),
         peers = migrated.peers.len(),
@@ -216,11 +233,13 @@ fn report(migrated: &config_go::Migrated, dry_run: bool) {
     );
     if dry_run {
         warn!(
+            target: mw_obs::AUDIT_TARGET,
             "this was a dry run: the transaction was rolled back and nothing was kept. \
-             Run it again without --migrate-config-dry-run to write it."
+             Run it again without --dry-run to write it."
         );
     } else {
         info!(
+            target: mw_obs::AUDIT_TARGET,
             config = "migrated",
             "the configuration is written. Start the daemon against it; the one-time \
              administrator setup token is logged at its first start."
@@ -263,6 +282,7 @@ mod tests {
                 config: scratch.0.join("config.db"),
                 format: None,
                 directive: None,
+                setup_listen: None,
             },
             from: scratch.0.join("go-config.db"),
             dry_run,
@@ -379,7 +399,7 @@ mod tests {
         pool.close().await;
     }
 
-    /// `--migrate-config-dry-run` produces the report and keeps nothing.
+    /// `migrate-config --dry-run` produces the report and keeps nothing.
     #[tokio::test]
     async fn a_dry_run_reports_and_writes_nothing() {
         let scratch = Scratch::new("dry");
@@ -416,5 +436,35 @@ mod tests {
             .expect_err("not a Go configuration database");
         let chain = mw_types::DisplayChain(e.as_ref()).to_string();
         assert!(chain.contains("go-config.db"), "{chain}");
+    }
+
+    /// **Every line of the report carries the audit target, and a source assertion is the
+    /// only kind that can say so.**
+    ///
+    /// `mw_obs`'s dedupe layer is keyed on the callsite and the whole report comes out of
+    /// two of them, so with `burst: 3` the first three lines were emitted and the rest were
+    /// suppressed as a flapping callsite would be. It was found by running the migration
+    /// against a real configuration and noticing that the report stopped after three lines,
+    /// which is the one way a reader would ever notice.
+    ///
+    /// A behavioural test cannot reach it: `mw_obs::install` is process-global, so only one
+    /// test per binary could install a subscriber, and this binary's one is the boot
+    /// sequence's. So the property is asserted over the source of this file -- which is
+    /// exactly what `ci/layers.toml`'s own source rules do one level up, and for the same
+    /// reason: the alternative is a convention a reviewer has to remember.
+    #[test]
+    fn the_report_is_exempt_from_repetition_control() {
+        let src = include_str!("migrate.rs");
+        let body = src.split_once("fn report(").expect("the report function").1;
+        let emits = body.matches("info!(").count() + body.matches("warn!(").count();
+        let targeted = body.matches("target: mw_obs::AUDIT_TARGET").count();
+        assert!(emits > 0, "the report emits nothing at all");
+        assert_eq!(
+            emits, targeted,
+            "{} of {emits} report lines carry `target: mw_obs::AUDIT_TARGET`. Without it \
+             the dedupe layer keeps the first three and suppresses the rest, because it is \
+             keyed on the callsite and this report has two.",
+            targeted
+        );
     }
 }

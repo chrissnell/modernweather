@@ -22,7 +22,7 @@
 //!     learns about a new `CHECK` late.
 //!   * **A dry run is free and is the same code.** `apply` does not commit, so the caller
 //!     chooses; `POST /api/v1/config/preview` and a real save already differ in exactly that
-//!     one way (W5 §2.4), and so do `--migrate-config-dry-run` and a real migration.
+//!     one way (W5 §2.4), and so do `migrate-config --dry-run` and a real migration.
 //!   * **What the migration can express is what an operator can express.** A configuration
 //!     only reachable by migration would be a configuration the management UI cannot edit.
 //!
@@ -229,7 +229,7 @@ pub enum ConfigGoError {
     /// The source is not a Go configuration database.
     #[error(
         "`{table}` is not in this database, so it is not a RemoteWeather configuration \
-         database. Point `--migrate-config-from` at the file the Go daemon's `--config` \
+         database. Point `migrate-config --from` at the file the Go daemon's `--config` \
          names."
     )]
     NotAGoConfig {
@@ -4048,7 +4048,7 @@ mod tests {
             matches!(e, ConfigGoError::NotAGoConfig { table: "devices" }),
             "{e}"
         );
-        assert!(e.to_string().contains("--migrate-config-from"), "{e}");
+        assert!(e.to_string().contains("migrate-config --from"), "{e}");
     }
 
     /// A source that is not there is an error, not an empty deployment.

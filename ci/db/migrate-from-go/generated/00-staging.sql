@@ -18,7 +18,7 @@ COMMENT ON SCHEMA w9 IS
      observations_1d_legacy is NOT in here and is not droppable.';
 
 -- ------------------------------------------------------------------
--- 1. What the destination expects: 215 columns from metrics/registry.toml.
+-- 1. What the destination expects: 213 columns from metrics/registry.toml.
 --    The partition key `station_id` is absent on purpose — the old table has no
 --    such column, and resolving it is w9.station_map's job.
 -- ------------------------------------------------------------------
@@ -35,220 +35,218 @@ CREATE TABLE w9.expected_column (
 -- column order exactly and a physical-order dependency is not a guarantee.
 INSERT INTO w9.expected_column (column_name, sql_type, kind, ord) VALUES
     ('time', 'timestamptz', 'time', 1),
-    ('stationname', 'text', 'attribute', 2),
-    ('stationtype', 'text', 'attribute', 3),
-    ('barometer', 'float4', 'metric', 4),
-    ('intemp', 'float4', 'metric', 5),
-    ('inhumidity', 'float4', 'metric', 6),
-    ('outtemp', 'float4', 'metric', 7),
-    ('outhumidity', 'float4', 'metric', 8),
-    ('windspeed', 'float4', 'metric', 9),
-    ('windspeed10', 'float4', 'metric', 10),
-    ('winddir', 'float4', 'metric', 11),
-    ('windchill', 'float4', 'metric', 12),
-    ('heatindex', 'float4', 'metric', 13),
-    ('extratemp1', 'float4', 'metric', 14),
-    ('extratemp2', 'float4', 'metric', 15),
-    ('extratemp3', 'float4', 'metric', 16),
-    ('extratemp4', 'float4', 'metric', 17),
-    ('extratemp5', 'float4', 'metric', 18),
-    ('extratemp6', 'float4', 'metric', 19),
-    ('extratemp7', 'float4', 'metric', 20),
-    ('soiltemp1', 'float4', 'metric', 21),
-    ('soiltemp2', 'float4', 'metric', 22),
-    ('soiltemp3', 'float4', 'metric', 23),
-    ('soiltemp4', 'float4', 'metric', 24),
-    ('leaftemp1', 'float4', 'metric', 25),
-    ('leaftemp2', 'float4', 'metric', 26),
-    ('leaftemp3', 'float4', 'metric', 27),
-    ('leaftemp4', 'float4', 'metric', 28),
-    ('extrahumidity1', 'float4', 'metric', 29),
-    ('extrahumidity2', 'float4', 'metric', 30),
-    ('extrahumidity3', 'float4', 'metric', 31),
-    ('extrahumidity4', 'float4', 'metric', 32),
-    ('extrahumidity5', 'float4', 'metric', 33),
-    ('extrahumidity6', 'float4', 'metric', 34),
-    ('extrahumidity7', 'float4', 'metric', 35),
-    ('rainrate', 'float4', 'metric', 36),
-    ('rainincremental', 'float4', 'metric', 37),
-    ('stormrain', 'float4', 'metric', 38),
-    ('stormstart', 'timestamptz', 'metric', 39),
-    ('dayrain', 'float4', 'metric', 40),
-    ('monthrain', 'float4', 'metric', 41),
-    ('yearrain', 'float4', 'metric', 42),
-    ('solarwatts', 'float4', 'metric', 43),
-    ('potentialsolarwatts', 'float4', 'metric', 44),
-    ('solarjoules', 'float4', 'metric', 45),
-    ('uv', 'float4', 'metric', 46),
-    ('radiation', 'float4', 'metric', 47),
-    ('dayet', 'float4', 'metric', 48),
-    ('monthet', 'float4', 'metric', 49),
-    ('yearet', 'float4', 'metric', 50),
-    ('soilmoisture1', 'float4', 'metric', 51),
-    ('soilmoisture2', 'float4', 'metric', 52),
-    ('soilmoisture3', 'float4', 'metric', 53),
-    ('soilmoisture4', 'float4', 'metric', 54),
-    ('leafwetness1', 'float4', 'metric', 55),
-    ('leafwetness2', 'float4', 'metric', 56),
-    ('leafwetness3', 'float4', 'metric', 57),
-    ('leafwetness4', 'float4', 'metric', 58),
-    ('insidealarm', 'int4', 'metric', 59),
-    ('rainalarm', 'int4', 'metric', 60),
-    ('outsidealarm1', 'int4', 'metric', 61),
-    ('outsidealarm2', 'int4', 'metric', 62),
-    ('extraalarm1', 'int4', 'metric', 63),
-    ('extraalarm2', 'int4', 'metric', 64),
-    ('extraalarm3', 'int4', 'metric', 65),
-    ('extraalarm4', 'int4', 'metric', 66),
-    ('extraalarm5', 'int4', 'metric', 67),
-    ('extraalarm6', 'int4', 'metric', 68),
-    ('extraalarm7', 'int4', 'metric', 69),
-    ('extraalarm8', 'int4', 'metric', 70),
-    ('soilleafalarm1', 'int4', 'metric', 71),
-    ('soilleafalarm2', 'int4', 'metric', 72),
-    ('soilleafalarm3', 'int4', 'metric', 73),
-    ('soilleafalarm4', 'int4', 'metric', 74),
-    ('txbatterystatus', 'int4', 'metric', 75),
-    ('consbatteryvoltage', 'float4', 'metric', 76),
-    ('stationbatteryvoltage', 'float4', 'metric', 77),
-    ('forecasticon', 'int4', 'metric', 78),
-    ('forecastrule', 'int4', 'metric', 79),
-    ('sunrise', 'timestamptz', 'metric', 80),
-    ('sunset', 'timestamptz', 'metric', 81),
-    ('snowdistance', 'float4', 'metric', 82),
-    ('snowdepth', 'float4', 'metric', 83),
-    ('extrafloat1', 'float4', 'metric', 84),
-    ('extrafloat2', 'float4', 'metric', 85),
-    ('extrafloat3', 'float4', 'metric', 86),
-    ('extrafloat4', 'float4', 'metric', 87),
-    ('extrafloat5', 'float4', 'metric', 88),
-    ('extrafloat6', 'float4', 'metric', 89),
-    ('extrafloat7', 'float4', 'metric', 90),
-    ('extrafloat8', 'float4', 'metric', 91),
-    ('extrafloat9', 'float4', 'metric', 92),
-    ('extrafloat10', 'float4', 'metric', 93),
-    ('extratext1', 'text', 'metric', 94),
-    ('extratext2', 'text', 'metric', 95),
-    ('extratext3', 'text', 'metric', 96),
-    ('extratext4', 'text', 'metric', 97),
-    ('extratext5', 'text', 'metric', 98),
-    ('extratext6', 'text', 'metric', 99),
-    ('extratext7', 'text', 'metric', 100),
-    ('extratext8', 'text', 'metric', 101),
-    ('extratext9', 'text', 'metric', 102),
-    ('extratext10', 'text', 'metric', 103),
-    ('temp1', 'float4', 'metric', 104),
-    ('temp2', 'float4', 'metric', 105),
-    ('temp3', 'float4', 'metric', 106),
-    ('temp4', 'float4', 'metric', 107),
-    ('temp5', 'float4', 'metric', 108),
-    ('temp6', 'float4', 'metric', 109),
-    ('temp7', 'float4', 'metric', 110),
-    ('temp8', 'float4', 'metric', 111),
-    ('temp9', 'float4', 'metric', 112),
-    ('temp10', 'float4', 'metric', 113),
-    ('soiltemp5', 'float4', 'metric', 114),
-    ('soiltemp6', 'float4', 'metric', 115),
-    ('soiltemp7', 'float4', 'metric', 116),
-    ('soiltemp8', 'float4', 'metric', 117),
-    ('soiltemp9', 'float4', 'metric', 118),
-    ('soiltemp10', 'float4', 'metric', 119),
-    ('humidity1', 'float4', 'metric', 120),
-    ('humidity2', 'float4', 'metric', 121),
-    ('humidity3', 'float4', 'metric', 122),
-    ('humidity4', 'float4', 'metric', 123),
-    ('humidity5', 'float4', 'metric', 124),
-    ('humidity6', 'float4', 'metric', 125),
-    ('humidity7', 'float4', 'metric', 126),
-    ('humidity8', 'float4', 'metric', 127),
-    ('humidity9', 'float4', 'metric', 128),
-    ('humidity10', 'float4', 'metric', 129),
-    ('soilhum1', 'float4', 'metric', 130),
-    ('soilhum2', 'float4', 'metric', 131),
-    ('soilhum3', 'float4', 'metric', 132),
-    ('soilhum4', 'float4', 'metric', 133),
-    ('soilhum5', 'float4', 'metric', 134),
-    ('soilhum6', 'float4', 'metric', 135),
-    ('soilhum7', 'float4', 'metric', 136),
-    ('soilhum8', 'float4', 'metric', 137),
-    ('soilhum9', 'float4', 'metric', 138),
-    ('soilhum10', 'float4', 'metric', 139),
-    ('leafwetness5', 'float4', 'metric', 140),
-    ('leafwetness6', 'float4', 'metric', 141),
-    ('leafwetness7', 'float4', 'metric', 142),
-    ('leafwetness8', 'float4', 'metric', 143),
-    ('soiltens1', 'float4', 'metric', 144),
-    ('soiltens2', 'float4', 'metric', 145),
-    ('soiltens3', 'float4', 'metric', 146),
-    ('soiltens4', 'float4', 'metric', 147),
-    ('gdd', 'int4', 'metric', 148),
-    ('etos', 'float4', 'metric', 149),
-    ('etrs', 'float4', 'metric', 150),
-    ('leak1', 'int4', 'metric', 151),
-    ('leak2', 'int4', 'metric', 152),
-    ('leak3', 'int4', 'metric', 153),
-    ('leak4', 'int4', 'metric', 154),
-    ('battout', 'int4', 'metric', 155),
-    ('battin', 'int4', 'metric', 156),
-    ('batt1', 'int4', 'metric', 157),
-    ('batt2', 'int4', 'metric', 158),
-    ('batt3', 'int4', 'metric', 159),
-    ('batt4', 'int4', 'metric', 160),
-    ('batt5', 'int4', 'metric', 161),
-    ('batt6', 'int4', 'metric', 162),
-    ('batt7', 'int4', 'metric', 163),
-    ('batt8', 'int4', 'metric', 164),
-    ('batt9', 'int4', 'metric', 165),
-    ('batt10', 'int4', 'metric', 166),
-    ('batt_25', 'int4', 'metric', 167),
-    ('batt_lightning', 'int4', 'metric', 168),
-    ('batleak1', 'int4', 'metric', 169),
-    ('batleak2', 'int4', 'metric', 170),
-    ('batleak3', 'int4', 'metric', 171),
-    ('batleak4', 'int4', 'metric', 172),
-    ('battsm1', 'int4', 'metric', 173),
-    ('battsm2', 'int4', 'metric', 174),
-    ('battsm3', 'int4', 'metric', 175),
-    ('battsm4', 'int4', 'metric', 176),
-    ('batt_co2', 'int4', 'metric', 177),
-    ('batt_cellgateway', 'int4', 'metric', 178),
-    ('baromrelin', 'float4', 'metric', 179),
-    ('baromabsin', 'float4', 'metric', 180),
-    ('relay1', 'int4', 'metric', 181),
-    ('relay2', 'int4', 'metric', 182),
-    ('relay3', 'int4', 'metric', 183),
-    ('relay4', 'int4', 'metric', 184),
-    ('relay5', 'int4', 'metric', 185),
-    ('relay6', 'int4', 'metric', 186),
-    ('relay7', 'int4', 'metric', 187),
-    ('relay8', 'int4', 'metric', 188),
-    ('relay9', 'int4', 'metric', 189),
-    ('relay10', 'int4', 'metric', 190),
-    ('pm25', 'float4', 'metric', 191),
-    ('pm25_24h', 'float4', 'metric', 192),
-    ('pm25_in', 'float4', 'metric', 193),
-    ('pm25_in_24h', 'float4', 'metric', 194),
-    ('pm25_in_aqin', 'float4', 'metric', 195),
-    ('pm25_in_24h_aqin', 'float4', 'metric', 196),
-    ('pm10_in_aqin', 'float4', 'metric', 197),
-    ('pm10_in_24h_aqin', 'float4', 'metric', 198),
-    ('co2', 'float4', 'metric', 199),
-    ('co2_in_aqin', 'int4', 'metric', 200),
-    ('co2_in_24h_aqin', 'int4', 'metric', 201),
-    ('pm_in_temp_aqin', 'float4', 'metric', 202),
-    ('pm_in_humidity_aqin', 'int4', 'metric', 203),
-    ('aqi_pm25_aqin', 'int4', 'metric', 204),
-    ('aqi_pm25_24h_aqin', 'int4', 'metric', 205),
-    ('aqi_pm10_aqin', 'int4', 'metric', 206),
-    ('aqi_pm10_24h_aqin', 'int4', 'metric', 207),
-    ('aqi_pm25_in', 'int4', 'metric', 208),
-    ('aqi_pm25_in_24h', 'int4', 'metric', 209),
-    ('lightning_day', 'int4', 'metric', 210),
-    ('lightning_hour', 'int4', 'metric', 211),
-    ('lightning_time', 'timestamptz', 'metric', 212),
-    ('lightning_distance', 'float4', 'metric', 213),
-    ('tz', 'text', 'metric', 214),
-    ('dateutc', 'int8', 'metric', 215);
+    ('barometer', 'float4', 'metric', 2),
+    ('intemp', 'float4', 'metric', 3),
+    ('inhumidity', 'float4', 'metric', 4),
+    ('outtemp', 'float4', 'metric', 5),
+    ('outhumidity', 'float4', 'metric', 6),
+    ('windspeed', 'float4', 'metric', 7),
+    ('windspeed10', 'float4', 'metric', 8),
+    ('winddir', 'float4', 'metric', 9),
+    ('windchill', 'float4', 'metric', 10),
+    ('heatindex', 'float4', 'metric', 11),
+    ('extratemp1', 'float4', 'metric', 12),
+    ('extratemp2', 'float4', 'metric', 13),
+    ('extratemp3', 'float4', 'metric', 14),
+    ('extratemp4', 'float4', 'metric', 15),
+    ('extratemp5', 'float4', 'metric', 16),
+    ('extratemp6', 'float4', 'metric', 17),
+    ('extratemp7', 'float4', 'metric', 18),
+    ('soiltemp1', 'float4', 'metric', 19),
+    ('soiltemp2', 'float4', 'metric', 20),
+    ('soiltemp3', 'float4', 'metric', 21),
+    ('soiltemp4', 'float4', 'metric', 22),
+    ('leaftemp1', 'float4', 'metric', 23),
+    ('leaftemp2', 'float4', 'metric', 24),
+    ('leaftemp3', 'float4', 'metric', 25),
+    ('leaftemp4', 'float4', 'metric', 26),
+    ('extrahumidity1', 'float4', 'metric', 27),
+    ('extrahumidity2', 'float4', 'metric', 28),
+    ('extrahumidity3', 'float4', 'metric', 29),
+    ('extrahumidity4', 'float4', 'metric', 30),
+    ('extrahumidity5', 'float4', 'metric', 31),
+    ('extrahumidity6', 'float4', 'metric', 32),
+    ('extrahumidity7', 'float4', 'metric', 33),
+    ('rainrate', 'float4', 'metric', 34),
+    ('rainincremental', 'float4', 'metric', 35),
+    ('stormrain', 'float4', 'metric', 36),
+    ('stormstart', 'timestamptz', 'metric', 37),
+    ('dayrain', 'float4', 'metric', 38),
+    ('monthrain', 'float4', 'metric', 39),
+    ('yearrain', 'float4', 'metric', 40),
+    ('solarwatts', 'float4', 'metric', 41),
+    ('potentialsolarwatts', 'float4', 'metric', 42),
+    ('solarjoules', 'float4', 'metric', 43),
+    ('uv', 'float4', 'metric', 44),
+    ('radiation', 'float4', 'metric', 45),
+    ('dayet', 'float4', 'metric', 46),
+    ('monthet', 'float4', 'metric', 47),
+    ('yearet', 'float4', 'metric', 48),
+    ('soilmoisture1', 'float4', 'metric', 49),
+    ('soilmoisture2', 'float4', 'metric', 50),
+    ('soilmoisture3', 'float4', 'metric', 51),
+    ('soilmoisture4', 'float4', 'metric', 52),
+    ('leafwetness1', 'float4', 'metric', 53),
+    ('leafwetness2', 'float4', 'metric', 54),
+    ('leafwetness3', 'float4', 'metric', 55),
+    ('leafwetness4', 'float4', 'metric', 56),
+    ('insidealarm', 'int4', 'metric', 57),
+    ('rainalarm', 'int4', 'metric', 58),
+    ('outsidealarm1', 'int4', 'metric', 59),
+    ('outsidealarm2', 'int4', 'metric', 60),
+    ('extraalarm1', 'int4', 'metric', 61),
+    ('extraalarm2', 'int4', 'metric', 62),
+    ('extraalarm3', 'int4', 'metric', 63),
+    ('extraalarm4', 'int4', 'metric', 64),
+    ('extraalarm5', 'int4', 'metric', 65),
+    ('extraalarm6', 'int4', 'metric', 66),
+    ('extraalarm7', 'int4', 'metric', 67),
+    ('extraalarm8', 'int4', 'metric', 68),
+    ('soilleafalarm1', 'int4', 'metric', 69),
+    ('soilleafalarm2', 'int4', 'metric', 70),
+    ('soilleafalarm3', 'int4', 'metric', 71),
+    ('soilleafalarm4', 'int4', 'metric', 72),
+    ('txbatterystatus', 'int4', 'metric', 73),
+    ('consbatteryvoltage', 'float4', 'metric', 74),
+    ('stationbatteryvoltage', 'float4', 'metric', 75),
+    ('forecasticon', 'int4', 'metric', 76),
+    ('forecastrule', 'int4', 'metric', 77),
+    ('sunrise', 'timestamptz', 'metric', 78),
+    ('sunset', 'timestamptz', 'metric', 79),
+    ('snowdistance', 'float4', 'metric', 80),
+    ('snowdepth', 'float4', 'metric', 81),
+    ('extrafloat1', 'float4', 'metric', 82),
+    ('extrafloat2', 'float4', 'metric', 83),
+    ('extrafloat3', 'float4', 'metric', 84),
+    ('extrafloat4', 'float4', 'metric', 85),
+    ('extrafloat5', 'float4', 'metric', 86),
+    ('extrafloat6', 'float4', 'metric', 87),
+    ('extrafloat7', 'float4', 'metric', 88),
+    ('extrafloat8', 'float4', 'metric', 89),
+    ('extrafloat9', 'float4', 'metric', 90),
+    ('extrafloat10', 'float4', 'metric', 91),
+    ('extratext1', 'text', 'metric', 92),
+    ('extratext2', 'text', 'metric', 93),
+    ('extratext3', 'text', 'metric', 94),
+    ('extratext4', 'text', 'metric', 95),
+    ('extratext5', 'text', 'metric', 96),
+    ('extratext6', 'text', 'metric', 97),
+    ('extratext7', 'text', 'metric', 98),
+    ('extratext8', 'text', 'metric', 99),
+    ('extratext9', 'text', 'metric', 100),
+    ('extratext10', 'text', 'metric', 101),
+    ('temp1', 'float4', 'metric', 102),
+    ('temp2', 'float4', 'metric', 103),
+    ('temp3', 'float4', 'metric', 104),
+    ('temp4', 'float4', 'metric', 105),
+    ('temp5', 'float4', 'metric', 106),
+    ('temp6', 'float4', 'metric', 107),
+    ('temp7', 'float4', 'metric', 108),
+    ('temp8', 'float4', 'metric', 109),
+    ('temp9', 'float4', 'metric', 110),
+    ('temp10', 'float4', 'metric', 111),
+    ('soiltemp5', 'float4', 'metric', 112),
+    ('soiltemp6', 'float4', 'metric', 113),
+    ('soiltemp7', 'float4', 'metric', 114),
+    ('soiltemp8', 'float4', 'metric', 115),
+    ('soiltemp9', 'float4', 'metric', 116),
+    ('soiltemp10', 'float4', 'metric', 117),
+    ('humidity1', 'float4', 'metric', 118),
+    ('humidity2', 'float4', 'metric', 119),
+    ('humidity3', 'float4', 'metric', 120),
+    ('humidity4', 'float4', 'metric', 121),
+    ('humidity5', 'float4', 'metric', 122),
+    ('humidity6', 'float4', 'metric', 123),
+    ('humidity7', 'float4', 'metric', 124),
+    ('humidity8', 'float4', 'metric', 125),
+    ('humidity9', 'float4', 'metric', 126),
+    ('humidity10', 'float4', 'metric', 127),
+    ('soilhum1', 'float4', 'metric', 128),
+    ('soilhum2', 'float4', 'metric', 129),
+    ('soilhum3', 'float4', 'metric', 130),
+    ('soilhum4', 'float4', 'metric', 131),
+    ('soilhum5', 'float4', 'metric', 132),
+    ('soilhum6', 'float4', 'metric', 133),
+    ('soilhum7', 'float4', 'metric', 134),
+    ('soilhum8', 'float4', 'metric', 135),
+    ('soilhum9', 'float4', 'metric', 136),
+    ('soilhum10', 'float4', 'metric', 137),
+    ('leafwetness5', 'float4', 'metric', 138),
+    ('leafwetness6', 'float4', 'metric', 139),
+    ('leafwetness7', 'float4', 'metric', 140),
+    ('leafwetness8', 'float4', 'metric', 141),
+    ('soiltens1', 'float4', 'metric', 142),
+    ('soiltens2', 'float4', 'metric', 143),
+    ('soiltens3', 'float4', 'metric', 144),
+    ('soiltens4', 'float4', 'metric', 145),
+    ('gdd', 'int4', 'metric', 146),
+    ('etos', 'float4', 'metric', 147),
+    ('etrs', 'float4', 'metric', 148),
+    ('leak1', 'int4', 'metric', 149),
+    ('leak2', 'int4', 'metric', 150),
+    ('leak3', 'int4', 'metric', 151),
+    ('leak4', 'int4', 'metric', 152),
+    ('battout', 'int4', 'metric', 153),
+    ('battin', 'int4', 'metric', 154),
+    ('batt1', 'int4', 'metric', 155),
+    ('batt2', 'int4', 'metric', 156),
+    ('batt3', 'int4', 'metric', 157),
+    ('batt4', 'int4', 'metric', 158),
+    ('batt5', 'int4', 'metric', 159),
+    ('batt6', 'int4', 'metric', 160),
+    ('batt7', 'int4', 'metric', 161),
+    ('batt8', 'int4', 'metric', 162),
+    ('batt9', 'int4', 'metric', 163),
+    ('batt10', 'int4', 'metric', 164),
+    ('batt_25', 'int4', 'metric', 165),
+    ('batt_lightning', 'int4', 'metric', 166),
+    ('batleak1', 'int4', 'metric', 167),
+    ('batleak2', 'int4', 'metric', 168),
+    ('batleak3', 'int4', 'metric', 169),
+    ('batleak4', 'int4', 'metric', 170),
+    ('battsm1', 'int4', 'metric', 171),
+    ('battsm2', 'int4', 'metric', 172),
+    ('battsm3', 'int4', 'metric', 173),
+    ('battsm4', 'int4', 'metric', 174),
+    ('batt_co2', 'int4', 'metric', 175),
+    ('batt_cellgateway', 'int4', 'metric', 176),
+    ('baromrelin', 'float4', 'metric', 177),
+    ('baromabsin', 'float4', 'metric', 178),
+    ('relay1', 'int4', 'metric', 179),
+    ('relay2', 'int4', 'metric', 180),
+    ('relay3', 'int4', 'metric', 181),
+    ('relay4', 'int4', 'metric', 182),
+    ('relay5', 'int4', 'metric', 183),
+    ('relay6', 'int4', 'metric', 184),
+    ('relay7', 'int4', 'metric', 185),
+    ('relay8', 'int4', 'metric', 186),
+    ('relay9', 'int4', 'metric', 187),
+    ('relay10', 'int4', 'metric', 188),
+    ('pm25', 'float4', 'metric', 189),
+    ('pm25_24h', 'float4', 'metric', 190),
+    ('pm25_in', 'float4', 'metric', 191),
+    ('pm25_in_24h', 'float4', 'metric', 192),
+    ('pm25_in_aqin', 'float4', 'metric', 193),
+    ('pm25_in_24h_aqin', 'float4', 'metric', 194),
+    ('pm10_in_aqin', 'float4', 'metric', 195),
+    ('pm10_in_24h_aqin', 'float4', 'metric', 196),
+    ('co2', 'float4', 'metric', 197),
+    ('co2_in_aqin', 'int4', 'metric', 198),
+    ('co2_in_24h_aqin', 'int4', 'metric', 199),
+    ('pm_in_temp_aqin', 'float4', 'metric', 200),
+    ('pm_in_humidity_aqin', 'int4', 'metric', 201),
+    ('aqi_pm25_aqin', 'int4', 'metric', 202),
+    ('aqi_pm25_24h_aqin', 'int4', 'metric', 203),
+    ('aqi_pm10_aqin', 'int4', 'metric', 204),
+    ('aqi_pm10_24h_aqin', 'int4', 'metric', 205),
+    ('aqi_pm25_in', 'int4', 'metric', 206),
+    ('aqi_pm25_in_24h', 'int4', 'metric', 207),
+    ('lightning_day', 'int4', 'metric', 208),
+    ('lightning_hour', 'int4', 'metric', 209),
+    ('lightning_time', 'timestamptz', 'metric', 210),
+    ('lightning_distance', 'float4', 'metric', 211),
+    ('tz', 'text', 'metric', 212),
+    ('dateutc', 'int8', 'metric', 213);
 
 -- ------------------------------------------------------------------
 -- 2. What the source actually has. Populated by migrate-from-go.sh from a
@@ -311,6 +309,23 @@ COMMENT ON TABLE w9.dropped_source_column IS
     'Source columns consciously not carried over. Every row is a decision someone
      made; `reason` is not optional for that reason.';
 
+CREATE PROCEDURE w9.record_retired_dimensions() LANGUAGE plpgsql AS $fn$
+BEGIN
+    INSERT INTO w9.dropped_source_column (column_name, reason)
+    SELECT r.column_name, r.reason
+      FROM (VALUES
+            ('stationname', 'station_name is role = "metadata" in metrics/registry.toml. It reaches the daemon on the wire and is not a column of observations; the display metadata it carried is in stations instead, written by w9.populate_stations() from w9.station_map.'),
+            ('stationtype', 'station_type is role = "metadata" in metrics/registry.toml. It reaches the daemon on the wire and is not a column of observations; the display metadata it carried is in stations instead, written by w9.populate_stations() from w9.station_map.')
+        ) AS r(column_name, reason)
+      JOIN w9.source_column s USING (column_name)
+    ON CONFLICT (column_name) DO NOTHING;
+END $fn$;
+
+COMMENT ON PROCEDURE w9.record_retired_dimensions() IS
+    'Records the registry''s `metadata` dimensions as consciously dropped, for
+     the ones the source actually declares. Call it after w9.source_column is
+     loaded and before w9.assert_no_unknown_source_columns().';
+
 -- Fails the migration rather than importing into a column nobody chose.
 CREATE FUNCTION w9.assert_no_unknown_source_columns() RETURNS void
 LANGUAGE plpgsql AS $fn$
@@ -329,16 +344,39 @@ BEGIN
 END $fn$;
 
 -- ------------------------------------------------------------------
--- 3. stationname -> station_id. The one mapping a human has to supply.
+-- 3. stationname -> station_id, and why it cannot be the name.
 -- ------------------------------------------------------------------
 --
 -- The old table keys readings by station *name* and the new one by `station_id`
--- (W4 2.1). `/span?station=<device name>` is frozen and matches the name, so the
--- safe default is station_id = stationname: it keeps every historical row
--- addressable by the parameter both shipped clients already send. Choosing
--- something else is allowed and means the history is reachable only under the new
--- id, which is why this table is populated by hand and asserted non-empty rather
--- than defaulted silently.
+-- (W4 2.1), and `station_id` is not free text. A station's key becomes a
+-- component id -- `station:campbell:<key>`, crates/mw-station/src/campbell.rs --
+-- and crates/mw-component/src/id.rs permits only lower-case ASCII, digits, `-`,
+-- `_`, `.` and `:`, with no empty `:`-delimited segment, inside 128 bytes. A key
+-- outside that set is StationPlanError::Key at startup, so the station never
+-- runs and its history is addressable by nothing.
+--
+-- `station_id = stationname` is therefore NOT a usable default, and M5-1b is
+-- what that cost: a Go `stationname` is a display name, and two of the three in
+-- production -- `CSI` and `Suncrest Air Quality` -- are refused by that type. The
+-- default is the DERIVED key `w9.station_key(stationname)`, and
+-- `w9.assert_station_map_usable()` refuses a map -- derived or hand-written --
+-- whose ids could not be configured afterwards.
+--
+-- The frozen contract is unaffected, and that is why `stationname` was the
+-- default to begin with: `/span?station=<device name>` matches a station's NAME
+-- and selects data by its KEY (`station_by_name`, crates/mw-api-legacy/src/span.rs),
+-- so a derived key changes nothing a shipped client already sends.
+--
+-- But be exact about where that name comes from, because getting it wrong is how
+-- `station_id = stationname` looked safe. It is the CONFIGURATION STORE's
+-- `stations.name`, not this database's: `w9.populate_stations()` writes
+-- `stationname` into `stations.name` for the read-side projection, which is what
+-- renders a station's name in the response, and the match itself never reads it.
+-- So the frozen parameter keeps working only if the configuration store's
+-- `station_key` equals the id written here. This migration cannot check that --
+-- that store is SQLite and M7-4 is what populates it -- and it is the one part of
+-- M5-1b these refusals do not close. Overriding a row here is still allowed and
+-- still means the history is reachable only under the id written in it.
 
 CREATE TABLE w9.station_map (
     stationname           text PRIMARY KEY,
@@ -368,6 +406,75 @@ LANGUAGE sql IMMUTABLE AS $fn$
               TO STDOUT (FORMAT csv)$q$
 $fn$;
 
+-- A Go display name, lowered into something the component id type accepts.
+--
+-- A function and not three typed-in values, because the property that matters is
+-- that the NEXT run of this migration produces the same station ids as this one:
+-- a key is a component id, a metric label and a partition key, and a re-import
+-- that renamed them would make the history of a live station unreachable a
+-- second time.
+--
+-- Runs of anything outside the permitted set collapse to one `-`, and a leading
+-- or trailing `-` is trimmed. `:` is accepted by the component id type but is
+-- never produced here: it is that type's segment separator, so a key carrying
+-- one adds a segment to `station:<driver>:<key>` rather than naming a station.
+-- `COLLATE "C"` and not the database default, because the determinism above is
+-- the whole point and `lower()` follows the locale: in a Turkish one, `lower('CSI')`
+-- is `csı` and this would derive `cs`. It also keeps the pattern operators off a
+-- nondeterministic ICU collation, which they refuse to run against at all.
+CREATE FUNCTION w9.station_key(stationname text) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT AS $fn$
+    SELECT trim(both '-' from
+                regexp_replace(
+                    regexp_replace(lower($1 COLLATE "C"), '[^a-z0-9._-]+', '-', 'g'),
+                    '-{2,}', '-', 'g'))
+$fn$;
+
+-- Why a station id is not usable as a station key, or NULL if it is. The
+-- character set, the empty-segment rule and the length limit of
+-- crates/mw-component/src/id.rs, restated here because this database is reached
+-- by psql and not only by the daemon, and in the same order so the message a
+-- reader gets is the message the daemon would have given.
+--
+-- 108 bytes and not 128: ComponentId::MAX_LEN is 128 and the longest wrapper any
+-- driver puts around a key is `station:airgradient:` at 20
+-- (crates/mw-station/src/airgradient.rs; `station:wll:<key>:rearm` is 18).
+-- mw_station::MAX_KEY_LEN carries the same number and
+-- crates/mw-station/tests/station_key_width.rs pins it from the Rust side.
+CREATE FUNCTION w9.station_key_problem(station_id text) RETURNS text
+LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT CASE
+        WHEN $1 IS NULL OR $1 = '' THEN 'it is empty'
+        WHEN octet_length($1) > 108
+            THEN format('it is %s bytes; the limit is 108', octet_length($1))
+        WHEN $1 ~ '[^a-z0-9._:-]'
+            THEN format('it contains %L, which is not permitted '
+                        '(lower-case ASCII, digits, -, _, . and :)',
+                        (regexp_match($1, '[^a-z0-9._:-]'))[1])
+        WHEN $1 ~ '(^:|:$|::)' THEN 'it has an empty :-delimited segment'
+    END
+$fn$;
+
+CREATE FUNCTION w9.assert_station_map_usable() RETURNS void
+LANGUAGE plpgsql AS $fn$
+DECLARE bad text;
+BEGIN
+    SELECT string_agg(format('%L -> %L: %s', stationname, station_id, problem),
+                      '; ' ORDER BY stationname) INTO bad
+      FROM (SELECT m.stationname, m.station_id,
+                   w9.station_key_problem(m.station_id) AS problem
+              FROM w9.station_map m) q
+     WHERE problem IS NOT NULL;
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'w9.station_map has station ids that cannot be station keys: %', bad
+            USING HINT = 'a station_id becomes a component id (station:<driver>:<station_id>), '
+                         'so the daemon would refuse the station at plan time; '
+                         'w9.station_key(stationname) derives an id that is accepted, '
+                         'except for the length -- that one needs a shorter id by hand, '
+                         'because truncating would silently change which station an id names';
+    END IF;
+END $fn$;
+
 CREATE FUNCTION w9.assert_station_map_complete() RETURNS void
 LANGUAGE plpgsql AS $fn$
 DECLARE bad text;
@@ -378,14 +485,59 @@ BEGIN
      WHERE m.stationname IS NULL;
     IF bad IS NOT NULL THEN
         RAISE EXCEPTION 'w9.station_map has no entry for: %', bad
-            USING HINT = 'INSERT INTO w9.station_map (stationname, station_id, stationtype) '
-                         'SELECT stationname, stationname, stationtype FROM w9.source_station '
-                         'adopts the frozen-contract-preserving default';
+            USING HINT = 'CALL w9.seed_station_map() adopts the derived default for '
+                         'every name the source has';
     END IF;
     IF NOT EXISTS (SELECT 1 FROM w9.source_station) THEN
         RAISE EXCEPTION 'w9.source_station is empty; load it before asserting'
             USING HINT = 'migrate-from-go.sh inventory';
     END IF;
+END $fn$;
+
+-- The default map, committed rather than typed at a prompt: every name the source
+-- has, keyed by its derived station id, leaving any row somebody has already
+-- written alone.
+CREATE PROCEDURE w9.seed_station_map() LANGUAGE plpgsql AS $fn$
+DECLARE bad text;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM w9.source_station) THEN
+        RAISE EXCEPTION 'w9.source_station is empty; load it before seeding the map'
+            USING HINT = 'migrate-from-go.sh stage';
+    END IF;
+    -- Two names that derive one id, or a derived id some other row already holds,
+    -- would otherwise arrive as a unique violation naming a constraint instead of
+    -- the two stations that collided. Nothing in production collides; a fourth
+    -- station called `Suncrest air quality` would.
+    SELECT string_agg(detail, '; ' ORDER BY detail) INTO bad FROM (
+        SELECT format('%L would be derived from %s', g.station_id, g.names) AS detail
+          FROM (SELECT w9.station_key(s.stationname) AS station_id,
+                       string_agg(quote_literal(s.stationname), ' and '
+                                  ORDER BY s.stationname) AS names,
+                       count(*) AS n
+                  FROM w9.source_station s
+                 WHERE NOT EXISTS (SELECT 1 FROM w9.station_map m
+                                    WHERE m.stationname = s.stationname)
+                 GROUP BY 1) g
+         WHERE g.n > 1
+        UNION ALL
+        SELECT format('%L would be derived from %L and already belongs to %L',
+                      m.station_id, s.stationname, m.stationname) AS detail
+          FROM w9.source_station s
+          JOIN w9.station_map m ON m.station_id = w9.station_key(s.stationname)
+                               AND m.stationname <> s.stationname
+         WHERE NOT EXISTS (SELECT 1 FROM w9.station_map m2
+                            WHERE m2.stationname = s.stationname)
+    ) d;
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'the derived station ids are not unique: %', bad
+            USING HINT = 'INSERT a w9.station_map row for each colliding name first; '
+                         'this procedure leaves an existing row alone';
+    END IF;
+    INSERT INTO w9.station_map (stationname, station_id, stationtype)
+    SELECT s.stationname, w9.station_key(s.stationname), s.stationtype
+      FROM w9.source_station s
+    ON CONFLICT (stationname) DO NOTHING;
+    PERFORM w9.assert_station_map_usable();
 END $fn$;
 
 -- ------------------------------------------------------------------

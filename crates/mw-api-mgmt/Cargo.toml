@@ -23,6 +23,11 @@ serde_json.workspace = true
 argon2.workspace = true
 subtle.workspace = true
 secrecy.workspace = true
+# The fast hash, for the two secrets that are already 32 CSPRNG bytes: the session secret
+# and the setup code. `crate::auth`'s module documentation has the whole argument for why
+# this is not Argon2id, and `[workspace.dependencies]`' entry has the amendment it is
+# recorded under (A-M7-2-1).
+sha2.workspace = true
 # `features = ["serde"]` rather than the bare workspace entry: every timestamp this API
 # emits is a `DateTime<Utc>` (`since`, `last_run`, `radar_registered_at`), and the whole
 # surface is `serde`. Narrowed to the crates that serialise one rather than turned on in
