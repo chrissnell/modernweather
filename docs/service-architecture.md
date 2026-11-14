@@ -993,7 +993,7 @@ are expensive, the handler reads it, and then computes six more values live anyw
 | `/forecast/{span}` | 2.4% combined | `ForecastStore` → a per-`(device, span)` snapshot refreshed hourly. **The cached value is the stored `jsonb` text, byte for byte.** |
 | `/` and `/portal` | 1.1% | rendered-page cache per `(website, config generation, version)`, invalidated by the config watch (§7) |
 | `/stationinfo` | 0.7% | per-website snapshot from `ConfigStore`, invalidated by the config watch |
-| `/almanac` | — | `almanac_cache` → per-station snapshot; already `max-age=3600` |
+| `/almanac` | — | `almanac_cache` → per-station snapshot; already `max-age=3600`. Written by `almanac:records` at `Every { 1 hour }`, which is Go's `add_job('refresh_almanac_cache', '1 hour')` (A-M7-6-1) |
 | `/alerts` | — | `AlertStore` → per-station snapshot, 15-minute refresh; already `max-age=300` |
 | `/span/{span}` | <1% | **the one query-shaped endpoint.** 60-second TTL cache keyed by `(station, span, snow-join)`, lossless because the 1-minute aggregate only advances once a minute |
 | `/api/stations`, `/api/remote-stations` | — | `ConfigStore` / `StationRegistry`, config-generation keyed |
@@ -2611,6 +2611,12 @@ detector**: if one of these is wrong, it is findable with a grep rather than dur
     chart resolution changes (W1 assumption 10).
 20. `almanac_cache` and `snow_totals_cache` continue to exist as precomputed tables (W1 assumption
     12); §2a.7's `snow:*` components write the latter and `/almanac` reads the former.
+    **This sentence named a writer for one of the two and nobody noticed that it named none for
+    the other.** `almanac_cache` had a reader and no writer for two milestones, so `/almanac`
+    served `{}` with a `200`; `almanac:records` is the component and
+    `docs/reconciliation.md` **A-M7-6-1** is the gap. The assumption itself was never wrong —
+    what was missing is the half of it that is a *requirement* rather than a fact, which is why
+    the plan test in `crates/modernweather/src/boot.rs` now asserts the writer is in the plan.
 21. The 1-minute aggregate's refresh policy makes a bucket readable within `window:rollup`'s
     10-second deadline of the minute boundary (W2a assumption 14). If it lags more,
     `window:rollup`'s period must grow and `Phase::Aligned` needs revisiting.

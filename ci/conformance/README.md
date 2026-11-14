@@ -95,9 +95,10 @@ second is the expensive direction for this gate to be wrong in.
 2. build the daemon and recreate `$PGDATABASE` from `migrations/`;
 3. **seed the weather database** from `ci/conformance/rust-seed/` — the `stations` projection, about
    22,700 readings across five stations, a refresh of all four aggregate levels, and
-   `almanac_cache`, `snow_totals_cache` and `forecasts`. Asserted **per station** and in both
+   `snow_totals_cache` and `forecasts`. Asserted **per station** and in both
    directions: two stations must have *no* readings, because that is what `latest-no-recent-data`,
-   `span-empty`, `almanac-empty` and `snow-device-never-reported` are;
+   `span-empty`, `almanac-empty` and `snow-device-never-reported` are.
+   **`almanac_cache` is not seeded** — see step 6;
 4. bootstrap the configuration database by starting the binary once, then seed the listener, the
    weather database URL, the node row and W1's seven stations and six websites;
 5. start the daemon and wait for **`snapshot:warm`** to have run. That wait is not tidiness:
@@ -190,7 +191,21 @@ table filtered on `solarwatts > 0`. On a runner whose clock reads 23:00 the metr
 `/almanac?station=davis-full` loses a key `almanac-populated` requires. The emulators therefore
 run in a fixed-offset zone picked to put their clock at midday. Nothing else is shifted.
 
-**`refresh_almanac_cache` is scheduled hourly.** If it fires after the air-quality station is
+**`almanac_cache` is the one cache this rig does not seed, and that is as of A-M7-6-1.**
+Seeding it made the two `/almanac` fixtures compare a seeded rig against a recording of a seeded
+rig, which says nothing about whether the daemon can produce those rows — and for two milestones
+it could not: nothing in the program wrote that table, the real deployment served `{}`, and this
+suite was green throughout (`docs/reconciliation.md` A-M7-6-1). `almanac:records` now computes
+the records on its first occurrence and `xtask::conformance::almanac_is_populated` waits for them
+before the replay, so an absent writer is **exit 2** with a message naming the component.
+
+Two rig properties keep `almanac-populated` at eight keys, and both are now predicates of the
+component rather than of the seed: `aqmon` is `enabled = 0` in `01-config.sql` and
+`almanac:records` plans only enabled stations, so the website's air-quality device has no
+records; and `nolocation` has no readings, so `almanac-empty` is produced by the absence of data.
+
+**`refresh_almanac_cache` is scheduled hourly** on the **Go** rig, which `freeze-jobs.sql`
+unschedules. If it fires after the air-quality station is
 seeded, `/almanac?station=davis-full` goes from 8 keys to 14 — `/almanac` reads the extremes of
 the *website's* air quality device, and two of the six extra keys are derived from the other
 four. Watched, not assumed: firing the refresh by hand against a seeded rig breaks two fixtures,
@@ -271,7 +286,7 @@ the guard rejects it.
 |---|---|
 | `go-target.sh` | the harness; the file whose existence arms the gate |
 | `config-seed.sql` | the capture rig's devices, websites and remote stations, as data |
-| `freeze-jobs.sql` | stops the almanac refresh job from rewriting a seeded snapshot mid-run |
+| `freeze-jobs.sql` | stops the **Go** rig's almanac refresh job from rewriting a seeded snapshot mid-run. It is the one file in the tree that named the almanac's writer, and it named it in order to stop it — which is part of why nobody noticed the Rust side had none (A-M7-6-1) |
 | `nullfill.sql` | the NULL→0 fill `contract/tools/README.md` leaves as a comment |
 | `rust-seed/01-config.sql` | the same devices and websites, in `migrations/config/`'s schema, plus the node row |
 | `rust-seed/02-weather.sql` | the `stations` projection and the readings, on `observations` |

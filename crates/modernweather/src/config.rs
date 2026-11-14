@@ -852,6 +852,53 @@ impl mw_pipeline::RollupConfig for Config {
 /// Column into field, like every other registrar trait here. The handle the uploaders need
 /// is the **same** `Arc<dyn WindowedView>` the snapshot components are given -- one object,
 /// so an uploader and `/latest` cannot disagree about what the five-minute wind average is.
+/// What `almanac:records` plans from.
+///
+/// One predicate and one join, both simpler than the snow registrar's three -- which is
+/// what the table's shape buys: every record is an extreme over a station's whole history,
+/// so there is no calibration to check and no local boundary to resolve.
+impl mw_pipeline::AlmanacConfig for Config {
+    fn has_weather_database(&self) -> bool {
+        self.weather_database.is_some()
+    }
+
+    /// Every **enabled** station, with its configured type -- and deliberately not only the
+    /// ones this node collects for.
+    ///
+    /// Two predicates, and the one that is missing is the interesting one:
+    ///
+    /// - `enabled`, which is W5 §1.2's "Collecting readings" toggle. A station switched off
+    ///   keeps the records it had: they are extremes over history that is no longer growing,
+    ///   so recomputing them every hour would read the same buckets forever and reach the
+    ///   same answer. `snow_stations` applies the same predicate for a different reason --
+    ///   there, the numbers would be stale rather than static.
+    /// - **No `transport_kind` predicate**, which is where this differs from
+    ///   `rollup_stations` and `snow_stations`. Those two exclude a station a peer forwards
+    ///   readings for, because its windows and its snow totals are computed on the node that
+    ///   owns it. An almanac record is a function of the *history in this database*, and a
+    ///   forwarded station's readings are written here by `writer:timescale` like any
+    ///   other -- so the node that serves that station's website is the node that has to
+    ///   compute its records. Excluding it would make `/almanac` answer `{}` for exactly the
+    ///   remote stations a collector exists to serve.
+    ///
+    /// **The air-quality device is covered by this and it has to be.** `/almanac` reads the
+    /// four particulate records from the *website's* `air_quality_station_key` rather than
+    /// from the station the request names (`mw_api_legacy::almanac`), so a plan that left
+    /// that station out would answer eight keys where the Go server answers fourteen. It is
+    /// a `config.stations` row like any other, so no second list is needed -- which is the
+    /// reason this predicate is station-shaped rather than website-shaped.
+    fn almanac_stations(&self) -> Vec<mw_pipeline::AlmanacStation> {
+        self.stations
+            .iter()
+            .filter(|r| r.enabled)
+            .map(|r| mw_pipeline::AlmanacStation {
+                key: StationKey::new(r.station_key.as_str()),
+                kind: r.kind.clone(),
+            })
+            .collect()
+    }
+}
+
 impl mw_pipeline::snow::SnowConfig for Config {
     fn has_weather_database(&self) -> bool {
         self.weather_database.is_some()

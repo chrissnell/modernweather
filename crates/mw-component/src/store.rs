@@ -245,6 +245,60 @@ pub trait ReadingStore: Send + Sync + 'static {
         &'a self,
         q: AlmanacQuery,
     ) -> BoxFuture<'a, Result<Vec<AlmanacRecord>, StoreError>>;
+
+    /// The one bucket at `level` where a `(metric, agg)` reaches its extreme over **all**
+    /// history, with the bucket's own value of a second column carried alongside.
+    ///
+    /// `almanac:records`' read, and the shape is the answer rather than a filter over one:
+    /// every record `/almanac` serves is an `ORDER BY ... LIMIT 1` — "the value and *when*
+    /// it happened" — which neither [`ReadingStore::series`] nor
+    /// [`ReadingStore::mean_series`] can express without returning the whole history to the
+    /// caller and reducing it there. A year of daily buckets is 365 rows and a year of
+    /// 1-minute buckets is 525,600, so the difference between pushing the reduction into
+    /// the statement and not is the difference between a bounded read and one that is
+    /// bounded by how long the station has been running.
+    ///
+    /// **Unbounded in time on purpose, and that is why `level` matters.** These are
+    /// all-time extremes: a `since` would make them extremes-since, which is a different
+    /// number. What keeps the read cheap is the level — the caller asks the **day** level
+    /// for all but one record, and `observations_1d` has one row per station per day and no
+    /// retention policy (`migrations/20261102042200_...sql`: "observations_1d unbounded on
+    /// purpose").
+    ///
+    /// `None` is a station with no bucket that satisfies the query — one that has never
+    /// reported, or has never reported this metric. Not an error, for
+    /// [`ReadingStore::totals`]' reason: the absence of a reading is a fact about the
+    /// station rather than a failure of the query, and the record is then simply absent
+    /// from the response.
+    ///
+    /// `Err` for a `(metric, agg)` the level does not declare, which is `Fatal` for
+    /// [`ReadingStore::span`]'s reason — the next call asks the same thing.
+    fn extreme<'a>(
+        &'a self,
+        q: ExtremeQuery,
+    ) -> BoxFuture<'a, Result<Option<ExtremeBucket>, StoreError>>;
+
+    /// The extreme **raw** reading of one metric inside a bounded window.
+    ///
+    /// `/almanac`'s `high_solar` is the only record Go reads from the raw table rather than
+    /// from an aggregate, because a daily mean is not a peak and the Go daily view carries
+    /// no `max_solarwatts`; the timestamp the contract serves is a *reading's*, to the
+    /// microsecond, and not a bucket's. This is that read.
+    ///
+    /// **The window is required, and it is the whole reason this is a second method.**
+    /// `observations` has no retention policy and never will (**D-4**), so it holds every
+    /// reading the station has ever produced — 6.4 million rows for one year of one
+    /// station — and no index covers a metric column. An unbounded `ORDER BY solarwatts
+    /// DESC LIMIT 1` is therefore a full scan of all history, every tick, forever. The
+    /// caller narrows it to a window it has already found with [`ReadingStore::extreme`]
+    /// over the day level, which turns the scan into one day of one station.
+    ///
+    /// `None` is a window with no qualifying reading, for [`ReadingStore::extreme`]'s
+    /// reason.
+    fn raw_extreme<'a>(
+        &'a self,
+        q: RawExtremeQuery,
+    ) -> BoxFuture<'a, Result<Option<RawExtreme>, StoreError>>;
 }
 
 /// Both halves of the reading store, as the one handle `db:postgres` publishes.
@@ -693,6 +747,91 @@ pub struct AlmanacRecord {
     pub wind_dir: Option<f32>,
 }
 
+/// Which all-time extreme [`ReadingStore::extreme`] should find.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtremeQuery {
+    /// Whose.
+    pub station: mw_types::StationKey,
+    /// Which level's buckets are searched. The caller's choice and not the store's, for
+    /// [`TotalsQuery`]'s reason — only the caller knows which level answers its question.
+    /// `/almanac`'s rain records are the clearest case: `max_rain_hour` and `max_rain_day`
+    /// are the **same** `(RainIncremental, Sum)` column at two levels, and nothing but the
+    /// level distinguishes them.
+    pub level: BucketLevel,
+    /// The column searched, as a `(metric, agg)` the level declares.
+    pub column: SpanColumn,
+    /// Greatest or least.
+    pub direction: Extremum,
+    /// Whether a non-positive value is excluded rather than merely a NULL one.
+    ///
+    /// **Go's two filters, and they are not interchangeable.**
+    /// `migrations/weather/030_almanac_airgradient_pm10.up.sql` writes `IS NOT NULL` for
+    /// the temperature and wind records and `> 0` for the barometer, the humidity, the
+    /// solar and the four particulate ones. The difference is load-bearing in one
+    /// direction: a barometer that reported `0` is a sensor fault and `low_barometer` must
+    /// not be it, while a genuine `low_temp` of 0°F is a January morning. Carried as a
+    /// flag rather than decided here, because which of the two a record wants is the
+    /// contract's and not the store's.
+    pub positive_only: bool,
+    /// A second column read from the **same** bucket, where the record carries one.
+    ///
+    /// `high_wind_speed` is the only user: the contract's `wind_dir` beside it is the
+    /// bucket's circular-mean direction, which is `(WindDir, CircularMean)` at the same
+    /// level. **Not the direction at the instant of the gust** — Go takes `winddir` from
+    /// the same daily row (`SELECT ... max_windspeed, bucket, winddir FROM weather_1d`), so
+    /// on a frozen response it is the day's mean direction and reproducing it means reading
+    /// it the same way.
+    pub carry: Option<SpanColumn>,
+}
+
+/// Which end of the range [`ReadingStore::extreme`] wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Extremum {
+    /// The greatest value — `high_temp`, `high_wind_speed`.
+    Greatest,
+    /// The least — `low_temp`, `low_barometer`, `low_humidity`.
+    Least,
+}
+
+/// What [`ReadingStore::extreme`] answered: the bucket, its value, and the carried column.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtremeBucket {
+    /// The bucket's start instant, which is the timestamp the record carries.
+    pub bucket: chrono::DateTime<chrono::Utc>,
+    /// The extreme.
+    pub value: f64,
+    /// [`ExtremeQuery::carry`]'s value in that bucket, where one was asked for and the
+    /// bucket has it. `None` is an absent `wind_dir` key rather than a zero one.
+    pub carried: Option<f64>,
+}
+
+/// Which raw extreme [`ReadingStore::raw_extreme`] should find.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawExtremeQuery {
+    /// Whose.
+    pub station: mw_types::StationKey,
+    /// Which raw column. One metric, not a `(metric, agg)`: a raw row holds values rather
+    /// than aggregate state, so there is nothing to finalise and no strategy to resolve.
+    pub metric: mw_types::MetricKey,
+    /// The oldest instant searched, inclusive.
+    pub since: chrono::DateTime<chrono::Utc>,
+    /// The first instant **not** searched. See the method: the bound is required.
+    pub until: chrono::DateTime<chrono::Utc>,
+    /// Greatest or least.
+    pub direction: Extremum,
+    /// Whether a non-positive value is excluded — [`ExtremeQuery::positive_only`].
+    pub positive_only: bool,
+}
+
+/// What [`ReadingStore::raw_extreme`] answered: the reading's instant and its value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawExtreme {
+    /// The reading's own `time`, to the microsecond the column stores.
+    pub time: chrono::DateTime<chrono::Utc>,
+    /// The extreme.
+    pub value: f64,
+}
+
 /// Aeris forecast rows — `Capability::ForecastStore`.
 ///
 /// Its own capability rather than a method on [`ReadingStore`], because the design gives it
@@ -1008,6 +1147,60 @@ pub trait SnowCache: Send + Sync + 'static {
 
 impl CapabilityHandle for Arc<dyn SnowCache> {
     const CAPABILITY: Capability = Capability::SnowCache;
+}
+
+/// The all-time extremes `/almanac` serves — `Capability::AlmanacCache`.
+///
+/// **Write-only, for [`AlertStore`]'s reason and with the same consequence.** The read half
+/// is [`ReadingStore::almanac`], which the frozen handler has used since M4-2 and which is
+/// keyed exactly the way the aggregate reads beside it are. Adding a read here would be a
+/// second query answering the same question, on the one endpoint whose contract is that
+/// there is only ever one answer (W1 assumption 12) — so this trait has the single method
+/// its single caller needs and nothing else.
+///
+/// # Why this capability exists at all
+///
+/// It is the gap this trait was written to close. W2a §2.1 names `almanac_cache` as one of
+/// the two precomputed caches and gives `snow_totals_cache` four components that maintain
+/// it; nothing in the plan ever owned the other one. The consequence was not a wrong
+/// number: `almanac_cache` stayed empty, [`ReadingStore::almanac`] correctly returned no
+/// rows, and `/almanac` correctly served `{}` with a `200` — a frozen endpoint answering
+/// successfully with nothing in it, for as long as nobody compared it against the Go
+/// server. `docs/reconciliation.md` **A-M7-6-1** records it.
+pub trait AlmanacCache: Send + Sync + 'static {
+    /// Replace one station's cached extremes with `records`, returning how many rows were
+    /// written.
+    ///
+    /// **Replace, not revise**, which is the opposite of [`AlertStore::store_alerts`] and
+    /// is right for the opposite reason. An alert that drops out of an upstream response
+    /// has not stopped being true; a record that is no longer the extreme **has**. Go
+    /// writes `DELETE FROM almanac_cache WHERE stationname = $1` and then inserts what it
+    /// found, so a record whose source column has been dropped from the schema or whose
+    /// history has aged out of the level disappears rather than being served forever — and
+    /// an upsert-only writer would turn the cache into a high-water mark that no correction
+    /// can ever lower.
+    ///
+    /// **One transaction.** A delete that commits without its inserts is the `{}` this
+    /// capability exists to make impossible, and `/almanac` is served from exactly these
+    /// rows with no fallback.
+    ///
+    /// **An empty slice writes nothing and deletes nothing**, and this is the one place the
+    /// implementation deliberately departs from Go's function. Go's `DELETE` runs
+    /// unconditionally, so a refresh that computes no record empties the cache — which is
+    /// indistinguishable, on the response, from the state this whole capability was added
+    /// to fix. A station with history always produces records, so an empty set means the
+    /// history read answered nothing; that is a fact about the read, not a new fact about
+    /// the extremes, and the right response to it is to leave the last known records in
+    /// place and say so in a log line. The caller does the saying.
+    fn replace_almanac<'a>(
+        &'a self,
+        station: &'a mw_types::StationKey,
+        records: &'a [AlmanacRecord],
+    ) -> BoxFuture<'a, Result<u64, StoreError>>;
+}
+
+impl CapabilityHandle for Arc<dyn AlmanacCache> {
+    const CAPABILITY: Capability = Capability::AlmanacCache;
 }
 
 /// The columns of one `snow_totals_cache` row that one component owns.

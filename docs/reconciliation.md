@@ -3775,3 +3775,89 @@ implementation of each is where a reader will look for it.
 | OQ-W5-2 | a breached-password list? | **(b)** ship one, warn, never block | `mw_api_mgmt::auth::is_breached`, over the list A-M7-2-2 describes. The warning lands in §8.5's `warnings` array on the claim and the password change, and in a console line on `reset-password` — both surfaces, so the rule cannot be evaded by using the other one |
 | OQ-W5-3 | any API token in v1? | **(a) none** | Nothing. There is no token table, no `Authorization` parsing and no bearer path; §3.7 fixes the shape in advance so adding one later cannot regress into "the cookie is the token" |
 | OQ-W5-5 | how much configuration history? | **(a) one step** | `POST /api/v1/config/revert`, which **M7-1 already shipped**, scoped to this process rather than to a session because a session-scoped one could not be written before sessions existed. M7-2 changes nothing here; the entry is kept so the answer is not looked for twice |
+
+**A-M7-6-1 — W1 assumption 12 names two precomputed caches and the plan gave only one of them
+a writer.**
+*Raised by the owner, 2026-11-14 — "The almanac on the weather website is broken." Resolved by
+implementation-plan.md **M7-6** on the owner's delegation of these calls. Applied: a thirteenth
+capability, `AlmanacCache`, and one component, `almanac:records`.*
+
+*What was found.* `/almanac?station=CSI` on the preview answered **`{}` with a `200`** against a
+Go server answering with fourteen records. Nothing was wrong with the handler, the route or the
+station lookup — `select count(*) from almanac_cache` was **0**, `ReadingStore::almanac`
+correctly returned no rows, and `mw_api_legacy::almanac` correctly rendered no rows as `{}`,
+which is the shipped empty-cache behaviour W1 assumption 12 requires.
+
+**The gap is in the plan, and it is one row wide.** Assumption 12 names `almanac_cache` and
+`snow_totals_cache` as the two precomputed caches. W3 §2a.7 gives the second one `snow:*`;
+M6-3's stated scope was "the Aeris components and the caches", and what it built was the Aeris
+components plus the **snow** cache becoming three. Nothing anywhere in eighteen crates wrote
+`almanac_cache`. §2612's own sentence says as much in the words it chose and nobody read it that
+way: *"§2a.7's `snow:*` components write the latter and `/almanac` reads the former."*
+
+*The migration was ruled out as a cause rather than assumed innocent.*
+`ci/db/migrate-from-go/migrate-from-go.sh` names the table in exactly two places — the `DELETE
+FROM stations` cascade in `reset-target`, and the row count it reports afterwards — and no step
+reads the Go table. The declared `copy` mode in `ci/db/offsite-backup.sh`'s RELATIONS and the
+restore rehearsal's reconciliation of it are about the **backup**, which is a different
+procedure; they are what made the table look migration-owned. It was never imported, and
+implementation-plan.md §5.0 had already measured why importing it would not have helped: the Go
+cache holds records from 2025-08-19, earlier than the first imported reading.
+
+*Why nobody caught it, which is the part worth keeping.* Four checks that should each have seen
+this did not, and the reason is the same every time — **an empty cache and a correct answer are
+the same bytes**:
+
+1. **The conformance suite is green with the cache empty.** Its fixtures were captured against a
+   rig whose own cache `ci/conformance/rust-seed/04-caches.sql` seeds, and
+   `xtask::conformance` asserts the seed is non-empty — so the suite compares a seeded rig
+   against a recording of a seeded rig and says nothing about a deployment. A frozen-contract
+   suite reporting green while an endpoint serves nothing is the **G-1** shape exactly.
+2. **The component-set audit compared against Go's *controllers*.** Every other row of the table
+   in `crates/modernweather/src/boot.rs`'s own plan test pairs a component with one of
+   `managers/controller.go`'s. `refresh_almanac_cache` is a **TimescaleDB background job**
+   registered by `migrations/weather/005_create_almanac_cache.up.sql`, so it was never in the
+   set being compared.
+3. **`ci/conformance/freeze-jobs.sql` deliberately unschedules that job** on the capture rig,
+   because "a post-seed fire was observed taking `/almanac` from 8 keys to 14 and breaking two
+   fixtures". The one file in the tree that names the writer names it in order to **stop** it.
+4. **`/almanac` has no 503 and must not have one.** The handler answers `{}` for an unreachable
+   database on purpose (**D-48**'s neighbourhood), so there is no status code that distinguishes
+   "nothing has been computed" from "there is nothing to compute".
+
+*What was chosen.* `Capability::AlmanacCache` — the thirteenth — provided by `db:postgres`
+beside the other three cache capabilities, and `almanac:records`, an `Every { 1 hour }`
+component in `mw-pipeline` that iterates every enabled station inside one tick.
+
+- **A capability rather than a method on `ReadingStore`**, for `AlertStore`'s reason one table
+  over: the writer and the reader are different components with different failure modes. It is
+  **write-only**, because the read half already exists and `/almanac` already uses it; a second
+  read would be a second answer on the one endpoint whose contract is that there is only ever
+  one.
+- **One component, not twelve.** **D-33** splits a cache when the parts have "independent
+  periods, failures and rate budgets". These twelve records have one period, one failure mode
+  and no rate budget.
+- **An hourly component, not a backfill.** Records imported once freeze at migration time and
+  rot silently, which is `sun_times` over again (**A-M5-4-1**).
+- **Two new `ReadingStore` reads**, `extreme` and `raw_extreme`, because every record is an
+  `ORDER BY ... LIMIT 1` and neither `series` nor `mean_series` can express an argmax without
+  returning all of history to the caller.
+
+**Three deviations from Go's function travel with this amendment, each stated where it is
+implemented.** None of them is a byte difference on a value Go can still compute:
+
+| | What Go does | What this does, and why |
+|---|---|---|
+| `high_solar` | `ORDER BY solarwatts DESC LIMIT 1` over the raw table, unbounded | the day level names the peak day, then raw is read **inside that day**. Identical value and identical instant; `observations` has no retention (**D-4**) so Go's form is a full scan of all history every hour, on a Pi |
+| `max_rain_hour` | reads an hourly view its retention keeps for years | `observations_1h` is kept for **90 days** (`migrations/20261102042200_...sql`), so this record is the one that is **carried forward** when the level can no longer see it. Without that an all-time maximum would *fall* every quarter — the rot this item exists to prevent. The cost, stated: it is the only record that is not a pure function of the data, and the Go server's value may be higher because its window is longer |
+| an empty computation | `DELETE` runs unconditionally, so a refresh that computes nothing empties the cache | writes nothing and leaves the records standing, with a `warn`. Go's form is `{}` by another route, on the endpoint this whole amendment is about |
+
+**And one property of the levels that is not a deviation but is visible.** Every level here is
+`materialized_only = true` — three of the four are the source of another, so none may serve a
+bucket the next one up has not seen — and a continuous aggregate materialises only *closed*
+buckets. So a record set today appears when today's bucket closes and its policy runs, within
+thirty minutes of midnight UTC for the day level. The Go views are `materialized_only = false`
+and union the real-time bucket, so Go can set a record the same hour. It is the same property
+**D-55** records for `/span` and it is stated here rather than worked around: the endpoint's own
+`Cache-Control` is `max-age=3600`, and an all-time extreme that arrives within a day of being
+set is not the defect this item was raised for.

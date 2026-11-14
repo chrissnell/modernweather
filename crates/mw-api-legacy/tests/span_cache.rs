@@ -116,6 +116,18 @@ impl mw_component::ReadingStore for Recording {
     ) -> BoxFuture<'a, Result<Vec<mw_component::AlmanacRecord>, StoreError>> {
         Self::gone()
     }
+    fn extreme<'a>(
+        &'a self,
+        _q: mw_component::ExtremeQuery,
+    ) -> BoxFuture<'a, Result<Option<mw_component::ExtremeBucket>, StoreError>> {
+        Self::gone()
+    }
+    fn raw_extreme<'a>(
+        &'a self,
+        _q: mw_component::RawExtremeQuery,
+    ) -> BoxFuture<'a, Result<Option<mw_component::RawExtreme>, StoreError>> {
+        Self::gone()
+    }
 }
 
 #[derive(Debug)]

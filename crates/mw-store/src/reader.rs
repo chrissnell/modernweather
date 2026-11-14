@@ -60,8 +60,9 @@ use std::fmt::Write as _;
 use chrono::{DateTime, Utc};
 use mw_component::{
     AlmanacQuery, AlmanacRecord, BoxFuture, Bucket, BucketLevel, BucketQuery, Bucketed,
-    LatestQuery, MeanBucket, MeanSeriesQuery, Piece, ReadingStore, SeriesQuery, Span, SpanBucket,
-    SpanColumn, SpanQuery, StoreError, TotalsQuery,
+    ExtremeBucket, ExtremeQuery, Extremum, LatestQuery, MeanBucket, MeanSeriesQuery, Piece,
+    RawExtreme, RawExtremeQuery, ReadingStore, SeriesQuery, Span, SpanBucket, SpanColumn,
+    SpanQuery, StoreError, TotalsQuery,
 };
 use mw_types::{
     Agg, AggregateColumn, MetricKey, MetricValue, Reading, SqlType, Strategy, LEVELS, METRICS,
@@ -504,6 +505,161 @@ impl ReadingStore for TimescaleReader {
                 .collect()
         })
     }
+
+    fn extreme<'a>(
+        &'a self,
+        q: ExtremeQuery,
+    ) -> BoxFuture<'a, Result<Option<ExtremeBucket>, StoreError>> {
+        Box::pin(async move {
+            let value = resolve_span_column(q.level, q.column)?.prefix;
+            let carried = match q.carry {
+                Some(carry) => Some(resolve_span_column(q.level, carry)?.prefix),
+                None => None,
+            };
+            let sql = extreme_statement(q.level, &value, carried.as_deref(), &q);
+            let Some(row) = sqlx::query(&sql)
+                .bind(q.station.as_str())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(classify)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(ExtremeBucket {
+                bucket: row.try_get(0).map_err(StoreError::rejected)?,
+                value: row.try_get(1).map_err(StoreError::rejected)?,
+                carried: match carried {
+                    Some(_) => row.try_get(2).map_err(StoreError::rejected)?,
+                    None => None,
+                },
+            }))
+        })
+    }
+
+    fn raw_extreme<'a>(
+        &'a self,
+        q: RawExtremeQuery,
+    ) -> BoxFuture<'a, Result<Option<RawExtreme>, StoreError>> {
+        Box::pin(async move {
+            let column = raw_column(q.metric)?;
+            let sql = raw_extreme_statement(column, &q);
+            let Some(row) = sqlx::query(&sql)
+                .bind(q.station.as_str())
+                .bind(q.since)
+                .bind(q.until)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(classify)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(RawExtreme {
+                time: row.try_get(0).map_err(StoreError::rejected)?,
+                value: row.try_get(1).map_err(StoreError::rejected)?,
+            }))
+        })
+    }
+}
+
+/// `SELECT bucket, <value>[, <carried>] FROM <view> WHERE station_id = $1 AND <value>
+/// <qualifies> ORDER BY 2 DESC|ASC LIMIT 1`.
+///
+/// # Three things about this statement are deliberate
+///
+/// **The qualifying predicate is in the `WHERE`, not expressed as `NULLS LAST`.** Go writes
+/// `ORDER BY max_outtemp DESC NULLS LAST LIMIT 1`, which gets the same answer by a weaker
+/// route: it relies on there being at least one non-NULL row, and returns a row whose value
+/// is NULL when there is not. That row would become an `almanac_cache` insert of a NULL
+/// into a `NOT NULL` column -- a failure rather than an absent record. Filtering is also
+/// what makes [`ExtremeQuery::positive_only`] expressible at all, since there is no
+/// `NULLS LAST` equivalent of "greater than zero".
+///
+/// **`ORDER BY 2`, positionally.** The ordering expression is the select list's, and for a
+/// finalised `mean` or circular mean that expression is a function call -- so naming it
+/// again here would be a third evaluation per row and a third place to keep in step.
+///
+/// **No `LIMIT` parameter and no bound on the scan.** One row out, by construction. What
+/// bounds the work is the *level* the caller chose: `observations_1d` is one row per station
+/// per day. The method's own documentation has why an unbounded search is the right thing
+/// here and a bounded one would answer a different question.
+fn extreme_statement(
+    level: BucketLevel,
+    value: &str,
+    carried: Option<&str>,
+    q: &ExtremeQuery,
+) -> String {
+    let mut sql = String::with_capacity(224);
+    let _ = write!(sql, "SELECT bucket, {value}");
+    if let Some(carried) = carried {
+        let _ = write!(sql, ", {carried}");
+    }
+    let _ = write!(
+        sql,
+        " FROM {view} WHERE station_id = $1 AND {value} {qualifies} ORDER BY 2 {dir} LIMIT 1",
+        view = view(level),
+        qualifies = qualifies(q.positive_only),
+        dir = direction(q.direction),
+    );
+    sql
+}
+
+/// `SELECT time, <column>::float8 FROM observations WHERE station_id = $1 AND time >= $2
+/// AND time < $3 AND <column> <qualifies> ORDER BY 2 DESC|ASC LIMIT 1`.
+///
+/// `observations` and not a level, which is the whole of the difference: the timestamp the
+/// contract serves for `high_solar` is a reading's and not a bucket's. The window is the
+/// caller's and is required -- [`mw_component::ReadingStore::raw_extreme`] has why.
+fn raw_extreme_statement(column: &str, q: &RawExtremeQuery) -> String {
+    let mut sql = String::with_capacity(192);
+    let _ = write!(
+        sql,
+        "SELECT time, {column}::float8 FROM observations \
+         WHERE station_id = $1 AND time >= $2 AND time < $3 AND {column} {qualifies} \
+         ORDER BY 2 {dir} LIMIT 1",
+        qualifies = qualifies(q.positive_only),
+        dir = direction(q.direction),
+    );
+    sql
+}
+
+/// The predicate that decides which rows an extreme may be taken from.
+///
+/// `> 0` **implies** `IS NOT NULL` in SQL -- a NULL comparison is NULL and a NULL predicate
+/// does not match -- so the positive case does not need both, and spelling out the
+/// redundant conjunct would suggest the two filters compose rather than that one subsumes
+/// the other.
+fn qualifies(positive_only: bool) -> &'static str {
+    if positive_only {
+        "> 0"
+    } else {
+        "IS NOT NULL"
+    }
+}
+
+/// `DESC` or `ASC`.
+fn direction(d: Extremum) -> &'static str {
+    match d {
+        Extremum::Greatest => "DESC",
+        Extremum::Least => "ASC",
+    }
+}
+
+/// One metric's raw column.
+///
+/// Infallible in practice -- `MetricKey` is generated from the same registry `METRICS` is
+/// -- and an `Err` rather than an `expect` because this crate's rule is that a store
+/// returns a `Fatal` for a request it cannot serve rather than taking the process down.
+fn raw_column(metric: MetricKey) -> Result<&'static str, StoreError> {
+    METRICS
+        .iter()
+        .find(|m| m.key == metric)
+        .map(|m| m.column)
+        .ok_or_else(|| {
+            StoreError::rejected(std::io::Error::other(format!(
+                "metrics/registry.toml declares no column for {metric:?}, so there is no \
+                 raw column to read. Re-run `cargo xtask codegen`."
+            )))
+        })
 }
 
 /// `n` consecutive `float8` columns from `at`, as the values of one [`SpanBucket`].

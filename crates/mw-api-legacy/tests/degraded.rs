@@ -220,6 +220,24 @@ impl mw_component::ReadingStore for DeadPool {
     > {
         Self::gone()
     }
+    fn extreme<'a>(
+        &'a self,
+        _q: mw_component::ExtremeQuery,
+    ) -> mw_component::BoxFuture<
+        'a,
+        Result<Option<mw_component::ExtremeBucket>, mw_component::StoreError>,
+    > {
+        Self::gone()
+    }
+    fn raw_extreme<'a>(
+        &'a self,
+        _q: mw_component::RawExtremeQuery,
+    ) -> mw_component::BoxFuture<
+        'a,
+        Result<Option<mw_component::RawExtreme>, mw_component::StoreError>,
+    > {
+        Self::gone()
+    }
 }
 
 impl ForecastStore for DeadPool {

@@ -79,7 +79,7 @@ pub struct Subject {
 impl Subject {
     /// The subject for a capability whose *contents* a component populates.
     ///
-    /// `None` for a capability no [`Freshness`] is declared over. Four of the twelve
+    /// `None` for a capability no [`Freshness`] is declared over. Five of the thirteen
     /// capabilities have contents that go stale and the rest are a connection, a route
     /// table or a control surface — asking when `HttpRoutes` was last updated is not a
     /// question, and answering it with a sentence this module invented would be worse than
@@ -98,6 +98,16 @@ impl Subject {
             }),
             Capability::SnowCache => Some(Self {
                 noun: "Snow totals",
+                verb: "calculated",
+                plural: true,
+            }),
+            // **Singular, and "records" is the noun rather than "Almanac".** "Almanac last
+            // calculated" reads as a document; what is recomputed on a schedule is the set
+            // of all-time extremes behind the page, and "Almanac records have never been
+            // calculated" is the sentence that was missing for as long as `/almanac` served
+            // `{}` with nobody writing to the cache.
+            Capability::AlmanacCache => Some(Self {
+                noun: "Almanac records",
                 verb: "calculated",
                 plural: true,
             }),
@@ -446,7 +456,7 @@ mod tests {
         assert_eq!(view.age_seconds, Some(0));
     }
 
-    /// The four capabilities whose contents go stale have a noun; the rest do not, and a
+    /// The five capabilities whose contents go stale have a noun; the rest do not, and a
     /// declaration over one of them renders the dull fallback rather than an invented word.
     #[test]
     fn only_the_capabilities_with_contents_have_a_subject() {
@@ -461,6 +471,7 @@ mod tests {
                 Capability::ForecastStore,
                 Capability::AlertStore,
                 Capability::SnowCache,
+                Capability::AlmanacCache,
                 Capability::LatestSnapshot,
             ]
         );
@@ -499,6 +510,11 @@ mod tests {
         assert_eq!(
             sentence(Capability::SnowCache),
             "Snow totals have never been calculated."
+        );
+        assert_eq!(
+            sentence(Capability::AlmanacCache),
+            "Almanac records have never been calculated.",
+            "the sentence that was missing while nothing wrote the cache"
         );
     }
 }

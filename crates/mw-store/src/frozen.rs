@@ -1,5 +1,13 @@
 //! The two caches the frozen REST surface reads directly, and the forecast table.
 //!
+//! **Three write halves and one read half**, which is not the symmetry it looks like.
+//! `/snow` reads `snow_totals_cache` through `SnowCache` here; `/almanac` reads
+//! `almanac_cache` through `ReadingStore::almanac` in `crate::reader`, and only its
+//! **write** half is here, as `AlmanacCache`. That split is the one the capabilities
+//! already had before this module gained the writer -- the almanac read arrived with the
+//! frozen handler in M4-2 and the writer did not arrive at all, which is the defect
+//! `docs/reconciliation.md` **A-M7-6-1** records.
+//!
 //! `ForecastStore` and `SnowCache` are their own capabilities rather than methods on
 //! [`mw_component::ReadingStore`] because `docs/component-model.md` §2.1 gives them their
 //! own, and because §3.2's table degrades them independently: `api:legacy` declares all
@@ -32,15 +40,30 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use mw_component::{
-    Alert, AlertStore, BoxFuture, DepthEstimate, EstimateWindow, Forecast, ForecastQuery,
-    ForecastStore, SnowCache, SnowEvent, SnowPatch, SnowTotals, StoreError,
+    Alert, AlertStore, AlmanacCache, AlmanacRecord, BoxFuture, DepthEstimate, EstimateWindow,
+    Forecast, ForecastQuery, ForecastStore, SnowCache, SnowEvent, SnowPatch, SnowTotals,
+    StoreError,
 };
 use mw_types::StationKey;
 use sqlx::{PgPool, Row};
 
 use crate::reader::classify;
 
-/// `ForecastStore`, `AlertStore` and `SnowCache` over one pool.
+/// The four handles [`FrozenReads::handles`] publishes, in the order `db:postgres`
+/// publishes them.
+///
+/// A named tuple rather than four return values, because it is the four-element shape that
+/// clippy's `type_complexity` objects to and the objection is worth answering with a name:
+/// adding a fifth cache capability should be an edit to this line and to the one function
+/// that destructures it.
+pub type FrozenHandles = (
+    Arc<dyn ForecastStore>,
+    Arc<dyn AlertStore>,
+    Arc<dyn SnowCache>,
+    Arc<dyn AlmanacCache>,
+);
+
+/// `ForecastStore`, `AlertStore`, `SnowCache` and `AlmanacCache` over one pool.
 #[derive(Debug)]
 pub struct FrozenReads {
     pool: PgPool,
@@ -58,17 +81,12 @@ impl FrozenReads {
     /// publish three different instances under capabilities that are meant to be one
     /// pool — which would be invisible until somebody wondered why `/forecast` saw a
     /// connection the probe loop had closed.
-    pub fn handles(
-        self: Arc<Self>,
-    ) -> (
-        Arc<dyn ForecastStore>,
-        Arc<dyn AlertStore>,
-        Arc<dyn SnowCache>,
-    ) {
+    pub fn handles(self: Arc<Self>) -> FrozenHandles {
         (
             Arc::clone(&self) as Arc<dyn ForecastStore>,
             Arc::clone(&self) as Arc<dyn AlertStore>,
-            self as Arc<dyn SnowCache>,
+            Arc::clone(&self) as Arc<dyn SnowCache>,
+            self as Arc<dyn AlmanacCache>,
         )
     }
 }
@@ -570,6 +588,66 @@ impl SnowCache for FrozenReads {
             }
             tx.commit().await.map_err(classify)?;
             Ok(())
+        })
+    }
+}
+
+impl AlmanacCache for FrozenReads {
+    fn replace_almanac<'a>(
+        &'a self,
+        station: &'a StationKey,
+        records: &'a [AlmanacRecord],
+    ) -> BoxFuture<'a, Result<u64, StoreError>> {
+        Box::pin(async move {
+            // **An empty set leaves the rows alone**, which the trait documents as the one
+            // deliberate departure from Go's function: Go's `DELETE` is unconditional, so a
+            // refresh that computes nothing empties the cache and `/almanac` serves `{}` --
+            // the exact state this capability exists to make impossible. Returning before
+            // the transaction opens, rather than inside it, so that the common no-op costs
+            // no round trip at all.
+            if records.is_empty() {
+                return Ok(0);
+            }
+            // One transaction, because a committed `DELETE` whose `INSERT` never arrives is
+            // that same `{}` reached by a different route -- and `/almanac` has no
+            // fallback query to cover for it.
+            let mut tx = self.pool.begin().await.map_err(classify)?;
+            sqlx::query("DELETE FROM almanac_cache WHERE station_id = $1")
+                .bind(station.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(classify)?;
+            let names: Vec<&str> = records.iter().map(|r| r.record.as_str()).collect();
+            let values: Vec<f32> = records.iter().map(|r| r.value).collect();
+            let observed: Vec<DateTime<Utc>> = records.iter().map(|r| r.observed_at).collect();
+            let wind_dir: Vec<Option<f32>> = records.iter().map(|r| r.wind_dir).collect();
+            // `UNNEST` rather than a statement per record, for `replace_events`' reason:
+            // twelve round trips inside one transaction is twelve chances for the deadline
+            // to land between the delete and the last insert.
+            //
+            // **No `ON CONFLICT`.** The `DELETE` above has just emptied this station's
+            // rows, so the only way a conflict could arise is a duplicate `record` within
+            // one call -- which is a caller that has computed the same record twice and
+            // should hear about it as a constraint violation rather than have one of the
+            // two silently win.
+            let written = sqlx::query(
+                "INSERT INTO almanac_cache \
+                     (station_id, record, value, observed_at, wind_dir, computed_at) \
+                 SELECT $1, r.record, r.value, r.observed_at, r.wind_dir, now() \
+                 FROM UNNEST($2::text[], $3::real[], $4::timestamptz[], $5::real[]) \
+                      AS r(record, value, observed_at, wind_dir)",
+            )
+            .bind(station.as_str())
+            .bind(&names)
+            .bind(&values)
+            .bind(&observed)
+            .bind(&wind_dir)
+            .execute(&mut *tx)
+            .await
+            .map_err(classify)?
+            .rows_affected();
+            tx.commit().await.map_err(classify)?;
+            Ok(written)
         })
     }
 }

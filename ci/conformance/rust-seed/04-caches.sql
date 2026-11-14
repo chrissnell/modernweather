@@ -1,10 +1,12 @@
--- The three tables the frozen contract reads **directly**, and nothing else reads.
+-- The three tables the frozen contract reads **directly**, and nothing else reads -- two of
+-- which this file seeds.
 --
 -- W1 assumption 12: `/almanac` and `/snow` read `almanac_cache` and `snow_totals_cache`
 -- "and nothing else", and `/almanac` returns `{}` rather than computing anything when its
 -- cache is empty. They are not an optimisation that can be skipped here -- they are the
 -- endpoints' only data source, so a seed that omitted them would make four fixtures fail on
--- an empty body rather than on the contract.
+-- an empty body rather than on the contract. **`almanac_cache` is the exception as of
+-- A-M7-6-1**: it has a writer now, so seeding it would hide whether that writer works.
 --
 -- The third is `forecasts`, which `/forecast` reads verbatim. The 240-hour row is W1's own
 -- captured Aeris payload, carried over from `contract/tools/rig/aeris.sql`; the 24-hour row is
@@ -15,32 +17,38 @@
 
 BEGIN;
 
+-- `almanac_cache` is emptied and not re-seeded; see the note below.
 DELETE FROM almanac_cache;
 DELETE FROM snow_totals_cache;
 DELETE FROM forecasts;
 
--- `/almanac?station=davis-full` -- the eight records `almanac-populated` recorded.
+-- `/almanac` is **not seeded here, deliberately**, and this is the one table in this file
+-- that is left empty on purpose.
 --
--- **Exactly eight, and no air-quality records**, which is a property of the rig rather than
--- an omission: `/almanac` reads the particulate extremes from the WEBSITE's air-quality
--- device, so seeding `aqmon`'s rows would take this response from 8 keys to 14 -- for every
--- station asked about, which is what `ci/conformance/README.md` records as having been
--- watched rather than assumed.
+-- It used to be seeded with the eight records `almanac-populated` recorded, and that seed
+-- was a lie this suite told itself for two milestones. `/almanac` reads `almanac_cache` and
+-- nothing else and renders no rows as `{}` with a `200` -- which is the frozen contract's
+-- behaviour for an empty cache -- so a seeded rig compared against a recording of a seeded
+-- rig says nothing at all about whether the daemon can produce those rows. It could not:
+-- nothing in the program wrote that table, `/almanac` served `{}` in the real deployment,
+-- and this gate was green throughout (`docs/reconciliation.md` **A-M7-6-1**).
 --
--- Only `high_wind_speed` carries a `wind_dir`. The column is nullable and the JSON field is
--- `omitempty` on a pointer, so an absent direction is an absent KEY and never a null --
--- which is the difference between a client reading "no direction was recorded" and one
--- failing to decode.
-INSERT INTO almanac_cache (station_id, record, value, observed_at, wind_dir)
-VALUES
-  ('davis-full', 'high_temp',       66.8,     now() - interval '18 hours', NULL),
-  ('davis-full', 'low_temp',        62.9,     now() - interval '18 hours', NULL),
-  ('davis-full', 'high_wind_speed', 22,       now() - interval '18 hours', 35.99653),
-  ('davis-full', 'max_rain_hour',   0,        now() - interval '2 hours',  NULL),
-  ('davis-full', 'max_rain_day',    0,        now() - interval '18 hours', NULL),
-  ('davis-full', 'low_barometer',   29.981,   now() - interval '18 hours', NULL),
-  ('davis-full', 'low_humidity',    47,       now() - interval '18 hours', NULL),
-  ('davis-full', 'high_solar',      478,      now() - interval '90 minutes', NULL);
+-- `almanac:records` now computes the records from each station's own history on its first
+-- occurrence, and `xtask::conformance::almanac_is_populated` asserts the rows exist
+-- **after the daemon has started**. So the two `/almanac` fixtures are now a measurement of
+-- the component rather than of this file, and removing the component fails the run.
+--
+-- Two properties of the rig that the fixtures depend on, recorded here because they are not
+-- obvious and they are what keeps `almanac-populated` at eight keys:
+--
+--   * `aqmon` is `enabled = 0` in `01-config.sql`, and `almanac:records` plans only enabled
+--     stations -- so the website's air-quality device has no records and the four
+--     particulate keys are absent. Enabling it takes this response from 8 keys to 14 for
+--     every station asked about, which `ci/conformance/README.md` records as having been
+--     watched rather than assumed.
+--   * `nolocation` has no readings, so no record can be computed for it and
+--     `/almanac?station=nolocation` is `{}` -- which is `almanac-empty`, now produced by the
+--     absence of data rather than by the absence of a seed.
 
 -- `/snow`. Three gauges and three states:
 --
