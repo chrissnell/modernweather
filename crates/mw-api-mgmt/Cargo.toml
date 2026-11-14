@@ -37,6 +37,18 @@ sha2.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
 tracing.workspace = true
+# M7-3's SSE endpoint. `broadcast` for the fan-out and `time` for the observation tick;
+# `ci/layers.toml` places this crate in the `surface` layer and forbids it `sqlx`,
+# `mw-store` and `mw-pipeline`, not a runtime -- and a push endpoint without a runtime is
+# a polling endpoint.
+tokio = { workspace = true }
+# `BroadcastStream`, so the broadcast receiver is a `Stream` that `axum::response::Sse`
+# accepts. Two dozen lines of `poll_next` by hand would be the alternative.
+tokio-stream = { workspace = true }
+# The UI bundle, embedded, matching W3 §7.2's decision for the public site's assets and
+# the Go version's `embed.FS`. `debug-embed` for `mw-web`'s reason: a debug build and a
+# release build must serve the same bytes from the same place.
+rust-embed = { workspace = true, features = ["debug-embed"] }
 
 [dev-dependencies]
 # The router is exercised end to end against `oneshot` rather than over a socket: only

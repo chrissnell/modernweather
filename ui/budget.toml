@@ -1,0 +1,77 @@
+# The management UI's bundle budget (W5 §6.5, W5 Decision 50).
+#
+# `cargo xtask gate-ui-bundle` reads this file, measures `build/` and fails the build on an
+# over-budget bundle, printing the largest chunks and the delta against the recorded
+# baseline. Raising a budget is a reviewed diff to this file, which is the point: a ratchet
+# against carelessness is only a ratchet while moving it is visible.
+#
+# **This file's existence arms the gate** (`ci/gates.toml`), so deleting it would not
+# quietly disarm the check -- `cargo xtask gates` would report a gate whose subject is
+# missing.
+#
+# WHAT COUNTS: every first-party and third-party `.js` and `.css` the browser must fetch to
+# use the application, measured **gzipped**, as emitted by `vite build`.
+#
+# WHAT DOES NOT: fonts (budgeted separately below), SVG and PNG assets, source maps (not
+# shipped -- `vite.config.ts` sets `sourcemap: false`) and the generated `.d.ts` (types,
+# compiled away).
+
+[budget]
+# JS + CSS needed to render Home after sign-in, minified and gzipped.
+initial_route_kb = 150
+
+# Every lazily-loaded chunk summed, minified and gzipped.
+all_routes_kb = 280
+
+# The largest single lazy chunk, so one page cannot quietly become the whole budget.
+largest_lazy_chunk_kb = 60
+
+# Self-hosted Inconsolata: woff2, Latin subset, two weights. A separate line because a font
+# is a one-time fetch that is then cached for a year, which is a different cost from code.
+fonts_kb = 45
+
+# Why these numbers are achievable rather than aspirational: Svelte compiles the framework
+# away; chonky is tree-shaken at the component level by Vite and this design uses roughly
+# thirty of its sixty-one components; `openapi-fetch` is ~2 KB and the generated types emit
+# nothing at runtime; `lucide-svelte` icons are tree-shaken per icon. The measured outcome
+# is well under these numbers, and they are set with headroom so the gate bites on
+# carelessness rather than on normal work.
+
+# W5 Decision 51's three prohibitions, each a defect in the current UI. The gate checks
+# them by name against the dependency tree, because "we did not add moment.js" is only true
+# until somebody does.
+[prohibited]
+# 1. No date library at all. The current UI vendors a deprecated copy of moment.js.
+#    `Intl.DateTimeFormat` and `Intl.RelativeTimeFormat` are built in, handle time zones
+#    properly, and cost zero bytes. `src/lib/format.ts` is the whole of the replacement.
+date_libraries = ["moment", "moment-timezone", "dayjs", "date-fns", "luxon", "js-joda"]
+
+# 2. No CDN. Everything is embedded: a weather station on a LAN with no internet must have
+#    a working admin UI, and a CDN is also a third party that learns when the operator
+#    signs in. Checked as a pattern against the built output rather than against the source,
+#    because a transitive dependency can inject one.
+cdn_hosts = [
+  "cdn.jsdelivr.net",
+  "unpkg.com",
+  "cdnjs.cloudflare.com",
+  "ajax.googleapis.com",
+  "fonts.googleapis.com",
+  "fonts.gstatic.com",
+  "esm.sh",
+  "skypack.dev",
+]
+
+# 3. No chart library. Charting is out of scope (D-38; the public website already does it).
+#    If a sparkline is ever needed, it is inline SVG.
+chart_libraries = [
+  "chart.js",
+  "chartjs",
+  "d3",
+  "echarts",
+  "highcharts",
+  "plotly.js",
+  "apexcharts",
+  "recharts",
+  "layerchart",
+  "uplot",
+]

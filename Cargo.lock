@@ -1521,6 +1521,7 @@ dependencies = [
  "chrono",
  "mw-component",
  "mw-types",
+ "rust-embed",
  "secrecy",
  "serde",
  "serde_json",
@@ -1528,6 +1529,7 @@ dependencies = [
  "subtle",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tower",
  "tracing",
  "utoipa",
@@ -3074,6 +3076,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -3812,6 +3815,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "mw-api-mgmt",
  "serde",
  "serde_json",

@@ -51,7 +51,7 @@ pub use crate::config_admin::{
     StationWrite, WebsiteWrite,
 };
 pub use crate::frozen::FrozenReads;
-pub use crate::peers::{PeerSnapshot, PeerStore};
+pub use crate::peers::{EnrolmentTokenRow, FleetPeer, PeerSnapshot, PeerStore};
 pub use crate::reader::TimescaleReader;
 pub use crate::registry::{
     hash_ingest_secret, ConfigRegistry, RegistrySnapshot, SecretHashError, SecretProblem,

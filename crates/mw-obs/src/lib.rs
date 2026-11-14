@@ -94,7 +94,7 @@ pub use crate::level::{parse, Reload};
 pub use crate::metrics::{Metrics, CONTENT_TYPE};
 pub use crate::record::{Record, Stream, Value};
 pub use crate::render::{json, pretty};
-pub use crate::ring::{LogRings, Ring, RingLayer, ACCESS_TARGET};
+pub use crate::ring::{LogRings, LogTap, Ring, RingLayer, ACCESS_TARGET};
 pub use crate::stderr::console_banner;
 pub use crate::write::WriteLayer;
 

@@ -398,6 +398,186 @@
         }
       }
     },
+    "/api/v1/events": {
+      "get": {
+        "tags": [
+          "events"
+        ],
+        "summary": "§5's one live connection.",
+        "description": "Not declared with a response body: the body is an unbounded `text/event-stream`, and\ndescribing it as a schema would invite a generated client to `await` it as JSON. The\nframe shapes are in `crate::events`' module documentation, which is where a client\nauthor should read them.",
+        "operationId": "get_events",
+        "parameters": [
+          {
+            "name": "channels",
+            "in": "query",
+            "description": "Comma-separated: components, logs, readings. Default components.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "log_stream",
+            "in": "query",
+            "description": "app, access, or both.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "last_event_id",
+            "in": "query",
+            "description": "Resume point; see also Last-Event-ID.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "An event stream, typed by the SSE event field",
+            "content": {
+              "text/event-stream": {}
+            }
+          },
+          "422": {
+            "description": "A channel or stream this build does not know",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "This build serves no live data",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/events/{stream_id}/channels": {
+      "post": {
+        "tags": [
+          "events"
+        ],
+        "summary": "§5.1's in-stream channel change, so a route change does not drop the connection.",
+        "operationId": "post_event_channels",
+        "parameters": [
+          {
+            "name": "stream_id",
+            "in": "path",
+            "description": "The id the stream's `hello` frame carried",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelsInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The channels now in force",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelsView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such connection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A channel this build does not know",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "This build serves no live data",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/fleet": {
+      "get": {
+        "tags": [
+          "fleet"
+        ],
+        "summary": "**N-11**: the unsent-readings buffer, the peers, and what enrolment is open.",
+        "operationId": "get_fleet",
+        "responses": {
+          "200": {
+            "description": "Unsent readings, peers and enrolment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FleetView"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The peer rows could not be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "This node has no spool and no peers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/forecasts": {
       "get": {
         "tags": [
@@ -2277,6 +2457,38 @@
         ],
         "description": "Everything an operator can change, as one discriminated union.\n\nBoth `POST /api/v1/config/preview` and every mutating route construct one of these, which\nis what makes the preview and the save one code path. The discriminant is `change` so\nthat `openapi-typescript` emits a union the client narrows on rather than an object with\nevery field optional."
       },
+      "ChannelsInput": {
+        "type": "object",
+        "description": "What a channel change submits.",
+        "required": [
+          "channels"
+        ],
+        "properties": {
+          "channels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The channels this connection should receive from now on."
+          }
+        }
+      },
+      "ChannelsView": {
+        "type": "object",
+        "description": "What a channel change answers with.",
+        "required": [
+          "channels"
+        ],
+        "properties": {
+          "channels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The channels now in force, which is what the client asked for when it succeeded."
+          }
+        }
+      },
       "ClaimInput": {
         "type": "object",
         "description": "What `POST /api/v1/auth/claim` submits — §3.4's one-time setup claim.",
@@ -2655,6 +2867,80 @@
           }
         }
       },
+      "EnrolmentToken": {
+        "type": "object",
+        "description": "One outstanding or historical enrolment token.\n\nW7 D-33, as W5 is required to surface it: **leaving enrolment open is the mistake and\nit should be visible.** `Enroll` is served only while an unexpired, unconsumed token\nexists, so an outstanding row is a door that is open right now.",
+        "required": [
+          "id",
+          "peer_name",
+          "issued_at",
+          "expires_at",
+          "state"
+        ],
+        "properties": {
+          "consumed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When it was consumed, if it was."
+          },
+          "consumed_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which node consumed it, hex."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When it stops working."
+          },
+          "id": {
+            "type": "string",
+            "description": "The row's id, hex. Never the token: the row holds an Argon2id hash and the\nplaintext was printed once."
+          },
+          "issued_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When it was issued."
+          },
+          "peer_name": {
+            "type": "string",
+            "description": "Which peer it was minted for."
+          },
+          "state": {
+            "type": "string",
+            "description": "`outstanding`, `used` or `expired` -- the three states the row can be in."
+          }
+        }
+      },
+      "EnrolmentView": {
+        "type": "object",
+        "description": "Outstanding enrolment and the history behind it.",
+        "required": [
+          "outstanding",
+          "log"
+        ],
+        "properties": {
+          "log": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnrolmentToken"
+            },
+            "description": "Every token this node has minted, newest first -- the enrolment log.\n\nThe log and the outstanding list come from the same rows rather than from a\nseparate audit table, and that is a property worth stating: a history assembled\nfrom a different source than the live state is a history that can disagree with it."
+          },
+          "outstanding": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnrolmentToken"
+            },
+            "description": "Tokens that would admit a new peer **right now**."
+          }
+        }
+      },
       "ErrorBody": {
         "type": "object",
         "description": "The management API's error body.\n\n`summary` is the one plain line a banner shows when there is no field to attach to;\n`detail` is the technical half, which W5 §0.4 puts behind a **Details** disclosure rather\nthan on the screen. Both are present on every error so the client never has to decide\nwhich one it got.",
@@ -2699,6 +2985,44 @@
             "type": "string",
             "description": "What is wrong, as a sentence that says what to do.",
             "example": "Enter a hostname or IP address."
+          }
+        }
+      },
+      "FleetView": {
+        "type": "object",
+        "description": "What `GET /api/v1/fleet` returns.\n\nAn object whose three members are each nullable, rather than three routes, because the\ntwo pages that render it show all three together and §4.4 wants one object with named\nfields so a fourth number is additive.",
+        "required": [
+          "peers"
+        ],
+        "properties": {
+          "enrolment": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EnrolmentView",
+                "description": "Enrolment, which is `None` on a node that is not a collector."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "peers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PeerView"
+            },
+            "description": "Every peer this node knows."
+          },
+          "spool": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SpoolView",
+                "description": "The unsent-readings buffer, or `None` on a node that has none."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       },
@@ -2793,6 +3117,86 @@
               "type": "string"
             },
             "description": "Which stations get forecasts and alerts."
+          }
+        }
+      },
+      "LatestReading": {
+        "type": "object",
+        "description": "One station's latest reading, as the Home tiles and §0.7 step 3 render it.\n\nA handful of named fields rather than the 212-column reading: these are the ones §0.7's\npanel shows, and widening it later is additive under §4.4. The units are in the field\nnames because the frozen contract's are, and a unit carried in a name cannot be\nconverted twice.",
+        "required": [
+          "station_key",
+          "station_name",
+          "ts"
+        ],
+        "properties": {
+          "barometer_inhg": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "humidity_pct": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "rain_day_in": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "snow_depth_in": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "solar_wm2": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "station_key": {
+            "type": "string",
+            "description": "Which station, by the key every path segment uses."
+          },
+          "station_name": {
+            "type": "string",
+            "description": "What the operator calls it, so the tile needs no second lookup.\n\nFilled in by the stream from the vocabulary, **not** by the implementation of\n[`Readings`]: D-36 puts the translation on the server in one place, and the half of\nthe system that produces readings has no business knowing what a station is called.\nAn implementation may leave it empty."
+          },
+          "temperature_f": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "ts": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the station says it measured."
+          },
+          "wind_dir_degrees": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "wind_speed_mph": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
           }
         }
       },
@@ -3216,6 +3620,49 @@
             "type": "integer",
             "description": "The fewest characters accepted.",
             "minimum": 0
+          }
+        }
+      },
+      "PeerView": {
+        "type": "object",
+        "description": "One peer, as `/data-storage/receive` renders it.",
+        "required": [
+          "name",
+          "node_id",
+          "stations"
+        ],
+        "properties": {
+          "last_seen": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When it was last heard from."
+          },
+          "name": {
+            "type": "string",
+            "description": "The peer's name, as it enrolled."
+          },
+          "node_id": {
+            "type": "string",
+            "description": "Its node id, hex, shown only under `System → Advanced`."
+          },
+          "peer_reported_depth_envelopes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "W7 D-40's `IngestBatch.sender_depth`: how many readings the **peer says** it still\nhas unsent.\n\n**Peer-reported, and the field name says so**, because W7 D-40 requires W5 to label\nit as such wherever it appears and a field called `depth` would make that a\nconvention the next page could forget. It is what lets this node render fleet-wide\nlag without scraping a satellite whose link is down -- and it is the satellite's\nown claim, not a measurement.",
+            "minimum": 0
+          },
+          "stations": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Which stations it has registered, by key."
           }
         }
       },
@@ -3824,6 +4271,89 @@
               "type": "string"
             },
             "description": "Consequences that do not block."
+          }
+        }
+      },
+      "SpoolView": {
+        "type": "object",
+        "description": "The unsent-readings buffer, as `/data-storage/send` renders it.\n\nW7 specified four numbers after W5 had finished and W5's inventory therefore has none\nof them. Three are here and the fourth is on [`PeerView`]:\n\n* `time_remaining_seconds` -- W7's `spool_time_remaining_seconds`;\n* the `ceiling < max_lag x rate` advisory of W7 §3.5, as the three figures it compares\n  plus the comparison's result, so that the sentence is rendered by W5 §0's vocabulary\n  rather than assembled from a server-side string;\n* the depth, which W5 already had.\n\n**The comparison is made here, not in the client.** It is one inequality over three\nnumbers, and a client that re-derives it is a second opinion about whether an operator\nis about to lose data.",
+        "required": [
+          "path",
+          "ceiling_bytes",
+          "max_lag_seconds",
+          "depth_bytes"
+        ],
+        "properties": {
+          "bytes_per_second": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "The observed write rate, over the window this process has been running.\n\n`None` until there is enough traffic to divide by: a rate computed from two\nappends is a number that would make the advisory below oscillate."
+          },
+          "ceiling_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How much disk unsent readings may use before the oldest are reclaimed (W7 D-16).",
+            "minimum": 0
+          },
+          "ceiling_covers_max_lag": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the ceiling covers `max_lag` at the observed rate.\n\n`None` when there is no rate to compare against, which is **not** the same as\n`true`: \"we cannot tell yet\" and \"you are fine\" are different sentences, and\ncollapsing them is what makes a ceiling policy a coin flip (W7 §3.5)."
+          },
+          "depth_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What is on disk now.",
+            "minimum": 0
+          },
+          "depth_envelopes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How many readings are waiting, when the buffer can say.",
+            "minimum": 0
+          },
+          "last_delivery": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "The last time a peer acknowledged a batch."
+          },
+          "max_lag_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How long a cursor may be behind before it is abandoned.",
+            "minimum": 0
+          },
+          "needed_for_max_lag_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "What the ceiling would have to be to cover `max_lag` at the observed rate.",
+            "minimum": 0
+          },
+          "path": {
+            "type": "string",
+            "description": "Where the buffer lives, for `System → Advanced` and for a support message."
+          },
+          "time_remaining_seconds": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "W7's `spool_time_remaining_seconds`: how long the remaining ceiling covers at the\nobserved rate. `None` for the same reason as the rate."
           }
         }
       },
@@ -4704,6 +5234,14 @@
     {
       "name": "system",
       "description": "System"
+    },
+    {
+      "name": "events",
+      "description": "Live data: one endpoint, several channels"
+    },
+    {
+      "name": "fleet",
+      "description": "Unsent readings, peers and enrolment"
     }
   ]
 }

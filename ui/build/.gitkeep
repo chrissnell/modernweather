@@ -1,0 +1,9 @@
+This directory holds the built bundle, which is not committed.
+
+`rust-embed` resolves `crates/mw-api-mgmt`'s folder at compile time, so `cargo build` on a
+tree that has never run `pnpm build` needs this path to exist. With nothing in it the
+binary embeds nothing, the management interface answers one plain sentence saying so, and
+`cargo xtask dist` refuses to package a release without a bundle (D-58) -- which keeps the
+missing-bundle case a gate rather than a confusing build error.
+
+Build it with `cargo xtask ui`, or `cd ui && pnpm install --frozen-lockfile && pnpm build`.

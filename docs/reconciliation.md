@@ -3687,3 +3687,150 @@ implementation of each is where a reader will look for it.
 | OQ-W5-2 | a breached-password list? | **(b)** ship one, warn, never block | `mw_api_mgmt::auth::is_breached`, over the list A-M7-2-2 describes. The warning lands in §8.5's `warnings` array on the claim and the password change, and in a console line on `reset-password` — both surfaces, so the rule cannot be evaded by using the other one |
 | OQ-W5-3 | any API token in v1? | **(a) none** | Nothing. There is no token table, no `Authorization` parsing and no bearer path; §3.7 fixes the shape in advance so adding one later cannot regress into "the cookie is the token" |
 | OQ-W5-5 | how much configuration history? | **(a) one step** | `POST /api/v1/config/revert`, which **M7-1 already shipped**, scoped to this process rather than to a session because a session-scoped one could not be written before sessions existed. M7-2 changes nothing here; the entry is kept so the answer is not looked for twice |
+
+---
+
+## M7-3's deviations, as implemented
+
+Recorded together because they are one work item's, and because a reader looking for "why
+does the UI do that" will look here. The authority for each is
+`docs/management-ui-design.md`'s section number; where this item diverged from it, the
+divergence is below rather than in a commit message.
+
+### A-M7-3-1 — the live stream has no clock and no task of its own
+
+*Proposed by implementation-plan.md **M7-3**, 2026-11-14. Not applied to `DESIGN.md`: it
+removes a mechanism rather than adding one.*
+
+*What was found.* W5 §5 specifies push, and the obvious implementation of
+`GET /api/v1/events`' component channel is a loop that reads
+[`ComponentControl::components`] on a tick. `clippy.toml` refuses both halves of that by
+name: `tokio::time::interval` because "there is one clock for the whole process, in
+`mw_supervisor::clock` (§3.3)", and `tokio::task::spawn` because a task belongs to
+`mw_supervisor::task`'s table (§3.2). The lint's permitted call sites are those two
+modules, and adding a third would be the first weakening of an invariant this repository
+has otherwise kept — docs/reconciliation.md **G-4** is what that becomes.
+
+*What was chosen.* The stream is driven by the two places a change is actually committed:
+
+* `ComponentControl::changes()` — a new, defaulted trait method returning the supervisor's
+  own publication signal. `mw_supervisor::publish::Publication` grew a version counter that
+  `store` bumps, so the UI learns of a state change **at the instant the supervisor commits
+  it** rather than up to a tick later.
+* `Readings::changes()` — the reading fan-out's own `watch`, forwarded.
+
+`mw_api_mgmt::events::observe` selects over the two and is awaited beside `supervisor.run`
+in the daemon's one `tokio::join!`, which is how this daemon already runs its process-level
+loops. So the process gains no clock, no task, and no polling anywhere — and the stream is
+strictly more current than a tick would have made it. A **version counter** rather than a
+`Notify` because a `Notify` wakes only the waiters registered at the moment of the store,
+which loses a change that lands between a read and the next wait.
+
+The heartbeat is `axum`'s `Sse::keep_alive`, which is the **comment frame** §5.2 asks for.
+§5.1 also lists a `heartbeat` event among the frame types; the comment frame is the better
+reading, because a typed frame carrying nothing is a record in a stream whose every other
+frame carries information. The one timer left in §5 is the client's `Backoff` countdown
+over a server-supplied absolute instant, which §5.6 names as the stated exception.
+
+### A-M7-3-2 — a committed change ends every open stream
+
+*Proposed by implementation-plan.md **M7-3**, 2026-11-14.*
+
+*What was found.* An SSE response is an in-flight request that never finishes, and
+`mw-http`'s graceful shutdown waits for in-flight requests. Adding or removing a station or
+a website restarts **every** component including the one listener — M7-1's stated cost — so
+with a browser connected, every such save waited out the whole ten-second drain deadline,
+logged two `WARN`s and then aborted the listener anyway. Measured, not predicted: it is
+what the first run of M7-3's second Playwright flow did.
+
+*What was chosen.* `Hub` carries an epoch that a generation change bumps, and each
+connection's stream **ends** when its epoch is stale. The client's answer to a stream that
+ends is already written and already tested: §5.2's one reconnect, a `gap` if applicable,
+and an `INFO` line — because "a server restart is not an error" is the same situation seen
+from the other side. The save now completes in the time the reconciliation takes.
+
+### A-M7-3-3 — `GET /api/v1/fleet`, and a `501` for a capability this node does not have
+
+*Proposed by implementation-plan.md **M7-3** (work item **N-11**), 2026-11-14.*
+
+*What was found.* C-W7-29's four numbers live in three crates `ci/layers.toml` forbids
+`mw-api-mgmt` from naming, and three of them are **gauges**. The `metrics` facade is
+write-only by design, so a page cannot read a gauge back.
+
+*What was chosen.* A `Fleet` trait declared in `mw-api-mgmt` and implemented in the binary
+— the same move `ConfigAdmin`, `LogSource` and `Machine` already make — over one new route.
+`mw_collector::metrics` retains the last value of the three per-peer gauges beside
+exporting them, which keeps **one writer** per number: a second owner computing the same
+figure its own way is how a page and a dashboard come to disagree about whether an operator
+is losing readings. The enrolment list and the enrolment log come from the same
+`peer_enrolment_token` rows, so a history cannot disagree with the live state it describes.
+
+`ApiError` grew a seventh variant, `Unsupported` → `501`, for the two routes that a node
+can legitimately not have (`/api/v1/events` on a build with no live stream,
+`/api/v1/fleet` on a node with no spool and no peers). Deliberately not `Conflict`: nothing
+the operator types differently fixes it, and nothing went wrong. A client reacts to it
+structurally — it stops asking — which is the same reason W5 §8.8 wanted `401` to be its
+own status rather than a banner.
+
+### A-M7-3-4 — `ui-bundle` reports headroom, not a delta against the previous commit
+
+*Proposed by implementation-plan.md **M7-3**, 2026-11-14.*
+
+*What was found.* W5 §6.5 asks the gate to print "the delta against the previous commit".
+Producing one means building the previous commit's bundle as well, which doubles the `ui`
+job for information the headroom column already carries.
+
+*What was chosen.* The gate prints measured, budget and headroom per line, plus the five
+largest files. Raising a budget stays a reviewed diff to `ui/budget.toml`, which is the
+property §6.5 is actually about. The gate's three exit codes are its own, for C-W2-20's
+reason: `1` is over budget, `2` is "no verdict" (no bundle to measure), `3` is a violated
+prohibition — and the three have different fixes.
+
+### A-M7-3-5 — the page inventory is twenty-seven, not twenty-six
+
+*A counting correction, not a finding of substance.*
+
+implementation-plan.md M7-3 says "Twenty-six pages". W5 §7.1's own table has **twenty-seven
+rows**, and all twenty-seven exist in `ui/src/routes`. Stated the way W5 stated the same
+class of correction about its own prompt's "46 routes": so that "every page in the
+inventory is built" cannot be satisfied while one is quietly missed. `ui/src/lib/pages.ts`
+holds the inventory and a unit test asserts the count.
+
+### A-M7-3-6 — three of W5 §0.5's worked hints exceed its own 90-character cap
+
+*A copy correction.*
+
+§0.5 caps a hint at ninety characters and gives worked examples for `Base snow distance`
+(98), `SSL mode` (105) and `App & integration port` (122). All three are kept in full: the
+first line is the hint and the rest is the `More` disclosure, which is the shape §0.5
+specifies for exactly this. A unit test enforces the cap over every field in every copy
+module, which is what found them.
+
+### Four new `chonky` findings, in §6.3's form
+
+§6.3 lists twelve gaps. Four more surfaced while building against the toolkit, each with
+what the UI does in the meantime. O-11's answer (2026-11-13) is that all of them are fair
+game and that G2/G4/G9/G10 go upstream now; upstreaming is a change to
+`chrissnell/chonky` rather than to this repository, so it is a separate pull request
+against that project and these are the findings it would carry.
+
+| # | Gap | Impact here | What this UI does |
+|---|---|---|---|
+| **G13** | **`Combobox` forwards neither attributes nor a change handler.** `Combobox.Root` takes `open`, `value` and `children`; `Combobox.Input` takes `class` and `placeholder`. | A combobox cannot carry an `id`, an `aria-describedby` or an input handler, so it cannot satisfy §0.5's hint or §7.4's labelling — which rules it out for the time-zone picker §6.2 maps to it. | A native `input` + `datalist`: searchable, keyboard-reachable, announced, and the list is the browser's own IANA database rather than a vendored table. |
+| **G14** | **Compound sub-components spread rest props at runtime but declare only `class` and `children`.** `AlertDialog.Action` is the one this UI hit. | An `onclick` on `AlertDialog.Action` works and is a type error, so the typed build (§4.3's mechanism 2) rejects the documented usage. | The handler goes on a `Button` inside `AlertDialog.Content`, with the dialog's `open` bound. |
+| **G15** | **`Box`'s `title` renders a styled `div`.** | §6.2 maps "page sections" to `Box (title prop)`, so a page built from boxes has **no heading outline at all** — which is a navigation surface a screen-reader user genuinely uses. | Every page carries its own `<h1>`, so the outline is not empty. A `Box` title is not a heading and is not asserted as one. |
+| **G16** | **`AlertDialog.Root` has no `onOpenChange`.** `open` is bindable and there is no change callback. | A dialog per row of a table needs a binding per row; the component is modal, so only one can be open. | One dialog for the table, opened by a plain button that records which row. |
+
+### What M7-3 deliberately did not build, and why
+
+Each of these is additive under §4.4 and needs no version bump. They are listed because a
+reader counting W5 §7.1's affordances will look for them, and because a button that
+silently does nothing would be worse than its absence.
+
+| Not built | Why | What the screen says instead |
+|---|---|---|
+| `POST /api/v1/checks/*` — all seven | Each is a `check:<name>` component with `Trigger::OnDemand`; **no work item creates those components**, and the routes are two lines each while the components are not | `/system/diagnostics` lists all seven with what each would do, marked unavailable; `/stations/{key}/diagnostics` says the same and links to the two surfaces that do work |
+| `GET /api/v1/discovery/weatherlink/*` | Needs M3-1's in-process mDNS probe driven from a request rather than from a station's build, which is a change to `mw-station`'s surface | §0.7 step 2's chooser says automatic discovery is not in this version and to type the address |
+| Reading a certificate back for its subject and expiry | Needs a handler that parses the PEM, which M7-1's surface does not have | `/website/{id}/certificate` says so; the paths are saved and used |
+| Database size and oldest reading | Not on M7-1's surface | `/data-storage/database` says so; the live status above it is what the running system reports |
+| Editing the CORS allowlist | **A-M7-2-6**: the list is read at startup and no route edits it | `/system/advanced` says an added origin takes effect at the next start, which is the thing an operator needs to know |

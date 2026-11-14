@@ -238,6 +238,24 @@ export interface components {
       listener: components["schemas"]["ListenerInput"];
     });
     /**
+     * What a channel change submits.
+     */
+    ChannelsInput: {
+      /**
+       * The channels this connection should receive from now on.
+       */
+      channels: string[];
+    };
+    /**
+     * What a channel change answers with.
+     */
+    ChannelsView: {
+      /**
+       * The channels now in force, which is what the client asked for when it succeeded.
+       */
+      channels: string[];
+    };
+    /**
      * What `POST /api/v1/auth/claim` submits — §3.4's one-time setup claim.
      */
     ClaimInput: {
@@ -489,6 +507,61 @@ export interface components {
       section: components["schemas"]["Section"];
     };
     /**
+     * One outstanding or historical enrolment token.
+     *
+     * W7 D-33, as W5 is required to surface it: **leaving enrolment open is the mistake and
+     * it should be visible.** `Enroll` is served only while an unexpired, unconsumed token
+     * exists, so an outstanding row is a door that is open right now.
+     */
+    EnrolmentToken: {
+      /**
+       * When it was consumed, if it was.
+       */
+      consumed_at?: (string | null);
+      /**
+       * Which node consumed it, hex.
+       */
+      consumed_by?: (string | null);
+      /**
+       * When it stops working.
+       */
+      expires_at: string;
+      /**
+       * The row's id, hex. Never the token: the row holds an Argon2id hash and the
+       * plaintext was printed once.
+       */
+      id: string;
+      /**
+       * When it was issued.
+       */
+      issued_at: string;
+      /**
+       * Which peer it was minted for.
+       */
+      peer_name: string;
+      /**
+       * `outstanding`, `used` or `expired` -- the three states the row can be in.
+       */
+      state: string;
+    };
+    /**
+     * Outstanding enrolment and the history behind it.
+     */
+    EnrolmentView: {
+      /**
+       * Every token this node has minted, newest first -- the enrolment log.
+       *
+       * The log and the outstanding list come from the same rows rather than from a
+       * separate audit table, and that is a property worth stating: a history assembled
+       * from a different source than the live state is a history that can disagree with it.
+       */
+      log: components["schemas"]["EnrolmentToken"][];
+      /**
+       * Tokens that would admit a new peer **right now**.
+       */
+      outstanding: components["schemas"]["EnrolmentToken"][];
+    };
+    /**
      * The management API's error body.
      *
      * `summary` is the one plain line a banner shows when there is no field to attach to;
@@ -527,6 +600,21 @@ export interface components {
        * What is wrong, as a sentence that says what to do.
        */
       message: string;
+    };
+    /**
+     * What `GET /api/v1/fleet` returns.
+     *
+     * An object whose three members are each nullable, rather than three routes, because the
+     * two pages that render it show all three together and §4.4 wants one object with named
+     * fields so a fourth number is additive.
+     */
+    FleetView: {
+      enrolment?: (components["schemas"]["EnrolmentView"] | null);
+      /**
+       * Every peer this node knows.
+       */
+      peers: components["schemas"]["PeerView"][];
+      spool?: (components["schemas"]["SpoolView"] | null);
     };
     /**
      * Forecasts and alerts, as their page submits them.
@@ -586,6 +674,41 @@ export interface components {
        * Which stations get forecasts and alerts.
        */
       stations: string[];
+    };
+    /**
+     * One station's latest reading, as the Home tiles and §0.7 step 3 render it.
+     *
+     * A handful of named fields rather than the 212-column reading: these are the ones §0.7's
+     * panel shows, and widening it later is additive under §4.4. The units are in the field
+     * names because the frozen contract's are, and a unit carried in a name cannot be
+     * converted twice.
+     */
+    LatestReading: {
+      barometer_inhg?: (number | null);
+      humidity_pct?: (number | null);
+      rain_day_in?: (number | null);
+      snow_depth_in?: (number | null);
+      solar_wm2?: (number | null);
+      /**
+       * Which station, by the key every path segment uses.
+       */
+      station_key: string;
+      /**
+       * What the operator calls it, so the tile needs no second lookup.
+       *
+       * Filled in by the stream from the vocabulary, **not** by the implementation of
+       * [`Readings`]: D-36 puts the translation on the server in one place, and the half of
+       * the system that produces readings has no business knowing what a station is called.
+       * An implementation may leave it empty.
+       */
+      station_name: string;
+      temperature_f?: (number | null);
+      /**
+       * When the station says it measured.
+       */
+      ts: string;
+      wind_dir_degrees?: (number | null);
+      wind_speed_mph?: (number | null);
     };
     /**
      * Where this node listens, as `System → Advanced` submits it.
@@ -916,6 +1039,38 @@ export interface components {
        * The fewest characters accepted.
        */
       minimum_characters: number;
+    };
+    /**
+     * One peer, as `/data-storage/receive` renders it.
+     */
+    PeerView: {
+      /**
+       * When it was last heard from.
+       */
+      last_seen?: (string | null);
+      /**
+       * The peer's name, as it enrolled.
+       */
+      name: string;
+      /**
+       * Its node id, hex, shown only under `System → Advanced`.
+       */
+      node_id: string;
+      /**
+       * W7 D-40's `IngestBatch.sender_depth`: how many readings the **peer says** it still
+       * has unsent.
+       *
+       * **Peer-reported, and the field name says so**, because W7 D-40 requires W5 to label
+       * it as such wherever it appears and a field called `depth` would make that a
+       * convention the next page could forget. It is what lets this node render fleet-wide
+       * lag without scraping a satellite whose link is down -- and it is the satellite's
+       * own claim, not a measurement.
+       */
+      peer_reported_depth_envelopes?: (number | null);
+      /**
+       * Which stations it has registered, by key.
+       */
+      stations: string[];
     };
     /**
      * What a change does to the running component set.
@@ -1320,6 +1475,72 @@ export interface components {
        * Consequences that do not block.
        */
       warnings: string[];
+    };
+    /**
+     * The unsent-readings buffer, as `/data-storage/send` renders it.
+     *
+     * W7 specified four numbers after W5 had finished and W5's inventory therefore has none
+     * of them. Three are here and the fourth is on [`PeerView`]:
+     *
+     * * `time_remaining_seconds` -- W7's `spool_time_remaining_seconds`;
+     * * the `ceiling < max_lag x rate` advisory of W7 §3.5, as the three figures it compares
+     *   plus the comparison's result, so that the sentence is rendered by W5 §0's vocabulary
+     *   rather than assembled from a server-side string;
+     * * the depth, which W5 already had.
+     *
+     * **The comparison is made here, not in the client.** It is one inequality over three
+     * numbers, and a client that re-derives it is a second opinion about whether an operator
+     * is about to lose data.
+     */
+    SpoolView: {
+      /**
+       * The observed write rate, over the window this process has been running.
+       *
+       * `None` until there is enough traffic to divide by: a rate computed from two
+       * appends is a number that would make the advisory below oscillate.
+       */
+      bytes_per_second?: (number | null);
+      /**
+       * How much disk unsent readings may use before the oldest are reclaimed (W7 D-16).
+       */
+      ceiling_bytes: number;
+      /**
+       * Whether the ceiling covers `max_lag` at the observed rate.
+       *
+       * `None` when there is no rate to compare against, which is **not** the same as
+       * `true`: "we cannot tell yet" and "you are fine" are different sentences, and
+       * collapsing them is what makes a ceiling policy a coin flip (W7 §3.5).
+       */
+      ceiling_covers_max_lag?: (boolean | null);
+      /**
+       * What is on disk now.
+       */
+      depth_bytes: number;
+      /**
+       * How many readings are waiting, when the buffer can say.
+       */
+      depth_envelopes?: (number | null);
+      /**
+       * The last time a peer acknowledged a batch.
+       */
+      last_delivery?: (string | null);
+      /**
+       * How long a cursor may be behind before it is abandoned.
+       */
+      max_lag_seconds: number;
+      /**
+       * What the ceiling would have to be to cover `max_lag` at the observed rate.
+       */
+      needed_for_max_lag_bytes?: (number | null);
+      /**
+       * Where the buffer lives, for `System → Advanced` and for a support message.
+       */
+      path: string;
+      /**
+       * W7's `spool_time_remaining_seconds`: how long the remaining ceiling covers at the
+       * observed rate. `None` for the same reason as the rate.
+       */
+      time_remaining_seconds?: (number | null);
     };
     /**
      * A weather station, as the "Add a station" and "Station settings" forms submit it.
@@ -2117,6 +2338,68 @@ export interface paths {
       responses: {
         200: { content: { "application/json": components["schemas"]["Applied"] } };
         409: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+      };
+    };
+  };
+  "/api/v1/events": {
+    /**
+     * §5's one live connection.
+     */
+    get: {
+      parameters: {
+        query: { channels?: string; log_stream?: string; last_event_id?: string };
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        200: { content?: never };
+        422: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+        501: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+      };
+    };
+  };
+  "/api/v1/events/{stream_id}/channels": {
+    /**
+     * §5.1's in-stream channel change, so a route change does not drop the connection.
+     */
+    post: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path: { stream_id: string };
+        cookie?: never;
+      };
+      requestBody: {
+        content: {
+          "application/json": components["schemas"]["ChannelsInput"];
+        };
+      };
+      responses: {
+        200: { content: { "application/json": components["schemas"]["ChannelsView"] } };
+        404: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+        422: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+        501: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+      };
+    };
+  };
+  "/api/v1/fleet": {
+    /**
+     * **N-11**: the unsent-readings buffer, the peers, and what enrolment is open.
+     */
+    get: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        200: { content: { "application/json": components["schemas"]["FleetView"] } };
+        500: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+        501: { content: { "application/json": components["schemas"]["ErrorBody"] } };
       };
     };
   };

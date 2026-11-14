@@ -97,6 +97,28 @@ impl StateTable {
 #[derive(Debug)]
 pub struct Publication<T> {
     cell: Cell<T>,
+    /// Bumped by every [`Publication::store`], so a reader can wait for the next one.
+    ///
+    /// **This is what lets the management UI push component state without a clock.**
+    /// Without it an observer has to poll, which would mean a second timer in a process
+    /// whose entire §3.3 argument is that there is exactly one -- and polling the state
+    /// table is strictly worse than being told, because the thing a reader wants to know
+    /// is precisely "has it changed".
+    ///
+    /// A **version counter** rather than a `Notify`, and the difference is a race rather
+    /// than a preference: a `Notify` wakes only the waiters registered at the moment of
+    /// the store, so a reader that is between "read the table" and "wait for the next
+    /// change" misses one. A `watch` receiver carries its own seen-marker, so a change
+    /// that lands in that window is still pending when the reader gets there.
+    ///
+    /// The counter and not the table: the value is already shared through the `Arc` the
+    /// cell hands out, and a second copy of it in a channel would be a second answer to
+    /// what the current state is. A woken reader re-reads through [`Publication::load`].
+    ///
+    /// Absent under `--cfg loom`, which models the cell's memory ordering and links a
+    /// `loom` runtime rather than tokio's.
+    #[cfg(not(loom))]
+    version: tokio::sync::watch::Sender<u64>,
 }
 
 #[cfg(not(loom))]
@@ -111,7 +133,22 @@ impl<T> Publication<T> {
         let cell = arc_swap::ArcSwap::new(value);
         #[cfg(loom)]
         let cell = loom::sync::RwLock::new(value);
-        Self { cell }
+        Self {
+            cell,
+            #[cfg(not(loom))]
+            version: tokio::sync::watch::Sender::new(0),
+        }
+    }
+
+    /// A receiver that fires on every [`Publication::store`].
+    ///
+    /// Held across iterations by its one consumer -- the management API's live stream --
+    /// which is what makes the wait race-free; a receiver created afresh for each wait
+    /// would mark the current version as seen and miss the change it was created to
+    /// notice.
+    #[cfg(not(loom))]
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.version.subscribe()
     }
 
     /// Read the current value. One load; the `Arc` keeps it alive for the caller.
@@ -132,6 +169,9 @@ impl<T> Publication<T> {
         #[cfg(not(loom))]
         {
             self.cell.store(value);
+            // After the store, so a reader woken by this always loads the value that woke
+            // it rather than the one before it.
+            self.version.send_modify(|v| *v = v.wrapping_add(1));
         }
         #[cfg(loom)]
         {

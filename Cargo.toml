@@ -60,6 +60,8 @@ thiserror = "2"
 # the part `ci/layers.toml` enforces.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "fs", "io-util", "sync", "signal", "process"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+# `wrappers::BroadcastStream`, for the management API's SSE endpoint (M7-3).
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Sink composition, rate limiting (D-32). The layer order in component-model.md §4b.5 is
 # Retry outside RateLimit outside Timeout, which is why all three features are here.

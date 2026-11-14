@@ -26,3 +26,8 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 # copy `tests/emulators/manifest.toml` recorded. D-32 governs the DAEMON's dependencies and
 # "test infrastructure is out of its scope" (**A-4**), which is what this crate is.
 sha2 = "0.10"
+# `gate-ui-bundle` measures the bundle **gzipped**, because that is what a browser
+# downloads and therefore what W5 §6.5's numbers mean. Done in-process rather than by
+# shelling out to `gzip`, so the gate needs nothing on PATH and two runs of the same tree
+# produce the same number.
+flate2 = "1"

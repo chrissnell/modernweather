@@ -26,6 +26,7 @@ mod authstore;
 mod boot;
 mod config;
 mod hostinfo;
+mod live;
 mod logctl;
 mod migrate;
 mod notify;
