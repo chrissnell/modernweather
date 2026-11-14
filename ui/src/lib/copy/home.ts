@@ -16,7 +16,14 @@ export const home = {
     waiting: 'Waiting',
     failed: 'Stopped',
     backoff: 'Retrying',
-    off: 'Turned off'
+    // **Not "Turned off".** The server's `off` bucket is "stopped, finished, or not
+    // started", and §0.4 gives those different words on purpose: a `Finished` one-shot is
+    // badged **Done** and only a `Stopped` one is **Off**, "because the only way an
+    // operator reaches `Stopped` deliberately is by turning something off". Labelling the
+    // tile "Turned off" therefore reported a successful start-up warm-up as something the
+    // operator had switched off -- which is the §2 lie in miniature, on the one screen
+    // that exists to answer "is this working?".
+    off: 'Not running'
   },
   stations: {
     heading: 'Your stations',
