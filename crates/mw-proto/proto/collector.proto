@@ -16,11 +16,19 @@
 // docs/collector.md §4.1 names the package `weather.v1`; the generator emits
 // `modernweather.v1`, and the generator is the artefact.
 //
-// SCOPE. This file carries `Envelope` and nothing else. `service Collector`, `IngestBatch`,
-// `IngestAck`, `OriginHigh`, `AckStatus`, `NodeIdentity`, `HelloAck`, `EnrolRequest` and
-// `EnrolGrant` are implementation-plan.md M6-4's, together with the tonic build they need;
-// `Envelope` is here because implementation-plan.md M3-2 owns the spool record format and
-// that format IS this message. `WeatherV1` is not touched (W7 D-19).
+// SCOPE. `Envelope` is here because implementation-plan.md M3-2 owns the spool record
+// format and that format IS this message. Everything else -- `service Collector`,
+// `IngestBatch`, `IngestAck`, `OriginHigh`, `AckStatus`, `NodeIdentity`, `StationMeta`,
+// `HelloAck`, `EnrolRequest`, `EnrolGrant` -- arrived with implementation-plan.md M6-4,
+// the collector. `WeatherV1` is not touched (W7 D-19).
+//
+// NO SERVICE CODE IS GENERATED FROM THE `service` BLOCK BELOW. `build.rs` runs
+// `prost-build` with no service generator, so the block is a declaration of the contract
+// and `prost` skips it; the method paths, the codecs and the two bodies are hand written in
+// `mw-collector`, which is the arrangement `mw_grpc::codec` already documents for
+// `WeatherV1` and the snow gauge. What that costs is one constant per method instead of a
+// derived path, and `mw_collector::service`'s tests assert each string exactly, because a
+// method path is a wire contract.
 
 syntax = "proto3";
 
@@ -69,4 +77,224 @@ message Envelope {
 
     // The reading itself, every metric field `optional` (D-89).
     modernweather.v1.Reading reading = 7;
+}
+
+// The node-to-node service (W7 D-19): a NEW service in a NEW file, because `WeatherV1`
+// carries the app-facing query RPCs with `google.api.http` annotations onto the surface W1
+// froze, and is registered at three separate sites in the Go tree.
+service Collector {
+    // Identity only. No secrets, ever (§5.2, W7 D-32).
+    rpc Hello(NodeIdentity) returns (HelloAck);
+
+    // Bidirectional and acked (§4.2, W7 D-20). Replaces
+    // `SendWeatherReadings(stream WeatherReading) returns (Empty)`, under which no sender
+    // could ever learn what its collector persisted -- with or without a local buffer.
+    rpc Ingest(stream IngestBatch) returns (stream IngestAck);
+
+    // Bootstrap only, separately gated (§5.3, W7 D-33).
+    rpc Enroll(EnrolRequest) returns (EnrolGrant);
+}
+
+// One batch, which is one append call, one fsync and one atom (W7 D-14).
+message IngestBatch {
+    // At most 256, and at most 1 MiB encoded. Over either, the stream is CLOSED rather
+    // than the batch trimmed: a trimmed batch would make `IngestAck.through` a claim about
+    // envelopes the collector never saw.
+    repeated Envelope envelopes = 1;
+
+    // The SENDER's spool `seq` of the last envelope in this batch -- the sender's
+    // coordinate space, not any origin's (W7 D-22). For a leaf satellite the two are
+    // numerically identical because the sender is the sole origin; for a relay this is the
+    // only form a cursor can consume, because a cursor is a position in ONE log and a
+    // relay's log interleaves origins.
+    uint64 through = 2;
+
+    // Envelopes still unsent in the sender's spool (§7). One varint per batch, and it is
+    // what lets a collector render fleet-wide lag without scraping a satellite whose link
+    // is down. PEER-REPORTED, and W5 must label it as such.
+    uint64 sender_depth = 3;
+}
+
+// One cumulative acknowledgement.
+//
+// An ack means **durably appended to the collector's spool**, not written to PostgreSQL
+// (W7 D-21). The collector's database write is a cursor on that same spool, so acking on
+// the database would make a stalled database back-pressure every satellite in the fleet.
+message IngestAck {
+    // Cumulative in the SENDER's coordinate space: every sender position at or below this
+    // is durable here.
+    //
+    // **MEANINGLESS UNLESS `status == ACK_OK` OR `ACK_REJECTED`. A sender must not move a
+    // cursor on any other status.** On `ACK_RESOURCE_EXHAUSTED` this carries the last
+    // position that *was* acknowledged on this stream, which is `0` when none has been --
+    // so a sender that advanced to it unconditionally would rewind to the start of its
+    // spool and replay everything it still holds. The dedup gate absorbs that, so it is a
+    // storm rather than a loss, but it is not what the field means.
+    //
+    // `ACK_REJECTED` carries the batch's own `through`, because every envelope in it was
+    // refused for a reason no later configuration changes (see `AckStatus`).
+    uint64 through = 1;
+
+    // The collector's per-origin high water, sent on the FIRST ack of a stream (W7 D-23).
+    // Advisory: the sender may skip a leading run it demonstrably already delivered, and
+    // ignoring it costs only deduplicated resends.
+    repeated OriginHigh known_through = 2;
+
+    AckStatus status = 3;
+
+    // In the batch just acked, for the sender's counters.
+    uint32 duplicates = 4;
+    uint32 rejected = 5;
+}
+
+// One origin's high-water sequence, for `HelloAck` and the first `IngestAck`.
+message OriginHigh {
+    // NodeId, 16 bytes.
+    bytes origin = 1;
+    // The highest `seq` from that origin this collector has durably appended.
+    uint64 seq = 2;
+}
+
+enum AckStatus {
+    // **Never sent.** proto3 makes field 0 the value a message that sets nothing decodes
+    // to, so whatever sits here is what an `IngestAck` from a buggy implementation -- or
+    // one whose `status` a proxy dropped -- claims. `ACK_OK` in this slot would make that
+    // message a successful durable acknowledgement and a receiver would advance its cursor
+    // on it; an unusable value makes it a protocol error instead.
+    ACK_UNSPECIFIED = 0;
+
+    // Everything in this batch that was not a duplicate is durably appended, and `through`
+    // may be taken as the sender's new cursor position.
+    ACK_OK = 1;
+
+    // **Back off and send this batch again.** `through` carries no new position.
+    //
+    // Two conditions produce it and both are properties of THIS node rather than of the
+    // batch, which is why they share an answer:
+    //
+    //   * the collector's spool is at its ceiling -- the collector's `Failed`, not the
+    //     satellite's (§4.3);
+    //   * one or more envelopes were refused for a reason this node can stop refusing --
+    //     a clock outside the skew window, a station it has no row for yet, an origin grant
+    //     an operator has not written, a full origin table.
+    //
+    // The second is the important one and it is not in §4.5's table. Acknowledging past
+    // such an envelope destroys an observation a later configuration would have accepted,
+    // and reports success while doing it: a collector ten minutes ahead of true time would
+    // refuse every envelope from every satellite in the fleet, and if that advanced their
+    // cursors the readings would be gone from every spool before NTP corrected the clock.
+    // Stalling instead costs a bounded delay -- `[spool].max_lag` is the backstop -- and is
+    // the only direction that cannot lose data silently.
+    ACK_RESOURCE_EXHAUSTED = 2;
+
+    // **Every envelope in this batch was refused permanently; do NOT retry.** `rejected`
+    // says how many, and `through` advances, because nothing here will ever be acceptable:
+    // a forged path, a hop that repeats, a reading with no metric. Stop and look at the
+    // sender's configuration -- the collector's `ingest_rejected_total{peer, reason}` says
+    // which clause.
+    ACK_REJECTED = 3;
+}
+
+// Registration carries identity ONLY (§5.2, W7 D-32).
+//
+// What is absent is the point. `RemoteStationConfig` (`remoteweather.proto:353-377`) has 15
+// fields, of which 12 are third-party service configuration and **4 are plaintext
+// secrets** -- `aprs_password`, `wu_api_key`, `aeris_client_secret`, `pws_password` --
+// which crossed the wire at every registration and came to rest in a second database in
+// cleartext, for a capability nothing ever read. They have no successor here. §6 is what
+// replaces them: the collector uploads on behalf of the fleet using its OWN credentials.
+message NodeIdentity {
+    // 16 bytes, allocated once by the node itself at first start.
+    bytes node_id = 1;
+    // Operator-facing, mutable, never an identity.
+    string node_name = 2;
+    // e.g. "modernweather 1.4.2". Load-bearing rather than decorative: W7 OQ-W7-6 gates
+    // removal of the Go compat shim on `peer_software_info` showing no Go-era peers.
+    string software = 3;
+    repeated StationMeta stations = 4;
+}
+
+// One station a peer declares, as the peer describes it.
+message StationMeta {
+    string station_key = 1;
+    string name = 2;
+    string station_type = 3;
+
+    // The node that **measures** this station -- `config.stations.owning_node_id` on the
+    // declaring node, 16 bytes. Absent means "the declaring peer itself".
+    //
+    // Not in §5.2's field list, and §2.3's diamond is why it has to be. `NodeIdentity`
+    // announces every `config.stations` row a node has, received ones included, because a
+    // relay's inventory is what makes the nodes behind it resolvable two hops up (§5.1).
+    // Without this field the receiver can only attribute every one of them to the relay
+    // that declared it -- and then in A -> {B, C} -> D, whichever relay said hello first
+    // owns A's station, so the other relay's envelopes for it are refused for ever as
+    // `UnauthorizedOrigin`. §2.3 is explicit that both arrivals are legitimate and that the
+    // dedup gate is what distinguishes them.
+    //
+    // **Authorised, not trusted.** A peer may only declare an owner it is entitled to speak
+    // for: itself always, and a node in its `peer_origins` grant when `peers.relay` is set
+    // (`mw_store::peers::upsert_station`). So this field cannot be used to attribute a
+    // station to a node the declaring peer has no authority over -- which is the same rule
+    // §5.4's layer 3 applies to an envelope's origin, applied to a registration.
+    bytes owning_node = 9;
+
+    // `optional` on all three coordinates, which is **D-89**'s field presence applied one
+    // level out from the reading. A proto3 bare `double` makes absent and `0.0` the same
+    // bytes, and `0.0, 0.0` is a real place in the Gulf of Guinea -- so an unplaced station
+    // and a station on the prime meridian would be indistinguishable, and the clear-sky
+    // model would be evaluated at the wrong one of them. §5.2 writes these as bare
+    // `double`; this is the same correction D-89 already made for every metric field, and
+    // the alternative was a zero-fill at the encoder that `ci/layers.toml`'s
+    // `one-zero-fill` rule exists to refuse.
+    optional double latitude = 4;
+    optional double longitude = 5;
+    optional double altitude_m = 6;
+
+    // IANA name (W2a Decision 11). A bare `string` needs no `optional`: the empty string is
+    // not a zone, so absent and empty are the same fact rather than two.
+    string timezone = 7;
+    // Identity, not a credential (§6.2, W7 D-39): a callsign is public, and beaconing on
+    // someone's behalf stays an explicit operator action on the collector. The passcode
+    // does not travel.
+    string aprs_callsign = 8;
+}
+
+message HelloAck {
+    bytes collector_node_id = 1;
+    // The station keys this collector will accept from this peer, which is what makes a
+    // satellite's `Reject::UnknownStation` visible at connect rather than per envelope.
+    repeated string accepted_stations = 2;
+    repeated OriginHigh known_through = 3;
+    // Unix milliseconds, so the satellite can export `clock_skew_seconds` against its
+    // collector and a drifting clock is a number before it is a rejection (§4.6).
+    int64 server_time = 4;
+    uint32 max_batch_envelopes = 5;
+}
+
+// The one-time bootstrap (§5.3, W7 D-33). Separately gated, rate-limited, and served only
+// while at least one unexpired token exists.
+message EnrolRequest {
+    // The operator-minted single-use token, stored Argon2id-hashed and compared
+    // constant-time. Never logged.
+    string token = 1;
+    // The DER SubjectPublicKeyInfo of the keypair this node generated.
+    //
+    // **An SPKI, not a PKCS#10 CSR.** §5.3 writes "sends Enroll { token, csr, identity }"
+    // and the collector "signs the CSR with the collector's peer CA (or records the SPKI
+    // fingerprint when auth_kind = "mtls-pinned")". Signing needs an X.509 issuer, which
+    // DESIGN.md D-32 names no crate for; pinning needs exactly these bytes. So the field
+    // carries the part both paths need, and `mw_collector::enrol` refuses the CA path by
+    // name rather than half-implementing it.
+    bytes spki = 2;
+    NodeIdentity identity = 3;
+}
+
+message EnrolGrant {
+    // The pinned SPKI SHA-256 this collector recorded, as the peer should now expect to be
+    // recognised by. Empty under a CA, where the certificate chain does the authenticating.
+    bytes pinned_spki_sha256 = 1;
+    bytes collector_node_id = 2;
+    // Which `peers.auth_kind` was recorded: "mtls-pinned" or "psk".
+    string auth_kind = 3;
 }

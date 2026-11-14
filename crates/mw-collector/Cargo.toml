@@ -16,9 +16,49 @@ workspace = true
 mw-component.workspace = true
 mw-types.workspace = true
 mw-proto.workspace = true
+# The spool, for the two numbers the uplink reports about itself (`crate::uplink`), and
+# the batch limits `Ingress::accept` enforces -- declared there, read here, so the wire
+# limit and the admission limit cannot drift apart.
+mw-pipeline.workspace = true
+# `RouteTable`, which is how a service reaches the one listener, and `PeerCerts`, which is
+# how the handshake's result reaches a method body. `mw-grpc` and `mw-api-legacy` take the
+# same route for the same reason: the listener may not name the crates it serves.
+mw-http.workspace = true
 
 tonic.workspace = true
+tonic-prost.workspace = true
+prost.workspace = true
+# Every service here is an `axum` route on the shared router, like every other route
+# table's: this crate may not bind a socket (ci/layers.toml, §1.4).
+axum.workspace = true
+http.workspace = true
+# The slot the running component installs its handlers into, which is
+# `mw_api_legacy::RouteState`'s pattern.
+arc-swap.workspace = true
 tokio.workspace = true
-tracing.workspace = true
-thiserror.workspace = true
 chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+metrics.workspace = true
+# Layer 1. The client-certificate verifier the ingest socket is configured with, and the
+# SHA-256 the SPKI pin is computed with -- `rustls`'s `ring` provider is already in the
+# binary (**A-W8-3**), so there is one digest implementation rather than two. `mw-http`
+# binds the socket; this crate decides who may complete a handshake on it.
+rustls.workspace = true
+rustls-pemfile.workspace = true
+# The uplink dials its collector. A CLIENT, not a listener: `ci/layers.toml`'s
+# `only-mw-http-binds-a-socket` rule names `tonic::transport::Server`, and this is
+# `Channel`.
+tower.workspace = true
+# `peers.auth_material`'s PSK hash is Argon2id, and the comparison inside
+# `Argon2::verify_password` is `password-hash`'s own constant-time one (**D-33**) -- which
+# is why `subtle` is NOT declared here: it would be a row in a D-32-governed manifest for a
+# comparison this crate does not write itself.
+argon2.workspace = true
+secrecy.workspace = true
+
+[dev-dependencies]
+# `macros` for `#[tokio::test]`.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `CancellationToken`, to construct the `Cx` a `Serve` body is handed.
+tokio-util.workspace = true

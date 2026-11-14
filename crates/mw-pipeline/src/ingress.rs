@@ -22,8 +22,8 @@
 //! The claim is about `admit`, and it is worth being exact about its limit: `StationKey::new`
 //! is public and validates nothing, and `mw-proto`'s envelope decode calls it on a peer's
 //! bytes. So on the `accept` path a station key is a *claim* until W7 §4.4 step 5 resolves
-//! it — which is M6-4's, is marked below at the line it goes on, and is why `accept` does
-//! not label a metric with the key.
+//! it — which `mw_collector::admit::Gate` does, **before** calling `accept`, and which is
+//! why `accept` does not label a metric with the key.
 //!
 //! **W3 D-87 is a property of the signatures here, not a rule to remember.** The only
 //! `.await` on `admit`'s path is the spool's group commit: `resolve` is a synchronous trait
@@ -34,19 +34,25 @@
 //!
 //! # What is deliberately not here
 //!
-//! Three of W7 §4.4's eleven `accept` steps are other items', and each is marked at the
-//! point it would go rather than only listed here, because a comment in a source file is
-//! not a work item (docs/reconciliation.md G-5) and a list in a module doc is not either:
+//! Three of W7 §4.4's eleven `accept` steps are **`mw_collector::admit::Gate`'s**, and they
+//! run before this crate is called rather than inside it:
 //!
-//! - **`origin ∈ peer.origins`** (`accept` step 3) — M6-4, which owns the peer registry and
-//!   the `relay = false` default.
-//! - **the clock-skew window** (`accept` step 4) — M6-4, with the rest of §4.6's boundary
-//!   validation.
-//! - **`station_key` resolves in `StationRegistry`** (`accept` step 5) — M6-4. The lookup a
-//!   peer's envelope needs is by key, and [`StationRegistry::metadata`] is now by key — but
-//!   it is total by design (an unknown station is `StationMeta::EMPTY`, not a refusal), so
-//!   it is deliberately **not** the resolution check. Turning it into one would make an
-//!   unplaced station's envelopes unstorable.
+//! - **`origin ∈ peer.origins`** (`accept` step 3) — it needs the peer registry, and this
+//!   crate holds the spool and the station registry and has no idea what a peer is.
+//! - **the clock-skew window** (`accept` step 4) — it needs a clock, and §4.6's window is
+//!   policy about who may say what rather than part of the append.
+//! - **`station_key` resolves, and its owner is on the inbound path** (`accept` step 5).
+//!   [`StationRegistry::metadata`] is deliberately **not** that check: it is total by design
+//!   (an unknown station is `StationMeta::EMPTY`, not a refusal), because turning it into a
+//!   refusal would make an unplaced station's envelopes unstorable.
+//!   [`StationRegistry::station_owner`] is the check, and `mw_collector::admit`'s module
+//!   documentation has why the owner clause is one wider than §4.4 writes it.
+//!
+//! What matters is the **order**, and it holds: everything in that list runs before
+//! `accept`, and `accept` is the only thing that can append to the spool — so an envelope
+//! that failed any of them never reaches the spool, and therefore never reaches the reading
+//! stream, the downstream peers, the snapshot or the database. That is W7 §4.4's "steps 2–7
+//! run before step 9", expressed as which function holds the spool.
 //!
 //! **The `stations` upsert of D-56 is not here either, and that one is a departure rather
 //! than a deferral.** D-56 assigns it to `admit`, and `admit` cannot do it: W3 **D-87**
@@ -283,9 +289,10 @@ impl SpoolIngress {
                 rejected += 1;
                 continue;
             }
-            // 3. `origin ∈ peer.origins` -- M6-4's, with the peer registry.
-            // 4. The clock-skew window -- M6-4's, with §4.6's boundary validation.
-            // 5. `station_key` resolves -- M6-4's, with the registry method it needs.
+            // 3. `origin ∈ peer.origins`, 4. the clock-skew window and 5. the station's
+            // existence and owner have all already run, in `mw_collector::admit::Gate`,
+            // before this function was called -- see this module's own documentation for
+            // why they are there and not here.
             // 8. enrich. Idempotent and `None`-only, which is what makes a collector agree
             // with its satellite rather than recompute from a different formula version.
             // It is here rather than skipped because a satellite may be *older* than this
@@ -362,10 +369,12 @@ impl SpoolIngress {
             );
         }
         for envelope in &committed.envelopes {
-            // No `station` label here: on this path the key is a peer's claim until
-            // M6-4's registry check lands, and §5.10 forbids a label whose values come
-            // from a request. The `admit` path labels its own, because `resolve` has
-            // already bounded it.
+            // No `station` label here. The key has been resolved by then --
+            // `mw_collector::admit::Gate` refuses an envelope whose station has no row --
+            // but this function is reachable with any `Ingress` implementation and a
+            // gate-less caller would be labelling a counter from a request. The per-peer
+            // breakdown that IS bounded by configuration is
+            // `mw_collector::metrics::ingested`, keyed by peer and origin.
             m::accepted(envelope.station.as_str());
         }
         // 11.

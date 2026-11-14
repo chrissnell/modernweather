@@ -880,4 +880,10 @@ impl StationRegistry for OneStation {
     fn projection(&self, _station: &StationKey) -> Option<StationProjection> {
         None
     }
+
+    /// The one station this double resolves to, so a driver test cannot accidentally
+    /// assert W7 §4.4 step 5 passing for a key nothing is configured for.
+    fn station_owner(&self, station: &StationKey) -> Option<mw_types::OriginId> {
+        (*station == self.station).then(|| mw_types::OriginId::new([1; 16]))
+    }
 }

@@ -346,4 +346,19 @@ impl StationRegistry for MemoryRegistry {
     fn projection(&self, _station: &StationKey) -> Option<mw_component::StationProjection> {
         None
     }
+
+    /// Whatever `allow` mapped, owned by node `1`.
+    ///
+    /// Not unconditionally `Some`: W7 §4.4's step 5 is a refusal, and a double that owned
+    /// every key would make a test asserting the refusal pass for the wrong reason.
+    fn station_owner(&self, station: &StationKey) -> Option<mw_types::OriginId> {
+        let known = self.fixed.lock().expect("not poisoned").as_ref() == Some(station)
+            || self
+                .presented
+                .lock()
+                .expect("not poisoned")
+                .values()
+                .any(|s| s == station);
+        known.then(|| mw_types::OriginId::new([1; 16]))
+    }
 }

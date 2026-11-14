@@ -88,6 +88,8 @@ const REGISTRARS: &[&dyn Registrar<Config>] = &[
     &Stations,
     &SnowGauges,
     &ReadingReceiver,
+    &Collector,
+    &Uplinks,
     &Database,
     &Rollup,
     &Snow,
@@ -179,6 +181,50 @@ impl Registrar<Config> for ReadingReceiver {
         out: &mut Vec<mw_component::ComponentSpec>,
     ) -> Result<(), RegisterError> {
         mw_grpc::grpcrx::register(cfg, cfg.grpcrx_service.as_ref(), out)
+            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
+    }
+}
+
+/// `ingest:grpc` — `mw-collector`'s `collector.v1.Collector`.
+///
+/// Conditional on a `config.ingest` row with `listen = 'grpc'`, which is the same
+/// predicate `station:grpcrx` is planned on — the two services share that row and are
+/// mounted side by side, because they are the *same endpoint* carrying two schemas: the
+/// new node-to-node one and the Go compat shim (W7 §9.2). What distinguishes them is the
+/// contract, not the port.
+#[derive(Debug)]
+struct Collector;
+
+impl Registrar<Config> for Collector {
+    fn name(&self) -> &'static str {
+        "mw-collector (ingest:grpc)"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        mw_collector::service::register(cfg, out)
+            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
+    }
+}
+
+/// One `uplink:<peer>` per `uplink` row — the other half of **D-44**.
+#[derive(Debug)]
+struct Uplinks;
+
+impl Registrar<Config> for Uplinks {
+    fn name(&self) -> &'static str {
+        "mw-collector (the uplinks)"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        mw_collector::uplink::register(cfg, out)
             .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
     }
 }
@@ -841,6 +887,16 @@ impl Slots {
         self.epoch
     }
 
+    /// The live station registry, for the half of it that is not a `StationRegistry`.
+    ///
+    /// `mw_store::PeerStore` publishes the **peer** half of the same object through an
+    /// inherent method, so it needs the concrete type rather than the trait (W7 §5.1: one
+    /// capability, two accessor sets). `None` before the first build, which is the one call
+    /// that has a snapshot and no registry to put it in.
+    pub(crate) fn registry(&self) -> Option<Arc<mw_store::ConfigRegistry>> {
+        self.registry.clone()
+    }
+
     /// Replace the station registry's snapshot. **After a commit only.**
     ///
     /// This is what makes a rotated ingest secret, a renamed station, a corrected altitude
@@ -895,6 +951,107 @@ pub(crate) fn assert_mounted_tables_match(
     Ok(())
 }
 
+/// Allocate this node's identity, once, at first start (W7 **D-5**).
+///
+/// Three values, and each one is somebody's decision rather than this function's:
+///
+/// - **`node_id`** is a UUIDv7 the node mints (`mw_store::ident`). Not a migration's,
+///   because every fresh install would then claim the same identity.
+/// - **`spool_path`** is `spool/` **beside `config.db`**, which is W7 **D-10**: the spool is
+///   "a sibling of `config.db`, not inside it" -- SQLite is the wrong write shape for a
+///   2 GiB append-only log, and a spool filesystem failure must be distinguishable from a
+///   configuration failure. The column has no `DEFAULT` for exactly that reason: only
+///   whoever knows where `config.db` is can answer it.
+/// - **`node_name`** is the hostname, because that is the name an operator already uses for
+///   the machine, and it is **mutable**: renaming a node is not an identity change (§5.2).
+///
+/// A second process racing on the same database adopts the winner's identity rather than
+/// overwriting it (`config_db::allocate_node`), which matters because a `node_id` that
+/// changed under a spool whose `MANIFEST` holds the old one is a spool this build refuses
+/// to open.
+async fn allocate_node(
+    pool: &sqlx::SqlitePool,
+    config_path: &std::path::Path,
+) -> anyhow::Result<mw_store::config_db::Node> {
+    let node_id =
+        mw_store::ident::node_id(chrono::Utc::now()).context("minting this node's NodeId")?;
+    let spool = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("spool");
+    let name = hostname();
+    let node =
+        mw_store::config_db::allocate_node(pool, &node_id, &name, &spool.to_string_lossy()).await?;
+    info!(
+        node = %name,
+        spool = %spool.display(),
+        "this node allocated its identity: a UUIDv7, once, never edited"
+    );
+    Ok(node)
+}
+
+/// This machine's hostname, for `node.node_name`.
+///
+/// Two files and a fallback, rather than `gethostname(3)`: that is a syscall needing
+/// `libc` or an `unsafe` block, and `DESIGN.md` **D-32** names neither. The column is
+/// operator-facing and mutable, so a wrong answer costs a label somebody can edit -- it is
+/// not an identity.
+fn hostname() -> String {
+    for path in ["/etc/hostname", "/proc/sys/kernel/hostname"] {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            let name = text.trim();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    "modernweather".to_string()
+}
+
+/// Step 4d: publish the peer half of the station registry, and hand the collector and the
+/// uplink what they read off the spool.
+///
+/// **One snapshot, two accessor sets** (W7 §5.1). `PeerStore` holds the pool for its writes
+/// and the published registry for its reads, which is what makes "a `Hello` registered this
+/// station" and "the gate can resolve it" the same fact rather than two.
+async fn attach_peers(
+    cfg: &mut Config,
+    fanout: &spool::Fanout,
+    pool: &sqlx::SqlitePool,
+    registry: Arc<mw_store::ConfigRegistry>,
+) -> anyhow::Result<()> {
+    let identity = node_identity(cfg);
+    // This node's own id separates a **local** station from one a peer owns, which is the
+    // predicate the peer snapshot's station map is read with
+    // (`mw_store::PeerSnapshot::with_peer_stations`). `node_identity`'s own fallback is
+    // unreachable here -- `attach_peers` runs only for a node that opened a spool, which
+    // needs a 16-byte `node_id` -- and is an all-zero id, which owns nothing.
+    let store = Arc::new(mw_store::PeerStore::new(
+        pool.clone(),
+        registry,
+        identity.node,
+    ));
+    let snapshot = store.republish().await.context("reading the peer rows")?;
+    info!(peers = snapshot.len(), "peer registry published");
+    for peer in snapshot.peers() {
+        if peer.is_revoked() {
+            // An operator's own past decision, still being honoured. Said once at startup
+            // because a revoked peer's connection attempts are otherwise just a counter.
+            warn!(
+                peer = %peer.name,
+                "this peer's enrolment is revoked, so its connections are refused"
+            );
+        }
+    }
+    cfg.set_collector(
+        store as Arc<dyn mw_component::PeerRegistry>,
+        Arc::clone(&fanout.spool),
+        identity,
+    );
+    Ok(())
+}
+
 /// Fold the shared root state's epoch into every component's `ConfigDigest`.
 ///
 /// [`Slots`]' documentation has the argument. In one sentence: a component's digest covers
@@ -904,6 +1061,65 @@ pub(crate) fn assert_mounted_tables_match(
 pub(crate) fn stamp(specs: &mut [mw_component::ComponentSpec], epoch: u64) {
     for spec in specs {
         spec.config_digest = mw_component::ConfigDigest::of(&(spec.config_digest.get(), epoch));
+    }
+}
+
+/// What an uplink's `Hello` announces about this node (§5.2).
+///
+/// **Every `config.stations` row, local and received.** A relay's rows include the stations
+/// it received from the nodes behind it, and a collector two hops up needs those rows to
+/// exist or §4.4's step 5 refuses everything the relay forwards. "A node has stations" is
+/// about the node's inventory, not only about its own sensors.
+///
+/// Identity only: no `ingest_secret_hash`, no third-party credential, nothing but what
+/// `StationMeta` carries. The 12 third-party-config fields and 4 plaintext secrets of
+/// `RemoteStationConfig` have no successor (**D-67**).
+fn node_identity(cfg: &Config) -> mw_collector::Identity {
+    let node = cfg
+        .node
+        .as_ref()
+        .and_then(|node| <[u8; 16]>::try_from(node.node_id.as_slice()).ok())
+        .map(mw_types::OriginId::new)
+        // Unreachable: `attach_peers` runs only for a node with a spool, which exists only
+        // for a node with a 16-byte `node_id`. An all-zero id would be refused by every
+        // collector rather than silently accepted as somebody.
+        .unwrap_or(mw_types::OriginId::new([0; 16]));
+    let stations = cfg
+        .stations
+        .iter()
+        .map(|row| {
+            mw_collector::wire::station_meta(
+                &mw_types::StationKey::new(row.station_key.as_str()),
+                &mw_component::StationProjection {
+                    name: row.name.clone(),
+                    kind: row.kind.clone(),
+                    timezone: row.timezone.clone().filter(|z| !z.trim().is_empty()),
+                    latitude: row.latitude,
+                    longitude: row.longitude,
+                    altitude_m: row.altitude_m,
+                    snow_base_distance_mm: row.snow_base_distance_mm,
+                },
+                // **The row's own owner, not this node's id.** For a local sensor the two
+                // are the same; for a station this node received from a peer they are not,
+                // and a collector two hops up needs the difference or §2.3's diamond
+                // refuses one of two legitimate arrivals for ever. A row whose column is
+                // not 16 bytes falls back to this node, which the receiving end then
+                // refuses to attribute elsewhere -- the fail-closed direction.
+                <[u8; 16]>::try_from(row.owning_node_id.as_slice())
+                    .map(mw_types::OriginId::new)
+                    .unwrap_or(node),
+            )
+        })
+        .collect();
+    mw_collector::Identity {
+        node,
+        name: cfg
+            .node
+            .as_ref()
+            .map(|n| n.node_name.clone())
+            .unwrap_or_default(),
+        software: concat!("modernweather ", env!("CARGO_PKG_VERSION")).to_string(),
+        stations,
     }
 }
 
@@ -980,6 +1196,13 @@ pub(crate) struct Mounted {
     /// `None` on the first build, where there was no registry to publish into and the
     /// snapshot went straight into it.
     registry: Option<mw_store::RegistrySnapshot>,
+    /// The collector's state slot, when this node has a `config.ingest` row.
+    ///
+    /// Carried out rather than stored on the configuration here, because the other half of
+    /// what `Config::set_ingest` takes -- the ingest socket's TLS -- is assembled from the
+    /// SNI resolver this function has only just built, and the resolver belongs to the
+    /// caller's step. `None` is every satellite (W7 **D-44**).
+    collector: Option<Arc<mw_collector::ServiceState>>,
 }
 
 /// Build the route tables, the host table and the certificate store.
@@ -1032,6 +1255,9 @@ fn build_route_tables(
     cfg.set_web_states(states);
 
     let snapshot = cfg.snapshot.clone();
+    // The collector's own sweep, for the same reason and on the same path: see
+    // `mw_collector::service::Handlers::sweep_last_seen`.
+    let ingest = cfg.ingest_service.clone();
     let mut tables = vec![mw_http::metrics_table(mw_http::MetricsRoute::new(
         Arc::new(move || {
             // **M4-1's constraint 2, on the scrape path.** `mw_snapshot_age_seconds` and
@@ -1042,6 +1268,12 @@ fn build_route_tables(
             // immediately before the payload is rendered.
             if let Some(state) = &snapshot {
                 mw_pipeline::metrics::sweep_snapshot_ages(state, chrono::Utc::now());
+            }
+            // §7's `peer_last_seen_seconds`: written to zero when a peer arrives, and aged
+            // here. `handlers()` is `None` while the component is not running, which is
+            // when there is nothing to age.
+            if let Some(handlers) = ingest.as_ref().and_then(|state| state.handlers()) {
+                handlers.sweep_last_seen();
             }
             render()
         }),
@@ -1090,6 +1322,28 @@ fn build_route_tables(
         );
         cfg.set_grpcrx_service(state);
     }
+    // `collector.v1.Collector`'s three methods and `POST /v1/ingest`, on the same predicate
+    // `mw_collector::service::register` plans on -- **either** ingest row, because the gRPC
+    // row brings the service and the REST row brings the path (§8.3's collector has both).
+    // The rows also decide *which* paths the table carries, which is why they travel into
+    // it: `mw_collector::service::manifest` has why.
+    //
+    // Mounted beside the compat shim's two, because they are the same endpoint carrying two
+    // schemas (W7 §9.2).
+    let collector_state = if cfg.ingest.is_empty() {
+        None
+    } else {
+        let state = Arc::new(mw_collector::ServiceState::new());
+        tables.push(
+            mw_collector::service::route_table(
+                Arc::clone(&state),
+                mw_collector::CollectorConfig::ingest(cfg),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("building the collector's route table")?,
+        );
+        Some(state)
+    };
     tables.extend(mw_web::tables(cfg).context("building the website's route tables")?);
 
     // §6.3's host table, in configuration order -- which is id order, because
@@ -1137,6 +1391,7 @@ fn build_route_tables(
         certs: sni,
         hostnames,
         registry,
+        collector: collector_state,
     })
 }
 
@@ -1230,6 +1485,83 @@ fn attach_listener(
         );
         Arc::new(mw_http::SniResolver::new(store))
     });
+    // **Layer 1** (W7 §5.4): the ingest socket's own `ServerConfig`, which is what makes
+    // `peer_auth` enforced rather than merely read. The certificate it presents is the
+    // website's, out of the same SNI resolver the main socket uses (W3 assumption 47),
+    // because that is the certificate an operator already configures and renews -- so a
+    // node with no TLS port has nothing to present and the socket stays plaintext, which
+    // `ingest:grpc`'s own plan check is what refuses.
+    let collector_state = built.collector.clone();
+    let ingest_tls = match (&collector_state, &sni, &cfg.peer_registry) {
+        // The **gRPC** row, because the TLS this configures is the gRPC socket's: a node
+        // whose only ingest row is `rest` is served on the main socket's own certificate
+        // and has no client-certificate verifier to configure.
+        // **`!resolver.is_empty()`, not merely `Some`.** `sni` exists whenever
+        // `listener.https_port` is set, without consulting the certificate store -- so a
+        // node with a TLS port and no readable certificate would have reported TLS as
+        // available, skipped D-35's opt-out, and then failed every ingest handshake with
+        // nothing at plan time saying why. `mw_http::bind` refuses a wholly empty resolver,
+        // but this is the predicate `CollectorConfig::ingest_tls_available` is documented
+        // against.
+        (Some(_), Some(resolver), Some(peers))
+            if !resolver.is_empty()
+                && cfg
+                    .ingest
+                    .iter()
+                    .any(|row| row.listen == mw_collector::IngestRow::GRPC) =>
+        {
+            let row = cfg
+                .ingest
+                .iter()
+                .find(|row| row.listen == mw_collector::IngestRow::GRPC);
+            let kind = row
+                .and_then(|row| mw_collector::PeerAuthKind::parse(&row.peer_auth))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "`config.ingest.peer_auth` is not one this build knows: expected \
+                         `mtls-ca`, `mtls-pinned` or `psk`"
+                    )
+                })?;
+            // The CA is a **node-level** trust store a listener may name rather than a
+            // per-listener setting: §8.3 sets `ca` on the gRPC row and omits it on the REST
+            // one with the same `peer_auth`, so the first row that names one wins and an
+            // `mtls-ca` socket with none is `TlsError::NoCa`.
+            let ca = cfg.ingest.iter().find_map(|row| row.ca_path.clone());
+            let config = mw_collector::handshake::server_config(
+                kind,
+                ca.as_deref(),
+                Arc::clone(resolver),
+                Arc::clone(peers),
+            )
+            .map_err(|e| anyhow::anyhow!("{}", mw_types::DisplayChain(&e)))
+            .context("configuring the ingest socket's TLS")?;
+            info!(
+                peer_auth = kind.as_str(),
+                client_certificates = kind.wants_client_certificate(),
+                "the ingest socket authenticates peers at the handshake"
+            );
+            Some(Arc::new(config))
+        }
+        (Some(_), _, _) => {
+            // A collector with no certificate to present. Not refused here -- the refusal
+            // is `ingest:grpc`'s plan check, which is where **D-35**'s opt-out is read --
+            // but said once, because an operator who configured `peer_auth` and no TLS
+            // port should not have to infer that it does nothing.
+            warn!(
+                "a `config.ingest` row configures peer authentication and this node has no \
+                 readable TLS certificate for the ingest socket to present, so the \
+                 handshake authenticates nobody: set `listener.https_port` and a website \
+                 certificate, or set `config.ingest.allow_insecure = 1` and use \
+                 `peer_auth = \'psk\'`"
+            );
+            None
+        }
+        _ => None,
+    };
+    if let Some(state) = collector_state {
+        cfg.set_ingest(state, ingest_tls);
+    }
+
     let (mount, report) =
         mw_http::Mount::new(built.tables, built.hosts).context("mounting the route tables")?;
     info!(
@@ -1374,6 +1706,19 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     // Returned to the pool before anything else runs: every read above is done, and SQLite
     // in WAL mode has a bounded connection budget that a held handle spends for nothing.
     drop(conn);
+    if cfg.node.is_none() {
+        // **First start: allocate this node's identity** (W7 **D-5**). The migration
+        // deliberately seeds no row, because a `node_id` a migration invented would make
+        // every fresh install claim the same identity -- so it is minted here, once, by
+        // the node itself, and `INSERT ... ON CONFLICT DO NOTHING` means two processes
+        // racing on one database agree about the answer rather than overwriting each
+        // other.
+        cfg.node = Some(
+            allocate_node(&pool, &args.config)
+                .await
+                .context("allocating this node's identity")?,
+        );
+    }
 
     // Step 4a, which is new with **M7-2**: make sure an unclaimed instance has a setup code
     // outstanding, and print it to the console.
@@ -1386,22 +1731,17 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     crate::authstore::ensure_setup_code(&pool, &cfg)
         .await
         .context("issuing the first-run setup code")?;
-    match &cfg.node {
-        Some(node) => info!(
+    // **Always `Some` from here on**, which is the change this work item made. Until M6-4
+    // this branch had a `None` arm saying "no node identity yet; this is a first start",
+    // and its own comment said minting it was W7's enrolment. `allocate_node` above is
+    // that, and it is also the only thing that knows where the spool lives (**D-10**).
+    if let Some(node) = &cfg.node {
+        info!(
             node = %node.node_name,
             timezone = %node.timezone,
             spool = %node.spool_path,
             "node identity"
-        ),
-        // The migration deliberately seeds no `node` row: `node_id` is a UUIDv7 the node
-        // mints once and never edits, so a migration that invented one would make every
-        // fresh install claim the same identity. An empty table means "not yet started",
-        // and the boot sequence handles it by starting anyway -- nothing here needs an
-        // identity to converge. Minting it is W7's enrolment (M6-4), which is also the
-        // only thing that knows what `spool_path` should be: the column has no default in
-        // the schema and no value in any design document, so writing the row here would
-        // mean this work item deciding where the spool lives.
-        None => info!("no node identity yet; this is a first start"),
+        );
     }
 
     notify::starting("asserting the database version");
@@ -1487,11 +1827,24 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     // component that has sent nothing is distinguishable from one whose metrics are broken
     // (§5.10).
     mw_output::metrics::register();
+    mw_collector::metrics::register();
     let mut slots = Slots::new();
     let registry =
         attach_registry(&mut cfg, &mut slots).context("publishing the station registry")?;
     if let Some(fanout) = &fanout {
         attach_ingress(&mut cfg, fanout).context("assembling the reading pipeline")?;
+        // Step 4d: the peer half of the same capability (W7 §5.1), and the two numbers the
+        // collector and the uplink read off the spool. After the ingress, because the
+        // collector needs both.
+        // The live registry object rather than the snapshot: the peer half is published
+        // into the same `ConfigRegistry` the station half resolves through, which is what
+        // makes "a `Hello` registered this station" and "the gate can resolve it" one fact.
+        let live = slots
+            .registry()
+            .context("the station registry is published before the peer half")?;
+        attach_peers(&mut cfg, fanout, &pool, live)
+            .await
+            .context("publishing the peer registry")?;
     }
 
     // Step 4e: the route tables, the host table, the certificate store and the one
@@ -1756,6 +2109,14 @@ mod tests {
             legacy_stations: Vec::new(),
             ingest: Vec::new(),
             declared_ingest: Vec::new(),
+            declared_collector_ingest: Vec::new(),
+            declared_uplinks: Vec::new(),
+            unjoinable_uplinks: Vec::new(),
+            peer_registry: None,
+            ingest_service: None,
+            node_identity: None,
+            ingest_tls: None,
+            spool: None,
             legacy_routes: None,
             ambient_upload: None,
             grpcrx_service: None,

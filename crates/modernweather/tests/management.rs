@@ -73,6 +73,9 @@ async fn free_ports() -> (u16, u16, u16) {
             router: axum::Router::new(),
             tls: None,
         }),
+        // No ingest TLS: this probe only wants the ports the kernel chose, and a plaintext
+        // gRPC socket is what every node without a `config.ingest` row binds anyway.
+        None,
     )
     .await
     .expect("three loopback ports are available");

@@ -61,6 +61,12 @@ use crate::config_db::StationRow;
 pub struct StationEntry {
     /// The station this resolves to.
     pub station: StationKey,
+    /// `config.stations.owning_node_id` -- the node that measures it.
+    ///
+    /// `None` for a row whose column is not 16 bytes, which is a schema its own `CHECK`
+    /// should have refused. Unowned then reads as unknown, which fails closed at W7 §4.4's
+    /// step 5 rather than admitting an envelope on the strength of a malformed column.
+    pub owner: Option<mw_types::OriginId>,
     /// Whether the operator has switched collection on.
     pub enabled: bool,
     /// How this station is configured to be identified.
@@ -198,6 +204,9 @@ impl RegistrySnapshot {
             };
             let entry = StationEntry {
                 station: StationKey::new(row.station_key.as_str()),
+                owner: <[u8; 16]>::try_from(row.owning_node_id.as_slice())
+                    .ok()
+                    .map(mw_types::OriginId::new),
                 zone,
                 enabled: row.enabled,
                 identity,
@@ -476,6 +485,18 @@ struct SecretState {
 #[derive(Debug)]
 pub struct ConfigRegistry {
     snapshot: ArcSwap<RegistrySnapshot>,
+    /// The peer half of the same capability (W7 §5.1), swapped independently.
+    ///
+    /// **Independently, and that is the decision.** The registration path writes a
+    /// `peers` row and a `config.stations` row on every `Hello`, and the obvious response
+    /// -- rebuild and republish the whole snapshot -- would also pick up every unrelated
+    /// `config.stations` edit an operator had made since boot, which the plan was not
+    /// re-derived from. That is a registry disagreeing with the running plan about which
+    /// stations exist, caused by a satellite reconnecting. Two stores means a peer's
+    /// registration is additive and can never shadow or alter a configured row, and the
+    /// station snapshot still changes only at a restart -- which is the limit this
+    /// module's documentation already states and M7-1 is what lifts.
+    peers: ArcSwap<crate::peers::PeerSnapshot>,
     /// One [`SecretState`] per station that has presented a secret. Each entry records the
     /// hash it was verified against, which is what makes a rotation safe: a read whose
     /// entry does not match the hash in hand is a miss. [`ConfigRegistry::publish`] also
@@ -493,6 +514,7 @@ impl ConfigRegistry {
     pub fn new(snapshot: RegistrySnapshot) -> Self {
         Self {
             snapshot: ArcSwap::from_pointee(snapshot),
+            peers: ArcSwap::from_pointee(crate::peers::PeerSnapshot::default()),
             secrets: Mutex::new(BTreeMap::new()),
         }
     }
@@ -520,6 +542,18 @@ impl ConfigRegistry {
     /// The snapshot, for a test and for the startup log line.
     pub fn snapshot(&self) -> Arc<RegistrySnapshot> {
         self.snapshot.load_full()
+    }
+
+    /// Replace the peer half. One store, so no reader can observe a half-updated registry.
+    ///
+    /// Driven by `mw_store::peers::PeerStore` after every write it makes, and once at boot.
+    pub fn publish_peers(&self, peers: crate::peers::PeerSnapshot) {
+        self.peers.store(Arc::new(peers));
+    }
+
+    /// The peer half, for a test and for the startup log line.
+    pub fn peer_snapshot(&self) -> Arc<crate::peers::PeerSnapshot> {
+        self.peers.load_full()
     }
 
     /// Verify a presented secret against one station's stored hash.
@@ -722,11 +756,18 @@ impl StationRegistry for ConfigRegistry {
     /// about *collection* and this is asked after a reading already exists -- a reading
     /// forwarded by a peer, or one admitted before the operator switched the station off.
     fn metadata(&self, station: &StationKey) -> StationMeta {
-        self.snapshot
+        if let Some(entry) = self.snapshot.load().by_station.get(station.as_str()) {
+            return entry.meta;
+        }
+        // A station this process learned about from a peer's `Hello` since the last
+        // restart. The configured row wins when there is one -- an operator's coordinates
+        // for a station are more authoritative than what a peer says about it -- so this
+        // is reached only for a key the station snapshot has never seen, where the
+        // alternative is `EMPTY` and a clear-sky column that stays NULL until a restart.
+        self.peers
             .load()
-            .by_station
-            .get(station.as_str())
-            .map_or(StationMeta::EMPTY, |e| e.meta)
+            .metadata(station)
+            .unwrap_or(StationMeta::EMPTY)
     }
 
     fn projection(&self, station: &StationKey) -> Option<StationProjection> {
@@ -735,6 +776,17 @@ impl StationRegistry for ConfigRegistry {
             .by_station
             .get(station.as_str())
             .map(|e| e.projection.clone())
+            .or_else(|| self.peers.load().projection(station))
+    }
+
+    fn station_owner(&self, station: &StationKey) -> Option<mw_types::OriginId> {
+        if let Some(entry) = self.snapshot.load().by_station.get(station.as_str()) {
+            // `and_then`, not `or_else`: a configured row with a malformed
+            // `owning_node_id` answers `None` and fails closed, rather than falling
+            // through to whatever a peer last claimed about the same key.
+            return entry.owner;
+        }
+        self.peers.load().owner(station)
     }
 }
 
@@ -747,6 +799,7 @@ mod tests {
         StationRow {
             id: 1,
             station_key: key.into(),
+            owning_node_id: vec![1; 16],
             name: key.into(),
             kind: "weatherlink-live".into(),
             enabled: true,

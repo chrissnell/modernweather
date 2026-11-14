@@ -56,6 +56,7 @@ fn row(key: &str, claim: &str) -> StationRow {
     StationRow {
         id: 0,
         station_key: key.to_string(),
+        owning_node_id: vec![1; 16],
         name: key.to_string(),
         kind: "davis".to_string(),
         enabled: true,
@@ -313,12 +314,18 @@ async fn a_disabled_station_is_refused() {
     collector.stop().await;
 }
 
-/// **Enrolment is M6-4's, and says so.** A satellite calling `RegisterRemoteStation` gets
-/// `Unimplemented` with the work item in the message, not a `404` that looks like the wrong
-/// address.
+/// **`RegisterRemoteStation` is not implemented and will not be**, and the message says
+/// which path to use instead — not a `404` that looks like the wrong address.
+///
+/// The message used to name implementation-plan.md M6-4 as the item that would land it.
+/// M6-4 landed and did not: that method's own schema carries the four plaintext secrets
+/// docs/collector.md §5.2 and **D-67** delete, so decoding it would put them back into this
+/// tree. What replaced it is `collector.v1.Collector/Hello`, which registers a peer's
+/// stations carrying identity only — so that is what the message has to name, because a
+/// refusal an operator cannot act on is the same as a 404 to them.
 #[tokio::test]
 #[ignore = "needs a Go toolchain; `cargo xtask emulator-tests` runs it"]
-async fn enrolment_answers_unimplemented_and_names_the_work_item() {
+async fn enrolment_answers_unimplemented_and_names_the_path_that_works() {
     let collector = Collector::start(
         "grpcrx-enrol",
         vec![row("satellite-a:backyard", REGISTERED)],
@@ -351,8 +358,8 @@ async fn enrolment_answers_unimplemented_and_names_the_work_item() {
         "`Unimplemented` is code 12: {headers}"
     );
     assert!(
-        headers.contains("M6-4"),
-        "the message names the work item: {headers}"
+        headers.contains("Hello"),
+        "the message names the RPC that replaced it: {headers}"
     );
     collector.stop().await;
 }

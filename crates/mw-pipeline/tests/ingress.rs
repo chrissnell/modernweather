@@ -91,6 +91,12 @@ impl StationRegistry for CountingRegistry {
     fn projection(&self, _station: &StationKey) -> Option<mw_component::StationProjection> {
         None
     }
+
+    /// Only the one station this double was built around, so that W7 §4.4 step 5's
+    /// refusal is reachable from here and not papered over.
+    fn station_owner(&self, station: &StationKey) -> Option<mw_types::OriginId> {
+        (self.station.as_ref() == Some(station)).then(|| mw_types::OriginId::new([1; 16]))
+    }
 }
 
 #[tokio::test]

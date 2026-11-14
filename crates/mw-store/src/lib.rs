@@ -23,6 +23,10 @@ pub mod config_db;
 pub mod config_go;
 /// `ForecastStore` and `SnowCache`: the frozen REST surface's own two reads.
 pub mod frozen;
+/// Minting this node's `NodeId` and an enrolment token, with no UUID or RNG crate (W7 D-5).
+pub mod ident;
+/// `PeerRegistry` over `peers` and the registration path W7 §5.1 gives `ingest:*`.
+pub mod peers;
 /// `db:postgres`: the weather pool, its version assertion and its publish/revoke loop.
 pub mod pg;
 /// The read half of `ReadingStore`: the roll-up's three reads, the snapshot seed, and
@@ -47,6 +51,7 @@ pub use crate::config_admin::{
     StationWrite, WebsiteWrite,
 };
 pub use crate::frozen::FrozenReads;
+pub use crate::peers::{PeerSnapshot, PeerStore};
 pub use crate::reader::TimescaleReader;
 pub use crate::registry::{
     hash_ingest_secret, ConfigRegistry, RegistrySnapshot, SecretHashError, SecretProblem,

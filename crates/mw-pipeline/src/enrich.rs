@@ -1086,7 +1086,8 @@ mod tests {
 
     /// A reading with no metadata still gets the three columns that need none, and gets
     /// `NULL` for the three that do. The accept path depends on this: a peer's station key
-    /// is a claim until M6-4, so `metadata` answers `EMPTY` for it.
+    /// is a claim until `mw_collector::admit::Gate` resolves it, so `metadata` answers
+    /// `EMPTY` for a key no row names.
     #[test]
     fn a_station_with_no_configured_metadata_derives_only_what_needs_none() {
         let mut reading = Reading {

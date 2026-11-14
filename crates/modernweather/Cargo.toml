@@ -59,12 +59,22 @@ metrics.workspace = true
 # The weather database's URL is a `SecretString` from the moment it is read (**D-33**), so
 # the one place that hands it to a connection has to be able to expose it.
 secrecy.workspace = true
+# The ingest socket's `ServerConfig` is assembled here, because the verifier's choice is
+# per `auth_kind` and the pinned case reads the `peers` snapshot: `mw-http` binds the
+# socket and may not name a peer, `mw-collector` decides who may be on it and may not bind
+# (ci/layers.toml, §1.4), and the binary is where the two meet (§1.3 rule 1).
+rustls.workspace = true
 # `Utc::now()` for the snapshot-age sweep the `/metrics` route runs on every scrape
 # (M4-1's constraint 2). One clock reading, at the one place §3.3 allows the binary to
 # take one: the scrape path is not a component tick.
 chrono.workspace = true
 
 [dev-dependencies]
+# `Status::unimplemented` for the Go-era collector `tests/collector_two_node.rs` stands up:
+# a gRPC server answers `Unimplemented` for a method it does not register, and `axum`'s own
+# fallback answers an HTTP 404 that `tonic` cannot read as a status at all -- so a test that
+# used the router's default fallback would exercise a shape no Go daemon produces.
+tonic.workspace = true
 # `Router::new()` for the probe in `tests/boot.rs` that asks `mw_http::bind` for two free
 # ports -- `ci/layers.toml` reserves binding for `mw-http` and scans `tests/`, so the probe
 # has to go through the real `bind` and therefore needs a router to hand it.

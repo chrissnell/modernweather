@@ -78,7 +78,7 @@ pub use component::{register, ListenerConfig, ID};
 pub use host::{matches_one_label, normalise, HostTable};
 pub use mount::{not_found, Mount, MountError, MountReport, NOT_FOUND_BODY};
 pub use sni::{CertError, CertPaths, CertStore, SniResolver};
-pub use socket::{bind, bind_all, bind_with_hosts, Bound, Listen, Management, DRAIN};
+pub use socket::{bind, bind_all, bind_with_hosts, Bound, Listen, Management, PeerCerts, DRAIN};
 pub use table::RouteTable;
 
 /// The five frozen path patterns, in `axum` 0.8 syntax.

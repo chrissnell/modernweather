@@ -104,6 +104,14 @@ pub trait ListenerConfig {
     /// with no certificate" is a configuration an operator can fix and a `Backoff` is how
     /// they see it.
     fn sni_resolver(&self) -> Option<&Arc<SniResolver>>;
+
+    /// The gRPC socket's own TLS, with a client-certificate verifier (W7 §5.4 layer 1).
+    ///
+    /// `None` leaves the gRPC port plaintext, which is every node with no `config.ingest`
+    /// row. Built by the binary, because the verifier's choice is per `auth_kind` and the
+    /// pinned case reads the `peers` snapshot -- neither of which this crate may know about
+    /// (`crate::socket`'s module documentation has the whole of that note).
+    fn ingest_tls(&self) -> Option<Arc<rustls::ServerConfig>>;
 }
 
 /// Why `http:listener` cannot be planned.
@@ -139,6 +147,7 @@ pub fn register<C: ListenerConfig>(
     let listen = cfg.listen();
     let mount = Arc::clone(cfg.mount().ok_or(ListenerPlanError::NoMount)?);
     let resolver = cfg.sni_resolver().map(Arc::clone);
+    let ingest_tls = cfg.ingest_tls();
     let management = cfg.management();
     // Every configuration value the builder closes over, folded in. The router and the
     // resolver are root resources whose *contents* follow the configuration the components
@@ -166,6 +175,7 @@ pub fn register<C: ListenerConfig>(
                 let listen = listen.clone();
                 let mount = Arc::clone(&mount);
                 let resolver = resolver.clone();
+                let ingest_tls = ingest_tls.clone();
                 // Cloned per build rather than moved, because a `Backoff` retry builds
                 // again: a port another process holds is a lifecycle transition retried
                 // with exponential backoff (W2a Decision 30), and a router moved out on the
@@ -185,6 +195,7 @@ pub fn register<C: ListenerConfig>(
                         resolver,
                         mount.hosts(),
                         management,
+                        ingest_tls,
                     )
                     .await
                     .map_err(|source| mw_component::BuildError::Resource {
@@ -195,6 +206,7 @@ pub fn register<C: ListenerConfig>(
                         main = %bound.local_addr(),
                         tls = listen.tls(),
                         grpc = %bound.grpc_addr(),
+                        grpc_tls = bound.grpc_tls(),
                         redirect = ?bound.redirect_addr(),
                         management = ?bound.management_addr(),
                         sites = mount.sites(),
@@ -280,6 +292,10 @@ mod tests {
             self.mount.as_ref()
         }
 
+        fn ingest_tls(&self) -> Option<Arc<rustls::ServerConfig>> {
+            None
+        }
+
         fn sni_resolver(&self) -> Option<&Arc<SniResolver>> {
             None
         }
@@ -341,6 +357,9 @@ mod tests {
                 Some(&self.1)
             }
             fn sni_resolver(&self) -> Option<&Arc<SniResolver>> {
+                None
+            }
+            fn ingest_tls(&self) -> Option<Arc<rustls::ServerConfig>> {
                 None
             }
         }

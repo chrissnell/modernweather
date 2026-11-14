@@ -15,15 +15,31 @@
 //! break every machine-to-machine peer at upgrade. It serves the **same** `Router`, so
 //! there is still exactly one route table.
 //!
-//! **No gRPC *service* is mounted on it yet**, and the reason is that nothing provides one:
-//! `grpc:weatherv1`, `grpc:weatherappsv1` and `station:grpcrx` are implementation-plan.md
-//! M6-1 and M6-4. What this item owes them is the socket and a serving path that accepts
-//! HTTP/2 -- `hyper-util`'s auto connection builder, which `axum::serve` uses, accepts
-//! HTTP/1.1 and HTTP/2-with-prior-knowledge on the same plaintext socket, so a peer that
-//! speaks h2c works on both the main and the gRPC port today (§6.6). Mounting a
-//! `tonic` service is one `tower::steer::Steer` over a `content-type: application/grpc`
-//! test in the fallback, and it is deliberately not written here: a dispatcher with nothing
-//! to dispatch to cannot be tested, and a gate that cannot fail is worth nothing.
+//! The services mounted on it are `station:grpcrx` (M6-1) and `ingest:grpc` (M6-4), as
+//! ordinary `axum` routes on the shared router -- `hyper-util`'s auto connection builder,
+//! which `axum::serve` uses, accepts HTTP/1.1 and HTTP/2-with-prior-knowledge on the same
+//! plaintext socket, so a peer that speaks h2c works on both the main and the gRPC port
+//! (§6.6) and no `tower::steer::Steer` dispatcher is needed.
+//!
+//! # The gRPC socket's own TLS, with client certificates (W7 §5.4 layer 1)
+//!
+//! The gRPC socket takes a **second** `ServerConfig` when one is supplied: the same
+//! [`SniResolver`] for the certificate it presents, and a client-certificate verifier
+//! beside it (W3 assumption 47). That is W7 **D-34**'s first admission layer and the only
+//! one that can refuse a peer "before any frame is decoded" -- and it is why `ingest:grpc`
+//! no longer needs `config.ingest.allow_insecure` to be set.
+//!
+//! **Who builds the verifier is deliberately not this crate.** The decision is per
+//! `auth_kind` and the pinned case has to consult the `peers` snapshot, which is three
+//! layers up; this crate takes an `Arc<ServerConfig>` and binds it. What that buys is that
+//! `mw-http` still knows nothing about peers, and the whole of "who is allowed" lives in
+//! one crate.
+//!
+//! **The peer's certificate chain reaches the request through the connection**, as
+//! [`PeerCerts`] in `ConnectInfo`: the handshake runs lazily inside the per-connection task
+//! (see [`LazyTls`]), so it has not happened when `accept` returns and the chain cannot be
+//! captured there. A shared slot is filled by the handshake and read by the handler, which
+//! is sound because no request byte can arrive before the handshake that produced it.
 //!
 //! # Binding and serving are separate calls
 //!
@@ -36,13 +52,14 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{header, HeaderValue, Request, Response, StatusCode};
 use axum::Router;
+use rustls::pki_types::CertificateDer;
 use rustls::ServerConfig;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -131,7 +148,10 @@ impl std::fmt::Debug for Management {
 pub struct Bound {
     main: Either,
     redirect: Option<(TcpListener, SocketAddr)>,
-    grpc: (TcpListener, SocketAddr),
+    /// The gRPC socket. `Either`, because it is also the **ingest** endpoint: a node with
+    /// a `config.ingest` row serves it over TLS with a client-certificate verifier, and one
+    /// without serves `grpc:weatherv1`'s read methods in plaintext (W7 §5.4, **D-46**).
+    grpc: Either,
     /// The management socket, when the configuration names one.
     management: Option<(Either, Router)>,
     router: Router,
@@ -147,7 +167,8 @@ impl std::fmt::Debug for Bound {
             .field("main", &self.main.addr())
             .field("tls", &matches!(self.main, Either::Tls { .. }))
             .field("redirect", &self.redirect.as_ref().map(|(_, a)| *a))
-            .field("grpc", &self.grpc.1)
+            .field("grpc", &self.grpc.addr())
+            .field("grpc_tls", &matches!(self.grpc, Either::Tls { .. }))
             .field(
                 "management",
                 &self.management.as_ref().map(|(e, _)| e.addr()),
@@ -210,6 +231,7 @@ pub async fn bind(
         router,
         resolver,
         Arc::new(crate::host::HostTable::default()),
+        None,
     )
     .await
 }
@@ -224,8 +246,9 @@ pub async fn bind_with_hosts(
     router: Router,
     resolver: Option<Arc<SniResolver>>,
     hosts: Arc<crate::host::HostTable>,
+    ingest_tls: Option<Arc<ServerConfig>>,
 ) -> Result<Bound, HttpError> {
-    bind_all(listen, router, resolver, hosts, None).await
+    bind_all(listen, router, resolver, hosts, None, ingest_tls).await
 }
 
 /// [`bind_with_hosts`] plus the management socket, which is what `http:listener` calls.
@@ -233,13 +256,15 @@ pub async fn bind_with_hosts(
 /// A third function rather than a fifth parameter on the other two, for the reason there are
 /// already two: the management socket exists only on a node that serves the management API,
 /// and every existing caller -- including the ones that only want a port the kernel chose --
-/// has nothing to pass.
+/// has nothing to pass. `ingest_tls` is in the same position one level down: it exists only
+/// on a node with a `config.ingest` row.
 pub async fn bind_all(
     listen: &Listen,
     router: Router,
     resolver: Option<Arc<SniResolver>>,
     hosts: Arc<crate::host::HostTable>,
     management: Option<Management>,
+    ingest_tls: Option<Arc<ServerConfig>>,
 ) -> Result<Bound, HttpError> {
     let main = match listen.https_port {
         Some(_) => {
@@ -284,7 +309,28 @@ pub async fn bind_all(
         Some(addr) => Some(listen_on(addr).await?),
         None => None,
     };
-    let grpc = listen_on(listen.grpc()).await?;
+    // The gRPC socket, which is the ingest endpoint (W3 §6.1, **D-92**). TLS with a client
+    // verifier when one was supplied, and plaintext otherwise -- the second is what every
+    // node without a `config.ingest` row gets, and what `grpc:weatherv1`'s read services
+    // are reached over on a LAN.
+    //
+    // Not `tls_or_plain`, which builds its own `ServerConfig` from an `SniResolver`: the
+    // ingest socket's configuration carries a **client**-certificate verifier, which is
+    // what makes it layer 1 (W7 **D-46**), and `mw_collector` is where that is assembled.
+    let grpc = match ingest_tls {
+        Some(config) => {
+            let (listener, addr) = listen_on(listen.grpc()).await?;
+            Either::Tls {
+                listener,
+                addr,
+                acceptor: TlsAcceptor::from(config),
+            }
+        }
+        None => {
+            let (listener, addr) = listen_on(listen.grpc()).await?;
+            Either::Plain(listener, addr)
+        }
+    };
     let management = match management {
         Some(m) => Some((tls_or_plain(m.addr, m.tls.as_ref()).await?, m.router)),
         None => None,
@@ -370,7 +416,15 @@ impl Bound {
 
     /// The gRPC socket's address.
     pub fn grpc_addr(&self) -> SocketAddr {
-        self.grpc.1
+        self.grpc.addr()
+    }
+
+    /// Whether the gRPC socket completes a TLS handshake (W7 §5.4 layer 1).
+    ///
+    /// Read by the boot log line and by `ingest:grpc`'s plan check, which is what makes
+    /// **D-35**'s "plaintext ingest is a plan-time error" answerable rather than assumed.
+    pub fn grpc_tls(&self) -> bool {
+        matches!(self.grpc, Either::Tls { .. })
     }
 
     /// The management socket's address, when one is bound.
@@ -400,7 +454,7 @@ impl Bound {
         F: Future<Output = ()> + Send + 'static,
     {
         let main_addr = self.main.addr();
-        let grpc_addr = self.grpc.1;
+        let grpc_addr = self.grpc.addr();
         let redirect_addr = self.redirect.as_ref().map(|(_, a)| *a);
         // One observation of the signal, fanned out. `watch` rather than three
         // `oneshot`s: the number of sockets is configuration, and a channel per socket
@@ -437,8 +491,35 @@ impl Bound {
         let serve_grpc = {
             let router = self.router.clone();
             let rx = signal.clone();
-            let (listener, addr) = self.grpc;
-            async move { serve_one(listener, router, addr, wait(rx)).await }
+            async move {
+                match self.grpc {
+                    // **With connect info here too**, even though there is no chain to
+                    // report: what a handler needs is "this arrived on the ingest socket",
+                    // and the struct's presence is that fact. See [`PeerCerts::tls`].
+                    Either::Plain(listener, addr) => {
+                        serve_with_peer_certs(listener, router, addr, wait(rx)).await
+                    }
+                    // **With connect info, and only here.** The handler that reads
+                    // [`PeerCerts`] is `ingest:grpc`'s, the chain only exists on a socket
+                    // that asked for a client certificate, and a request that reached the
+                    // main port carries no `ConnectInfo<PeerCerts>` at all -- which is how
+                    // that handler can tell "arrived over the ingest socket" from
+                    // "arrived over the website's".
+                    Either::Tls {
+                        listener,
+                        addr,
+                        acceptor,
+                    } => {
+                        serve_with_peer_certs(
+                            TlsListener { listener, acceptor },
+                            router,
+                            addr,
+                            wait(rx),
+                        )
+                        .await
+                    }
+                }
+            }
         };
         let serve_redirect = {
             let rx = signal.clone();
@@ -505,6 +586,36 @@ impl Bound {
             }
         }
     }
+}
+
+/// [`serve_one`] with [`PeerCerts`] in each request's `ConnectInfo`.
+///
+/// Separate from `serve_one` rather than one generic function, because
+/// `into_make_service_with_connect_info` changes the service type and only the ingest
+/// socket has a certificate chain to report. The main socket deliberately does **not** get
+/// this: it is `with_no_client_auth`, so the slot would always be empty and an empty slot
+/// that exists is harder to reason about than one that does not.
+async fn serve_with_peer_certs<L, F>(
+    listener: L,
+    router: Router,
+    addr: SocketAddr,
+    shutdown: F,
+) -> Result<(), HttpError>
+where
+    L: axum::serve::Listener,
+    L::Addr: std::fmt::Debug,
+    // Higher-ranked: `axum` constructs an `IncomingStream` per connection, borrowed for
+    // that connection, so the bound has to hold for **any** lifetime rather than for one.
+    PeerCerts: for<'a> axum::extract::connect_info::Connected<axum::serve::IncomingStream<'a, L>>,
+    F: Future<Output = ()> + Send + 'static,
+{
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<PeerCerts>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .map_err(|source| HttpError::Serve { addr, source })
 }
 
 /// Serve one socket until the shutdown future completes.
@@ -626,6 +737,7 @@ impl axum::serve::Listener for TlsListener {
                             state: State::Handshaking(Box::pin(async move {
                                 acceptor.accept(stream).await
                             })),
+                            certs: PeerCerts::default(),
                         },
                         addr,
                     );
@@ -689,6 +801,110 @@ enum State {
 /// A TLS stream whose handshake runs on first use. See [`TlsListener`].
 pub struct LazyTls {
     state: State,
+    certs: PeerCerts,
+}
+
+/// The client certificate chain one connection presented, or nothing.
+///
+/// A shared slot rather than a value, because of **when** the two halves happen: the
+/// handshake runs inside the per-connection task on the first `poll_read` ([`LazyTls`]), and
+/// `axum`'s `Connected::connect_info` runs before that, as the connection is accepted. So
+/// the slot is handed over empty and filled by the handshake. Reading it from a request
+/// handler is sound without any synchronisation argument beyond the `OnceLock`'s own: a
+/// request is bytes that arrived *after* the handshake that decrypted them.
+///
+/// `Clone` is a pointer copy, and the chain itself is shared rather than copied per request.
+#[derive(Clone, Debug)]
+pub struct PeerCerts {
+    chain: Arc<OnceLock<Arc<Vec<CertificateDer<'static>>>>>,
+    remote: SocketAddr,
+    tls: bool,
+}
+
+impl Default for PeerCerts {
+    /// An empty slot with an unspecified source address, for a test and for the accept
+    /// path, which fills the address in before the slot is handed over.
+    fn default() -> Self {
+        Self {
+            chain: Arc::new(OnceLock::new()),
+            remote: SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+            tls: false,
+        }
+    }
+}
+
+impl PeerCerts {
+    /// The end-entity certificate, which is `chain[0]` (RFC 8446 §4.4.2).
+    ///
+    /// `None` on a connection that presented no certificate -- a `psk` ingest socket, or a
+    /// verifier configured as optional -- and on one whose handshake has not completed,
+    /// which no request can be observed from.
+    pub fn leaf(&self) -> Option<CertificateDer<'static>> {
+        self.chain.get()?.first().cloned()
+    }
+
+    /// Whether a chain was presented at all.
+    pub fn is_present(&self) -> bool {
+        self.chain.get().is_some_and(|chain| !chain.is_empty())
+    }
+
+    /// Where the connection came from.
+    ///
+    /// Carried here rather than as a second `ConnectInfo` because `axum` holds one type per
+    /// service, and the enrolment RPC needs both: the chain to authenticate with, and the
+    /// address to rate-limit and to log (W7 §5.3 requires every attempt to be logged with
+    /// its source).
+    pub fn remote(&self) -> SocketAddr {
+        self.remote
+    }
+
+    /// Whether this connection completed a TLS handshake.
+    ///
+    /// **The reason this is a field and not "`leaf()` is `Some`".** A `psk` ingest socket
+    /// asks for no client certificate, and an ingest socket an operator has explicitly
+    /// opted into running in plaintext (W7 **D-35**) has no handshake at all — so on both
+    /// of those `leaf()` is `None` and the connection is still one a peer is allowed to
+    /// make. What a handler actually needs to know is **which socket this arrived on**, and
+    /// the presence of this whole struct in `ConnectInfo` is that fact: it is installed on
+    /// the gRPC socket and on no other, TLS or not. This flag is the second half — "and it
+    /// was encrypted" — which is what lets `mw_collector` refuse the two `mtls-*` kinds on
+    /// a plaintext socket while letting `psk` through.
+    ///
+    /// Inferring the socket from `leaf().is_some()` was the first version and it made
+    /// D-35's documented escape hatch non-functional: every peer, `psk` included, was
+    /// refused on a plaintext ingest socket while the startup warning said the opposite.
+    pub fn tls(&self) -> bool {
+        self.tls
+    }
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsListener>>
+    for PeerCerts
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, TlsListener>) -> Self {
+        let mut info = stream.io().certs.clone();
+        info.remote = *stream.remote_addr();
+        info.tls = true;
+        info
+    }
+}
+
+/// The same report for a **plaintext** connection: no chain, and `tls()` is `false`.
+///
+/// Installed on the gRPC socket when it has no TLS, which is W7 **D-35**'s explicit
+/// opt-out. Without it that socket reported nothing at all and `mw_collector` could not
+/// tell "arrived over the ingest port with no encryption" from "arrived over the website's
+/// port", so it refused both — see [`PeerCerts::tls`].
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TcpListener>>
+    for PeerCerts
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, TcpListener>) -> Self {
+        Self {
+            chain: Arc::new(OnceLock::new()),
+            remote: *stream.remote_addr(),
+            tls: false,
+        }
+    }
 }
 
 impl std::fmt::Debug for LazyTls {
@@ -707,7 +923,20 @@ impl LazyTls {
         if let State::Handshaking(accept) = &mut self.state {
             match accept.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(stream)) => self.state = State::Ready(Box::new(stream)),
+                Poll::Ready(Ok(stream)) => {
+                    // Recorded once, here, because this is the only point at which the
+                    // handshake's result is in hand. `set` can only fail if a second
+                    // handshake completed on one connection, which cannot happen.
+                    let _ = self.certs.chain.set(Arc::new(
+                        stream
+                            .get_ref()
+                            .1
+                            .peer_certificates()
+                            .map(<[CertificateDer<'static>]>::to_vec)
+                            .unwrap_or_else(Vec::new),
+                    ));
+                    self.state = State::Ready(Box::new(stream));
+                }
                 Poll::Ready(Err(e)) => {
                     self.state = State::Failed;
                     return Poll::Ready(Err(e));

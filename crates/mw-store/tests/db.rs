@@ -182,6 +182,7 @@ fn row(key: &str) -> StationRow {
     StationRow {
         id: 1,
         station_key: key.into(),
+        owning_node_id: vec![1; 16],
         name: format!("{key} (configured)"),
         kind: "weatherlink-live".into(),
         enabled: true,

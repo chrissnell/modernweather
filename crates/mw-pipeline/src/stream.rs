@@ -199,7 +199,11 @@ impl DurableSubscription {
                 self.in_flight = None;
                 continue;
             }
-            return Some(ReadingBatch::new(kept));
+            // `read.through`, not the last survivor's position: the uplink's
+            // `IngestBatch.through` is the sender's spool `seq` (W7 **D-22**) and the
+            // cursor advances over filtered envelopes too (W7 **D-9**), so the number that
+            // travels has to be the one the cursor will take.
+            return Some(ReadingBatch::at(kept, read.through));
         }
     }
 }

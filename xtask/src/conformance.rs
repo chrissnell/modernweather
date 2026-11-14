@@ -1255,6 +1255,24 @@ fn clear_workdir(opts: &Options) -> Result<(), String> {
             std::fs::remove_file(&p).map_err(|e| format!("{}: {e}", p.display()))?;
         }
     }
+    // **The spool, because a `node_id` is stamped into it.** A first start mints an
+    // identity and opens a spool beside `config.db` (W7 D-5, D-10), and a spool refuses to
+    // open under an identity that is not the one in its `MANIFEST` -- so a second
+    // consecutive run in the same tree would find last run's spool, stamped with last run's
+    // seeded `node_id`, and the bootstrap daemon would exit with a fatal error on every
+    // repeat. The run recovers (the migration ledger commits before the spool opens) but
+    // the error and the log line are noise that reads like a failure.
+    //
+    // Here rather than only after the seed so that **one place decides what a fresh run
+    // starts from**, which is what this function's own comment in `bootstrap_configuration`
+    // says. The post-seed removal stays as well, because it answers a different question:
+    // the re-identification that happens *within* a run.
+    for name in ["logs", "spool"] {
+        let p = opts.workdir.join(name);
+        if p.exists() {
+            std::fs::remove_dir_all(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        }
+    }
     if opts.log_dir.exists() {
         std::fs::remove_dir_all(&opts.log_dir)
             .map_err(|e| format!("{}: {e}", opts.log_dir.display()))?;
@@ -1626,6 +1644,27 @@ fn seed_configuration(opts: &Options, config_db: &Path) -> Result<(), String> {
     let sql = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     println!("    {}", path.display());
     sqlite_write(config_db, &sql)?;
+    // **The spool the bootstrap start allocated, removed because the seed just replaced the
+    // identity that owns it.**
+    //
+    // A first start mints a `node_id` and opens a spool beside `config.db` (W7 D-5, D-10),
+    // so the bootstrap run above -- which is a first start -- leaves one at
+    // `<workdir>/spool` stamped with a UUIDv7 nothing else will ever use again. The seed
+    // then `DELETE`s that row and inserts W1's fixed `node_id` at the same `spool_path`, and
+    // a spool refuses to open under an identity that is not the one in its `MANIFEST`: the
+    // daemon exits at step 4b with "the spool belongs to node ...".
+    //
+    // That refusal is correct and must not be softened -- a spool adopted by a different
+    // identity is a node claiming another node's history. What is wrong is doing the
+    // replacement at all, and only this rig does it: an operator never re-stamps a
+    // `node_id`, which is why the column's comment says "allocated once; never edited". So
+    // the rig cleans up after itself, here, where the replacement happens.
+    let spool = opts.workdir.join("spool");
+    if spool.exists() {
+        std::fs::remove_dir_all(&spool)
+            .map_err(|e| format!("removing the bootstrap spool at {}: {e}", spool.display()))?;
+        println!("    removed the bootstrap start's spool, which the seed re-identified");
+    }
     let stations = sqlite_query(config_db, "select count(*) from stations")?;
     let websites = sqlite_query(config_db, "select count(*) from website")?;
     println!(

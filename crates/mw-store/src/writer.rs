@@ -1047,6 +1047,10 @@ mod tests {
         fn projection(&self, station: &StationKey) -> Option<StationProjection> {
             (station.as_str() == "configured").then(|| self.0.clone())
         }
+
+        fn station_owner(&self, station: &StationKey) -> Option<mw_types::OriginId> {
+            (station.as_str() == "configured").then(|| mw_types::OriginId::new([1; 16]))
+        }
     }
 
     fn configured() -> OneConfigured {

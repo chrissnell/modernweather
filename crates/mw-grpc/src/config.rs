@@ -43,6 +43,21 @@ pub trait GrpcIngestConfig {
 
     /// The write end of the reading pipeline, when this process has one.
     fn ingress(&self) -> Option<&Arc<dyn Ingress>>;
+
+    /// Whether the gRPC socket completes a TLS handshake with a client-certificate
+    /// verifier (W7 §5.4 layer 1).
+    ///
+    /// **Added by implementation-plan.md M6-4, which is what made the answer able to be
+    /// `true`.** `station:grpcrx` is mounted on that same socket, so when the collector's
+    /// `peer_auth` is enforced at the handshake this method's routes are behind it too —
+    /// and decision 35's opt-out stops being required. The receiver's own limitation does
+    /// not go away and is restated where it belongs
+    /// ([`crate::grpcrx::PEER_AUTH_NOTE`]): the handshake proves *which node* is
+    /// connecting, and a `WeatherReading` carries no provenance for that to be checked
+    /// against, so an authenticated peer can still write readings for any station key it
+    /// knows. What changes is that an **unauthenticated** one cannot reach the method at
+    /// all.
+    fn ingest_tls_available(&self) -> bool;
 }
 
 /// What `crate::snowgauge`'s registrar reads.
