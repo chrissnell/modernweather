@@ -887,6 +887,65 @@ async fn an_hour_that_beats_the_standing_record_replaces_it() {
     assert_eq!(rain.value, 0.23000003);
 }
 
+/// **A station whose every level read answers nothing writes nothing — even when it has a
+/// carried-forward record to offer.**
+///
+/// The regression test for the defect the first code review of this component found. `out`
+/// being non-empty is not the same question as "did the history answer": a station with a
+/// standing `max_rain_hour` and no other readable bucket produces exactly that one record,
+/// which looked like a successful computation and replaced the other seven with it — and
+/// every later tick found the same nothing and rewrote the same one row, so `/almanac` fell
+/// from eight keys to one permanently. The state is reachable: the `warn` beside the write
+/// names it, an aggregate level rebuilt without being materialised
+/// (`ci/db/rebuild-aggregates.sh`).
+#[tokio::test]
+async fn a_station_whose_levels_answer_nothing_writes_nothing_even_with_a_record_to_carry() {
+    let store = Arc::new(Store::default().cached(vec![
+        held("high_temp", 95.0, "2025-08-20T00:00:00Z"),
+        held("low_temp", 12.0, "2026-02-19T00:00:00Z"),
+        held("max_rain_hour", 0.23, "2026-04-28T16:00:00Z"),
+        held("low_barometer", 29.44, "2026-02-18T00:00:00Z"),
+    ]));
+    let cache = Arc::new(Cache::default());
+    let mut records = body(
+        vec![station("csi", "campbellscientific")],
+        Arc::clone(&store),
+        Arc::clone(&cache),
+    );
+    records.tick(&cx()).await.expect("no read failed");
+    assert!(
+        cache.writes().is_empty(),
+        "the four standing records must survive a tick that could read nothing: {:?}",
+        cache.writes()
+    );
+}
+
+/// And the converse, so the guard above is not "never write when anything is missing": one
+/// readable level is enough, and the carried-forward record travels with it.
+#[tokio::test]
+async fn one_readable_record_is_enough_to_write_and_the_carry_travels_with_it() {
+    let store = Arc::new(
+        Store::default()
+            .with(
+                BucketLevel::Day,
+                MetricKey::OutTemp,
+                Agg::Max,
+                bucket(95.73979, "2025-08-20T00:00:00Z"),
+            )
+            .cached(vec![held("max_rain_hour", 0.23, "2026-04-28T16:00:00Z")]),
+    );
+    let cache = Arc::new(Cache::default());
+    let mut records = body(
+        vec![station("csi", "campbellscientific")],
+        Arc::clone(&store),
+        Arc::clone(&cache),
+    );
+    records.tick(&cx()).await.expect("no read failed");
+    let written = cache.only_write();
+    let names: Vec<&str> = written.iter().map(|r| r.record.as_str()).collect();
+    assert_eq!(names, vec!["high_temp", "max_rain_hour"]);
+}
+
 /// A record whose level is unbounded is **not** carried forward: `observations_1d` can
 /// always still see the day that set it, so a cached value that is greater than the data
 /// means the data changed and the record should follow it.

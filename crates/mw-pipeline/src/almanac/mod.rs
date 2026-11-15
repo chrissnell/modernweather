@@ -189,8 +189,18 @@ impl Records {
             Vec::new()
         };
         let mut out = Vec::with_capacity(RECORD_COUNT);
+        // **Whether the HISTORY answered, which is not the same question as whether `out`
+        // is empty**, and conflating the two was a defect this function had: a station
+        // whose every level read returns nothing still produces a carried-forward
+        // `max_rain_hour`, so `out` was non-empty, the caller's "write nothing" branch did
+        // not fire, and the replace took the other seven standing records with it --
+        // permanently, since each later tick found the same nothing and rewrote the same one
+        // row. The carry-forward exists to keep a record that the data can no longer see;
+        // it must not be the reason the rest are deleted.
+        let mut computed = 0usize;
         for spec in &specs {
             let fresh = self.fresh(station, spec).await?;
+            computed += usize::from(fresh.is_some());
             let record = if spec.retained {
                 let held = previous.iter().find(|r| r.record == spec.name).cloned();
                 more_extreme(spec.direction, fresh, held)
@@ -200,6 +210,9 @@ impl Records {
             if let Some(record) = record {
                 out.push(record);
             }
+        }
+        if computed == 0 {
+            return Ok(Vec::new());
         }
         Ok(out)
     }

@@ -562,9 +562,9 @@ impl ReadingStore for TimescaleReader {
 }
 
 /// `SELECT bucket, <value>[, <carried>] FROM <view> WHERE station_id = $1 AND <value>
-/// <qualifies> ORDER BY 2 DESC|ASC LIMIT 1`.
+/// <qualifies> ORDER BY 2 DESC|ASC, 1 ASC LIMIT 1`.
 ///
-/// # Three things about this statement are deliberate
+/// # Four things about this statement are deliberate
 ///
 /// **The qualifying predicate is in the `WHERE`, not expressed as `NULLS LAST`.** Go writes
 /// `ORDER BY max_outtemp DESC NULLS LAST LIMIT 1`, which gets the same answer by a weaker
@@ -577,6 +577,16 @@ impl ReadingStore for TimescaleReader {
 /// **`ORDER BY 2`, positionally.** The ordering expression is the select list's, and for a
 /// finalised `mean` or circular mean that expression is a function call -- so naming it
 /// again here would be a third evaluation per row and a third place to keep in step.
+///
+/// **`, 1 ASC` -- the earliest bucket breaks a tie, and this is a deviation from Go with a
+/// reason.** Go writes no tiebreaker, so for a record whose extreme is a plateau its
+/// `timestamp` is whichever row the plan happened to return first: `high_tvoc` is an index
+/// pinned at a ceiling of 500 across many days, and a bare `ORDER BY ... LIMIT 1` over it
+/// can serve a different day after a refresh that saw no new data. A frozen response has to
+/// be a function of the data, so the tie is broken towards the **earliest** observation --
+/// which is also the rule `mw_pipeline::almanac::more_extreme` applies to the one record it
+/// carries forward ("an hour that merely equals the standing record has not broken it"),
+/// so the two places that can resolve a tie resolve it the same way.
 ///
 /// **No `LIMIT` parameter and no bound on the scan.** One row out, by construction. What
 /// bounds the work is the *level* the caller chose: `observations_1d` is one row per station
@@ -595,7 +605,8 @@ fn extreme_statement(
     }
     let _ = write!(
         sql,
-        " FROM {view} WHERE station_id = $1 AND {value} {qualifies} ORDER BY 2 {dir} LIMIT 1",
+        " FROM {view} WHERE station_id = $1 AND {value} {qualifies} \
+         ORDER BY 2 {dir}, 1 ASC LIMIT 1",
         view = view(level),
         qualifies = qualifies(q.positive_only),
         dir = direction(q.direction),
@@ -604,18 +615,22 @@ fn extreme_statement(
 }
 
 /// `SELECT time, <column>::float8 FROM observations WHERE station_id = $1 AND time >= $2
-/// AND time < $3 AND <column> <qualifies> ORDER BY 2 DESC|ASC LIMIT 1`.
+/// AND time < $3 AND <column> <qualifies> ORDER BY 2 DESC|ASC, 1 ASC LIMIT 1`.
 ///
 /// `observations` and not a level, which is the whole of the difference: the timestamp the
 /// contract serves for `high_solar` is a reading's and not a bucket's. The window is the
 /// caller's and is required -- [`mw_component::ReadingStore::raw_extreme`] has why.
+///
+/// `, 1 ASC` for [`extreme_statement`]'s reason, and it bites harder here: a sensor that
+/// reports the same peak for a minute gives ten identical rows, and the instant served would
+/// otherwise be whichever one the scan reached first.
 fn raw_extreme_statement(column: &str, q: &RawExtremeQuery) -> String {
     let mut sql = String::with_capacity(192);
     let _ = write!(
         sql,
         "SELECT time, {column}::float8 FROM observations \
          WHERE station_id = $1 AND time >= $2 AND time < $3 AND {column} {qualifies} \
-         ORDER BY 2 {dir} LIMIT 1",
+         ORDER BY 2 {dir}, 1 ASC LIMIT 1",
         qualifies = qualifies(q.positive_only),
         dir = direction(q.direction),
     );

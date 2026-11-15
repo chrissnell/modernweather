@@ -1783,7 +1783,7 @@ fn start_daemon(opts: &Options, config_db: &Path, procs: &mut Processes) -> Resu
             log.display()
         )
     })?;
-    almanac_is_populated(opts)?;
+    almanac_is_populated(opts, procs, daemon)?;
     Ok(())
 }
 
@@ -1808,7 +1808,16 @@ fn start_daemon(opts: &Options, config_db: &Path, procs: &mut Processes) -> Resu
 ///
 /// **Per station, and `davis-full` specifically**, because a total would be satisfied by
 /// `csi-minimal` alone and `almanac-populated` is the fixture that reads `davis-full`.
-fn almanac_is_populated(opts: &Options) -> Result<(), String> {
+///
+/// `procs` and `daemon` are taken for the same reason the snapshot wait above takes them: a
+/// daemon that exits after `snapshot:warm` would otherwise burn the whole deadline and then
+/// report the long "check that it is in the plan" message, which sends a reader to the wrong
+/// place.
+fn almanac_is_populated(
+    opts: &Options,
+    procs: &mut Processes,
+    daemon: Handle,
+) -> Result<(), String> {
     let target = opts.db.target_url();
     // A short wait rather than a single read: `almanac:records` is `Every` with
     // `FirstRun::Immediate`, so its first occurrence is concurrent with the daemon reaching
@@ -1824,6 +1833,9 @@ fn almanac_is_populated(opts: &Options) -> Result<(), String> {
             Ok(n) if n != "0" => {
                 println!("    {n} almanac records computed for davis-full");
                 Wait::Ready
+            }
+            Ok(_) if procs.exited(daemon) => {
+                Wait::GiveUp("the daemon exited before it computed any almanac record".to_string())
             }
             Ok(_) => Wait::Pending,
             Err(e) => Wait::GiveUp(e),

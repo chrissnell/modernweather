@@ -288,7 +288,6 @@ impl Pool {
                         self.alerts.revoke();
                         self.snow.revoke();
                         self.almanac.revoke();
-                        self.almanac.revoke();
                         pool.close().await;
                         return Err(ComponentError::tick(
                             "keep the weather database pool usable",
@@ -317,6 +316,7 @@ impl Pool {
         self.forecasts.revoke();
         self.alerts.revoke();
         self.snow.revoke();
+        self.almanac.revoke();
         pool.close().await;
         info!("the weather database pool is closed");
         Ok(())
