@@ -115,10 +115,45 @@ body {
   margin-block-start: 1.5rem;
 }
 
-/* chonky right-aligns td.actions and not th.actions, so an action column's header and
-   its cells sat at opposite ends of the same column. */
+/* The three rules below are chonky's, carried here until the fix ships.
+   chrissnell/chonky#3 adds all of them upstream; delete this block and bump the
+   dependency once it is released.
+
+   1. td.actions was right-aligned and th.actions was not, so an action column's header
+      and its cells sat at opposite ends of the same column.
+   2. Spacing two buttons in a cell by making it `display: flex` discards that alignment,
+      and then a row with one button and a row with two stop lining up with each other.
+      Providing the gap means the cell can stay inline and keep its alignment.
+   3. A control inside a table cell should not carry the stacked-form bottom margin; in a
+      row it only pushes the control off the baseline of whatever sits beside it. */
 th.actions {
   text-align: right;
+}
+
+td.actions > * + * {
+  margin-inline-start: 0.4rem;
+}
+
+td :is(input, select, textarea) {
+  margin-bottom: 0;
+}
+
+/* A control and the button that acts on it, on one line and actually aligned: `input`
+   and `select` carry `margin-bottom: 1rem` for stacked forms and `.btn` does not, which
+   leaves the button half a rem high against the control it belongs to. */
+.control-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.control-row > :is(input, select, textarea, .btn, button) {
+  margin-bottom: 0;
+}
+
+.control-row > :is(input, select, textarea) {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 /* Rows need a little more height now that the text in them is larger. */

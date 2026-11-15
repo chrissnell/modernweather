@@ -85,7 +85,12 @@ impl Section {
 /// What a component is called on screen.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct Display {
-    /// What it is: "Weather Underground", "Saving readings", "your Davis station".
+    /// What it is: "Weather Underground", "Saving readings", "Davis station".
+    ///
+    /// A capitalised noun phrase with no article and no possessive, because this is the
+    /// name column of a list of things rather than a sentence. The lowercase phrases in
+    /// [`capability_as_a_thing`] are deliberately the other way round -- those are read
+    /// inside a sentence ("waiting for the weather database") and stay lowercase.
     pub name: String,
     /// Which station or website it belongs to, when it belongs to one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -171,6 +176,32 @@ impl Vocabulary {
             .unwrap_or_else(|| key.to_string())
     }
 
+    /// What to call a component **inside a sentence**.
+    ///
+    /// The name column wants "Weather database"; a sentence wants "the weather database".
+    /// One string cannot do both jobs, and when it tried, capitalising the name column
+    /// turned a status line into "waiting for Weather database." Families whose name is a
+    /// common noun get their sentence form here; everything named by the operator -- a
+    /// website, a station, an upload account -- is already a proper noun and reads
+    /// correctly mid-sentence, so it falls through to [`Self::describe`].
+    pub fn thing_in_sentence(&self, id: &ComponentId) -> String {
+        let s = id.as_str();
+        let family = s.split_once(':').map_or(s, |(f, _)| f);
+        match family {
+            "db" => "the weather database".to_string(),
+            "http" => "the web server".to_string(),
+            "api" => "the phone app and legacy API".to_string(),
+            "writer" => "saving readings".to_string(),
+            "window" => "recent-conditions calculations".to_string(),
+            "snapshot" => "current conditions".to_string(),
+            "snow" => "snow calculations".to_string(),
+            "ingest" => "readings from other RemoteWeathers".to_string(),
+            "rain" => "the rainfall day boundary".to_string(),
+            "mgmt" => "the admin screen".to_string(),
+            _ => self.describe(id).one_line(),
+        }
+    }
+
     /// What this component is called on screen.
     ///
     /// **Total.** Every id gets a rendering, including one this function has never seen: an
@@ -185,31 +216,73 @@ impl Vocabulary {
             None => (s, ""),
         };
         match family {
-            "api" | "http" => Display {
-                name: "Website & API".into(),
+            // `http:listener` and `api:legacy` are two different things and used to share
+            // one label, which put two rows reading "Website & API" next to each other on
+            // the diagnostics page with nothing to tell them apart.
+            "http" => Display {
+                name: "Web server".into(),
+                qualifier: None,
+                section: Section::Website,
+                href: "/website".into(),
+            },
+            "api" => Display {
+                name: "Phone app & legacy API".into(),
+                qualifier: None,
+                section: Section::Website,
+                href: "/website".into(),
+            },
+            // `web:static` is the catch-all asset tree, not a website, and fell into the
+            // arm below as "Website (static)".
+            "web" if rest == "static" => Display {
+                name: "Shared pages & assets".into(),
                 qualifier: None,
                 section: Section::Website,
                 href: "/website".into(),
             },
             "web" => {
-                // `web:site:<id>`.
+                // `web:site:<id>`. The site's own name **is** this component's name: three
+                // rows all reading "your website" with the name demoted to a qualifier --
+                // and one of them blank, because a site may be saved without a name -- is
+                // a list that cannot be read. An unnamed or unknown site keeps its id, so
+                // every row still says which one it is.
                 let site = rest.strip_prefix("site:").unwrap_or(rest);
-                let qualifier = site
-                    .parse::<i64>()
-                    .ok()
-                    .and_then(|n| self.websites.get(&n).cloned());
-                Display {
-                    name: "your website".into(),
-                    qualifier,
-                    section: Section::Website,
-                    href: "/website".into(),
+                let id = site.parse::<i64>().ok();
+                let named = id
+                    .and_then(|n| self.websites.get(&n))
+                    .map(String::as_str)
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty());
+                match named {
+                    Some(name) => Display {
+                        name: name.to_string(),
+                        qualifier: None,
+                        section: Section::Website,
+                        href: "/website".into(),
+                    },
+                    None => Display {
+                        name: "Website".into(),
+                        qualifier: Some(match id {
+                            Some(n) => format!("site {n}"),
+                            None => site.to_string(),
+                        }),
+                        section: Section::Website,
+                        href: "/website".into(),
+                    },
                 }
             }
             "db" => Display {
-                name: "the weather database".into(),
+                name: "Weather database".into(),
                 qualifier: None,
                 section: Section::Storage,
                 href: "/data-storage".into(),
+            },
+            // The peer ingest service, which used to fall through to the unknown-family
+            // arm and render as the bare word "ingest" under System.
+            "ingest" => Display {
+                name: "Readings from other RemoteWeathers".into(),
+                qualifier: None,
+                section: Section::Storage,
+                href: "/data-storage/receive".into(),
             },
             "writer" => Display {
                 name: "Saving readings".into(),
@@ -234,7 +307,12 @@ impl Vocabulary {
                 href: "/system/diagnostics".into(),
             },
             "snapshot" => Display {
-                name: "Current conditions".into(),
+                name: if rest == "warm" {
+                    "Current conditions warm-up"
+                } else {
+                    "Current conditions"
+                }
+                .into(),
                 qualifier: None,
                 section: Section::System,
                 href: "/system/diagnostics".into(),
@@ -289,11 +367,11 @@ impl Vocabulary {
         // §0.2 names each device type. The two that are not a driver at all are named by
         // what they do, because that is what the operator configured.
         let (name, section, href) = match driver {
-            "davis" => ("your Davis station", Section::Stations, None),
-            "campbell" => ("your Campbell Scientific station", Section::Stations, None),
+            "davis" => ("Davis station", Section::Stations, None),
+            "campbell" => ("Campbell Scientific station", Section::Stations, None),
             "airgradient" => ("AirGradient air-quality sensor", Section::Stations, None),
             "snowgauge" => ("Snow depth sensor", Section::Stations, None),
-            "wll" => ("your WeatherLink Live station", Section::Stations, None),
+            "wll" => ("WeatherLink Live station", Section::Stations, None),
             "ambient" => (
                 "Ambient Weather station (sends to us)",
                 Section::Stations,
@@ -304,7 +382,7 @@ impl Vocabulary {
                 Section::Storage,
                 Some("/data-storage"),
             ),
-            _ => ("your weather station", Section::Stations, None),
+            _ => ("Weather station", Section::Stations, None),
         };
         // `station:wll:udp:<port>` is one broadcast listener for every WeatherLink unit on
         // the segment rather than a station's own component, so it has no station to
@@ -458,7 +536,7 @@ pub fn sentence_for(
 fn waiting_things(on: &[WaitingOn], vocab: &Vocabulary) -> String {
     let mut things: Vec<String> = Vec::new();
     for w in on {
-        let named = w.provider.as_ref().map(|id| vocab.describe(id).one_line());
+        let named = w.provider.as_ref().map(|id| vocab.thing_in_sentence(id));
         let thing = named.unwrap_or_else(|| capability_as_a_thing(w.capability).to_string());
         if !things.contains(&thing) {
             things.push(thing);
@@ -630,6 +708,107 @@ mod tests {
 
     fn id(s: &str) -> ComponentId {
         ComponentId::new(s).expect("a literal id")
+    }
+
+    fn website(id: i64, name: &str) -> crate::view::WebsiteView {
+        crate::view::WebsiteView {
+            id,
+            name: name.into(),
+            hostname: String::new(),
+            page_title: String::new(),
+            about_station_html: String::new(),
+            primary_station_key: None,
+            snow_enabled: false,
+            snow_station_key: None,
+            air_quality_enabled: false,
+            air_quality_station_key: None,
+            is_portal: false,
+            apple_app_id: String::new(),
+            radar_enabled: false,
+            radar_registered_at: None,
+            tls_cert_path: None,
+            tls_key_path: None,
+            is_default_tls: false,
+        }
+    }
+
+    /// **Two components must never render as the same row.**
+    ///
+    /// Each of these pairs shared one label, and each put two rows with identical text
+    /// next to each other on the diagnostics page with nothing to tell them apart --
+    /// `http:listener`/`api:legacy` under My Website, `snapshot:latest`/`snapshot:warm`
+    /// under System, and every `web:site:*` reading "your website" with the site's own
+    /// name demoted to a qualifier that is blank when the site was saved without one.
+    #[test]
+    fn distinct_components_get_distinct_names() {
+        let mut c = cfg();
+        c.websites = vec![website(1, "Suncrest Live Weather"), website(2, "  ")];
+        let v = Vocabulary::new(&c);
+        let name = |s: &str| v.describe(&id(s)).one_line();
+
+        assert_ne!(name("http:listener"), name("api:legacy"));
+        assert_ne!(name("snapshot:latest"), name("snapshot:warm"));
+
+        // A named site is called what the operator called it.
+        assert_eq!(name("web:site:1"), "Suncrest Live Weather");
+        // A site saved with a blank name, and one the configuration no longer has, still
+        // say which one they are rather than rendering as the same bare word.
+        assert_eq!(name("web:site:2"), "Website (site 2)");
+        assert_eq!(name("web:site:9"), "Website (site 9)");
+        assert_ne!(name("web:site:2"), name("web:site:9"));
+        // The catch-all asset tree is not a website at all.
+        assert_eq!(name("web:static"), "Shared pages & assets");
+
+        assert_eq!(name("db:postgres"), "Weather database");
+        assert_eq!(name("ingest:grpc"), "Readings from other RemoteWeathers");
+    }
+
+    /// A name column is a list of things, so every name is a capitalised noun phrase with
+    /// no article and no possessive. The sentence forms are the other way round and have
+    /// their own test below.
+    #[test]
+    fn names_read_as_a_list_rather_than_as_a_sentence() {
+        let v = Vocabulary::new(&cfg());
+        for s in [
+            "http:listener",
+            "api:legacy",
+            "web:static",
+            "db:postgres",
+            "writer:timescale",
+            "window:rollup",
+            "snapshot:latest",
+            "snapshot:warm",
+            "ingest:grpc",
+            "station:davis:backyard",
+            "station:campbell:backyard",
+            "station:wll:backyard",
+            "station:nosuchdriver:backyard",
+            "aeris:forecast",
+        ] {
+            let name = v.describe(&id(s)).name;
+            let first = name.chars().next().expect("a non-empty name");
+            assert!(
+                first.is_uppercase(),
+                "{s} renders as {name:?}, which does not start a list entry"
+            );
+            for lead in ["the ", "your ", "a "] {
+                assert!(
+                    !name.to_lowercase().starts_with(lead),
+                    "{s} renders as {name:?}, which reads as a sentence fragment"
+                );
+            }
+        }
+    }
+
+    /// The other half: inside a sentence the same things keep their article and their
+    /// lowercase, because "waiting for Weather database." is not English.
+    #[test]
+    fn the_sentence_form_keeps_its_article() {
+        let v = Vocabulary::new(&cfg());
+        assert_eq!(v.thing_in_sentence(&id("db:postgres")), "the weather database");
+        assert_eq!(v.thing_in_sentence(&id("snapshot:latest")), "current conditions");
+        // Named by the operator, so it is already correct mid-sentence.
+        assert_eq!(v.thing_in_sentence(&id("wu:backyard")), "Weather Underground (Backyard)");
     }
 
     /// §2.3's worked example, exactly: `wu:backyard` renders as "Weather Underground" /

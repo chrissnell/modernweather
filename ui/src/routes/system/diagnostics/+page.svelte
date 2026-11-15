@@ -14,6 +14,16 @@
   The live list is **grouped by `display.section`**, in navigation order. Ungrouped, it is
   one flat run of every component in the process, which is the whole system in arbitrary
   order and reads as noise.
+
+  **One table, not one per group.** A `Table` per group gave each group its own column
+  widths, so the Restart buttons -- and every other column -- landed somewhere different
+  in each one. The groups are `tbody` elements inside a single table instead, which is
+  what makes a column a column.
+
+  **The status cell is the pill and nothing else.** It used to carry §0.4's sentence
+  beside the badge, which reads "[Running] Running." on the row where it is least needed
+  and is noise on the row where it repeats. The sentence moves under the name, and only
+  when it says something the pill does not.
 -->
 <script lang="ts">
   import { AlertDialog, Badge, Box, Button, Table, toast } from '@chrissnell/chonky-ui';
@@ -80,42 +90,63 @@
   function runnable(kind: string): boolean {
     return kind === 'every' || kind === 'calendar' || kind === 'on_demand';
   }
+
+  /**
+   * §0.4's sentence, but only when it is not a longer way of saying the badge.
+   *
+   * "Running." beside a `Running` pill is the case that prompted this; the comparison is
+   * on the words rather than a list of known sentences, so a sentence the server grows
+   * later -- "Running, but ... isn't available." -- keeps showing up without this needing
+   * to be taught about it.
+   */
+  function detail(sentence: string | undefined, label: string): string | null {
+    if (!sentence) return null;
+    const bare = sentence
+      .replace(/[.…]+$/u, '')
+      .trim()
+      .toLowerCase();
+    return bare === label.trim().toLowerCase() ? null : sentence;
+  }
 </script>
 
 <h1>{copy.diagnostics.title}</h1>
 <p class="blurb">{copy.diagnostics.blurb}</p>
 
-{#if stream.components.length === 0}
-  <Box title={copy.diagnostics.runningHeading}>
+<Box>
+  {#if stream.components.length === 0}
     <p class="blurb">{common.loading}</p>
-  </Box>
-{:else}
-  {#each groups as group (group.label)}
-    <Box title={group.label}>
-      <Table>
-        <thead>
-          <tr>
-            <th>{copy.diagnostics.columns.what}</th>
-            <th>{copy.diagnostics.columns.status}</th>
-            <th>{copy.diagnostics.columns.schedule}</th>
-            <th>{copy.diagnostics.columns.lastRun}</th>
-            <th><span class="mw-visually-hidden">Actions</span></th>
-          </tr>
-        </thead>
+  {:else}
+    <Table>
+      <thead>
+        <tr>
+          <th>{copy.diagnostics.columns.what}</th>
+          <th>{copy.diagnostics.columns.status}</th>
+          <th>{copy.diagnostics.columns.schedule}</th>
+          <th>{copy.diagnostics.columns.lastRun}</th>
+          <th class="actions"><span class="mw-visually-hidden">Actions</span></th>
+        </tr>
+      </thead>
+      {#each groups as group (group.label)}
         <tbody>
+          <tr>
+            <th class="group" colspan="5" scope="colgroup">{group.label}</th>
+          </tr>
           {#each group.items as c (c.id)}
+            {@const extra = detail(c.sentence, c.badge.label)}
             <tr>
               <td>
-                <a href={c.display.href}>{c.display.name}</a>
-                {#if c.display.qualifier}
-                  <span class="dim">{c.display.qualifier}</span>
+                <span class="what">
+                  <a href={c.display.href}>{c.display.name}</a>
+                  {#if c.display.qualifier}
+                    <span class="dim">{c.display.qualifier}</span>
+                  {/if}
+                  {#if c.pending}
+                    <Badge variant="info">Catching up</Badge>
+                  {/if}
+                </span>
+                {#if extra}
+                  <p class="note">{extra}</p>
                 {/if}
-                {#if c.pending}
-                  <Badge variant="info">Catching up</Badge>
-                {/if}
-              </td>
-              <td>
-                <StatusBadge badge={c.badge} state={c.state} sentence={c.sentence} />
                 {#each c.notes as note (note)}
                   <p class="note">{note}</p>
                 {/each}
@@ -123,6 +154,7 @@
                   <p class="note err">{c.last_error}</p>
                 {/if}
               </td>
+              <td><StatusBadge badge={c.badge} state={c.state} /></td>
               <td><ScheduleLine schedule={c.schedule} now={stream.now} /></td>
               <td>{c.schedule.last_run ? stamp(c.schedule.last_run) : common.never}</td>
               <td class="actions">
@@ -132,9 +164,10 @@
                   </Button>
                 {/if}
                 <!--
-                  One dialog for the table rather than one per row: `AlertDialog.Root` takes
-                  a bindable `open` and no change handler, so a per-row instance would need a
-                  per-row binding -- and the dialog is modal, so only one can be open anyway.
+                  One dialog for the table rather than one per row: `AlertDialog.Root`
+                  takes a bindable `open` and no change handler, so a per-row instance
+                  would need a per-row binding -- and the dialog is modal, so only one can
+                  be open anyway.
                 -->
                 <Button
                   size="sm"
@@ -151,10 +184,10 @@
             </tr>
           {/each}
         </tbody>
-      </Table>
-    </Box>
-  {/each}
-{/if}
+      {/each}
+    </Table>
+  {/if}
+</Box>
 
 <p class="blurb">{copy.diagnostics.noStopNote}</p>
 
@@ -192,10 +225,34 @@
     max-width: 80ch;
   }
 
+  /* The group heading is a row of the one table rather than a title above a table of its
+     own, which is what keeps every group's columns in the same place. */
+  .group {
+    padding-top: 1.1rem;
+    color: var(--color-text-muted);
+    font-size: var(--text-xs);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  tbody:first-of-type .group {
+    padding-top: 0;
+  }
+
+  .what {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+
   .note {
     margin: 0.2rem 0 0;
-    font-size: var(--text-xs);
+    font-size: var(--text-sm);
     color: var(--color-text-muted);
+    max-width: 70ch;
   }
 
   .note.err {
@@ -205,11 +262,5 @@
   .dim {
     color: var(--color-text-muted);
     font-size: var(--text-xs);
-  }
-
-  .actions {
-    display: flex;
-    gap: 0.4rem;
-    align-items: center;
   }
 </style>
