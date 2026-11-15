@@ -1,5 +1,11 @@
 -- Unschedule the one background job that could rewrite a seeded snapshot the fixtures depend on.
 --
+-- NOTE, A-M7-6-1: this file governs the GO rig only, and it is the one place in this
+-- repository that named the almanac's writer before `almanac:records` existed -- in order to
+-- STOP it. That is part of why the Rust side's missing writer went unnoticed for two
+-- milestones: the only mention of the mechanism was a mention of switching it off. The Rust
+-- rig no longer seeds `almanac_cache` at all; see ci/conformance/rust-seed/04-caches.sql.
+--
 -- migrations/weather/005_create_almanac_cache.up.sql registers `refresh_almanac_cache` with
 -- `add_job('refresh_almanac_cache', '1 hour', initial_start => NOW())`, guarded by an IF NOT
 -- EXISTS on proc_name. It is the only one of the five migrations that registers it; 028, 029 and

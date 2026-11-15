@@ -1450,15 +1450,21 @@ fn seed_weather_database(opts: &Options) -> Result<(), String> {
     //     because each level reads the one below. A level that materialised nothing leaves
     //     `/span/72h` and `/span/720h` answering with D-55's trailing raw bucket alone: one
     //     element, of the right shape, which passes.
-    //   - `almanac_cache` and `forecasts` are caught today -- `{}` and a 404 differ in shape
-    //     -- and are asserted anyway, because that is a property of the fixtures rather than
-    //     of the seed.
+    //   - `forecasts` is caught today -- a 404 and a body differ in shape -- and is asserted
+    //     anyway, because that is a property of the fixtures rather than of the seed.
+    //
+    // **`almanac_cache` is deliberately NOT in this list and is no longer seeded at all.**
+    // It is asserted after the daemon has started instead, by [`almanac_is_populated`], and
+    // the reason is the defect that gave this programme `almanac:records`: a seeded almanac
+    // made the two `/almanac` fixtures pass whether or not anything in the daemon ever wrote
+    // that table -- and for two milestones nothing did, while this suite reported green
+    // (`docs/reconciliation.md` A-M7-6-1). A seeded cache and a working writer are the same
+    // bytes; the difference only becomes visible if the seed is removed.
     let counts = [
         ("observations", "readings"),
         ("observations_5m", "five-minute buckets"),
         ("observations_1h", "hourly buckets"),
         ("observations_1d", "daily buckets"),
-        ("almanac_cache", "almanac rows"),
         ("snow_totals_cache", "snow rows"),
         ("forecasts", "forecast rows"),
     ];
@@ -1777,7 +1783,75 @@ fn start_daemon(opts: &Options, config_db: &Path, procs: &mut Processes) -> Resu
             log.display()
         )
     })?;
+    almanac_is_populated(opts, procs, daemon)?;
     Ok(())
+}
+
+/// **The almanac cache is not empty, asserted against the daemon that just started.**
+///
+/// This is the check that was missing. `/almanac` reads `almanac_cache` and nothing else,
+/// and renders no rows as `{}` with a `200` -- which is the frozen contract's behaviour for
+/// an empty cache and is therefore indistinguishable, to this suite, from an endpoint that
+/// has no writer. For two milestones it had none: `ci/conformance/rust-seed/04-caches.sql`
+/// seeded the table, the two `/almanac` fixtures compared a seeded rig against a recording
+/// of a seeded rig, and the deployment served `{}` to the owner
+/// (`docs/reconciliation.md` **A-M7-6-1**).
+///
+/// So the seed is gone and this runs **after** the daemon has started, which makes the rows
+/// `almanac:records`' output rather than the seed's. `FirstRun::Immediate` is what makes it
+/// available without waiting an hour, and it is one of that component's declarations rather
+/// than a convenience for this gate.
+///
+/// Exit **2**, not 1, for this file's usual reason: an empty cache here means the run
+/// measured a daemon with no almanac, which is a different statement from "the rewrite does
+/// not match the contract".
+///
+/// **Per station, and `davis-full` specifically**, because a total would be satisfied by
+/// `csi-minimal` alone and `almanac-populated` is the fixture that reads `davis-full`.
+///
+/// `procs` and `daemon` are taken for the same reason the snapshot wait above takes them: a
+/// daemon that exits after `snapshot:warm` would otherwise burn the whole deadline and then
+/// report the long "check that it is in the plan" message, which sends a reader to the wrong
+/// place.
+fn almanac_is_populated(
+    opts: &Options,
+    procs: &mut Processes,
+    daemon: Handle,
+) -> Result<(), String> {
+    let target = opts.db.target_url();
+    // A short wait rather than a single read: `almanac:records` is `Every` with
+    // `FirstRun::Immediate`, so its first occurrence is concurrent with the daemon reaching
+    // `Running` and not ordered before it.
+    await_for(
+        "the almanac records",
+        Duration::from_secs(60),
+        || match psql_query(
+            opts,
+            &target,
+            "select count(*) from almanac_cache where station_id = 'davis-full'",
+        ) {
+            Ok(n) if n != "0" => {
+                println!("    {n} almanac records computed for davis-full");
+                Wait::Ready
+            }
+            Ok(_) if procs.exited(daemon) => {
+                Wait::GiveUp("the daemon exited before it computed any almanac record".to_string())
+            }
+            Ok(_) => Wait::Pending,
+            Err(e) => Wait::GiveUp(e),
+        },
+    )
+    .map_err(|e| {
+        format!(
+            "{e}.\n  `almanac_cache` is empty for `davis-full`, so `/almanac` would answer \
+             `{{}}` with a 200 -- which the `almanac-empty` fixture says is correct for a \
+             station with no records and `almanac-populated` says is a contract break for \
+             one with eight. This table is NOT seeded: `almanac:records` computes it from \
+             the station's history on its first occurrence, and the component is planned for \
+             every enabled station on a node with a weather database. Check that it is in \
+             the plan at all (docs/reconciliation.md A-M7-6-1) before looking at the seed."
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------------------

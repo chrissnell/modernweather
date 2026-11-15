@@ -49,6 +49,11 @@
 //! pre-serialised bytes, so a database outage no longer touches it: that module is the
 //! table, the fold, and the cold-start seed.
 //!
+//! Also here: [`almanac`] -- `almanac:records`, the component W1 assumption 12 described
+//! the cache for and the plan never declared. `/almanac` served `{}` with a `200` because
+//! `almanac_cache` had a reader and no writer; that module is the twelve extremes Go
+//! computes in PL/pgSQL, as a table and a station loop.
+//!
 //! Also here: [`snow`] -- the four `snow:*` components, which are **R2**'s expensive tier.
 //! Every one of the seven numbers `/snow` serves is a function of a window of readings, so
 //! none of them may be computed per request; that module is the dual-threshold walk, the
@@ -63,6 +68,7 @@
 //! goes on — because a list in a module doc is not a work item
 //! (docs/reconciliation.md G-5).
 
+pub mod almanac;
 pub mod clock;
 pub mod enrich;
 pub mod metrics;
@@ -77,6 +83,7 @@ mod sink;
 mod stream;
 pub mod writer;
 
+pub use almanac::{AlmanacConfig, AlmanacPlanError, AlmanacStation};
 pub use clock::{Clock, SystemClock, TestClock};
 pub use enrich::enrich;
 pub use ingress::{

@@ -35,8 +35,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mw_component::{
-    AlertStore, Builder, Capability, ComponentError, ComponentId, ComponentSpec, Cx, ForecastStore,
-    Provision, Publisher, Serve, SnowCache, StationRegistry, Store, Trigger,
+    AlertStore, AlmanacCache, Builder, Capability, ComponentError, ComponentId, ComponentSpec, Cx,
+    ForecastStore, Provision, Publisher, Serve, SnowCache, StationRegistry, Store, Trigger,
 };
 use mw_types::{Class, Classify, DisplayChain};
 use secrecy::ExposeSecret as _;
@@ -107,6 +107,7 @@ pub fn spec(
                 let forecasts = cx.publisher::<Arc<dyn ForecastStore>>()?;
                 let alerts = cx.publisher::<Arc<dyn AlertStore>>()?;
                 let snow = cx.publisher::<Arc<dyn SnowCache>>()?;
+                let almanac = cx.publisher::<Arc<dyn AlmanacCache>>()?;
                 Ok(Pool {
                     url,
                     registry,
@@ -114,15 +115,19 @@ pub fn spec(
                     forecasts,
                     alerts,
                     snow,
+                    almanac,
                 })
             }
         }),
     )
     // No needs at all: W2a §4.1's table gives `db:postgres` none, which is what makes it a
     // root of the ordering graph and therefore unable to participate in a cycle.
-    // Four capabilities, one pool. W2a §4.1's table gives `db:postgres` `ReadingStore`;
-    // §2.1 gives `ForecastStore`, `AlertStore` and `SnowCache` the same provider. The last
-    // of the four used to be absent, because `/alerts` is not carried forward (**D-69**)
+    // Five capabilities, one pool. W2a §4.1's table gives `db:postgres` `ReadingStore`;
+    // §2.1 gives `ForecastStore`, `AlertStore` and `SnowCache` the same provider, and
+    // `AlmanacCache` -- the write half of the one precomputed cache W2a named and left
+    // unowned (`docs/reconciliation.md` **A-M7-6-1**) -- belongs here for the same reason
+    // the other three do. The fourth of the five used to be absent, because `/alerts` is
+    // not carried forward (**D-69**)
     // and a capability with no consumer is a handle trait nobody has checked against a
     // query. M6-3 gives it one: `docs/reconciliation.md` **A-M6-3-1** keeps the endpoint
     // retired and builds the two components that WRITE alerts, so the trait now has the
@@ -137,6 +142,7 @@ pub fn spec(
         Provision::of(Capability::ForecastStore),
         Provision::of(Capability::AlertStore),
         Provision::of(Capability::SnowCache),
+        Provision::of(Capability::AlmanacCache),
     ])
     // The URL is the only configuration this component closes over, so it is the whole of
     // the digest: a re-plan after the operator points the daemon at another server
@@ -169,6 +175,7 @@ struct Pool {
     forecasts: Publisher<Arc<dyn ForecastStore>>,
     alerts: Publisher<Arc<dyn AlertStore>>,
     snow: Publisher<Arc<dyn SnowCache>>,
+    almanac: Publisher<Arc<dyn AlmanacCache>>,
 }
 
 impl std::fmt::Debug for Pool {
@@ -215,13 +222,14 @@ impl Pool {
             "the weather database is usable"
         );
         self.publisher.publish(Arc::new(store) as Arc<dyn Store>);
-        // The three tables beside the aggregates, over the same pool and published in the
+        // The four tables beside the aggregates, over the same pool and published in the
         // same breath: a consumer that resolved one and not the other would degrade an
         // endpoint for a reason that is not about the database.
-        let (forecasts, alerts, snow) = Arc::new(FrozenReads::new(pool.clone())).handles();
+        let (forecasts, alerts, snow, almanac) = Arc::new(FrozenReads::new(pool.clone())).handles();
         self.forecasts.publish(forecasts);
         self.alerts.publish(alerts);
         self.snow.publish(snow);
+        self.almanac.publish(almanac);
 
         // The probe loop. W2a §3.4's worked example is explicit about where this ends:
         // `db:postgres` "probe fails -> revokes ReadingStore ... -> **Failed -> Backoff**",
@@ -279,6 +287,7 @@ impl Pool {
                         self.forecasts.revoke();
                         self.alerts.revoke();
                         self.snow.revoke();
+                        self.almanac.revoke();
                         pool.close().await;
                         return Err(ComponentError::tick(
                             "keep the weather database pool usable",
@@ -307,6 +316,7 @@ impl Pool {
         self.forecasts.revoke();
         self.alerts.revoke();
         self.snow.revoke();
+        self.almanac.revoke();
         pool.close().await;
         info!("the weather database pool is closed");
         Ok(())
@@ -464,6 +474,7 @@ mod tests {
                 Capability::ForecastStore,
                 Capability::AlertStore,
                 Capability::SnowCache,
+                Capability::AlmanacCache,
             ]),
             Vec::new(),
             Arc::clone(&bus) as Arc<dyn CapabilityPublisher>,
@@ -481,6 +492,9 @@ mod tests {
         let snow = build
             .publisher::<Arc<dyn SnowCache>>()
             .expect("the spec declares this provision");
+        let almanac = build
+            .publisher::<Arc<dyn AlmanacCache>>()
+            .expect("the spec declares this provision");
         (
             Box::new(Pool {
                 url: secrecy::SecretString::from(url.to_string()),
@@ -491,6 +505,7 @@ mod tests {
                 forecasts,
                 alerts,
                 snow,
+                almanac,
             }),
             bus,
             cx,
@@ -566,9 +581,12 @@ mod tests {
                 Provision::of(Capability::ForecastStore),
                 Provision::of(Capability::AlertStore),
                 Provision::of(Capability::SnowCache),
+                Provision::of(Capability::AlmanacCache),
             ],
-            "all four of W2a §4.1's. AlertStore is here as of M6-3, whose aeris:alerts:* \
-             components write it -- the endpoint stays retired (D-69, A-M6-3-1)"
+            "the four of W2a §4.1's plus AlmanacCache. AlertStore arrived with M6-3, whose \
+             aeris:alerts:* components write it -- the endpoint stays retired (D-69, \
+             A-M6-3-1). AlmanacCache arrived with almanac:records, the component W2a \
+             described the cache for and never declared (A-M7-6-1)"
         );
         assert!(matches!(spec.trigger, Trigger::Service));
         assert!(

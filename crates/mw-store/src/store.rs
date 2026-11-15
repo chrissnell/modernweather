@@ -16,9 +16,9 @@
 use std::sync::Arc;
 
 use mw_component::{
-    AlmanacQuery, AlmanacRecord, BoxFuture, Bucket, BucketQuery, Bucketed, LatestQuery, MeanBucket,
-    MeanSeriesQuery, ReadingSink, ReadingStore, SeriesQuery, Span, SpanQuery, StoreError, Stored,
-    TotalsQuery,
+    AlmanacQuery, AlmanacRecord, BoxFuture, Bucket, BucketQuery, Bucketed, ExtremeBucket,
+    ExtremeQuery, LatestQuery, MeanBucket, MeanSeriesQuery, RawExtreme, RawExtremeQuery,
+    ReadingSink, ReadingStore, SeriesQuery, Span, SpanQuery, StoreError, Stored, TotalsQuery,
 };
 use mw_types::{Envelope, Reading};
 use sqlx::PgPool;
@@ -99,5 +99,19 @@ impl ReadingStore for TimescaleStore {
         q: AlmanacQuery,
     ) -> BoxFuture<'a, Result<Vec<AlmanacRecord>, StoreError>> {
         self.reader.almanac(q)
+    }
+
+    fn extreme<'a>(
+        &'a self,
+        q: ExtremeQuery,
+    ) -> BoxFuture<'a, Result<Option<ExtremeBucket>, StoreError>> {
+        self.reader.extreme(q)
+    }
+
+    fn raw_extreme<'a>(
+        &'a self,
+        q: RawExtremeQuery,
+    ) -> BoxFuture<'a, Result<Option<RawExtreme>, StoreError>> {
+        self.reader.raw_extreme(q)
     }
 }

@@ -598,6 +598,18 @@ mod driven {
         ) -> BoxFuture<'a, Result<Vec<mw_component::AlmanacRecord>, StoreError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
+        fn extreme<'a>(
+            &'a self,
+            _q: mw_component::ExtremeQuery,
+        ) -> BoxFuture<'a, Result<Option<mw_component::ExtremeBucket>, StoreError>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn raw_extreme<'a>(
+            &'a self,
+            _q: mw_component::RawExtremeQuery,
+        ) -> BoxFuture<'a, Result<Option<mw_component::RawExtreme>, StoreError>> {
+            Box::pin(async { Ok(None) })
+        }
     }
 
     fn folder(

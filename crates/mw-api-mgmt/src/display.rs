@@ -334,6 +334,7 @@ pub const fn capability_as_a_thing(cap: Capability) -> &'static str {
         Capability::ReadingStore => "the weather database",
         Capability::ForecastStore | Capability::AlertStore => "forecasts and alerts",
         Capability::SnowCache => "snow calculations",
+        Capability::AlmanacCache => "the almanac records",
         Capability::WindowedView => "recent-conditions calculations",
         Capability::LatestSnapshot => "current conditions",
         Capability::ConfigStore | Capability::ConfigAdmin => "the configuration",

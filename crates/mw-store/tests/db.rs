@@ -2168,3 +2168,488 @@ async fn a_closed_bucket_the_aggregate_has_not_caught_up_to_is_still_returned() 
     )
     .await;
 }
+
+/// **The twelve `ORDER BY ... LIMIT 1`s behind `/almanac`, against a real server.**
+///
+/// `almanac:records` is the component W1 assumption 12 described the cache for and the plan
+/// never declared, and `mw_pipeline::almanac` asserts its record table and its
+/// carry-forward over a fake store. What a fake store cannot say anything about is the half
+/// that is a statement: that `(metric, agg)` resolves to the column the registry declares
+/// at the level asked for, that the carried direction is the bucket's finalised circular
+/// mean rather than a raw column, that Go's `> 0` and `IS NOT NULL` filters select different
+/// rows, and that two levels of the same column are two different records.
+///
+/// Three days of readings with the extremes placed by hand, and every assertion is against
+/// a value this test put there.
+#[tokio::test]
+#[ignore = "needs a real TimescaleDB; run with `cargo xtask db-tests`"]
+async fn the_almanac_extremes_are_the_argmax_of_the_history() {
+    let station = "db-tests:almanac-extremes";
+    let pool = prepare(&[station]).await;
+    let w = writer(&pool, station);
+    let reader = TimescaleReader::new(pool.clone());
+
+    // 2026-06-01T00:00:00Z, away from every other test's window. Three whole UTC days, so
+    // the day level has exactly three buckets and "which day" is an assertion.
+    let base = 1_780_272_000i64;
+    let day = 86_400i64;
+    let mut batch: Vec<Envelope> = Vec::new();
+    let mut seq = 0u64;
+    let push = |batch: &mut Vec<Envelope>, seq: &mut u64, offset: i64, reading: Reading| {
+        *seq += 1;
+        batch.push(envelope(station, at(base + offset), *seq, reading));
+    };
+
+    // Day 0: the wind record and the solar record. The barometer reads **zero** here, which
+    // is the dead-sensor row Go's `> 0` filter exists to skip -- and the lowest number in
+    // the column, so a filter that did not skip it would pick this day.
+    for minute in 0..5i64 {
+        push(
+            &mut batch,
+            &mut seq,
+            minute * 60,
+            Reading {
+                out_temp: Some(50.0 + minute as f32),
+                out_humidity: Some(40.0),
+                barometer: Some(0.0),
+                wind_speed: Some(40.0 + minute as f32),
+                // Due north, so the day's circular mean is an assertion with no rounding
+                // to argue about.
+                wind_dir: Some(0.0),
+                rain_incremental: Some(0.01),
+                solar_watts: Some(100.0 * (minute as f32 + 1.0)),
+                ..Reading::default()
+            },
+        );
+    }
+
+    // Day 1: the high temperature, and the heaviest **hour** of rain -- all of it inside
+    // one hour, so the hourly record is this hour and the daily record is a different day.
+    for minute in 0..5i64 {
+        push(
+            &mut batch,
+            &mut seq,
+            day + minute * 60,
+            Reading {
+                out_temp: Some(90.0 + minute as f32),
+                out_humidity: Some(30.0),
+                barometer: Some(29.80),
+                wind_speed: Some(10.0),
+                wind_dir: Some(180.0),
+                rain_incremental: Some(0.10),
+                solar_watts: Some(50.0),
+                ..Reading::default()
+            },
+        );
+    }
+
+    // Day 2: the low temperature, the low humidity, the lowest POSITIVE barometer, and the
+    // heaviest **day** of rain -- spread over three hours, so no single hour of it beats
+    // day 1's.
+    for hour in 0..3i64 {
+        for minute in 0..5i64 {
+            push(
+                &mut batch,
+                &mut seq,
+                2 * day + hour * 3600 + minute * 60,
+                Reading {
+                    out_temp: Some(5.0 + minute as f32),
+                    out_humidity: Some(6.0 + minute as f32),
+                    barometer: Some(29.10),
+                    wind_speed: Some(5.0),
+                    wind_dir: Some(270.0),
+                    rain_incremental: Some(0.08),
+                    solar_watts: Some(25.0),
+                    ..Reading::default()
+                },
+            );
+        }
+    }
+    w.store(&batch).await.expect("the readings are stored");
+    materialise(&pool, at(base), at(base + 3 * day)).await;
+
+    let extreme = |level, column, direction, positive_only, carry| {
+        reader.extreme(mw_component::ExtremeQuery {
+            station: StationKey::new(station),
+            level,
+            column,
+            direction,
+            positive_only,
+            carry,
+        })
+    };
+    let day_level = mw_component::BucketLevel::Day;
+
+    // `high_temp`: day 1, and the day's own maximum rather than the last reading in it.
+    let high_temp = extreme(
+        day_level,
+        (MetricKey::OutTemp, Agg::Max),
+        mw_component::Extremum::Greatest,
+        false,
+        None,
+    )
+    .await
+    .expect("the query runs")
+    .expect("three days of temperatures");
+    assert_eq!(high_temp.bucket, at(base + day));
+    assert_eq!(high_temp.value, 94.0);
+    assert_eq!(
+        high_temp.carried, None,
+        "no carry was asked for, so there is no `wind_dir` to serve"
+    );
+
+    // `low_temp`: the same column at the other end, which is a different column at the
+    // level -- `outtemp_min`, not `outtemp_max` ordered the other way.
+    let low_temp = extreme(
+        day_level,
+        (MetricKey::OutTemp, Agg::Min),
+        mw_component::Extremum::Least,
+        false,
+        None,
+    )
+    .await
+    .expect("the query runs")
+    .expect("three days of temperatures");
+    assert_eq!(low_temp.bucket, at(base + 2 * day));
+    assert_eq!(low_temp.value, 5.0);
+
+    // `high_wind_speed`, with the direction carried from the same bucket. **The carried
+    // value is the day's finalised circular mean**, which is what Go serves beside the
+    // gust -- not the direction at the instant of it.
+    let wind = extreme(
+        day_level,
+        (MetricKey::WindSpeed, Agg::Max),
+        mw_component::Extremum::Greatest,
+        false,
+        Some((MetricKey::WindDir, Agg::CircularMean)),
+    )
+    .await
+    .expect("the query runs")
+    .expect("three days of wind");
+    assert_eq!(wind.bucket, at(base));
+    assert_eq!(wind.value, 44.0);
+    let carried = wind
+        .carried
+        .expect("a direction was asked for and reported");
+    assert!(
+        carried.abs() < 1e-6 || (carried - 360.0).abs() < 1e-6,
+        "every reading in that day was due north, so the vector mean is 0 (or 360): \
+         {carried}"
+    );
+
+    // **Go's two filters select different rows, and this is the pair that proves it.** Day
+    // 0's barometer is zero, which is the lowest number in the column and a dead sensor.
+    let low_barometer = extreme(
+        day_level,
+        (MetricKey::Barometer, Agg::Min),
+        mw_component::Extremum::Least,
+        true,
+        None,
+    )
+    .await
+    .expect("the query runs")
+    .expect("two days of positive barometers");
+    assert_eq!(
+        low_barometer.bucket,
+        at(base + 2 * day),
+        "`> 0` skips the dead sensor, which is why `low_barometer` is `> 0` in Go and \
+         `low_temp` is not"
+    );
+    // A tolerance here and an exact comparison on the temperatures above, for a reason
+    // rather than out of caution: `barometer_min` is a `real` column, 29.10 is not exactly
+    // representable in 24 bits of mantissa, and the cast to `float8` in the statement
+    // widens the stored `29.100000381469727` rather than recovering the literal. The
+    // temperatures, humidities and wind speeds in this test are whole numbers, which are.
+    assert!(
+        (low_barometer.value - 29.10).abs() < 1e-5,
+        "{}",
+        low_barometer.value
+    );
+    let including_zero = extreme(
+        day_level,
+        (MetricKey::Barometer, Agg::Min),
+        mw_component::Extremum::Least,
+        false,
+        None,
+    )
+    .await
+    .expect("the query runs")
+    .expect("three days of barometers");
+    assert_eq!(
+        (including_zero.bucket, including_zero.value),
+        (at(base), 0.0),
+        "without the filter the dead sensor wins, so the flag is load-bearing rather than \
+         decorative"
+    );
+
+    // `low_humidity`, the other `> 0` record.
+    let low_humidity = extreme(
+        day_level,
+        (MetricKey::OutHumidity, Agg::Min),
+        mw_component::Extremum::Least,
+        true,
+        None,
+    )
+    .await
+    .expect("the query runs")
+    .expect("three days of humidity");
+    assert_eq!(
+        (low_humidity.bucket, low_humidity.value),
+        (at(base + 2 * day), 6.0)
+    );
+
+    // **`max_rain_hour` and `max_rain_day` are the same column at two levels**, and nothing
+    // but the level distinguishes them. Day 1 put 0.5" into one hour; day 2 put 1.2" into
+    // three, so the two records name different days.
+    let rain_hour = extreme(
+        mw_component::BucketLevel::Hour,
+        (MetricKey::RainIncremental, Agg::Sum),
+        mw_component::Extremum::Greatest,
+        false,
+        None,
+    )
+    .await
+    .expect("the query runs")
+    .expect("three days of rain");
+    assert_eq!(rain_hour.bucket, at(base + day));
+    assert!(
+        (rain_hour.value - 0.5).abs() < 1e-6,
+        "five readings of 0.10 inches in one hour: {}",
+        rain_hour.value
+    );
+    let rain_day = extreme(
+        day_level,
+        (MetricKey::RainIncremental, Agg::Sum),
+        mw_component::Extremum::Greatest,
+        false,
+        None,
+    )
+    .await
+    .expect("the query runs")
+    .expect("three days of rain");
+    assert_eq!(rain_day.bucket, at(base + 2 * day));
+    assert!(
+        (rain_day.value - 1.2).abs() < 1e-6,
+        "fifteen readings of 0.08 inches over one day: {}",
+        rain_day.value
+    );
+
+    // **A metric the station never reported is `None`, not zero.** `high_pm25` and
+    // `high_co2` are absent keys on a station with no air-quality sensor, which is what
+    // makes `/almanac` eight keys for one station and fourteen for another.
+    for column in [(MetricKey::Pm25, Agg::Max), (MetricKey::Co2, Agg::Max)] {
+        assert_eq!(
+            extreme(
+                day_level,
+                column,
+                mw_component::Extremum::Greatest,
+                true,
+                None
+            )
+            .await
+            .expect("the query runs"),
+            None,
+            "{column:?} was never reported"
+        );
+    }
+
+    // `high_solar`: the day level names the peak day and the raw lookup inside it finds the
+    // **reading**, which is the instant the contract serves. Day 0's peak is the fifth
+    // reading, four minutes in.
+    let solar_day = extreme(
+        day_level,
+        (MetricKey::SolarWatts, Agg::Max),
+        mw_component::Extremum::Greatest,
+        true,
+        None,
+    )
+    .await
+    .expect("the query runs")
+    .expect("three days of sun");
+    assert_eq!(solar_day.bucket, at(base));
+    let peak = reader
+        .raw_extreme(mw_component::RawExtremeQuery {
+            station: StationKey::new(station),
+            metric: MetricKey::SolarWatts,
+            since: solar_day.bucket,
+            until: solar_day.bucket + chrono::Duration::days(1),
+            direction: mw_component::Extremum::Greatest,
+            positive_only: true,
+        })
+        .await
+        .expect("the query runs")
+        .expect("that day has readings in it");
+    assert_eq!(
+        (peak.time, peak.value),
+        (at(base + 4 * 60), 500.0),
+        "a reading's own instant, not the bucket's midnight"
+    );
+    assert_eq!(
+        peak.value, solar_day.value,
+        "the day's maximum and the peak reading inside it are the same number, which is \
+         what makes the two-step bounded rather than approximate"
+    );
+
+    // And the window is honoured rather than ignored: day 2's peak is 25 W/m², not 500.
+    let elsewhere = reader
+        .raw_extreme(mw_component::RawExtremeQuery {
+            station: StationKey::new(station),
+            metric: MetricKey::SolarWatts,
+            since: at(base + 2 * day),
+            until: at(base + 3 * day),
+            direction: mw_component::Extremum::Greatest,
+            positive_only: true,
+        })
+        .await
+        .expect("the query runs")
+        .expect("that day has readings in it");
+    assert_eq!(elsewhere.value, 25.0);
+
+    touched(&pool, "the_almanac_extremes_are_the_argmax_of_the_history").await;
+}
+
+/// **Every record name `almanac:records` can write satisfies `almanac_cache`'s `CHECK`, and
+/// a replace is a replace.**
+///
+/// The `CHECK (record IN (...))` is the contract: "a typo here would silently drop a field
+/// from a response rather than fail" is the column's own comment, and the only place that
+/// claim can be tested is against a server that has the constraint. So this writes all
+/// seventeen permitted names -- which is a superset of the twelve the component produces --
+/// and reads them back through the handle `/almanac` reads through.
+///
+/// It also pins the three behaviours `mw_component::AlmanacCache::replace_almanac`
+/// documents and a fake cannot establish: a record that is no longer the extreme
+/// disappears, the write is one transaction, and an empty slice changes nothing.
+#[tokio::test]
+#[ignore = "needs a real TimescaleDB; run with `cargo xtask db-tests`"]
+async fn the_almanac_cache_replaces_rows_and_accepts_every_permitted_record_name() {
+    let station = "db-tests:almanac-cache";
+    let pool = prepare(&[station]).await;
+    // `almanac_cache` has a foreign key to `stations`, so the projection row has to exist
+    // before anything can be written for it. One reading is the cheapest way to create it,
+    // and it is `writer:timescale` that creates it in production too (**D-56**).
+    writer(&pool, station)
+        .store(&[envelope(
+            station,
+            at(1_780_272_000),
+            1,
+            Reading {
+                out_temp: Some(70.0),
+                ..Reading::default()
+            },
+        )])
+        .await
+        .expect("the reading is stored, which creates the projection row");
+
+    let cache = Arc::new(mw_store::frozen::FrozenReads::new(pool.clone()));
+    let handle: Arc<dyn mw_component::AlmanacCache> = cache;
+    let reader = TimescaleReader::new(pool.clone());
+    let key = StationKey::new(station);
+
+    // All seventeen the `CHECK` permits, including the three snow records and the two AQI
+    // ones that nothing writes today: the constraint is what this is about, and a name the
+    // component may one day produce has to be a name the column accepts.
+    let permitted = [
+        "high_temp",
+        "low_temp",
+        "high_wind_speed",
+        "max_rain_hour",
+        "max_rain_day",
+        "low_barometer",
+        "low_humidity",
+        "deepest_snow",
+        "max_snow_hour",
+        "max_snow_day",
+        "high_solar",
+        "high_pm25",
+        "high_pm10_in",
+        "high_co2",
+        "high_tvoc",
+        "high_aqi_pm25",
+        "high_aqi_pm10",
+    ];
+    let records: Vec<mw_component::AlmanacRecord> = permitted
+        .iter()
+        .enumerate()
+        .map(|(i, name)| mw_component::AlmanacRecord {
+            record: (*name).to_string(),
+            value: i as f32,
+            observed_at: at(1_780_272_000 + i as i64 * 60),
+            // A direction on one record only, so "an absent direction is a NULL and not a
+            // zero" is an assertion rather than an accident of every row having one.
+            wind_dir: if *name == "high_wind_speed" {
+                Some(184.5)
+            } else {
+                None
+            },
+        })
+        .collect();
+    let written = handle
+        .replace_almanac(&key, &records)
+        .await
+        .expect("every name satisfies the CHECK");
+    assert_eq!(written, permitted.len() as u64);
+
+    let read = reader
+        .almanac(mw_component::AlmanacQuery {
+            station: key.clone(),
+        })
+        .await
+        .expect("the read runs");
+    assert_eq!(read.len(), permitted.len());
+    let wind = read
+        .iter()
+        .find(|r| r.record == "high_wind_speed")
+        .expect("written");
+    assert_eq!(wind.wind_dir, Some(184.5));
+    assert!(
+        read.iter()
+            .filter(|r| r.record != "high_wind_speed")
+            .all(|r| r.wind_dir.is_none()),
+        "an absent direction is a NULL, which the handler renders as an absent key rather \
+         than a zero"
+    );
+
+    // **A replace is a replace.** A record that is no longer the extreme has to disappear,
+    // which is why this is a delete-and-insert rather than an upsert: an upsert-only writer
+    // would make the cache a high-water mark that no correction can lower.
+    let fewer = vec![mw_component::AlmanacRecord {
+        record: "high_temp".to_string(),
+        value: 101.0,
+        observed_at: at(1_780_272_000),
+        wind_dir: None,
+    }];
+    handle
+        .replace_almanac(&key, &fewer)
+        .await
+        .expect("the write runs");
+    let read = reader
+        .almanac(mw_component::AlmanacQuery {
+            station: key.clone(),
+        })
+        .await
+        .expect("the read runs");
+    assert_eq!(read.len(), 1);
+    assert_eq!(read[0].record, "high_temp");
+    assert_eq!(read[0].value, 101.0);
+
+    // **An empty slice changes nothing**, which is the one deliberate departure from Go's
+    // function: its `DELETE` is unconditional, so a refresh that computed nothing emptied
+    // the cache and `/almanac` served `{}` -- the state this capability exists to prevent.
+    let unchanged = handle
+        .replace_almanac(&key, &[])
+        .await
+        .expect("the no-op runs");
+    assert_eq!(unchanged, 0);
+    let read = reader
+        .almanac(mw_component::AlmanacQuery { station: key })
+        .await
+        .expect("the read runs");
+    assert_eq!(read.len(), 1, "the standing record survives an empty write");
+
+    touched(
+        &pool,
+        "the_almanac_cache_replaces_rows_and_accepts_every_permitted_record_name",
+    )
+    .await;
+}
