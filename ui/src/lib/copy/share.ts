@@ -36,7 +36,7 @@ export const destinations: readonly DestinationCopy[] = [
 
 export const share = {
   index: {
-    title: 'Share My Data',
+    title: 'Data Sharing',
     blurb: 'Where your readings go, besides your own website.',
     columns: {
       destination: 'Where',

@@ -182,7 +182,7 @@
           <th>{copy.list.columns.collecting}</th>
           <th>{copy.list.columns.status}</th>
           <th>{copy.list.columns.lastReading}</th>
-          <th class="actions">{common.details}</th>
+          <th class="actions"><span class="mw-visually-hidden">{common.details}</span></th>
         </tr>
       </thead>
       <tbody>
@@ -275,7 +275,7 @@
   }
 
   h1 {
-    margin: 0 0 0.25rem;
+    margin: 0 0 0.5rem;
     font-size: var(--text-xl);
   }
 

@@ -6,36 +6,23 @@
   describes, which is a second source of truth and the thing D-28 exists to remove.
   Turning something off is a configuration change on the page that owns it.
 
-  The seven checks are `POST /api/v1/checks/*`, and the plan is explicit that **no work
-  item creates those components** -- each is a `check:<name>` with `Trigger::OnDemand`, the
-  routes are two lines each and the components are not. So they are listed with what they
-  would do and marked unavailable, rather than being seven buttons that answer
-  `NoSuchComponent`.
+  **No checks section.** W2a §4.4's seven on-demand checks have no components behind them
+  -- no work item creates a `check:<name>` -- so the page used to list all seven marked
+  "not available". Seven rows that can never do anything are not information; the live
+  list below is, and the activity log has the detail.
+
+  The live list is **grouped by `display.section`**, in navigation order. Ungrouped, it is
+  one flat run of every component in the process, which is the whole system in arbitrary
+  order and reads as noise.
 -->
 <script lang="ts">
   import { AlertDialog, Badge, Box, Button, Table, toast } from '@chrissnell/chonky-ui';
   import { api, asFailure, unwrap } from '$lib/api/client';
-  import { common, system as copy } from '$lib/copy';
+  import { common, nav, system as copy } from '$lib/copy';
   import { stamp } from '$lib/format';
-  import CheckResult from '$lib/components/CheckResult.svelte';
   import StatusBadge from '$lib/components/StatusBadge.svelte';
   import ScheduleLine from '$lib/components/ScheduleLine.svelte';
   import { stream } from '$lib/sse/stream.svelte';
-
-  /** W2a §4.4's seven, named in the operator's words. */
-  const CHECKS = [
-    { name: 'Weather station', description: 'Open a connection to each station and read a value.' },
-    { name: 'Weather database', description: 'Connect, and check the schema is the one this build expects.' },
-    { name: 'Weather Underground', description: 'Send a test upload and report what they answered.' },
-    { name: 'PWS Weather', description: 'Send a test upload and report what they answered.' },
-    { name: 'Forecasts & Alerts', description: 'Fetch a forecast with the stored account details.' },
-    { name: 'Another RemoteWeather', description: 'Open the peer link and confirm the handshake.' },
-    {
-      name: 'APRS / CWOP',
-      description:
-        'Check the beacon path. This is the connectivity check the 90-second health monitor was already doing.'
-    }
-  ];
 
   let busy = $state<string | null>(null);
   // **Two pieces of state, not one.** `AlertDialog.Root` takes a bindable `open` and no
@@ -75,6 +62,20 @@
     }
   }
 
+  /**
+   * The live list, grouped by the part of the UI that owns each component and ordered the
+   * way the navigation is. `Section` is a closed enum of exactly the six navigation
+   * sections, so every component lands in a group.
+   */
+  const groups = $derived(
+    nav
+      .map((item) => ({
+        label: item.label,
+        items: stream.components.filter((c) => c.display.section === item.section)
+      }))
+      .filter((group) => group.items.length > 0)
+  );
+
   /** `OnDemand` gets no schedule sentence (§0.4) -- it is a button. */
   function runnable(kind: string): boolean {
     return kind === 'every' || kind === 'calendar' || kind === 'on_demand';
@@ -84,85 +85,78 @@
 <h1>{copy.diagnostics.title}</h1>
 <p class="blurb">{copy.diagnostics.blurb}</p>
 
-<h2>{copy.diagnostics.checksHeading}</h2>
-<p class="blurb">{copy.diagnostics.checksUnavailable}</p>
-{#each CHECKS as check (check.name)}
-  <CheckResult
-    name={check.name}
-    description={check.description}
-    outcome="unavailable"
-    message={copy.diagnostics.checksUnavailable}
-  />
-{/each}
-
-<h2>{copy.diagnostics.runningHeading}</h2>
-<Box>
-  {#if stream.components.length === 0}
+{#if stream.components.length === 0}
+  <Box title={copy.diagnostics.runningHeading}>
     <p class="blurb">{common.loading}</p>
-  {:else}
-    <Table>
-      <thead>
-        <tr>
-          <th>{copy.diagnostics.columns.what}</th>
-          <th>{copy.diagnostics.columns.status}</th>
-          <th>{copy.diagnostics.columns.schedule}</th>
-          <th>{copy.diagnostics.columns.lastRun}</th>
-          <th><span class="mw-visually-hidden">Actions</span></th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each stream.components as c (c.id)}
+  </Box>
+{:else}
+  {#each groups as group (group.label)}
+    <Box title={group.label}>
+      <Table>
+        <thead>
           <tr>
-            <td>
-              <a href={c.display.href}>{c.display.name}</a>
-              {#if c.display.qualifier}
-                <span class="dim">{c.display.qualifier}</span>
-              {/if}
-              {#if c.pending}
-                <Badge variant="info">Catching up</Badge>
-              {/if}
-            </td>
-            <td>
-              <StatusBadge badge={c.badge} state={c.state} sentence={c.sentence} />
-              {#each c.notes as note (note)}
-                <p class="note">{note}</p>
-              {/each}
-              {#if c.last_error}
-                <p class="note err">{c.last_error}</p>
-              {/if}
-            </td>
-            <td><ScheduleLine schedule={c.schedule} now={stream.now} /></td>
-            <td>{c.schedule.last_run ? stamp(c.schedule.last_run) : common.never}</td>
-            <td class="actions">
-              {#if runnable(c.schedule.kind)}
-                <Button size="sm" onclick={() => runNow(c.id)} disabled={busy === c.id}>
-                  {copy.diagnostics.runNow}
-                </Button>
-              {/if}
-              <!--
-                One dialog for the table rather than one per row: `AlertDialog.Root` takes
-                a bindable `open` and no change handler, so a per-row instance would need a
-                per-row binding -- and the dialog is modal, so only one can be open anyway.
-              -->
-              <Button
-                size="sm"
-                variant="default"
-                onclick={() => {
-                  restartTarget = c.id;
-                  restartOpen = true;
-                }}
-                disabled={busy === c.id}
-              >
-                {copy.diagnostics.restart}
-              </Button>
-            </td>
+            <th>{copy.diagnostics.columns.what}</th>
+            <th>{copy.diagnostics.columns.status}</th>
+            <th>{copy.diagnostics.columns.schedule}</th>
+            <th>{copy.diagnostics.columns.lastRun}</th>
+            <th><span class="mw-visually-hidden">Actions</span></th>
           </tr>
-        {/each}
-      </tbody>
-    </Table>
-  {/if}
-  <p class="blurb">{copy.diagnostics.noStopNote}</p>
-</Box>
+        </thead>
+        <tbody>
+          {#each group.items as c (c.id)}
+            <tr>
+              <td>
+                <a href={c.display.href}>{c.display.name}</a>
+                {#if c.display.qualifier}
+                  <span class="dim">{c.display.qualifier}</span>
+                {/if}
+                {#if c.pending}
+                  <Badge variant="info">Catching up</Badge>
+                {/if}
+              </td>
+              <td>
+                <StatusBadge badge={c.badge} state={c.state} sentence={c.sentence} />
+                {#each c.notes as note (note)}
+                  <p class="note">{note}</p>
+                {/each}
+                {#if c.last_error}
+                  <p class="note err">{c.last_error}</p>
+                {/if}
+              </td>
+              <td><ScheduleLine schedule={c.schedule} now={stream.now} /></td>
+              <td>{c.schedule.last_run ? stamp(c.schedule.last_run) : common.never}</td>
+              <td class="actions">
+                {#if runnable(c.schedule.kind)}
+                  <Button size="sm" onclick={() => runNow(c.id)} disabled={busy === c.id}>
+                    {copy.diagnostics.runNow}
+                  </Button>
+                {/if}
+                <!--
+                  One dialog for the table rather than one per row: `AlertDialog.Root` takes
+                  a bindable `open` and no change handler, so a per-row instance would need a
+                  per-row binding -- and the dialog is modal, so only one can be open anyway.
+                -->
+                <Button
+                  size="sm"
+                  variant="default"
+                  onclick={() => {
+                    restartTarget = c.id;
+                    restartOpen = true;
+                  }}
+                  disabled={busy === c.id}
+                >
+                  {copy.diagnostics.restart}
+                </Button>
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </Table>
+    </Box>
+  {/each}
+{/if}
+
+<p class="blurb">{copy.diagnostics.noStopNote}</p>
 
 <AlertDialog.Root bind:open={restartOpen}>
   <AlertDialog.Content>
@@ -187,13 +181,8 @@
 
 <style>
   h1 {
-    margin: 0 0 0.25rem;
+    margin: 0 0 0.5rem;
     font-size: var(--text-xl);
-  }
-
-  h2 {
-    margin: 1.25rem 0 0.35rem;
-    font-size: var(--text-lg);
   }
 
   .blurb {

@@ -56,7 +56,7 @@
 
 <style>
   h1 {
-    margin: 0 0 0.25rem;
+    margin: 0 0 0.5rem;
     font-size: var(--text-xl);
   }
 

@@ -15,15 +15,14 @@
     address printed -- a browser does not follow.
 -->
 <script lang="ts">
-  import { Accordion, Box, Button, Input, toast } from '@chrissnell/chonky-ui';
+  import { Box, Button, Input, toast } from '@chrissnell/chonky-ui';
   import { untrack } from 'svelte';
   import { api, asFailure, unwrap, type ApiFailure } from '$lib/api/client';
   import type { Schemas } from '$lib/api/client';
-  import { advancedTerms, common, system as copy } from '$lib/copy';
+  import { common, system as copy } from '$lib/copy';
   import Field from '$lib/components/Field.svelte';
   import { config } from '$lib/live/config.svelte';
   import { previewChange, previewSentence, saves } from '$lib/live/save.svelte';
-  import { stream } from '$lib/sse/stream.svelte';
 
   const listener = $derived(config.listener);
 
@@ -40,19 +39,9 @@
   let busy = $state(false);
   let failure = $state<ApiFailure | null>(null);
   let preview = $state<string | null>(null);
-  let levels = $state<Schemas['LogLevelsView'] | null>(null);
-  let directive = $state('');
 
   $effect(() => {
     void config.load();
-    void (async () => {
-      try {
-        levels = unwrap(await api.GET('/api/v1/runtime/log-levels'));
-        directive = levels.directive;
-      } catch (e) {
-        void asFailure(e);
-      }
-    })();
   });
 
   $effect(() => {
@@ -118,20 +107,6 @@
       failure = asFailure(e);
     } finally {
       busy = false;
-    }
-  }
-
-  async function setDirective() {
-    try {
-      unwrap(
-        await api.POST('/api/v1/runtime/log-level', {
-          body: { directive: directive || null }
-        })
-      );
-      levels = unwrap(await api.GET('/api/v1/runtime/log-levels'));
-      toast('Applied.', 'success');
-    } catch (e) {
-      toast(asFailure(e).summary, 'danger');
     }
   }
 
@@ -271,66 +246,6 @@
   {/if}
 </Box>
 
-<Box title={copy.advanced.sections.cors}>
-  <p class="blurb">{copy.advanced.corsNote}</p>
-  <p class="blurb">{copy.advanced.corsEmpty}</p>
-</Box>
-
-<Box title={copy.advanced.sections.logLevels}>
-  <Field copy={copy.fields.logDirective}>
-    {#snippet children({ id, describedBy })}
-      <Input
-        {id}
-        value={directive}
-        oninput={(e) => (directive = (e.currentTarget as HTMLInputElement).value)}
-        aria-describedby={describedBy}
-        spellcheck={false}
-      />
-    {/snippet}
-  </Field>
-  <div class="actions">
-    <Button onclick={setDirective}>{common.save}</Button>
-    <Button
-      variant="ghost"
-      onclick={() => {
-        directive = '';
-        void setDirective();
-      }}
-    >
-      Back to normal
-    </Button>
-  </div>
-</Box>
-
-<Box title={copy.advanced.sections.ids}>
-  <p class="blurb">{copy.advanced.idsNote}</p>
-  <p class="blurb">{advancedTerms.internalIdNote}</p>
-  <Accordion.Root>
-    <Accordion.Item value="ids">
-      <Accordion.Trigger>{advancedTerms.internalId}</Accordion.Trigger>
-      <Accordion.Content>
-        <ul class="ids">
-          {#each stream.components as c (c.id)}
-            <li>
-              <code>{c.id}</code>
-              <span class="dim">{c.display.name}</span>
-            </li>
-          {/each}
-        </ul>
-      </Accordion.Content>
-    </Accordion.Item>
-    <Accordion.Item value="vocab">
-      <Accordion.Trigger>What the log calls things</Accordion.Trigger>
-      <Accordion.Content>
-        <p class="blurb">{advancedTerms.stateNote}</p>
-        <p class="blurb">{advancedTerms.triggerNote}</p>
-        <p class="blurb">{advancedTerms.capabilityNote}</p>
-        <p class="blurb">{advancedTerms.spoolNote}</p>
-      </Accordion.Content>
-    </Accordion.Item>
-  </Accordion.Root>
-</Box>
-
 <Box title={copy.advanced.sections.raw}>
   <p class="blurb">{copy.advanced.rawNote}</p>
   <Button onclick={downloadConfig} disabled={!config.value}>{common.download}</Button>
@@ -345,7 +260,7 @@
 
 <style>
   h1 {
-    margin: 0 0 0.25rem;
+    margin: 0 0 0.5rem;
     font-size: var(--text-xl);
   }
 
@@ -372,27 +287,6 @@
     display: flex;
     gap: 0.75rem;
     flex-wrap: wrap;
-  }
-
-  .ids {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0.2rem;
-    font-size: var(--text-sm);
-  }
-
-  .ids li {
-    display: flex;
-    gap: 0.6rem;
-    align-items: baseline;
-  }
-
-  .dim {
-    color: var(--color-text-muted);
-    font-size: var(--text-xs);
   }
 
   .error {

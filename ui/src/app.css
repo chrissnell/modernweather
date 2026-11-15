@@ -20,17 +20,64 @@
   src: url('./lib/fonts/inconsolata-latin-700-normal.woff2') format('woff2');
 }
 
-/* The toolkit's scale tops out at 0.9rem for body text, which is small for a console
-   read at arm's length on a desktop. These are plain custom properties, so raising them
-   here lifts every chonky component at once rather than forking any of them. The anchor
-   is --text-base at the browser's own default. */
+/* The toolkit's scale tops out at 0.9rem for body text and drops to 0.72rem for hints,
+   which is small for a console read at arm's length. These are plain custom properties,
+   so raising them here lifts every chonky component at once rather than forking any of
+   them. The small end moves most: a hint nobody can read is not a hint.
+
+   The colours are the second half of the same problem. chonky's --color-primary is
+   #ffaa00, and amber on #f8f8f8 is about 1.9:1 -- under a third of what WCAG asks of
+   body text, and it is the colour every link on every page is painted in. The light
+   theme gets an amber dark enough to read (about 6.5:1 on both the page and the panel
+   background) and --color-primary-fg flips to white to match, since the few places that
+   fill with primary need the pair to move together. The dark theme keeps #ffaa00, where
+   it has ~10:1 against #111 and was never the problem. */
 :root {
-  --text-xs: 0.82rem;
-  --text-sm: 0.92rem;
-  --text-base: 1rem;
-  --text-lg: 1.15rem;
-  --text-xl: 1.4rem;
-  --text-2xl: 1.75rem;
+  --text-xs: 0.9rem;
+  --text-sm: 1rem;
+  --text-base: 1.0625rem;
+  --text-lg: 1.2rem;
+  --text-xl: 1.5rem;
+  --text-2xl: 1.9rem;
+
+  --color-primary: #8a5500;
+  --color-primary-hover: #6b4200;
+  --color-primary-fg: #fff;
+  --color-primary-muted: rgba(138, 85, 0, 0.1);
+  --color-warning: #8a5500;
+  --color-warning-fg: #fff;
+  --color-warning-muted: rgba(138, 85, 0, 0.12);
+  /* #999 is 2.5:1 on the panel background. */
+  --color-text-dim: #767676;
+}
+
+/* Both of chonky's dark selectors, because the block above lands on :root and would
+   otherwise follow the page into the dark theme and paint every link dark brown on
+   near-black. */
+[data-theme='dark'] {
+  --color-primary: #ffaa00;
+  --color-primary-hover: #ffbb33;
+  --color-primary-fg: #000;
+  --color-primary-muted: rgba(255, 170, 0, 0.12);
+  --color-warning: #ffaa00;
+  --color-warning-fg: #000;
+  --color-warning-muted: rgba(255, 170, 0, 0.15);
+  --color-text-muted: #8a8a8a;
+  --color-text-dim: #6f6f6f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --color-primary: #ffaa00;
+    --color-primary-hover: #ffbb33;
+    --color-primary-fg: #000;
+    --color-primary-muted: rgba(255, 170, 0, 0.12);
+    --color-warning: #ffaa00;
+    --color-warning-fg: #000;
+    --color-warning-muted: rgba(255, 170, 0, 0.15);
+    --color-text-muted: #8a8a8a;
+    --color-text-dim: #6f6f6f;
+  }
 }
 
 html,
@@ -58,6 +105,20 @@ body {
 .box:not(.box--titled) > * + *:not(.badge),
 .box .box-body > * + *:not(.badge) {
   margin-block-start: 0.75rem;
+}
+
+/* A page title, its one-line summary and the first panel under them were running
+   together. chonky gives .box a bottom margin and no top one; adding a top margin here
+   separates the header from the first panel, and collapses against the existing bottom
+   margin between two stacked panels rather than doubling it. */
+.box {
+  margin-block-start: 1.5rem;
+}
+
+/* chonky right-aligns td.actions and not th.actions, so an action column's header and
+   its cells sat at opposite ends of the same column. */
+th.actions {
+  text-align: right;
 }
 
 /* Rows need a little more height now that the text in them is larger. */

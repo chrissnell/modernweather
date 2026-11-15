@@ -24,7 +24,7 @@ export const nav: readonly NavItem[] = [
   },
   {
     href: '/share',
-    label: 'Share My Data',
+    label: 'Data Sharing',
     summary: 'Weather Underground, PWS Weather, APRS/CWOP, forecasts and alerts',
     section: 'share'
   },

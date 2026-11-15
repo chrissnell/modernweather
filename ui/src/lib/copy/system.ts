@@ -9,7 +9,7 @@ export const system = {
       {
         href: '/system/diagnostics',
         label: 'Diagnostics',
-        summary: 'Checks you can run, and everything that is running.'
+        summary: 'Everything that is running right now.'
       },
       { href: '/system/machine', label: 'This machine', summary: 'Version, uptime and hardware.' },
       {
@@ -20,7 +20,7 @@ export const system = {
       {
         href: '/system/advanced',
         label: 'Advanced',
-        summary: 'Admin address, raw configuration, extra detail in the log.'
+        summary: 'Addresses and ports, raw configuration, metrics.'
       }
     ]
   },
@@ -75,10 +75,7 @@ export const system = {
   },
   diagnostics: {
     title: 'Diagnostics',
-    blurb: 'Checks you can run on demand, and everything that is running right now.',
-    checksHeading: 'Checks',
-    checksUnavailable:
-      'On-demand checks are not in this version. Everything below is live, and the activity log has the detail.',
+    blurb: 'Everything that is running right now, grouped by what it belongs to.',
     runningHeading: 'Everything That Is Running',
     columns: { what: 'What', status: 'Status', schedule: 'Schedule', lastRun: 'Last run' },
     runNow: 'Run now',
@@ -128,21 +125,13 @@ export const system = {
     blurb: 'For when you know what you are looking for.',
     sections: {
       admin: 'Admin Address',
-      cors: 'Allowed Origins',
-      logLevels: 'Standing Detail Overrides',
       raw: 'Raw Configuration',
-      ids: 'Internal Names',
       metrics: 'Metrics'
     },
     portChangeWarning: (url: string) =>
       `Changing the address moves this screen. After saving, this page is at ${url} and this browser will not follow automatically.`,
     portChangeConfirm: 'Change the address',
-    corsNote:
-      'An added origin takes effect at the next start, not immediately. The list is read once when the process starts.',
-    corsEmpty: 'Empty, which means no other site may call this API. That is the right default.',
     rawNote: 'Secrets are left out. What is shown is what you could re-type.',
-    idsNote:
-      'These are the names used inside the system and in the log. They are shown here and nowhere else.',
     metricsNote: 'Numbers for a monitoring system, in the Prometheus text format.',
     openMetrics: 'Open the metrics page'
   },
@@ -190,21 +179,13 @@ export const system = {
       hint: 'Which address the public website listens on. 0.0.0.0 means every network.'
     }),
     grpcPort: field({
-      // W5 §0.5 offers this exact sentence as the worked example of a hint written for
-      // someone who has just bought a weather station, and it is 122 characters against
-      // its own 90-character cap. Both halves are kept: the first line is the hint and
-      // the advice is the disclosure, which is the shape §0.5 specifies anyway.
-      label: 'App & integration port',
-      hint: 'The port the RemoteWeather phone app connects to.',
-      more: 'Leave it alone unless something else on this machine already uses 50051. Peers that send readings here use this port too, so changing it means changing it on them as well.'
-    }),
-    corsOrigin: field({
-      label: 'Allowed origin',
-      hint: 'A full address, such as https://admin.example.com. One per line.'
-    }),
-    logDirective: field({
-      label: 'Detail override',
-      hint: 'Which parts of the system to record extra detail for, in the usual filter syntax.'
+      // Not "the app's port": the phone app has never used it. `Collector` is the
+      // node-to-node service -- peer ingest and enrolment -- and the app-facing query
+      // surface is `api:legacy`, mounted on the website listener, which is what the Go
+      // tree served and what the proto says in so many words.
+      label: 'Peer port',
+      hint: 'The port another RemoteWeather sends its readings to.',
+      more: 'This is only for RemoteWeather-to-RemoteWeather links. The phone app does not use it: the app talks to your website address on the website port above, the same way a visitor to your site does. Leave this alone unless something else on this machine already uses 50051 -- changing it means changing it on every peer that sends here.'
     })
   } satisfies Record<string, FieldCopy>
 };
