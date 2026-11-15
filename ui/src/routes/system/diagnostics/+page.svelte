@@ -116,76 +116,78 @@
   {#if stream.components.length === 0}
     <p class="blurb">{common.loading}</p>
   {:else}
-    <Table>
-      <thead>
-        <tr>
-          <th>{copy.diagnostics.columns.what}</th>
-          <th>{copy.diagnostics.columns.status}</th>
-          <th>{copy.diagnostics.columns.schedule}</th>
-          <th>{copy.diagnostics.columns.lastRun}</th>
-          <th class="actions"><span class="mw-visually-hidden">Actions</span></th>
-        </tr>
-      </thead>
-      {#each groups as group (group.label)}
-        <tbody>
+    <div class="scroll">
+      <Table>
+        <thead>
           <tr>
-            <th class="group" colspan="5" scope="colgroup">{group.label}</th>
+            <th>{copy.diagnostics.columns.what}</th>
+            <th>{copy.diagnostics.columns.status}</th>
+            <th>{copy.diagnostics.columns.schedule}</th>
+            <th>{copy.diagnostics.columns.lastRun}</th>
+            <th class="actions"><span class="mw-visually-hidden">Actions</span></th>
           </tr>
-          {#each group.items as c (c.id)}
-            {@const extra = detail(c.sentence, c.badge.label)}
+        </thead>
+        {#each groups as group (group.label)}
+          <tbody>
             <tr>
-              <td>
-                <span class="what">
-                  <a href={c.display.href}>{c.display.name}</a>
-                  {#if c.display.qualifier}
-                    <span class="dim">{c.display.qualifier}</span>
-                  {/if}
-                  {#if c.pending}
-                    <Badge variant="info">Catching up</Badge>
-                  {/if}
-                </span>
-                {#if extra}
-                  <p class="note">{extra}</p>
-                {/if}
-                {#each c.notes as note (note)}
-                  <p class="note">{note}</p>
-                {/each}
-                {#if c.last_error}
-                  <p class="note err">{c.last_error}</p>
-                {/if}
-              </td>
-              <td><StatusBadge badge={c.badge} state={c.state} /></td>
-              <td><ScheduleLine schedule={c.schedule} now={stream.now} /></td>
-              <td>{c.schedule.last_run ? stamp(c.schedule.last_run) : common.never}</td>
-              <td class="actions">
-                {#if runnable(c.schedule.kind)}
-                  <Button size="sm" onclick={() => runNow(c.id)} disabled={busy === c.id}>
-                    {copy.diagnostics.runNow}
-                  </Button>
-                {/if}
-                <!--
-                  One dialog for the table rather than one per row: `AlertDialog.Root`
-                  takes a bindable `open` and no change handler, so a per-row instance
-                  would need a per-row binding -- and the dialog is modal, so only one can
-                  be open anyway.
-                -->
-                <Button
-                  size="sm"
-                  variant="default"
-                  onclick={() => {
-                    restartTarget = c.id;
-                    restartOpen = true;
-                  }}
-                  disabled={busy === c.id}
-                >
-                  {copy.diagnostics.restart}
-                </Button>
-              </td>
+              <th class="group" colspan="5" scope="colgroup">{group.label}</th>
             </tr>
-          {/each}
-        </tbody>
-      {/each}
-    </Table>
+            {#each group.items as c (c.id)}
+              {@const extra = detail(c.sentence, c.badge.label)}
+              <tr>
+                <td>
+                  <span class="what">
+                    <a href={c.display.href}>{c.display.name}</a>
+                    {#if c.display.qualifier}
+                      <span class="dim">{c.display.qualifier}</span>
+                    {/if}
+                    {#if c.pending}
+                      <Badge variant="info">Catching up</Badge>
+                    {/if}
+                  </span>
+                  {#if extra}
+                    <p class="note">{extra}</p>
+                  {/if}
+                  {#each c.notes as note (note)}
+                    <p class="note">{note}</p>
+                  {/each}
+                  {#if c.last_error}
+                    <p class="note err">{c.last_error}</p>
+                  {/if}
+                </td>
+                <td><StatusBadge badge={c.badge} state={c.state} /></td>
+                <td><ScheduleLine schedule={c.schedule} now={stream.now} /></td>
+                <td>{c.schedule.last_run ? stamp(c.schedule.last_run) : common.never}</td>
+                <td class="actions">
+                  {#if runnable(c.schedule.kind)}
+                    <Button size="sm" onclick={() => runNow(c.id)} disabled={busy === c.id}>
+                      {copy.diagnostics.runNow}
+                    </Button>
+                  {/if}
+                  <!--
+                    One dialog for the table rather than one per row: `AlertDialog.Root`
+                    takes a bindable `open` and no change handler, so a per-row instance
+                    would need a per-row binding -- and the dialog is modal, so only one can
+                    be open anyway.
+                  -->
+                  <Button
+                    size="sm"
+                    variant="default"
+                    onclick={() => {
+                      restartTarget = c.id;
+                      restartOpen = true;
+                    }}
+                    disabled={busy === c.id}
+                  >
+                    {copy.diagnostics.restart}
+                  </Button>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        {/each}
+      </Table>
+    </div>
   {/if}
 </Box>
 
@@ -248,11 +250,15 @@
     flex-wrap: wrap;
   }
 
+  /* `overflow-wrap` rather than just a max-width: a connection string is one unbreakable
+     token, and a table cell is sized by its longest one -- which pushed the whole table
+     wider than the panel around it and left the Restart column hanging off the edge. */
   .note {
     margin: 0.2rem 0 0;
     font-size: var(--text-sm);
     color: var(--color-text-muted);
-    max-width: 70ch;
+    max-width: 58ch;
+    overflow-wrap: anywhere;
   }
 
   .note.err {
@@ -262,5 +268,30 @@
   .dim {
     color: var(--color-text-muted);
     font-size: var(--text-xs);
+  }
+
+  .scroll {
+    overflow-x: auto;
+  }
+
+  /* Proportions rather than content-driven widths. `overflow-wrap: anywhere` above stops
+     a connection string forcing the table wider than its panel, but on its own it lets
+     the browser shrink the first column to almost nothing and render that error as a
+     tall ribbon. These give each column a share of the width and keep the wrapping as a
+     safety valve rather than the layout. */
+  .scroll :global(thead th:nth-child(1)) {
+    width: 38%;
+  }
+
+  .scroll :global(thead th:nth-child(2)) {
+    width: 14%;
+  }
+
+  .scroll :global(thead th:nth-child(3)) {
+    width: 20%;
+  }
+
+  .scroll :global(thead th:nth-child(4)) {
+    width: 14%;
   }
 </style>
