@@ -33,23 +33,64 @@ So the split is along that line rather than along repository boundaries:
 `.helmignore` excludes `values-site*.yaml`, so a copy left in this directory cannot be
 packaged into a chart tarball by accident. It is not a substitute for not committing it.
 
-### 2. The database is a vendored subchart, not a dependency on somebody else's
+### 2. The database is a vendored subchart, because the official chart is unmaintained
 
-`charts/timescaledb/Chart.yaml` carries the full argument. In short: the deployment is a
+**The official chart was the first choice and it was checked, not assumed.**
+`timescale/helm-charts` exists and `helm repo add timescale https://charts.timescale.com`
+still resolves, so the answer is not "they do not have one". The answer is that it is
+retired:
+
+| | |
+|---|---|
+| Upstream repository | `timescale/helm-charts`, **`"archived": true`** |
+| Its last commit | 2024-01-18, and the commit is titled **"Unmaintained note in README"** |
+| The README's first line | ⚠ **"This project is no longer maintained."** |
+| Last `timescaledb-single` release | **0.33.1, 2023-01-26** |
+| Its default image | `timescale/timescaledb-ha:pg14.6-ts2.9.1-p1` — **PostgreSQL 14.6, TimescaleDB 2.9.1** |
+| Its default topology | `replicaCount: 3`, Patroni-managed HA |
+| Its data volume | `volumeClaimTemplate` named `storage-volume` |
+
+Each of the last three is a problem on its own. This deployment is PG17 / TimescaleDB
+2.31, and the chart's templates — `patroni_callback.sh`, `pgbackrest_bootstrap.sh`,
+`tstune.sh` — are written against the 2023 generation of `timescaledb-docker-ha`, so
+running pg17 through them means overriding the image out from under the scripts that
+configure it. Three Patroni replicas is the shape `docs/reconciliation.md` §7.3 rejected
+and §7.4 recorded the owner rejecting. And `storage-volume` is the one that settles it: a
+StatefulSet derives its claim name from the volume's, so the existing
+`data-modernweather-db-0` — with 350 GiB of observations in it — would be bound to nothing
+and an empty volume provisioned beside it.
+
+**The part of it worth having is pgBackRest, and we do not need the chart to get it.** Its
+`backup.pgBackRest` block does support a custom `repo1-s3-endpoint`, so R2 would work. But
+the existing arrangement already backs up to R2 and does something pgBackRest does not:
+`ci/db/offsite-backup.sh` keeps a **closed inventory** — a table that exists and is not
+declared stops the dump — and it is per-year, so a weekly run re-dumps only the current
+year. A physical-backup tool has no view of that. So the backups came here as they are
+(below), rather than being replaced by a feature of a chart that is no longer maintained.
+
+So: vendored subchart. `charts/timescaledb/Chart.yaml` carries the rest of the argument —
 **single replica on a `local` PersistentVolume pinned to one machine**, because the
-workload is fsync-latency bound (`docs/reconciliation.md` §7.4), and it **cannot
-reschedule** — which the owner accepted explicitly, conditional on off-site backups
-(§7.5). The image must be `timescale/timescaledb-ha` for `timescaledb_toolkit` (D-2).
-CloudNativePG was already considered and declined in §7.4.
+workload is fsync-latency bound (§7.4), and it **cannot reschedule**, which the owner
+accepted conditional on off-site backups (§7.5); `timescaledb-ha` for `timescaledb_toolkit`
+(D-2); CloudNativePG considered and declined in §7.4.
 
-An upstream chart would have to be overridden on every one of those points, and overriding
-an upstream chart's image is the override that drops its init scripts, its `pg_hba`
-templating and its exporter into a combination nobody upstream tests. There are no
-decisions left to inherit, so there is nothing to depend on.
+### 2a. The backups, which the chart now owns
 
-What the subchart does **not** own: the weekly backup CronJob and its `ExternalSecret`.
-Those hold R2 credentials and stay in `kube-cluster-helm-values` under
-`apps/modernweather-db/backup/` (`docs/backup-and-restore.md` §4).
+The first pass left the backup CronJobs in `kube-cluster-helm-values`. They are here now,
+because "set the database up the way we like it" includes them.
+
+| | |
+|---|---|
+| `backup.enabled` | **`true` by default.** §7.5 makes off-site backups the condition that makes a single replica safe, so a chart that defaulted them off would default to the configuration the owner declined. `backup.enabled: false` is how you decline it deliberately |
+| Mechanism | `ci/db/offsite-backup.sh` — `pg_dump` plus an aggregate refresh on restore, per D-6. No bespoke tool |
+| The script | `files/offsite-backup.sh` is a **symlink** to `ci/db/offsite-backup.sh`. Helm follows it and inlines the content when packaging, so the repository holds one copy and there is no second to drift |
+| Backup job | Mounts that script from a ConfigMap, because it must not depend on GitHub being up at 04:00 on a Sunday |
+| Rehearsal job | **Fetches `main` at run time, deliberately.** Its question is whether *today's* restore path can read the archive you have; a pinned script freezes that question |
+| Required | `backup.bucket` and `backup.credentials.existingSecret` (keys `accessKeyId`, `secretAccessKey`, `endpoint` — the endpoint is in the Secret because it contains the account id) |
+
+What the subchart still does **not** own: the `ExternalSecret` that populates that
+credential. It belongs to the cluster's secret plumbing, not to this chart
+(`docs/backup-and-restore.md` §4).
 
 ### 3. Configuration is not chart values
 
