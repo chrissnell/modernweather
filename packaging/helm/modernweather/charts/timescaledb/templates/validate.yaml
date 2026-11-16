@@ -16,3 +16,15 @@
 {{- if and (not .Values.persistence.local.enabled) (not .Values.persistence.storageClass) -}}
 {{- fail "local.enabled is false and persistence.storageClass is empty, so the claim would fall to the cluster's default StorageClass. Name it: this volume is the single point of failure for the whole deployment and should not be chosen by whatever happens to be default." -}}
 {{- end -}}
+
+{{- if .Values.backup.enabled -}}
+{{- if not .Values.backup.bucket -}}
+{{- fail "timescaledb.backup.bucket is required when backup.enabled. Off-site backups are docs/reconciliation.md §7.5's condition for accepting a single replica on a `local` volume, so they are on by default -- set backup.enabled=false to decline them deliberately rather than by leaving the bucket empty." -}}
+{{- end -}}
+{{- if not .Values.backup.credentials.existingSecret -}}
+{{- fail (printf "timescaledb.backup.credentials.existingSecret is required when backup.enabled. It needs three keys -- %s, %s and %s -- and the endpoint belongs in the Secret rather than in values because it contains the Cloudflare account id." .Values.backup.credentials.accessKeyIdKey .Values.backup.credentials.secretAccessKeyKey .Values.backup.credentials.endpointKey) -}}
+{{- end -}}
+{{- if and .Values.backup.rehearsal.enabled (eq .Values.backup.rehearsal.database .Values.auth.database) -}}
+{{- fail (printf "backup.rehearsal.database is %q, which is the live database. `restore-rehearsal.sh` DROPS and recreates its target." .Values.backup.rehearsal.database) -}}
+{{- end -}}
+{{- end -}}

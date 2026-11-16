@@ -1,0 +1,121 @@
+{{- if and .Values.backup.enabled .Values.backup.rehearsal.enabled }}
+{{- /*
+The monthly restore rehearsal. A backup nobody has restored is a hypothesis.
+
+IT FETCHES THE SCRIPTS AT RUN TIME, AND THAT IS DELIBERATE -- the one place in this chart
+that reaches the network for code. The backup job mounts `offsite-backup.sh` from a
+ConfigMap because it must not depend on GitHub being up at backup time; the rehearsal's
+question is the opposite one: can TODAY's restore path read the archive you already have?
+A pinned script freezes that question, and a frozen question is how a restore path drifts
+away from its own archive unnoticed. `sourceRef` defaults to `main` for that reason.
+
+The failure mode this accepts is that GitHub being down turns a rehearsal into a NO
+VERDICT. That is the correct outcome: nothing was restored, and nothing is claimed.
+
+It restores into `rehearsal.database` on the SAME server, which is what makes it cheap
+enough to run monthly -- and `restore-rehearsal.sh` drops and recreates that database, so
+the name must not be one anything else uses.
+*/ -}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ printf "%s-restore-rehearsal" (include "timescaledb.fullname" .) }}
+  labels:
+    {{- include "timescaledb.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.backup.rehearsal.schedule | quote }}
+  timeZone: {{ .Values.backup.rehearsal.timeZone | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: {{ .Values.backup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.backup.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      {{- /*
+      No retry at all. A rehearsal that failed has told you something, and running it
+      again writes over the evidence with the same answer.
+      */}}
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ .Values.backup.rehearsal.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "timescaledb.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: restore-rehearsal
+        spec:
+          restartPolicy: Never
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          initContainers:
+            {{- include "timescaledb.rcloneInit" . | nindent 12 }}
+          containers:
+            - name: rehearse
+              image: {{ printf "%s:%s" .Values.image.repository .Values.image.tag }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command:
+                - /bin/bash
+                - -c
+              args:
+                - |
+                  set -euo pipefail
+                  export PATH="/shared:$PATH"
+                  export MW_BACKUP_REMOTE="{{ .Values.backup.remoteName }}:${MW_BACKUP_BUCKET}/{{ .Values.backup.prefix }}"
+                  export MW_REHEARSAL_DB_DST={{ .Values.backup.rehearsal.database | quote }}
+                  # PGPASSWORD rather than a password in the URL; cronjob-backup.yaml has
+                  # the whole reason. Connects to `postgres`, not to the weather database,
+                  # because the script creates and drops its own target.
+                  export DATABASE_URL="postgresql://{{ .Values.auth.username }}@{{ include "timescaledb.rwHost" . }}/postgres"
+
+                  cd /tmp
+                  curl -fsSL -o src.tar.gz \
+                    "https://codeload.github.com/{{ .Values.backup.rehearsal.sourceRepo }}/tar.gz/refs/heads/{{ .Values.backup.rehearsal.sourceRef }}"
+                  tar xzf src.tar.gz
+                  cd "{{ (splitList "/" .Values.backup.rehearsal.sourceRepo) | last }}-{{ .Values.backup.rehearsal.sourceRef }}"
+
+                  # Exit 2 is the script's own code for "reached no verdict", and a
+                  # checkout that does not carry the rehearsal is exactly that rather
+                  # than a failed restore. Without this, bash reports `No such file or
+                  # directory` about a path nobody can place in context.
+                  if [ ! -x ci/db/restore-rehearsal.sh ]; then
+                    echo "NO VERDICT: {{ .Values.backup.rehearsal.sourceRef }} does not carry" >&2
+                    echo "  ci/db/restore-rehearsal.sh, so there is nothing to rehearse" >&2
+                    echo "  with. Nothing was restored." >&2
+                    exit 2
+                  fi
+                  echo "upstream layout version: $(ci/db/offsite-backup.sh layout-version)"
+                  ci/db/restore-rehearsal.sh --from-archive
+              env:
+                {{- include "timescaledb.backupEnv" . | nindent 16 }}
+                {{- with .Values.backup.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+              resources:
+                {{- toYaml .Values.backup.rehearsal.resources | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: shared
+                  mountPath: /shared
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: shared
+              emptyDir: {}
+            - name: tmp
+              emptyDir:
+                {{- with .Values.backup.rehearsal.tmpSizeLimit }}
+                sizeLimit: {{ . | quote }}
+                {{- end }}
+          {{- with .Values.backup.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.backup.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

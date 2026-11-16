@@ -1,0 +1,131 @@
+{{- if .Values.backup.enabled }}
+{{- /*
+The weekly off-site dump. §7.5: this is the condition the owner made of accepting a single
+replica on a `local` volume, so it is part of the database rather than an optional extra --
+`backup.enabled` defaults to true and turning it OFF is the explicit act.
+
+WHY WEEKLY FULL DUMPS ARE CHEAP HERE (§7.5): raw is append-only and immutable per time
+range, so `offsite-backup.sh` writes one object per calendar year and a weekly run
+re-dumps only the current year -- roughly 4-5 GB rather than 40. The aggregate levels are
+not dumped at all; they are disposable derived data (D-15) and are rebuilt on restore.
+*/ -}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ printf "%s-backup" (include "timescaledb.fullname" .) }}
+  labels:
+    {{- include "timescaledb.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  timeZone: {{ .Values.backup.timeZone | quote }}
+  {{- /*
+  Forbid, because two dumps writing the same per-year object is the one way this archive
+  can be left half-written.
+  */}}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: {{ .Values.backup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.backup.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      {{- /*
+      One retry. A dump that failed on a closed-inventory check will fail again
+      identically, and the failure is the message.
+      */}}
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "timescaledb.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
+          annotations:
+            {{- /*
+            So that `helm diff` shows a change to the backup script as a change to the
+            job that runs it, rather than as a ConfigMap edit nobody reads.
+            */}}
+            checksum/scripts: {{ .Files.Get "files/offsite-backup.sh" | sha256sum }}
+        spec:
+          restartPolicy: Never
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          initContainers:
+            {{- include "timescaledb.rcloneInit" . | nindent 12 }}
+          containers:
+            - name: dump
+              image: {{ printf "%s:%s" .Values.image.repository .Values.image.tag }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command:
+                - /bin/bash
+                - -c
+              args:
+                - |
+                  set -euo pipefail
+                  export PATH="/shared:$PATH"
+                  export MW_BACKUP_REMOTE="{{ .Values.backup.remoteName }}:${MW_BACKUP_BUCKET}/{{ .Values.backup.prefix }}"
+                  # No password in the URL, and this is a fix rather than a preference.
+                  # The superuser password is `openssl rand -base64 36`, so it contains
+                  # `/` and `+`, and a `/` ends the authority component of a URL: libpq
+                  # parsed the rest of the password as the port and the first real run
+                  # died with `invalid integer value "aZr1mD0tc" for connection option
+                  # "port"`. PGPASSWORD is already in the environment and libpq uses it
+                  # whenever the URL carries no password, so the secret never reaches a
+                  # URL parser at all.
+                  export DATABASE_URL="postgresql://{{ .Values.auth.username }}@{{ include "timescaledb.rwHost" . }}/{{ .Values.auth.database }}"
+                  echo "layout version $(/backup/offsite-backup.sh layout-version)"
+                  /backup/offsite-backup.sh plan
+                  /backup/offsite-backup.sh dump
+              env:
+                {{- include "timescaledb.backupEnv" . | nindent 16 }}
+                - name: MW_BACKUP_MANIFEST_RETENTION_DAYS
+                  value: {{ .Values.backup.manifestRetentionDays | quote }}
+                {{- if .Values.backup.allowNoConfigDb }}
+                {{- /*
+                The daemon's SQLite configuration database lives on the DAEMON's volume,
+                which this job does not mount, so there is nothing here to dump. §7.5
+                does list config.db as irreplaceable; it is backed up where it lives, not
+                from the database's job.
+                */}}
+                - name: MW_BACKUP_ALLOW_NO_CONFIG_DB
+                  value: "1"
+                {{- end }}
+                {{- with .Values.backup.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: shared
+                  mountPath: /shared
+                  readOnly: true
+                - name: backup-scripts
+                  mountPath: /backup
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: shared
+              emptyDir: {}
+            - name: tmp
+              emptyDir:
+                {{- with .Values.backup.tmpSizeLimit }}
+                sizeLimit: {{ . | quote }}
+                {{- end }}
+            - name: backup-scripts
+              configMap:
+                name: {{ printf "%s-backup-scripts" (include "timescaledb.fullname" .) }}
+                # 0555: the script is executed, and a ConfigMap's default 0644 is not.
+                defaultMode: 0555
+          {{- with .Values.backup.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.backup.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

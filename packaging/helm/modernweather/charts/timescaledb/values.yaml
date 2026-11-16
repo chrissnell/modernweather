@@ -142,3 +142,113 @@ livenessProbe:
 # postgresql.conf, not as chart values: §7 does not fix those numbers, and inventing
 # defaults for them in a chart would freeze a guess.
 extraEnv: []
+
+# -- Off-site backups to Cloudflare R2 ---------------------------------------------------
+#
+# ON BY DEFAULT, and that is the point. docs/reconciliation.md §7.5 makes off-site backups
+# "the condition that makes a single replica safe" -- the owner's condition for accepting a
+# database that cannot reschedule. A chart that shipped that database with backups off by
+# default would ship the configuration the owner declined. Turning them OFF is the explicit
+# act; `backup.enabled: false` is how.
+#
+# The mechanism is `ci/db/offsite-backup.sh`, which this chart mounts rather than copies:
+# `files/offsite-backup.sh` is a symlink to it, and Helm inlines the content when packaging.
+# D-6's decision stands -- `pg_dump` of the raw hypertable plus an aggregate refresh on
+# restore, and no bespoke tool.
+backup:
+  enabled: true
+
+  # The bucket, and the credential that can write to it. Both REQUIRED when enabled; the
+  # chart refuses to render without them rather than installing a CronJob that fails at
+  # 04:00 on Sunday.
+  bucket: ""
+  # Everything is written under <bucket>/<prefix>/.
+  prefix: db
+  # The rclone remote's name. It appears only inside the job, in MW_BACKUP_REMOTE and in
+  # the RCLONE_CONFIG_<NAME>_* variables.
+  remoteName: r2
+  credentials:
+    existingSecret: ""
+    accessKeyIdKey: accessKeyId
+    secretAccessKeyKey: secretAccessKey
+    # The account-specific endpoint, in the Secret rather than in values: it contains the
+    # Cloudflare account id.
+    endpointKey: endpoint
+  # R2 is addressed as S3. `Cloudflare` selects rclone's R2-specific behaviour and `auto`
+  # is the only region R2 has.
+  provider: Cloudflare
+  region: auto
+
+  # Weekly, per the owner's constraint (§7.5). Sunday 04:00 UTC.
+  schedule: "0 4 * * 0"
+  timeZone: Etc/UTC
+
+  # `latest.json` is never pruned; this bounds only the timestamped manifests beside it.
+  manifestRetentionDays: 90
+
+  # The daemon's config.db is on the DAEMON's volume, which this job does not mount, so
+  # there is nothing here for it to dump. §7.5 does count config.db as irreplaceable -- it
+  # is backed up where it lives.
+  allowNoConfigDb: true
+
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+
+  # rclone is copied out of its own image by an init container, because the backup has to
+  # run in the TimescaleDB image to get the matching `pg_dump` and that image has no
+  # rclone. Pinned: an unpinned `latest` would change the thing that writes the archive
+  # without anybody choosing to.
+  rcloneImage: rclone/rclone:1.68.2
+  rcloneResources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 128Mi
+    limits:
+      cpu: "2"
+      memory: 512Mi
+
+  # Left unbounded on purpose. `offsite-backup.sh` streams everything --
+  # `psql COPY ... TO STDOUT | gzip | rclone rcat` -- so /tmp holds only the progress
+  # meter and the manifest, a few kilobytes. The rehearsal below is the one that needs a
+  # cap, because it downloads.
+  tmpSizeLimit: ""
+
+  nodeSelector: {}
+  tolerations: []
+  extraEnv: []
+
+  # The monthly restore rehearsal. A backup nobody has restored is a hypothesis.
+  rehearsal:
+    enabled: true
+    schedule: "0 5 1 * *"
+    timeZone: Etc/UTC
+    # Restored into a database of its own on the same server, which is what makes it cheap
+    # enough to run monthly. `restore-rehearsal.sh` DROPS and recreates this, so it must
+    # not name anything else.
+    database: mw_restore_rehearsal
+    # Fetched at run time, from the branch rather than a pinned commit. The rehearsal asks
+    # whether TODAY's restore path can read the archive you have; a pinned script freezes
+    # that question. cronjob-restore-rehearsal.yaml has the full argument.
+    sourceRepo: chrissnell/modernweather
+    sourceRef: main
+    activeDeadlineSeconds: 7200
+    # BOUNDED, unlike the backup's. The rehearsal downloads the archive and restores it,
+    # so /tmp is real data -- and this emptyDir is on the node's root filesystem, which on
+    # a single-node database is the same machine the database is on. An unbounded one
+    # would make a failed rehearsal able to fill the disk under the live server.
+    tmpSizeLimit: 1Gi
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: "4"
+        memory: 4Gi

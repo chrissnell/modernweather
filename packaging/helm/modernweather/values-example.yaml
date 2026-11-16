@@ -34,6 +34,17 @@ timescaledb:
     # `kubectl create secret generic modernweather-db-superuser \
     #    --from-literal=password="$(openssl rand -base64 32)"`
     existingSecret: modernweather-db-superuser
+  backup:
+    # On by default: §7.5 makes off-site backups the condition for accepting a single
+    # replica on a `local` volume. The bucket and the credential are the two things the
+    # chart will not guess.
+    bucket: example-backups
+    credentials:
+      # Three keys: accessKeyId, secretAccessKey, endpoint. The endpoint is in the Secret
+      # rather than here because it contains the Cloudflare account id.
+      existingSecret: modernweather-db-r2-backup
+    rehearsal:
+      sourceRepo: chrissnell/modernweather
   persistence:
     size: 350Gi
     local:
