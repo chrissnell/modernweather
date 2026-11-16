@@ -699,6 +699,15 @@ jobs:
             (cd "$dir" && go vet ./...)
             echo "::endgroup::"
           done
+      # The fourth job that needs `socat`, and the only one where it was hidden: this job
+      # died at the gofmt step above, so the gate below had never run. With that fixed,
+      # `emulator_davis.rs` and `emulator_campbell.rs` both failed with the same sentence
+      # the `test` job's step quotes -- W3 D-83 wants the serial path over a real character
+      # device, and here the pty is bridged to the pinned emulator's TCP port. Two of the
+      # six declared emulators are serial, so without this the gate can only ever report
+      # four.
+      - name: Install socat, which the serial emulators need
+        run: sudo apt-get update && sudo apt-get install -y socat
       - run: cargo xtask gate driver-emulators
 
   serial-bridge:

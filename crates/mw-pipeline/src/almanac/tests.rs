@@ -604,214 +604,10 @@ fn only_the_hourly_rain_record_is_marked_as_coming_from_a_retained_level() {
 // ---------------------------------------------------------------------------------------
 // The body.
 
-#[tokio::test]
-async fn one_tick_writes_every_record_the_history_supports() {
-    let store = Arc::new(a_full_campbell_history());
-    let cache = Arc::new(Cache::default());
-    let mut records = body(
-        vec![station("csi", "campbellscientific")],
-        Arc::clone(&store),
-        Arc::clone(&cache),
-    );
-    records.tick(&cx()).await.expect("the reads all answered");
-
-    let written = cache.only_write();
-    let names: Vec<&str> = written.iter().map(|r| r.record.as_str()).collect();
-    assert_eq!(
-        names,
-        vec![
-            "high_temp",
-            "low_temp",
-            "high_wind_speed",
-            "max_rain_hour",
-            "max_rain_day",
-            "low_barometer",
-            "low_humidity",
-            "high_solar",
-        ],
-        "the three particulate records have no column on a Campbell logger, so they are \
-         absent rather than zero -- which is what makes /almanac eight keys for this \
-         station and fourteen for a site with an air-quality device"
-    );
-    // Eleven reads for eleven records, including the three that answered nothing: a record
-    // is absent because the query found no bucket, not because this component decided a
-    // Campbell logger has no PM2.5.
-    assert_eq!(store.asked().len(), 11);
-}
-
-/// The value and the timestamp a record carries, down to the digit the contract serves.
-#[tokio::test]
-async fn a_day_level_record_carries_the_buckets_own_instant() {
-    let store = Arc::new(a_full_campbell_history());
-    let cache = Arc::new(Cache::default());
-    let mut records = body(
-        vec![station("csi", "campbellscientific")],
-        Arc::clone(&store),
-        Arc::clone(&cache),
-    );
-    records.tick(&cx()).await.expect("the reads all answered");
-    let written = cache.only_write();
-    let high_temp = written
-        .iter()
-        .find(|r| r.record == "high_temp")
-        .expect("written");
-    assert_eq!(high_temp.value, 95.73979);
-    assert_eq!(high_temp.observed_at, at("2025-08-20T00:00:00Z"));
-    assert_eq!(
-        high_temp.wind_dir, None,
-        "only `high_wind_speed` carries a direction, and an absent one is an absent key"
-    );
-}
-
-/// **`high_wind_speed` carries the bucket's mean direction, not the direction at the gust.**
+/// A record already in the cache.
 ///
-/// Go selects `max_windspeed, bucket, winddir` from one `weather_1d` row, so the direction
-/// beside the gust is `mw_circular_mean` over the whole day. Reproducing the contract means
-/// reading it the same way, and the test that matters is that the carry is *asked for* with
-/// `CircularMean` at the record's own level.
-#[tokio::test]
-async fn the_wind_record_carries_the_buckets_circular_mean_direction() {
-    let store = Arc::new(a_full_campbell_history());
-    let cache = Arc::new(Cache::default());
-    let mut records = body(
-        vec![station("csi", "campbellscientific")],
-        Arc::clone(&store),
-        Arc::clone(&cache),
-    );
-    records.tick(&cx()).await.expect("the reads all answered");
-    let wind = cache
-        .only_write()
-        .into_iter()
-        .find(|r| r.record == "high_wind_speed")
-        .expect("written");
-    assert_eq!(wind.value, 46.014404);
-    assert_eq!(wind.wind_dir, Some(184.01839));
-    assert!(
-        store.asked().iter().any(|q| q
-            == "1d WindSpeed/Max Greatest positive_only=false carry=Some((WindDir, \
-                CircularMean))"),
-        "{:?}",
-        store.asked()
-    );
-}
-
-/// **`high_solar`'s timestamp is a reading's, and the raw lookup is bounded by the day the
-/// day level named.**
-///
-/// The live Go server answers `2026-05-18T13:04:28.657385-06:00` for this record, which is
-/// not a bucket boundary — Go reads the raw table because "aggregates keep only a daily
-/// average". What makes that bounded here is the two-step: the day level finds the peak day
-/// out of one row per day, and raw is read only inside it.
-#[tokio::test]
-async fn the_solar_record_is_the_raw_peak_inside_the_peak_day() {
-    let store = Arc::new(a_full_campbell_history());
-    let cache = Arc::new(Cache::default());
-    let mut records = body(
-        vec![station("csi", "campbellscientific")],
-        Arc::clone(&store),
-        Arc::clone(&cache),
-    );
-    records.tick(&cx()).await.expect("the reads all answered");
-    let solar = cache
-        .only_write()
-        .into_iter()
-        .find(|r| r.record == "high_solar")
-        .expect("written");
-    assert_eq!(solar.observed_at, at("2026-05-18T19:04:28.657385Z"));
-    assert_eq!(solar.value, 1514.0381);
-    assert_eq!(
-        store.raw_asked(),
-        vec!["SolarWatts [2026-05-18 00:00:00 UTC, 2026-05-19 00:00:00 UTC)"],
-        "one day of one station, not all of history"
-    );
-}
-
-/// A day bucket whose raw rows are gone leaves the record out rather than serving a
-/// midnight timestamp for a solar peak. Unreachable while **D-4** holds — `observations`
-/// has no retention policy — and answered anyway, because the alternative is a visibly
-/// wrong instant on a frozen response.
-#[tokio::test]
-async fn a_peak_day_with_no_raw_reading_in_it_produces_no_record() {
-    let mut store = a_full_campbell_history();
-    store.raw.clear();
-    let store = Arc::new(store);
-    let cache = Arc::new(Cache::default());
-    let mut records = body(
-        vec![station("csi", "campbellscientific")],
-        Arc::clone(&store),
-        Arc::clone(&cache),
-    );
-    records.tick(&cx()).await.expect("the reads all answered");
-    assert!(
-        !cache.only_write().iter().any(|r| r.record == "high_solar"),
-        "no instant is better than midnight"
-    );
-}
-
-/// **A station with no history writes nothing at all**, rather than emptying its records.
-///
-/// Go's `DELETE` is unconditional, so a refresh that computes nothing empties the cache and
-/// `/almanac` serves `{}` — the state this component exists to prevent. The departure is
-/// deliberate and `mw_component::AlmanacCache::replace_almanac` documents it; this asserts
-/// the component's half, which is that it does not even call.
-#[tokio::test]
-async fn a_station_with_no_history_leaves_the_cache_alone() {
-    let store = Arc::new(Store::default());
-    let cache = Arc::new(Cache::default());
-    let mut records = body(
-        vec![station("csi", "campbellscientific")],
-        Arc::clone(&store),
-        Arc::clone(&cache),
-    );
-    records.tick(&cx()).await.expect("no read failed");
-    assert!(cache.writes().is_empty());
-}
-
-/// A failed read aborts the station and writes nothing — Go's transaction boundary. A
-/// partial set would replace eleven records with however many were read before the database
-/// stopped answering.
-#[tokio::test]
-async fn a_failed_read_writes_nothing_and_names_the_station() {
-    let store = Arc::new(Store::broken());
-    let cache = Arc::new(Cache::default());
-    let mut records = body(
-        vec![station("csi", "campbellscientific")],
-        Arc::clone(&store),
-        Arc::clone(&cache),
-    );
-    let err = records.tick(&cx()).await.expect_err("the store is broken");
-    assert!(
-        format!("{err}").contains("csi"),
-        "an operator reading `last_error` has no other way to learn which station: {err}"
-    );
-    assert!(cache.writes().is_empty());
-}
-
-/// Every station gets its own write, and one station's failure is the whole tick's — the
-/// supervisor's retry re-reads all of them, which is cheap and keeps "did this tick
-/// succeed" a single fact.
-#[tokio::test]
-async fn each_station_is_written_separately() {
-    let store = Arc::new(a_full_campbell_history());
-    let cache = Arc::new(Cache::default());
-    let mut records = body(
-        vec![
-            station("csi", "campbellscientific"),
-            station("aq", "airgradient"),
-        ],
-        Arc::clone(&store),
-        Arc::clone(&cache),
-    );
-    records.tick(&cx()).await.expect("the reads all answered");
-    let writes = cache.writes();
-    assert_eq!(writes.len(), 2);
-    assert_eq!(writes[0].0, "csi");
-    assert_eq!(writes[1].0, "aq");
-}
-
-// ---------------------------------------------------------------------------------------
-// The carry-forward, which is `max_rain_hour` and nothing else.
-
+/// At parent scope rather than inside `driven` below, because the carry-forward's
+/// comparison tests are synchronous and stay in the loom build while `driven` does not.
 fn held(record: &str, value: f32, at_: &str) -> AlmanacRecord {
     AlmanacRecord {
         record: record.to_string(),
@@ -821,174 +617,408 @@ fn held(record: &str, value: f32, at_: &str) -> AlmanacRecord {
     }
 }
 
-/// **An all-time record does not un-set itself when its source ages out.**
+/// The body, which needs a **real `tokio` runtime** and therefore cannot run under
+/// `--cfg loom`.
 ///
-/// `observations_1h` is kept for 90 days. The hour that set `max_rain_hour` leaves the
-/// level after that, and the extreme over what is left is smaller — so a writer that simply
-/// replaced the record would *lower* an all-time maximum every quarter, which is the rotting
-/// this component was written to prevent.
-#[tokio::test]
-async fn the_hourly_rain_record_is_never_lowered_by_the_levels_retention() {
-    let store = Arc::new(
-        a_full_campbell_history()
-            .with(
-                BucketLevel::Hour,
-                MetricKey::RainIncremental,
-                Agg::Sum,
-                bucket(0.04, "2026-11-01T18:00:00Z"),
-            )
-            .cached(vec![held(
+/// That flag applies to every crate in the graph, and `tokio` gates its whole `net`
+/// module behind `#![cfg(not(loom))]` — so `runtime::Builder::build` asserts the I/O
+/// driver is disabled and a `#[tokio::test]` panics before its body runs, inside tokio
+/// rather than in anything this crate wrote:
+///
+/// ```text
+/// tokio-1.54.1/src/runtime/driver.rs:165:9: assertion failed: !enabled
+/// ```
+///
+/// `super::super::writer`'s `adapter` module, `super::super::snapshot::tests`' driven
+/// module and `super::super::rollup::tests`' all carry the same guard for the same
+/// reason; `tests/spool.rs`, `tests/fanout.rs` and `tests/ingress.rs` carry it at file
+/// level. `.github/workflows/pr.yml`'s loom job explains the flag's reach in full.
+///
+/// Nothing excluded here is a concurrency model, so nothing is lost by excluding it:
+/// this module asserts which records a history supports and what the carry-forward
+/// does, both of which are sequential. The eleven plan tests above and the two
+/// comparison tests below stay in the loom build because they are synchronous.
+#[cfg(not(loom))]
+mod driven {
+    use super::*;
+
+    #[tokio::test]
+    async fn one_tick_writes_every_record_the_history_supports() {
+        let store = Arc::new(a_full_campbell_history());
+        let cache = Arc::new(Cache::default());
+        let mut records = body(
+            vec![station("csi", "campbellscientific")],
+            Arc::clone(&store),
+            Arc::clone(&cache),
+        );
+        records.tick(&cx()).await.expect("the reads all answered");
+
+        let written = cache.only_write();
+        let names: Vec<&str> = written.iter().map(|r| r.record.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "high_temp",
+                "low_temp",
+                "high_wind_speed",
                 "max_rain_hour",
-                0.23000003,
-                "2026-04-28T16:00:00Z",
-            )]),
-    );
-    let cache = Arc::new(Cache::default());
-    let mut records = body(
-        vec![station("csi", "campbellscientific")],
-        Arc::clone(&store),
-        Arc::clone(&cache),
-    );
-    records.tick(&cx()).await.expect("the reads all answered");
-    let rain = cache
-        .only_write()
-        .into_iter()
-        .find(|r| r.record == "max_rain_hour")
-        .expect("written");
-    assert_eq!(rain.value, 0.23000003, "the standing record is kept");
-    assert_eq!(rain.observed_at, at("2026-04-28T16:00:00Z"));
-    assert_eq!(
-        store.almanac_reads(),
-        1,
-        "the records as they stand are read once per station, not once per record"
-    );
-}
+                "max_rain_day",
+                "low_barometer",
+                "low_humidity",
+                "high_solar",
+            ],
+            "the three particulate records have no column on a Campbell logger, so they are \
+             absent rather than zero -- which is what makes /almanac eight keys for this \
+             station and fourteen for a site with an air-quality device"
+        );
+        // Eleven reads for eleven records, including the three that answered nothing: a record
+        // is absent because the query found no bucket, not because this component decided a
+        // Campbell logger has no PM2.5.
+        assert_eq!(store.asked().len(), 11);
+    }
 
-/// And an hour that *does* beat the standing record replaces it.
-#[tokio::test]
-async fn an_hour_that_beats_the_standing_record_replaces_it() {
-    let store = Arc::new(a_full_campbell_history().cached(vec![held(
-        "max_rain_hour",
-        0.1,
-        "2026-04-28T16:00:00Z",
-    )]));
-    let cache = Arc::new(Cache::default());
-    let mut records = body(
-        vec![station("csi", "campbellscientific")],
-        Arc::clone(&store),
-        Arc::clone(&cache),
-    );
-    records.tick(&cx()).await.expect("the reads all answered");
-    let rain = cache
-        .only_write()
-        .into_iter()
-        .find(|r| r.record == "max_rain_hour")
-        .expect("written");
-    assert_eq!(rain.value, 0.23000003);
-}
+    /// The value and the timestamp a record carries, down to the digit the contract serves.
+    #[tokio::test]
+    async fn a_day_level_record_carries_the_buckets_own_instant() {
+        let store = Arc::new(a_full_campbell_history());
+        let cache = Arc::new(Cache::default());
+        let mut records = body(
+            vec![station("csi", "campbellscientific")],
+            Arc::clone(&store),
+            Arc::clone(&cache),
+        );
+        records.tick(&cx()).await.expect("the reads all answered");
+        let written = cache.only_write();
+        let high_temp = written
+            .iter()
+            .find(|r| r.record == "high_temp")
+            .expect("written");
+        assert_eq!(high_temp.value, 95.73979);
+        assert_eq!(high_temp.observed_at, at("2025-08-20T00:00:00Z"));
+        assert_eq!(
+            high_temp.wind_dir, None,
+            "only `high_wind_speed` carries a direction, and an absent one is an absent key"
+        );
+    }
 
-/// **A station whose every level read answers nothing writes nothing — even when it has a
-/// carried-forward record to offer.**
-///
-/// The regression test for the defect the first code review of this component found. `out`
-/// being non-empty is not the same question as "did the history answer": a station with a
-/// standing `max_rain_hour` and no other readable bucket produces exactly that one record,
-/// which looked like a successful computation and replaced the other seven with it — and
-/// every later tick found the same nothing and rewrote the same one row, so `/almanac` fell
-/// from eight keys to one permanently. The state is reachable: the `warn` beside the write
-/// names it, an aggregate level rebuilt without being materialised
-/// (`ci/db/rebuild-aggregates.sh`).
-#[tokio::test]
-async fn a_station_whose_levels_answer_nothing_writes_nothing_even_with_a_record_to_carry() {
-    let store = Arc::new(Store::default().cached(vec![
-        held("high_temp", 95.0, "2025-08-20T00:00:00Z"),
-        held("low_temp", 12.0, "2026-02-19T00:00:00Z"),
-        held("max_rain_hour", 0.23, "2026-04-28T16:00:00Z"),
-        held("low_barometer", 29.44, "2026-02-18T00:00:00Z"),
-    ]));
-    let cache = Arc::new(Cache::default());
-    let mut records = body(
-        vec![station("csi", "campbellscientific")],
-        Arc::clone(&store),
-        Arc::clone(&cache),
-    );
-    records.tick(&cx()).await.expect("no read failed");
-    assert!(
-        cache.writes().is_empty(),
-        "the four standing records must survive a tick that could read nothing: {:?}",
-        cache.writes()
-    );
-}
+    /// **`high_wind_speed` carries the bucket's mean direction, not the direction at the gust.**
+    ///
+    /// Go selects `max_windspeed, bucket, winddir` from one `weather_1d` row, so the direction
+    /// beside the gust is `mw_circular_mean` over the whole day. Reproducing the contract means
+    /// reading it the same way, and the test that matters is that the carry is *asked for* with
+    /// `CircularMean` at the record's own level.
+    #[tokio::test]
+    async fn the_wind_record_carries_the_buckets_circular_mean_direction() {
+        let store = Arc::new(a_full_campbell_history());
+        let cache = Arc::new(Cache::default());
+        let mut records = body(
+            vec![station("csi", "campbellscientific")],
+            Arc::clone(&store),
+            Arc::clone(&cache),
+        );
+        records.tick(&cx()).await.expect("the reads all answered");
+        let wind = cache
+            .only_write()
+            .into_iter()
+            .find(|r| r.record == "high_wind_speed")
+            .expect("written");
+        assert_eq!(wind.value, 46.014404);
+        assert_eq!(wind.wind_dir, Some(184.01839));
+        assert!(
+            store.asked().iter().any(|q| q
+                == "1d WindSpeed/Max Greatest positive_only=false carry=Some((WindDir, \
+                    CircularMean))"),
+            "{:?}",
+            store.asked()
+        );
+    }
 
-/// And the converse, so the guard above is not "never write when anything is missing": one
-/// readable level is enough, and the carried-forward record travels with it.
-#[tokio::test]
-async fn one_readable_record_is_enough_to_write_and_the_carry_travels_with_it() {
-    let store = Arc::new(
-        Store::default()
-            .with(
-                BucketLevel::Day,
-                MetricKey::OutTemp,
-                Agg::Max,
-                bucket(95.73979, "2025-08-20T00:00:00Z"),
-            )
-            .cached(vec![held("max_rain_hour", 0.23, "2026-04-28T16:00:00Z")]),
-    );
-    let cache = Arc::new(Cache::default());
-    let mut records = body(
-        vec![station("csi", "campbellscientific")],
-        Arc::clone(&store),
-        Arc::clone(&cache),
-    );
-    records.tick(&cx()).await.expect("no read failed");
-    let written = cache.only_write();
-    let names: Vec<&str> = written.iter().map(|r| r.record.as_str()).collect();
-    assert_eq!(names, vec!["high_temp", "max_rain_hour"]);
-}
+    /// **`high_solar`'s timestamp is a reading's, and the raw lookup is bounded by the day the
+    /// day level named.**
+    ///
+    /// The live Go server answers `2026-05-18T13:04:28.657385-06:00` for this record, which is
+    /// not a bucket boundary — Go reads the raw table because "aggregates keep only a daily
+    /// average". What makes that bounded here is the two-step: the day level finds the peak day
+    /// out of one row per day, and raw is read only inside it.
+    #[tokio::test]
+    async fn the_solar_record_is_the_raw_peak_inside_the_peak_day() {
+        let store = Arc::new(a_full_campbell_history());
+        let cache = Arc::new(Cache::default());
+        let mut records = body(
+            vec![station("csi", "campbellscientific")],
+            Arc::clone(&store),
+            Arc::clone(&cache),
+        );
+        records.tick(&cx()).await.expect("the reads all answered");
+        let solar = cache
+            .only_write()
+            .into_iter()
+            .find(|r| r.record == "high_solar")
+            .expect("written");
+        assert_eq!(solar.observed_at, at("2026-05-18T19:04:28.657385Z"));
+        assert_eq!(solar.value, 1514.0381);
+        assert_eq!(
+            store.raw_asked(),
+            vec!["SolarWatts [2026-05-18 00:00:00 UTC, 2026-05-19 00:00:00 UTC)"],
+            "one day of one station, not all of history"
+        );
+    }
 
-/// A record whose level is unbounded is **not** carried forward: `observations_1d` can
-/// always still see the day that set it, so a cached value that is greater than the data
-/// means the data changed and the record should follow it.
-#[tokio::test]
-async fn a_day_level_record_is_not_carried_forward() {
-    let store = Arc::new(a_full_campbell_history().cached(vec![held(
-        "high_temp",
-        120.0,
-        "2020-01-01T00:00:00Z",
-    )]));
-    let cache = Arc::new(Cache::default());
-    let mut records = body(
-        vec![station("csi", "campbellscientific")],
-        Arc::clone(&store),
-        Arc::clone(&cache),
-    );
-    records.tick(&cx()).await.expect("the reads all answered");
-    let high = cache
-        .only_write()
-        .into_iter()
-        .find(|r| r.record == "high_temp")
-        .expect("written");
-    assert_eq!(high.value, 95.73979, "the data wins over the cached value");
-}
+    /// A day bucket whose raw rows are gone leaves the record out rather than serving a
+    /// midnight timestamp for a solar peak. Unreachable while **D-4** holds — `observations`
+    /// has no retention policy — and answered anyway, because the alternative is a visibly
+    /// wrong instant on a frozen response.
+    #[tokio::test]
+    async fn a_peak_day_with_no_raw_reading_in_it_produces_no_record() {
+        let mut store = a_full_campbell_history();
+        store.raw.clear();
+        let store = Arc::new(store);
+        let cache = Arc::new(Cache::default());
+        let mut records = body(
+            vec![station("csi", "campbellscientific")],
+            Arc::clone(&store),
+            Arc::clone(&cache),
+        );
+        records.tick(&cx()).await.expect("the reads all answered");
+        assert!(
+            !cache.only_write().iter().any(|r| r.record == "high_solar"),
+            "no instant is better than midnight"
+        );
+    }
 
-/// A station whose records have never been computed has nothing to carry forward, and the
-/// first tick is not a special case.
-#[tokio::test]
-async fn a_first_tick_with_an_empty_cache_takes_what_the_level_has() {
-    let store = Arc::new(a_full_campbell_history());
-    let cache = Arc::new(Cache::default());
-    let mut records = body(
-        vec![station("csi", "campbellscientific")],
-        Arc::clone(&store),
-        Arc::clone(&cache),
-    );
-    records.tick(&cx()).await.expect("the reads all answered");
-    let rain = cache
-        .only_write()
-        .into_iter()
-        .find(|r| r.record == "max_rain_hour")
-        .expect("written");
-    assert_eq!(rain.value, 0.23000003);
+    /// **A station with no history writes nothing at all**, rather than emptying its records.
+    ///
+    /// Go's `DELETE` is unconditional, so a refresh that computes nothing empties the cache and
+    /// `/almanac` serves `{}` — the state this component exists to prevent. The departure is
+    /// deliberate and `mw_component::AlmanacCache::replace_almanac` documents it; this asserts
+    /// the component's half, which is that it does not even call.
+    #[tokio::test]
+    async fn a_station_with_no_history_leaves_the_cache_alone() {
+        let store = Arc::new(Store::default());
+        let cache = Arc::new(Cache::default());
+        let mut records = body(
+            vec![station("csi", "campbellscientific")],
+            Arc::clone(&store),
+            Arc::clone(&cache),
+        );
+        records.tick(&cx()).await.expect("no read failed");
+        assert!(cache.writes().is_empty());
+    }
+
+    /// A failed read aborts the station and writes nothing — Go's transaction boundary. A
+    /// partial set would replace eleven records with however many were read before the database
+    /// stopped answering.
+    #[tokio::test]
+    async fn a_failed_read_writes_nothing_and_names_the_station() {
+        let store = Arc::new(Store::broken());
+        let cache = Arc::new(Cache::default());
+        let mut records = body(
+            vec![station("csi", "campbellscientific")],
+            Arc::clone(&store),
+            Arc::clone(&cache),
+        );
+        let err = records.tick(&cx()).await.expect_err("the store is broken");
+        assert!(
+            format!("{err}").contains("csi"),
+            "an operator reading `last_error` has no other way to learn which station: {err}"
+        );
+        assert!(cache.writes().is_empty());
+    }
+
+    /// Every station gets its own write, and one station's failure is the whole tick's — the
+    /// supervisor's retry re-reads all of them, which is cheap and keeps "did this tick
+    /// succeed" a single fact.
+    #[tokio::test]
+    async fn each_station_is_written_separately() {
+        let store = Arc::new(a_full_campbell_history());
+        let cache = Arc::new(Cache::default());
+        let mut records = body(
+            vec![
+                station("csi", "campbellscientific"),
+                station("aq", "airgradient"),
+            ],
+            Arc::clone(&store),
+            Arc::clone(&cache),
+        );
+        records.tick(&cx()).await.expect("the reads all answered");
+        let writes = cache.writes();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].0, "csi");
+        assert_eq!(writes[1].0, "aq");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The carry-forward, which is `max_rain_hour` and nothing else.
+
+    /// **An all-time record does not un-set itself when its source ages out.**
+    ///
+    /// `observations_1h` is kept for 90 days. The hour that set `max_rain_hour` leaves the
+    /// level after that, and the extreme over what is left is smaller — so a writer that simply
+    /// replaced the record would *lower* an all-time maximum every quarter, which is the rotting
+    /// this component was written to prevent.
+    #[tokio::test]
+    async fn the_hourly_rain_record_is_never_lowered_by_the_levels_retention() {
+        let store = Arc::new(
+            a_full_campbell_history()
+                .with(
+                    BucketLevel::Hour,
+                    MetricKey::RainIncremental,
+                    Agg::Sum,
+                    bucket(0.04, "2026-11-01T18:00:00Z"),
+                )
+                .cached(vec![held(
+                    "max_rain_hour",
+                    0.23000003,
+                    "2026-04-28T16:00:00Z",
+                )]),
+        );
+        let cache = Arc::new(Cache::default());
+        let mut records = body(
+            vec![station("csi", "campbellscientific")],
+            Arc::clone(&store),
+            Arc::clone(&cache),
+        );
+        records.tick(&cx()).await.expect("the reads all answered");
+        let rain = cache
+            .only_write()
+            .into_iter()
+            .find(|r| r.record == "max_rain_hour")
+            .expect("written");
+        assert_eq!(rain.value, 0.23000003, "the standing record is kept");
+        assert_eq!(rain.observed_at, at("2026-04-28T16:00:00Z"));
+        assert_eq!(
+            store.almanac_reads(),
+            1,
+            "the records as they stand are read once per station, not once per record"
+        );
+    }
+
+    /// And an hour that *does* beat the standing record replaces it.
+    #[tokio::test]
+    async fn an_hour_that_beats_the_standing_record_replaces_it() {
+        let store = Arc::new(a_full_campbell_history().cached(vec![held(
+            "max_rain_hour",
+            0.1,
+            "2026-04-28T16:00:00Z",
+        )]));
+        let cache = Arc::new(Cache::default());
+        let mut records = body(
+            vec![station("csi", "campbellscientific")],
+            Arc::clone(&store),
+            Arc::clone(&cache),
+        );
+        records.tick(&cx()).await.expect("the reads all answered");
+        let rain = cache
+            .only_write()
+            .into_iter()
+            .find(|r| r.record == "max_rain_hour")
+            .expect("written");
+        assert_eq!(rain.value, 0.23000003);
+    }
+
+    /// **A station whose every level read answers nothing writes nothing — even when it has a
+    /// carried-forward record to offer.**
+    ///
+    /// The regression test for the defect the first code review of this component found. `out`
+    /// being non-empty is not the same question as "did the history answer": a station with a
+    /// standing `max_rain_hour` and no other readable bucket produces exactly that one record,
+    /// which looked like a successful computation and replaced the other seven with it — and
+    /// every later tick found the same nothing and rewrote the same one row, so `/almanac` fell
+    /// from eight keys to one permanently. The state is reachable: the `warn` beside the write
+    /// names it, an aggregate level rebuilt without being materialised
+    /// (`ci/db/rebuild-aggregates.sh`).
+    #[tokio::test]
+    async fn a_station_whose_levels_answer_nothing_writes_nothing_even_with_a_record_to_carry() {
+        let store = Arc::new(Store::default().cached(vec![
+            held("high_temp", 95.0, "2025-08-20T00:00:00Z"),
+            held("low_temp", 12.0, "2026-02-19T00:00:00Z"),
+            held("max_rain_hour", 0.23, "2026-04-28T16:00:00Z"),
+            held("low_barometer", 29.44, "2026-02-18T00:00:00Z"),
+        ]));
+        let cache = Arc::new(Cache::default());
+        let mut records = body(
+            vec![station("csi", "campbellscientific")],
+            Arc::clone(&store),
+            Arc::clone(&cache),
+        );
+        records.tick(&cx()).await.expect("no read failed");
+        assert!(
+            cache.writes().is_empty(),
+            "the four standing records must survive a tick that could read nothing: {:?}",
+            cache.writes()
+        );
+    }
+
+    /// And the converse, so the guard above is not "never write when anything is missing": one
+    /// readable level is enough, and the carried-forward record travels with it.
+    #[tokio::test]
+    async fn one_readable_record_is_enough_to_write_and_the_carry_travels_with_it() {
+        let store = Arc::new(
+            Store::default()
+                .with(
+                    BucketLevel::Day,
+                    MetricKey::OutTemp,
+                    Agg::Max,
+                    bucket(95.73979, "2025-08-20T00:00:00Z"),
+                )
+                .cached(vec![held("max_rain_hour", 0.23, "2026-04-28T16:00:00Z")]),
+        );
+        let cache = Arc::new(Cache::default());
+        let mut records = body(
+            vec![station("csi", "campbellscientific")],
+            Arc::clone(&store),
+            Arc::clone(&cache),
+        );
+        records.tick(&cx()).await.expect("no read failed");
+        let written = cache.only_write();
+        let names: Vec<&str> = written.iter().map(|r| r.record.as_str()).collect();
+        assert_eq!(names, vec!["high_temp", "max_rain_hour"]);
+    }
+
+    /// A record whose level is unbounded is **not** carried forward: `observations_1d` can
+    /// always still see the day that set it, so a cached value that is greater than the data
+    /// means the data changed and the record should follow it.
+    #[tokio::test]
+    async fn a_day_level_record_is_not_carried_forward() {
+        let store = Arc::new(a_full_campbell_history().cached(vec![held(
+            "high_temp",
+            120.0,
+            "2020-01-01T00:00:00Z",
+        )]));
+        let cache = Arc::new(Cache::default());
+        let mut records = body(
+            vec![station("csi", "campbellscientific")],
+            Arc::clone(&store),
+            Arc::clone(&cache),
+        );
+        records.tick(&cx()).await.expect("the reads all answered");
+        let high = cache
+            .only_write()
+            .into_iter()
+            .find(|r| r.record == "high_temp")
+            .expect("written");
+        assert_eq!(high.value, 95.73979, "the data wins over the cached value");
+    }
+
+    /// A station whose records have never been computed has nothing to carry forward, and the
+    /// first tick is not a special case.
+    #[tokio::test]
+    async fn a_first_tick_with_an_empty_cache_takes_what_the_level_has() {
+        let store = Arc::new(a_full_campbell_history());
+        let cache = Arc::new(Cache::default());
+        let mut records = body(
+            vec![station("csi", "campbellscientific")],
+            Arc::clone(&store),
+            Arc::clone(&cache),
+        );
+        records.tick(&cx()).await.expect("the reads all answered");
+        let rain = cache
+            .only_write()
+            .into_iter()
+            .find(|r| r.record == "max_rain_hour")
+            .expect("written");
+        assert_eq!(rain.value, 0.23000003);
+    }
 }
 
 /// A tie keeps the stored observation, because `/almanac`'s `timestamp` is part of the
