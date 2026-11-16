@@ -58,6 +58,7 @@ jobs:
       tags: ${{ steps.r.outputs.tags }}
       matrix: ${{ steps.m.outputs.matrix }}
       linux_matrix: ${{ steps.m.outputs.linux_matrix }}
+      profile: ${{ steps.m.outputs.profile }}
       daemon_present: ${{ steps.r.outputs.daemon_present }}
     steps:
       - uses: actions/checkout@v4
@@ -141,6 +142,9 @@ jobs:
         run: |
           echo "matrix=$(cargo xtask targets)" >> "$GITHUB_OUTPUT"
           echo "linux_matrix=$(cargo xtask targets --linux-only)" >> "$GITHUB_OUTPUT"
+          # The cargo profile the binary is built with, from the same file. The deb and rpm
+          # steps have to be told, because their asset paths are `target/release/...`.
+          echo "profile=$(cargo xtask targets --profile)" >> "$GITHUB_OUTPUT"
 
   # **D-58**: the bundle is built ONCE, natively, BEFORE the cross matrix.
   #
@@ -228,6 +232,17 @@ jobs:
           # --no-build: the binary is already cross-compiled above, and cargo-deb cannot
           # cross-compile it itself. --no-strip because the dist profile already strips
           # debug info and cargo-deb's strip is the host's, which cannot touch an ARM ELF.
+          #
+          # --profile, and this is the flag whose absence broke the first green
+          # cross-compile. Both tools resolve `target/release/<binary>` from
+          # [package.metadata], rewriting `release` to `<triple>/release` when --target is
+          # given -- but `ci/release.toml` builds with `profile = "dist"`, so the binary is
+          # in `target/<triple>/dist/` and the tools looked one directory away from it:
+          #
+          #   error: Can't resolve asset: target/x86_64-unknown-linux-musl/release/modernweather
+          #
+          # The value comes from `cargo xtask targets --profile` rather than being spelled
+          # `dist` here, so there is still one place that says what the profile is.
           # Explicit --output filenames, and this is load-bearing rather than
           # tidiness. cargo-deb derives the Debian architecture from the target
           # triple, and both arm-unknown-linux-musleabihf and
@@ -238,9 +253,11 @@ jobs:
           # packaging layer. `label` is already unique per target.
           cargo deb --no-build --no-strip -p modernweather \
             --target ${{ matrix.triple }} \
+            --profile ${{ needs.config.outputs.profile }} \
             --output "dist/modernweather_${{ needs.config.outputs.version }}_${{ matrix.label }}.deb"
           cargo generate-rpm -p crates/modernweather \
             --target ${{ matrix.triple }} \
+            --profile ${{ needs.config.outputs.profile }} \
             --output "dist/modernweather-${{ needs.config.outputs.version }}-1.${{ matrix.rpm_arch }}.rpm"
       - name: List what was produced
         if: needs.config.outputs.daemon_present == 'true'

@@ -210,6 +210,8 @@ fn usage() {
          \x20                    [--version <v>] [--out <dir>]\n\
          \x20 targets            the release matrix from ci/release.toml, as JSON for a\n\
          \x20        [--linux-only]  GitHub Actions strategy.matrix\n\
+         \x20        [--profile]     or just [release].profile, which the deb and rpm\n\
+         \x20                        steps need to find the cross-built binary\n\
          \n\
          Exit codes: 0 ok \u{b7} 1 drift found by --check, or a conformance replay that \
          did not conform \u{b7} 2 invariant violated, bad usage, or a conformance run that \
