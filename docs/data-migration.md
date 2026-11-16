@@ -604,6 +604,132 @@ table costs nothing but disc. `DROP TABLE w9_carried_observations;` when a backu
 
 ---
 
+## 2d. The gaps after the deploy, filled rather than re-imported, 2026-11-16
+
+**What the owner asked for:** *"Migrate my data once again once those two items are done and we've
+deployed to my K8S cluster. The current DB is missing some gaps where we were down during
+development. If we can just fill that missing data in, fine, but if we can't we need to re-migrate."*
+
+**Filling was the right branch, and the measurement that decides it also says a re-import would have
+been the worse one.** The target's raw starts 2025-10-30; `pitcairn`'s now starts **2025-11-12**,
+because job 1022 dropped the oldest fourteen days after the §2c run (the note at the end of M5-1b
+predicted exactly this). A full re-import therefore no longer reproduces the target — it would need
+`carry-out`/`carry-in` to preserve a window the source cannot supply, which is more machinery than
+the five ranges below needed. Job 1022 is `scheduled = f` today and the fourteen days are still only
+in the new database.
+
+**Five ranges across two stations — 8,780 readings of `csi` and 102,108 of
+`suncrest-air-quality`:**
+
+| station | range (UTC) | length | readings | what it was |
+|---|---|---|---|---|
+| `csi` | 2026-11-13 06:44:08 → 17:56:58 | 11 h 13 m | 8,073 | the station sat `enabled = 0` after being switched off through the admin UI |
+| `csi` | 2026-11-14 15:15:48 → 16:02:18 | 46 m | 557 | development downtime |
+| `csi` | 2026-11-16 17:49:03 → 17:58:58 | 10 m | 119 | the GRA-801 chart rollout |
+| `csi` | 2026-11-16 19:29:13 → 19:31:48 | 2 m 35 s | 31 | this run's own scale-to-zero |
+| `suncrest-air-quality` | 2026-11-13 06:44:11 → 2026-11-16 19:53:02 | 3 d 13 h | 102,108 | nothing is collecting this station into the new database; see below |
+
+**Two gaps were left alone, and that is the finding.** `csi` 2026-11-13 01:41:43 → 02:45:13 (1 h 03 m)
+and `suncrest-air-quality` 2026-11-13 02:35:16 → 02:45:08 (9 m 51 s) are **absent from `pitcairn`
+too**, to the microsecond on both boundaries. They are the stations' own outage, the import recorded
+them faithfully, and there is nothing to fill. The second one ending within four seconds of the first
+suggests one event on the old box rather than two.
+
+**Per station per year, against the two previous runs.** §2a is the first import, §2c the re-import
+with derived station ids; both are import-time counts. "Before" is 2026-11-16 19:22 UTC, immediately
+before the fill; "after" is 19:53 UTC, immediately after the last top-up. The
+`suncrest-air-quality` range took three passes rather than one, and that is the source being live
+rather than anything going wrong: its upper bound had not passed, so the first pass imported a
+prefix of it. The two top-ups are 456 readings of the 102,108.
+
+| station | year | §2a / §2c import | before fill | after fill |
+|---|---|---|---|---|
+| `csi` | 2025 | 1,083,003 | 1,083,003 | **1,083,003** |
+| `csi` | 2026 | 5,352,342 | 5,409,064 | **5,418,189** |
+| `snow` | 2025 | 45,600 | 45,600 | **45,600** |
+| `snow` | 2026 | 91,941 | 91,941 | **91,941** |
+| `suncrest-air-quality` | 2025 | 1,620,854 | 1,620,854 | **1,620,854** |
+| `suncrest-air-quality` | 2026 | 8,969,086 | 8,977,805 | **9,079,913** |
+
+The after column sums to **17,339,500**. `csi` is live and gains a reading every five seconds, so no
+two numbers in this section are taken at the same instant; the aggregate counts below were measured
+at 19:33, twenty minutes earlier. Every 2025 count is unchanged from the first import, which is the
+cheapest available statement that the fill touched only what it was aimed at. `snow` is unchanged in
+both years: it stops on 2026-10-02 on `pitcairn` as well, so it has no tail to fill.
+
+**The aggregates were refreshed over the filled range afterwards** —
+`rebuild-aggregates.sh --from '2026-11-13 00:00:00+00' --to '2026-11-16 19:00:00+00'`, all four
+levels bottom-up, then the open-ended tail. A raw row with no bucket above it is invisible to
+`/span`, so this is not an optional second half.
+
+| level, over 2026-11-13 → 11-15 | before | after | ideal |
+|---|---|---|---|
+| `observations_1h`, `csi` | 29 buckets | **48** | 48 |
+| `observations_1h`, `suncrest-air-quality` | 7 buckets | **48** | 48 |
+| `observations_1d`, `csi` 11-13 | 8,441 readings | **16,514** | 17,279 (a settled day) |
+| `observations_1d`, `csi` 11-14 | 10,520 | **17,242** | |
+| `observations_1d`, `suncrest-air-quality` 11-13 | 7,882 | **28,589** | 28,775 |
+| `observations_1d`, `suncrest-air-quality` 11-14 | absent | **28,782** | |
+| `observations_5m`, `csi` | | **564 of 576** | |
+| `observations_1m`, `csi` | | **2,817 of 2,880** | |
+
+The shortfalls are all the same two unfillable outages, counted at each level: 765 readings on
+`csi`'s 11-13, which is its 1 h 03 m; 12 five-minute and 63 one-minute buckets, which is the same
+hour again.
+
+**Verified on the deployed preview**, which is the owner's own acceptance step:
+
+| | |
+|---|---|
+| `/span/96h?station=CSI` | **97 hourly points**, 24 on each of 11-13, 11-14, 11-15 — no short day |
+| `/span/8760h?station=CSI` | **365 daily points**, 2025-11-16 → 2026-11-16 |
+| the Week tab, rendered | 169 hourly points per chart, 2026-11-09 19:00 → 2026-11-16 19:00, continuous across the filled window on all eight charts |
+| the almanac | all eight all-time extremes populated from the migrated history |
+
+**The live writer was scaled to zero for the import and scaled back afterwards**, and its own
+2 m 35 s of downtime is row four of the table above.
+
+### What this run found that is not a gap
+
+**`suncrest-air-quality` is in the database and not on the website.** Its history is now complete to
+2026-11-16 19:53, but `/span?station=Suncrest%20Air%20Quality` answers `station not found`: the
+configuration store holds one device, `csi`, and the API resolves a device *name* before it selects
+by key (§2c). So the backfill is real and invisible, and **nothing is extending it** — `report`'s
+trailing-edge section measured the backlog re-opening at 448 readings in the twenty-two minutes after
+the fill, which is the rate it will keep. Configuring the station needs a transport decision that is
+the owner's: an AirGradient is an HTTP poller or receiver, not another `ser2net` client. Until that
+happens this backfill ages, and re-running `fill` is a stopgap rather than a fix.
+
+**The almanac's lowest barometer reads 6.15 inHg**, 2026-10-20. That is `pitcairn`'s own value —
+`min(barometer)` over that day is `6.147712` on both sides, with 13 readings below 20 inHg — so it is
+a sensor dropout carried faithfully, not a migration artefact. The old site shows the same number. A
+plausibility filter on the almanac is a product question, not this item's.
+
+### The tool
+
+`ci/db/migrate-from-go/fill-gaps.sh`, `report` and `fill`. It exists because
+`migrate-from-go.sh`'s `raw` step cannot do this: `raw` plans slices from the source's extent and
+imports *every* station in each slice, which is correct into an empty table and wrong into one a live
+daemon is writing to — `suncrest-air-quality`'s last imported reading sits three seconds inside
+`csi`'s eleven-hour gap, so a slice-shaped import of that gap collides on
+`observations_station_id_time_key` instead of filling anything. `fill` therefore takes one station
+and one range, and refuses a range the target is not empty over. The column list and the
+`stationname → station_id` mapping are read from the `w9` schema on the target rather than retyped.
+
+`report` has two halves and the second one is not decoration. `lag()` finds a hole *between* two
+readings, so a station the new database simply stopped recording has no hole — it has an end, and
+`lag()` reports nothing at all while the station falls further behind every day. That is
+`suncrest-air-quality` exactly, and a gap report that could not see it would have called this
+database complete. The trailing-edge half compares each station's last reading against the source's
+and counts what lies between.
+
+**`report` is also the verification**, and it is the whole of it — the owner scoped the W9
+reconciliation out of this run explicitly, and the five counted ranges above plus the preview are
+what replaced it. Run against both databases after the fill it returns the two unfillable outages,
+a trailing edge of zero for `csi` and for `snow`, and `suncrest-air-quality`'s re-opening backlog.
+
+---
+
 ## 3. The history decision
 
 **The decision is the owner's. Here are the two options, the cost of each, and a recommendation.**

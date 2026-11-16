@@ -303,6 +303,7 @@ jobs:
             ci/db/offsite-backup.sh \
             ci/db/restore-rehearsal.sh \
             ci/db/migrate-from-go/migrate-from-go.sh \
+            ci/db/migrate-from-go/fill-gaps.sh \
             ci/db/migrate-from-go/extract-go-views.sh \
             ci/db/migrate-from-go/lab/run-in-pod.sh \
             ci/db/migrate-from-go/lab/lab-env.sh \
