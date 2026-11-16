@@ -35,6 +35,60 @@
         }
       })();
     </script>
+    <script>
+      // `crypto.randomUUID` is **secure-context only**, and this UI is reached over plain
+      // HTTP at a LAN address -- so on the real deployment the function is simply absent.
+      // The first thing to call it is chonky's `toast`, which a save raises *after* its
+      // POST has already committed, so the operator saw
+      // `TypeError: crypto.randomUUID is not a function` and read it as a save that failed
+      // when the save had landed (GRA-803).
+      //
+      // `crypto.getRandomValues` carries no such gate, so the same version-4 value is
+      // available by a route that exists here. Inline rather than a module so it is in
+      // place before anything that might call it is imported, and after the theme script
+      // because that one has to be first for the paint.
+      (function () {
+        try {
+          var c = window.crypto;
+          if (
+            !c ||
+            typeof c.randomUUID === 'function' ||
+            typeof c.getRandomValues !== 'function'
+          ) {
+            return;
+          }
+          var uuid = function () {
+            var b = new Uint8Array(16);
+            c.getRandomValues(b);
+            b[6] = (b[6] & 0x0f) | 0x40; // version 4
+            b[8] = (b[8] & 0x3f) | 0x80; // variant 1
+            var s = '';
+            for (var i = 0; i < 16; i++) {
+              s += (b[i] + 0x100).toString(16).slice(1);
+              if (i === 3 || i === 5 || i === 7 || i === 9) {
+                s += '-';
+              }
+            }
+            return s;
+          };
+          try {
+            c.randomUUID = uuid;
+          } catch (e) {
+            // Assignment refused; the prototype below is the other way in.
+          }
+          if (typeof c.randomUUID !== 'function') {
+            Object.defineProperty(Object.getPrototypeOf(c), 'randomUUID', {
+              value: uuid,
+              writable: true,
+              configurable: true
+            });
+          }
+        } catch (e) {
+          // A browser with no `getRandomValues` at all is older than this UI supports;
+          // leaving the absence in place is better than a predictable identifier.
+        }
+      })();
+    </script>
     %sveltekit.head%
   </head>
   <body data-sveltekit-preload-data="hover">
