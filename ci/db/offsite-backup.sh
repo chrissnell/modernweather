@@ -142,6 +142,7 @@ RELATIONS=(
   "observations_1d|skip|aggregate level, same"
   "_sqlx_migrations|skip|the migration ledger. A restore applies migrations/ itself, so restoring the ledger would describe a history the restored database never had"
   "_mw_ci_applied|skip|the shell applier's ledger, used by ci/db/migrate-twice.sh and ci/db/restore-rehearsal.sh. Not part of the schema, and absent from any database the daemon migrated"
+  "w9_carried_observations|skip|the 462,495 readings ci/db/migrate-from-go/migrate-from-go.sh held across a re-import, kept only until the carry was reconciled -- which it was (docs/data-migration.md §2). Verified against the live database rather than taken from the document: SELECT * FROM w9_carried_observations EXCEPT ALL SELECT * FROM observations returns 0 rows over all 462,495, so every row here is already in observations and therefore already in this archive under raw-per-year. Skipped rather than pgdump because backing it up weekly would be 893 MB of a second copy of rows the same archive already holds. Its own comment says to DROP it once the reconciliation has passed"
 )
 
 relation_field() { # <name> <1=mode|2=reason>
