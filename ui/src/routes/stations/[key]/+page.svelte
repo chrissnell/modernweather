@@ -107,7 +107,15 @@
 </script>
 
 {#if station}
-  <StationForm {station} busy={busy || previewing} {failure} onsubmit={propose} />
+  <!--
+    Keyed on the station. SvelteKit reuses this component when only the route parameter
+    changes, and `StationForm` seeds its fields once from `untrack` -- so navigating from
+    one station to another left every field holding the previous station's values under
+    the new one's heading, and saving wrote them to it. The key is what forces the seed.
+  -->
+  {#key station.key}
+    <StationForm {station} busy={busy || previewing} {failure} onsubmit={propose} />
+  {/key}
 
   {#if preview && pending}
     <!-- §2.4 ①: the consequence, then the confirmation. -->

@@ -44,7 +44,9 @@ test('the log backfills, goes live, survives a restart and comes back', async ({
 
   // §5.2: the UI says what it is doing rather than silently showing the old list as
   // current. The backoff starts at a second, so this is quick.
-  await expect(indicator).toContainText(/reconnecting|disconnected|live/, {
+  // Not `|live`: the indicator already reads "live", so including it made this assertion
+  // pass whether or not the restart was ever noticed.
+  await expect(indicator).toContainText(/reconnecting|disconnected/, {
     timeout: 20_000
   });
 

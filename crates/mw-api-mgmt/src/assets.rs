@@ -140,7 +140,93 @@ const NO_BUNDLE: &str = "The management interface was not built into this copy o
                          RemoteWeather. The API is working; the pages are not here.\n";
 
 /// Serve one path out of the bundle, with the SPA fallback (§6.4).
+/// Standard base64, for the one CSP hash below. Twelve lines against a new direct
+/// dependency for a single call site.
+fn base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(A[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// §3.5's policy for the **document**, with the bundle's own inline bootstrap allowed by
+/// hash rather than by opening the policy.
+///
+/// `app.html` carries exactly one inline script -- the theme pin, which has to run before
+/// first paint or every load flashes the wrong theme -- so `'self'` alone would block it.
+/// Naming its SHA-256 keeps `unsafe-inline` out. The digest is taken from the **embedded
+/// document that is actually served**, so it cannot drift from the bundle the way a
+/// constant checked in beside it would.
+fn document_csp(assets: &Assets) -> &'static str {
+    static CSP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CSP.get_or_init(|| {
+        let mut hashes = String::new();
+        if let Some((bytes, _)) = assets.read("index.html") {
+            let html = String::from_utf8_lossy(&bytes);
+            let mut rest = html.as_ref();
+            while let Some(open) = rest.find("<script") {
+                let after = &rest[open..];
+                let Some(gt) = after.find('>') else { break };
+                let (tag, body) = after.split_at(gt + 1);
+                let Some(end) = body.find("</script>") else { break };
+                // A script with a `src` loads from the origin and is covered by `'self'`.
+                if !tag.contains(" src") {
+                    let digest = <sha2::Sha256 as sha2::Digest>::digest(&body.as_bytes()[..end]);
+                    hashes.push_str(&format!(" 'sha256-{}'", base64(&digest)));
+                }
+                rest = &body[end..];
+            }
+        }
+        format!(
+            "default-src 'self'; script-src 'self'{hashes}; frame-ancestors 'none'; \
+             base-uri 'none'; form-action 'self'"
+        )
+        .replace("\
+             ", "")
+    })
+}
+
+/// The security headers every served document and asset carries.
+///
+/// These used to be set only by `guard::decorate`, which sits on the API sub-router --
+/// and `Router::layer` wraps the fallback **as it exists at that moment**, so the asset
+/// fallback registered afterwards was never wrapped. The upshot was that `index.html`,
+/// the sign-in page and every chunk were served with no CSP, no `nosniff` and no
+/// `Referrer-Policy`: the four directives were present only on JSON responses, which are
+/// the ones that least need them. Set here rather than by a second layer because `serve`
+/// already owns this response and layer ordering is what caused the bug.
+fn secure(response: &mut Response<Body>, assets: &Assets) {
+    let headers = response.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(document_csp(assets)) {
+        headers.insert(header::CONTENT_SECURITY_POLICY, v);
+    }
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+}
+
 pub fn serve(assets: &Assets, uri: &Uri, request_headers: &HeaderMap) -> Response<Body> {
+    let mut response = build(assets, uri, request_headers);
+    secure(&mut response, assets);
+    response
+}
+
+fn build(assets: &Assets, uri: &Uri, request_headers: &HeaderMap) -> Response<Body> {
     let path = uri.path().trim_start_matches('/');
 
     // The API's own 404 must stay the API's. See the module note.

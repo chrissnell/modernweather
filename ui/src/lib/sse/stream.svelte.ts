@@ -130,6 +130,11 @@ class Stream {
 
   #open(): void {
     if (this.#stopped) return;
+    // §5.1 is one connection. Belt to the layout's brace: `start()` is reachable from a
+    // `$effect`, and an effect that runs while a retry is in flight would otherwise leave
+    // the socket opened by the retry with nothing holding it -- orphaned, never closed,
+    // and still delivering frames the client appends a second time.
+    if (this.#source) return;
     const params = new URLSearchParams({ channels: this.#channels.join(',') });
     if (this.state.lastEventId) params.set('last_event_id', this.state.lastEventId);
     const source = new EventSource(`/api/v1/events?${params.toString()}`);
@@ -199,10 +204,19 @@ class Stream {
 
     source.onerror = () => {
       source.close();
-      if (this.#source === source) this.#source = null;
+      // Only the current connection drives the backoff. A superseded one firing its own
+      // error would otherwise increment `attempt` a second time and overwrite the single
+      // `#timer`, so the schedule stops being §5.2's 1/2/4/8/15.
+      if (this.#source !== source) return;
+      this.#source = null;
       if (this.#stopped) return;
       const delayMs = delayFor(this.state.attempt);
       this.#apply({ kind: 'error', at: Date.now(), delayMs });
+      // §5.2's `disconnected [Retry]`. Five attempts is the whole 1/2/4/8/15 ladder, so
+      // this is "down for about half a minute" rather than "briefly restarting", which
+      // is the distinction the state exists to draw. The timer below is still armed --
+      // giving up on the *message* is not giving up on the connection.
+      if (this.state.attempt >= 5) this.#apply({ kind: 'give_up' });
       this.#clearTimer();
       this.#timer = setTimeout(() => {
         this.#apply({ kind: 'retry_now' });

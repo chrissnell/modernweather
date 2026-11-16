@@ -292,8 +292,11 @@ impl Hub {
         let ring = self.lock_replay();
         let oldest = ring.front().and_then(|f| f.id)?;
         // `id + 1 < oldest` rather than `id < oldest`: resuming from exactly the frame
-        // before the oldest retained one loses nothing.
-        if id + 1 < oldest {
+        // before the oldest retained one loses nothing. Saturating because `id` is
+        // whatever the client put in `Last-Event-ID`, and `u64::MAX + 1` is a panic in a
+        // request handler under the dev profile's overflow checks -- one the client's
+        // `EventSource` would then reconnect and reproduce forever.
+        if id.saturating_add(1) < oldest {
             return None;
         }
         Some(
@@ -425,7 +428,61 @@ impl std::fmt::Debug for Rendering {
     }
 }
 
+/// The retained frames a resuming connection may be sent: its own channels, nothing else.
+///
+/// Separate from `connect` so it can be tested without a hub, a supervisor and a stream.
+fn replayable(frames: Vec<Arc<Frame>>, channels: &BTreeSet<Channel>) -> Vec<Frame> {
+    frames
+        .into_iter()
+        .filter(|f| channels.contains(&f.channel))
+        .map(|f| (*f).clone())
+        .collect()
+}
+
+/// A vocabulary and the generation it was built from.
+///
+/// `observe` keeps one of these across wakes. See [`Rendering::gather_cached`].
+pub type VocabularyCache = Option<(u64, Vocabulary)>;
+
 impl Rendering {
+    /// Gather it, reusing a vocabulary already built for this generation.
+    ///
+    /// [`Self::gather`]'s configuration read is a multi-table load, and `observe` wakes on
+    /// **every** supervisor publication and **every** reading -- which on a node with one
+    /// two-second station is more database work per second than the polling §5.6 deleted,
+    /// with or without a browser attached. The vocabulary is a pure function of the
+    /// configuration, so it only has to be rebuilt when the configuration changes.
+    ///
+    /// **This does not weaken D-36.** Every commit stores a new generation
+    /// (`admin.rs`'s `commit`), so a station renamed through the API misses the cache on
+    /// the next frame and the new name reaches every connected browser exactly as before.
+    /// `awaiting` is still read every time, because it moves as components converge
+    /// without the generation changing.
+    ///
+    /// The generation is read **before** the configuration rather than after: a commit
+    /// landing between the two then caches a newer vocabulary under an older generation,
+    /// which misses once and corrects itself. Reading it after would cache an older
+    /// vocabulary under the newer generation, and that would stick.
+    pub async fn gather_cached(
+        admin: &dyn ConfigAdmin,
+        cache: &mut VocabularyCache,
+    ) -> Result<Self, crate::ApiError> {
+        let generation = admin.generation().get();
+        let vocab = match cache {
+            Some((cached, vocab)) if *cached == generation => vocab.clone(),
+            _ => {
+                let vocab = Vocabulary::new(&admin.read().await?);
+                *cache = Some((generation, vocab.clone()));
+                vocab
+            }
+        };
+        Ok(Rendering {
+            vocab,
+            awaiting: admin.awaiting(),
+            generation,
+        })
+    }
+
     /// Gather it from a [`ConfigAdmin`].
     pub async fn gather(admin: &dyn ConfigAdmin) -> Result<Self, crate::ApiError> {
         let config = admin.read().await?;
@@ -475,6 +532,7 @@ pub async fn observe(
     hub.logs_tap(&sources);
     let mut previous: BTreeMap<String, ComponentView> = BTreeMap::new();
     let mut last_reading: BTreeMap<String, chrono::DateTime<chrono::Utc>> = BTreeMap::new();
+    let mut vocab_cache: VocabularyCache = None;
 
     // Taken **once** and held: a receiver created per wait would mark the current version
     // as seen and miss the change it was created to notice.
@@ -523,9 +581,18 @@ pub async fn observe(
         };
 
         match woke {
-            Woke::Stop => return,
+            // `close_all` before returning: an SSE response is an in-flight request, and
+            // `mw_http`'s drain waits `DRAIN` for those. Without this, a process with one
+            // browser attached spends its entire ten-second exit budget every time -- the
+            // same failure `Hub::epoch` exists to prevent, reached by a different door.
+            Woke::Stop => {
+                hub.close_all();
+                return;
+            }
             Woke::Components => {
-                let Ok(rendering) = Rendering::gather(sources.admin.as_ref()).await else {
+                let Ok(rendering) =
+                    Rendering::gather_cached(sources.admin.as_ref(), &mut vocab_cache).await
+                else {
                     // A configuration read that failed is a database that is unreachable,
                     // and the log already says so through the tap. Keeping the last good
                     // state on screen -- dimmed by the client, because the stream itself
@@ -581,10 +648,12 @@ pub async fn observe(
                 }
             }
             Woke::Readings => {
-                // The vocabulary, for `station_name`. Read here rather than cached for
-                // D-36's reason: a station renamed through the API changes the name on
-                // every connected browser's tile at the next reading.
-                let rendering = Rendering::gather(sources.admin.as_ref()).await.ok();
+                // The vocabulary, for `station_name`. Cached on the generation rather
+                // than re-read: D-36 still holds, because a rename is a commit and a
+                // commit is a new generation. See `gather_cached`.
+                let rendering = Rendering::gather_cached(sources.admin.as_ref(), &mut vocab_cache)
+                    .await
+                    .ok();
                 for mut reading in sources.readings.latest() {
                     let unchanged = last_reading
                         .get(&reading.station_key)
@@ -752,7 +821,11 @@ pub fn connect(
     let replayed = request.last_event_id.and_then(|id| hub.after(id));
     match (request.last_event_id, replayed) {
         (Some(_), Some(frames)) => {
-            prologue.extend(frames.into_iter().map(|f| (*f).clone()));
+            // Filtered, like `backfill` below and like the live tail. Without this a page
+            // holding a `components`-only connection is handed every retained `log` and
+            // `reading` frame on each reconnect -- data it did not ask for, and a prologue
+            // that grows with the busiest channel rather than with its own.
+            prologue.extend(replayable(frames, &request.channels));
         }
         (Some(_), None) => {
             // The resume point is gone. Say so, then start again -- in that order, so the
@@ -911,6 +984,46 @@ fn log_stream_name(stream: LogStream) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A resuming connection is sent its own channels and nothing else.
+    ///
+    /// The resume path used to push **every** retained frame into the prologue, unlike the
+    /// backfill and the live tail, which both filter. Every page holds a
+    /// `components`-only connection, so each reconnect handed it the whole retained log --
+    /// records the client's own `log` listener then appended to its buffer.
+    #[test]
+    fn a_resume_replays_only_the_channels_it_asked_for() {
+        let frame = |id: u64, channel: Channel| {
+            Arc::new(Frame {
+                id: Some(id),
+                event: "x",
+                data: String::new(),
+                channel,
+            })
+        };
+        let retained = vec![
+            frame(1, Channel::Components),
+            frame(2, Channel::Logs),
+            frame(3, Channel::Readings),
+            frame(4, Channel::Components),
+        ];
+
+        let only_components = replayable(retained.clone(), &BTreeSet::from([Channel::Components]));
+        assert_eq!(
+            only_components
+                .iter()
+                .map(|f| f.id.expect("a retained frame has an id"))
+                .collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+
+        // And a connection that did ask for logs still gets them.
+        let with_logs = replayable(
+            retained,
+            &BTreeSet::from([Channel::Components, Channel::Logs]),
+        );
+        assert_eq!(with_logs.len(), 3);
+    }
 
     #[test]
     fn an_unknown_channel_is_an_error_rather_than_a_silent_drop() {

@@ -61,6 +61,23 @@
     settled += 1;
   }
 
+  /**
+   * Every way out of the dialog that is not "confirm" has to settle the switch.
+   *
+   * `decline()` covers the Cancel button. bits-ui also closes on Escape and on a click
+   * outside, and both do it by assigning `open = false` directly -- so `settled` was not
+   * bumped, the `{#key}` below did not change, and chonky's `Toggle` stayed showing
+   * "off" while the station was still collecting. The next click then read as *turn on*.
+   * That is exactly the desync this counter was added for; only one of its three doors
+   * was covered.
+   */
+  $effect(() => {
+    if (!confirmOpen && confirmOff && !confirming) {
+      confirmOff = null;
+      settled += 1;
+    }
+  });
+
   async function ask(key: string, name: string) {
     confirming = key;
     try {

@@ -83,11 +83,19 @@
 
   // Picking a kind on a create sets the connection that kind actually uses, so the
   // operator is not asked to choose between transports they have never heard of.
+  //
+  // **Tracked against the kind it was derived from, not against emptiness.** The guard
+  // used to be `!transportKind`, so it fired once and never again: picking Davis then
+  // changing to AirGradient left `transport.kind` as `serial`, which rendered the serial
+  // device and baud fields for a network sensor, rendered no address field, hid the
+  // transport selector -- and submitted a combination `mw-station::plan` refuses. A Save
+  // that cannot succeed is the defect this table exists to prevent.
+  let derivedFor = $state<string | null>(null);
   $effect(() => {
-    if (creating && kind && !transportKind) {
-      transportKind = shape.defaultTransport;
-      if (shape.defaultBaud && !baud) baud = String(shape.defaultBaud);
-    }
+    if (!creating || !kind || derivedFor === kind) return;
+    derivedFor = kind;
+    transportKind = shape.defaultTransport;
+    baud = shape.defaultBaud ? String(shape.defaultBaud) : '';
   });
 
   let ports = $state<Schemas['SerialPort'][]>([]);

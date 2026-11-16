@@ -31,7 +31,12 @@
 
   $effect(() => {
     session.load().then(() => (ready = true));
-    return () => stream.stop();
+    // `started` is cleared with the stream it tracks, so a teardown and a fresh mount
+    // open a connection again rather than calling `setChannels` on a dead one.
+    return () => {
+      stream.stop();
+      started = false;
+    };
   });
 
   // The guard, as an effect on the session rather than a `load` function: SPA mode has no
@@ -57,14 +62,27 @@
   // set depends on the page: `components` everywhere, `readings` where a reading is shown,
   // `logs` only on the activity view -- which is what keeps the log channel's volume off
   // every other page's connection.
+  // Deliberately not `$state`: this must not make the effect below re-run.
+  let started = false;
+
   $effect(() => {
     if (!session.authenticated) return;
     const path = page.url.pathname;
     const channels: ('components' | 'logs' | 'readings')[] = ['components'];
     if (path === '/' || path.startsWith('/stations')) channels.push('readings');
     if (path === '/system/activity') channels.push('logs');
-    if (stream.state.phase === 'connecting' && !stream.streamId) stream.start(channels);
-    else void stream.setChannels(channels);
+    // `started` rather than reading the connection's phase. This effect used to gate on
+    // `stream.state.phase === 'connecting' && !stream.streamId`: `state` is `$state`, so
+    // the effect re-ran on every transition, while `streamId` is a plain field and could
+    // not gate anything. When the first attempt failed -- a restarting daemon, which this
+    // app treats as routine -- the retry opened a socket and the effect then opened a
+    // second one on top of it. §5.1 is one connection.
+    if (!started) {
+      started = true;
+      stream.start(channels);
+    } else {
+      void stream.setChannels(channels);
+    }
   });
 
   const guarded = $derived(!UNGUARDED.includes(page.url.pathname));

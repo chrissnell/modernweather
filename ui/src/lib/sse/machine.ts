@@ -81,8 +81,14 @@ export function reduce(state: StreamState, event: StreamEvent): StreamState {
         caughtUp: false
       };
     case 'retry_now':
-      return { ...state, phase: 'connecting', retryAt: null, givenUp: false };
+      // `givenUp` deliberately survives this: the automatic retries continue underneath,
+      // and clearing it here would make the indicator flicker between `disconnected` and
+      // `connecting` once per backoff step. Only a connection that actually opens clears
+      // it, which is the `open` case above.
+      return { ...state, phase: state.givenUp ? 'disconnected' : 'connecting', retryAt: null };
     case 'give_up':
+      // "We have been failing long enough that you should be told, and offered a button."
+      // Not "we have stopped": `stream.svelte.ts` keeps its timer.
       return { ...state, phase: 'disconnected', retryAt: null, givenUp: true };
     case 'stop':
       return { ...initial, lastEventId: state.lastEventId };

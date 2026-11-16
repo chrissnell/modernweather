@@ -171,8 +171,11 @@
   }
 
   /** Whether the capture level is above the level the process started with. */
+  // A bare level too, not just `target=level`: `raise()` sends `debug` with no `=` when
+  // no target is chosen, and that is the case the chip exists for -- "debug left on
+  // forever quietly fills the ring".
   const standing = $derived(
-    Boolean(levels && /=(debug|trace)/.test(levels.directive))
+    Boolean(levels && /(^|[,=])\s*(debug|trace)\b/.test(levels.directive))
   );
 
   function download() {

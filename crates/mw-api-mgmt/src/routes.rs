@@ -1821,6 +1821,21 @@ fn session_view(session: &crate::auth::Session, current: Option<&[u8; 16]>) -> S
 /// Truncated rather than rejected, because a long one is a browser quirk and not an attack,
 /// and this column is shown in a list: 256 bytes is more than any real agent string and
 /// bounds what one request can write into the configuration database.
+/// A rejected username, bounded, for the audit line.
+///
+/// `LoginInput::username` is whatever the caller sent and `/api/v1/auth/login` is one of
+/// the three unauthenticated routes, so the failure paths below write an attacker-chosen
+/// string straight into the log ring -- which retains 4096 records **by count**, and which
+/// the live stream mirrors. Unbounded, a few thousand requests with a large username are
+/// gigabytes retained on a machine this project sizes at 512 MB, and they evict the real
+/// audit trail on the way. The third attempt onward returns 429 *without hashing*, so the
+/// progressive delay does not stand in front of this.
+///
+/// Same bound and same reasoning as [`user_agent`] above.
+fn audited(username: &str) -> String {
+    username.chars().take(256).collect()
+}
+
 fn user_agent(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get(axum::http::header::USER_AGENT)
@@ -1866,7 +1881,7 @@ async fn post_login(
         tracing::warn!(
             target: crate::auth::AUDIT,
             outcome = "throttled",
-            username = %input.username,
+            username = %audited(&input.username),
             source_ip = peer.0.as_deref().unwrap_or("-"),
             retry_after_seconds = seconds,
             "login refused"
@@ -1887,7 +1902,7 @@ async fn post_login(
         tracing::warn!(
             target: crate::auth::AUDIT,
             outcome = "refused",
-            username = %input.username,
+            username = %audited(&input.username),
             source_ip = peer.0.as_deref().unwrap_or("-"),
             "login refused"
         );
@@ -2060,6 +2075,7 @@ async fn delete_session(
     Extension(current): Extension<Current>,
 ) -> Result<axum::response::Response, ApiError> {
     guard.store().revoke(current.session.id).await?;
+    guard.close_live_streams();
     tracing::info!(
         target: crate::auth::AUDIT,
         outcome = "ok",
@@ -2118,6 +2134,7 @@ async fn delete_one_session(
             id,
         });
     }
+    guard.close_live_streams();
     tracing::info!(
         target: crate::auth::AUDIT,
         outcome = "ok",
@@ -2146,6 +2163,7 @@ async fn delete_all_sessions(
     Extension(current): Extension<Current>,
 ) -> Result<axum::response::Response, ApiError> {
     let revoked = guard.store().revoke_all().await?;
+    guard.close_live_streams();
     tracing::info!(
         target: crate::auth::AUDIT,
         outcome = "ok",
@@ -2232,6 +2250,9 @@ async fn post_password(
 
     let phc = crate::auth::hash_password(&input.new_password)?;
     store.change_password(phc, current.session.id).await?;
+    // This session survives the change, but every other one was just revoked and their
+    // streams have to go with them -- "my laptop was stolen" is the case this is for.
+    guard.close_live_streams();
     tracing::info!(
         target: crate::auth::AUDIT,
         outcome = "ok",

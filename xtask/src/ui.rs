@@ -420,11 +420,17 @@ pub fn copy(root: &Path) -> ExitCode {
                 misplaced_raw.push(format!("{relative}: raw('{raw}')"));
             }
         }
-        if relative == RAW_MODULE || relative == "src/lib/copy/raw.ts" {
-            // The one module whose whole purpose is to name internal terms deliberately,
-            // and the function that marks them.
+        if relative == "src/lib/copy/raw.ts" {
+            // The function that marks the exceptions, rather than any of them.
             continue;
         }
+        // `raw('Trigger')` is a declared exception; `Trigger` written plainly in the same
+        // file is not, and used to pass because the whole module was skipped.
+        let text = if relative == RAW_MODULE {
+            blank_raw_calls(&text)
+        } else {
+            text
+        };
 
         let in_copy_dir = relative.starts_with("src/lib/copy/");
         let is_svelte = relative.ends_with(".svelte");
@@ -573,6 +579,31 @@ fn strip_comments(text: &str, is_svelte: bool) -> String {
 }
 
 /// Every `raw('x')` argument in a file.
+/// The same text with every `raw('...')` argument replaced by a neutral placeholder.
+///
+/// Used on [`RAW_MODULE`] so that its declared exceptions are exempt from the banned-word
+/// scan while everything else in the file is not.
+fn blank_raw_calls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("raw(") {
+        out.push_str(&rest[..at + 4]);
+        rest = &rest[at + 4..];
+        let Some(quote) = rest.chars().next() else { break };
+        if quote != '\'' && quote != '"' && quote != '`' {
+            continue;
+        }
+        let body = &rest[quote.len_utf8()..];
+        let Some(end) = body.find(quote) else { break };
+        out.push(quote);
+        out.push_str("an exception");
+        out.push(quote);
+        rest = &body[end + quote.len_utf8()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn raw_terms(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = text;
@@ -693,7 +724,22 @@ fn string_literals(text: &str) -> Vec<(usize, String)> {
 }
 
 /// The attributes whose values a person reads or hears.
-const SPOKEN_ATTRIBUTES: &[&str] = &["aria-label", "title", "placeholder", "label", "alt"];
+const SPOKEN_ATTRIBUTES: &[&str] = &[
+    "aria-label",
+    "aria-description",
+    "aria-roledescription",
+    "aria-placeholder",
+    "title",
+    "placeholder",
+    "label",
+    "alt",
+    // `description` and `hint` are this application's own prose props --
+    // `CheckResult description=` and `Field hint=` both take a sentence an operator
+    // reads. `summary` is the same for `<details>`.
+    "description",
+    "hint",
+    "summary",
+];
 
 /// Template text nodes and spoken attribute values from a `.svelte` file.
 fn template_strings(text: &str) -> Vec<(usize, String)> {

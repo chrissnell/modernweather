@@ -1,14 +1,19 @@
 <!--
   §2.4's five banner states.
 
-  chonky ships `ApplyBanner { count, onApply }` and this uses it **for ② only**, where a
-  count of items catching up is exactly what it shows. The other four states are not
-  "apply this" affordances -- ③ is a receipt, ④ is a diagnosis, ⑤ is a decision -- so
-  reusing a component named for an Apply button to render them would make the markup lie
-  about what the operator can do.
+  chonky ships `ApplyBanner { count, onApply }` and **none of the five uses it**, for the
+  reason the name gives away. Its markup is `{count} pending changes` next to a button
+  reading `apply`, and §2.1's whole thesis is that there is no staging area and nothing to
+  apply: a save *is* the change. ② used to render it with `onApply={() => {}}`, so the
+  state an operator sees most often after saving told them their change was **pending**
+  and offered them a control that did nothing, while the correct sentence was rendered
+  `sr-only` on the next line -- sighted users got the wrong message and screen-reader
+  users got the right one. All five states are a `Box` now, and the one sentence serves
+  both. (It also puts that copy back where `cargo xtask gate-ui-copy` can see it;
+  inside chonky it was beyond the lint's reach.)
 -->
 <script lang="ts">
-  import { ApplyBanner, Badge, Box, Button, Collapsible, Spinner } from '@chrissnell/chonky-ui';
+  import { Badge, Box, Button, Collapsible, Spinner } from '@chrissnell/chonky-ui';
   import { home } from '$lib/copy';
   import { saves, blockedSentence } from '$lib/live/save.svelte';
   import { toast } from '@chrissnell/chonky-ui';
@@ -41,8 +46,12 @@
 
 {#if phase.kind === 'catching_up'}
   <!-- ② JUST SAVED -->
-  <ApplyBanner count={phase.remaining} onApply={() => {}} />
-  <p class="sr-only" aria-live="polite">{home.apply.savedCatchingUp(phase.remaining)}</p>
+  <Box>
+    <p class="row" aria-live="polite">
+      <Spinner size={14} />
+      {home.apply.savedCatchingUp(phase.remaining)}
+    </p>
+  </Box>
 {:else if phase.kind === 'live'}
   <!-- ③ LIVE -->
   <Box>
@@ -111,11 +120,4 @@
     font-size: var(--text-sm);
   }
 
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip: rect(0 0 0 0);
-  }
 </style>

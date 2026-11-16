@@ -32,11 +32,21 @@
     void refresh();
   });
 
+  // Separate from the password form's `failure`: this read's error used to be assigned
+  // there, so a failed GET was reported as an error *under the change-password form* --
+  // and `change()` then cleared it. `loaded` is what tells an empty list apart from a
+  // list that has not arrived, which is why the panel below could say "Loading…" forever.
+  let sessionsError = $state<ReturnType<typeof asFailure> | null>(null);
+  let loaded = $state(false);
+
   async function refresh() {
     try {
       sessions = unwrap(await api.GET('/api/v1/auth/sessions')).sessions;
+      sessionsError = null;
     } catch (e) {
-      failure = asFailure(e);
+      sessionsError = asFailure(e);
+    } finally {
+      loaded = true;
     }
   }
 
@@ -158,8 +168,13 @@
 </Box>
 
 <Box title={copy.administrator.sessionsHeading}>
-  {#if sessions.length === 0}
+  {#if sessionsError}
+    <p class="error" role="alert">{sessionsError.summary}</p>
+    <Button onclick={refresh}>{common.retry}</Button>
+  {:else if !loaded}
     <p class="blurb">{common.loading}</p>
+  {:else if sessions.length === 0}
+    <p class="blurb">{common.none}</p>
   {:else}
     <Table>
       <thead>

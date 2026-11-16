@@ -531,9 +531,21 @@ async fn first_run_prints_a_code_to_the_console_that_never_reaches_the_log_ring(
         !rendered.contains(&code),
         "the setup code reached the log ring"
     );
-    // Nor any fragment of it: a redaction that split it would still be a leak.
-    for group in code.split('-') {
-        assert!(!rendered.contains(group), "`{group}` reached the log ring");
+    // Nor any run of it: a redaction that split the code would still be a leak.
+    //
+    // **An eight-character window rather than each four-character group.** The code is
+    // thirteen base32 groups of four, and a four-character base32 string appears in a
+    // few hundred kilobytes of timestamps, hex ids and paths often enough to fail this
+    // test at random -- which it did, under a loaded `cargo test --workspace`. Eight
+    // characters is 2^40 of alphabet and cannot collide by accident, while still
+    // catching any contiguous leak worth the name.
+    let canonical: String = code.chars().filter(|c| *c != '-').collect();
+    for window in canonical
+        .as_bytes()
+        .windows(8)
+        .map(|w| std::str::from_utf8(w).expect("base32 is ascii"))
+    {
+        assert!(!rendered.contains(window), "`{window}` reached the log ring");
     }
     // The issue itself **is** audited, without its value.
     assert!(

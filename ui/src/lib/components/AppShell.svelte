@@ -14,6 +14,7 @@
     navigable by keyboard.
 -->
 <script lang="ts">
+  import { goto } from '$app/navigation';
   import {
     Button,
     Command,
@@ -244,7 +245,10 @@
         <Command.Item
           onSelect={() => {
             paletteOpen = false;
-            location.assign(item.href);
+            // `goto`, not `location.assign`: a full document load drops the one
+            // `EventSource` and `saves.awaiting` with it, so using the palette straight
+            // after a save threw away the banner that reports the save going live.
+            void goto(item.href);
           }}
         >
           {item.label}

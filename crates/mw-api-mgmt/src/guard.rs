@@ -109,6 +109,9 @@ pub struct Guard {
     /// Whether this socket is TLS, which decides the cookie's name and its `Secure`
     /// attribute (§3.3).
     secure: bool,
+    /// §5's hub, so that revoking a session also ends that session's open streams.
+    /// `None` in a router built without a live stream, which is most of the tests.
+    live: Option<Arc<crate::events::Hub>>,
 }
 
 impl std::fmt::Debug for Guard {
@@ -129,7 +132,36 @@ impl Guard {
     pub fn new(auth: Arc<dyn AuthStore>, mut cors: Vec<String>, secure: bool) -> Self {
         cors.sort();
         cors.dedup();
-        Self { auth, cors, secure }
+        Self {
+            auth,
+            cors,
+            secure,
+            live: None,
+        }
+    }
+
+    /// Attach §5's hub, so a revocation can reach the streams it has to end.
+    #[must_use]
+    pub fn with_hub(mut self, hub: Arc<crate::events::Hub>) -> Self {
+        self.live = Some(hub);
+        self
+    }
+
+    /// End every open live stream, because a session was revoked.
+    ///
+    /// **Why all of them rather than the revoked one.** `enforce` authenticates an SSE
+    /// request once, when it is made; the response then runs until the client goes away.
+    /// So "sign out everywhere" left the highest-bandwidth channel in the product -- log
+    /// records, component state and readings -- flowing to a browser whose session no
+    /// longer exists, until the process restarted or an unrelated configuration change
+    /// happened to bump the epoch. The hub does not key connections by session, and
+    /// closing all of them costs a legitimate browser one silent reconnect, which it
+    /// already does on every configuration commit. A revoked one reconnects into a 401
+    /// and §8.8's signed-out state.
+    pub fn close_live_streams(&self) {
+        if let Some(hub) = &self.live {
+            hub.close_all();
+        }
     }
 
     /// Whether this socket is TLS, so the routes can name the cookie correctly.
