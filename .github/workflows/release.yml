@@ -55,6 +55,7 @@ jobs:
       publish_release: ${{ steps.r.outputs.publish_release }}
       publish_containers: ${{ steps.r.outputs.publish_containers }}
       sign: ${{ steps.r.outputs.sign }}
+      tags: ${{ steps.r.outputs.tags }}
       matrix: ${{ steps.m.outputs.matrix }}
       linux_matrix: ${{ steps.m.outputs.linux_matrix }}
       daemon_present: ${{ steps.r.outputs.daemon_present }}
@@ -91,6 +92,26 @@ jobs:
             echo "publish_release=$(enabled "${V_RELEASE:-}")"
             echo "publish_containers=$(enabled "${V_CONTAINERS:-}")"
             echo "sign=$(enabled "${V_SIGN:-}")"
+          } >> "$GITHUB_OUTPUT"
+
+          # The container tag list, computed here because two of the three are
+          # conditional and a `tags:` expression cannot drop a line it does not want.
+          #
+          # `:$version` is the release's own name. `:sha-<short>` is the only tag that
+          # is immutable -- `0.0.0-dev` is overwritten by the next rehearsal and
+          # `:latest` by the next release -- so it is what a deployment pins
+          # (packaging/helm/modernweather). `:latest` moves ONLY on a tag push: a
+          # rehearsal builds `0.0.0-dev`, and pointing `latest` at that would make
+          # `docker pull` of the obvious tag fetch something nobody released.
+          repo="ghcr.io/${GITHUB_REPOSITORY_OWNER}/modernweather"
+          {
+            echo "tags<<MW_TAGS"
+            echo "${repo}:${version}"
+            echo "${repo}:sha-${GITHUB_SHA::7}"
+            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+              echo "${repo}:latest"
+            fi
+            echo "MW_TAGS"
           } >> "$GITHUB_OUTPUT"
 
           if [ -f crates/modernweather/Cargo.toml ]; then
@@ -310,9 +331,7 @@ jobs:
           build-args: |
             VERSION=${{ needs.config.outputs.version }}
             REVISION=${{ github.sha }}
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/modernweather:${{ needs.config.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/modernweather:latest
+          tags: ${{ needs.config.outputs.tags }}
       - name: Say what was not pushed
         if: needs.config.outputs.publish_containers != 'true'
         run: |

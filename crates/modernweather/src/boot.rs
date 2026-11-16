@@ -1984,18 +1984,20 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
     // Built before the guard rather than with the rest of §5 below, because the guard
     // needs it: revoking a session has to end that session's open streams.
     let hub = mw_api_mgmt::Hub::new();
-    let guard = Arc::new(mw_api_mgmt::Guard::new(
-        Arc::clone(&auth) as Arc<dyn mw_api_mgmt::AuthStore>,
-        origins,
-        // Whether the session cookie carries `Secure` and the `__Host-` prefix (W5 §3.3).
-        // The management socket either has a certificate or it does not, for the life of
-        // this process's router -- and `http:listener` restarts when that changes, so a
-        // certificate added at run time is reflected in new cookies at the next start.
-        // Deliberately not per-request: `mw-http` terminates TLS, and nothing it hands a
-        // handler says which socket the bytes arrived on.
-        mgmt_sni.is_some(),
-    )
-    .with_hub(Arc::clone(&hub)));
+    let guard = Arc::new(
+        mw_api_mgmt::Guard::new(
+            Arc::clone(&auth) as Arc<dyn mw_api_mgmt::AuthStore>,
+            origins,
+            // Whether the session cookie carries `Secure` and the `__Host-` prefix (W5 §3.3).
+            // The management socket either has a certificate or it does not, for the life of
+            // this process's router -- and `http:listener` restarts when that changes, so a
+            // certificate added at run time is reflected in new cookies at the next start.
+            // Deliberately not per-request: `mw-http` terminates TLS, and nothing it hands a
+            // handler says which socket the bytes arrived on.
+            mgmt_sni.is_some(),
+        )
+        .with_hub(Arc::clone(&hub)),
+    );
     // §5's live stream, and N-11's fleet numbers.
     //
     // The hub is built here and the observation future is joined below, after the router

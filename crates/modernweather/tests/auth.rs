@@ -545,7 +545,10 @@ async fn first_run_prints_a_code_to_the_console_that_never_reaches_the_log_ring(
         .windows(8)
         .map(|w| std::str::from_utf8(w).expect("base32 is ascii"))
     {
-        assert!(!rendered.contains(window), "`{window}` reached the log ring");
+        assert!(
+            !rendered.contains(window),
+            "`{window}` reached the log ring"
+        );
     }
     // The issue itself **is** audited, without its value.
     assert!(
