@@ -25,13 +25,17 @@
    so raising them here lifts every chonky component at once rather than forking any of
    them. The small end moves most: a hint nobody can read is not a hint.
 
-   The colours are the second half of the same problem. chonky's --color-primary is
-   #ffaa00, and amber on #f8f8f8 is about 1.9:1 -- under a third of what WCAG asks of
-   body text, and it is the colour every link on every page is painted in. The light
-   theme gets an amber dark enough to read (about 6.5:1 on both the page and the panel
-   background) and --color-primary-fg flips to white to match, since the few places that
-   fill with primary need the pair to move together. The dark theme keeps #ffaa00, where
-   it has ~10:1 against #111 and was never the problem. */
+   The colours below are chonky's, carried here until the fix ships. chrissnell/chonky#4
+   makes all of them upstream and adds a check that keeps them that way; delete these
+   three blocks and bump the dependency once it is released. Values are identical to
+   that PR's, so nothing shifts when they come from the package instead.
+
+   chonky's --color-primary is #ffaa00, which is 1.80:1 on --color-surface -- under half
+   of what WCAG asks of body text, and it is the colour every link on every page is
+   painted in. The light theme gets the same hue dark enough to read, with
+   --color-primary-fg flipped to white so the pair still works where primary is a fill.
+   The dark theme keeps #ffaa00, which has ~9.9:1 against #111 and was never the
+   problem. */
 :root {
   --text-xs: 0.9rem;
   --text-sm: 1rem;
@@ -40,20 +44,19 @@
   --text-xl: 1.5rem;
   --text-2xl: 1.9rem;
 
-  --color-primary: #8a5500;
+  --color-primary: #8a5500; /* 5.85:1 on the panel; #ffaa00 was 1.80:1 */
   --color-primary-hover: #6b4200;
-  --color-primary-fg: #fff;
+  --color-primary-fg: #fff; /* 6.21:1 on the fill above */
   --color-primary-muted: rgba(138, 85, 0, 0.1);
   --color-warning: #8a5500;
   --color-warning-fg: #fff;
   --color-warning-muted: rgba(138, 85, 0, 0.12);
-  /* #999 is 2.5:1 on the panel background. */
-  --color-text-dim: #767676;
+  --color-text-dim: #717171; /* 4.60:1; #999 was 2.68:1, and #767676 only 4.28:1 */
 }
 
 /* Both of chonky's dark selectors, because the block above lands on :root and would
    otherwise follow the page into the dark theme and paint every link dark brown on
-   near-black. */
+   near-black. The greys, green and red here were failing on their own account. */
 [data-theme='dark'] {
   --color-primary: #ffaa00;
   --color-primary-hover: #ffbb33;
@@ -62,8 +65,15 @@
   --color-warning: #ffaa00;
   --color-warning-fg: #000;
   --color-warning-muted: rgba(255, 170, 0, 0.15);
-  --color-text-muted: #8a8a8a;
-  --color-text-dim: #6f6f6f;
+  --color-text-muted: #8a8a8a; /* 5.47:1; #555 was 2.53:1 */
+  --color-text-dim: #808080; /* 4.78:1; #444 was 1.94:1, and #6f6f6f only 3.8:1 */
+  --color-accent: #34a334; /* 5.79:1; #2a8a2a was 4.29:1 */
+  --color-danger: #ef4444; /* 5.02:1; #d60202 was 3.48:1 */
+  --color-danger-hover: #f87171;
+  --color-success: #34a334;
+  /* A fill light enough to read on #111 is too light to carry white text. */
+  --color-danger-fg: #0a0a0a;
+  --color-info-fg: #0a0a0a;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -75,8 +85,15 @@
     --color-warning: #ffaa00;
     --color-warning-fg: #000;
     --color-warning-muted: rgba(255, 170, 0, 0.15);
-    --color-text-muted: #8a8a8a;
-    --color-text-dim: #6f6f6f;
+    --color-text-muted: #8a8a8a; /* 5.47:1; #555 was 2.53:1 */
+    --color-text-dim: #808080; /* 4.78:1; #444 was 1.94:1, and #6f6f6f only 3.8:1 */
+    --color-accent: #34a334; /* 5.79:1; #2a8a2a was 4.29:1 */
+    --color-danger: #ef4444; /* 5.02:1; #d60202 was 3.48:1 */
+    --color-danger-hover: #f87171;
+    --color-success: #34a334;
+    /* A fill light enough to read on #111 is too light to carry white text. */
+    --color-danger-fg: #0a0a0a;
+    --color-info-fg: #0a0a0a;
   }
 }
 
