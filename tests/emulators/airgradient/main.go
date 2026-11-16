@@ -96,15 +96,15 @@ func main() {
 			// made a failure in `every_occurrence_produces_a_reading_and_the_values_move`
 			// unreplayable, and the only assertion over this field is that the values
 			// move -- which the sine already satisfies.
-			Rco2:       f(round(600 + 20*math.Sin(phase) + 5*math.Cos(3*phase))),
-			TvocIndex:  f(round(100 + 5*math.Sin(phase))),
-			TvocRaw:    f(31000),
-			NoxIndex:   f(1),
-			NoxRaw:     f(16000),
-			Wifi:       f(-58),
-			SerialNo:   *serial,
-			Firmware:   "3.1.9",
-			Model:      "I-9PSL",
+			Rco2:      f(round(600 + 20*math.Sin(phase) + 5*math.Cos(3*phase))),
+			TvocIndex: f(round(100 + 5*math.Sin(phase))),
+			TvocRaw:   f(31000),
+			NoxIndex:  f(1),
+			NoxRaw:    f(16000),
+			Wifi:      f(-58),
+			SerialNo:  *serial,
+			Firmware:  "3.1.9",
+			Model:     "I-9PSL",
 		}
 		if *sensor != "none" {
 			// The raw pair is what every firmware reports.

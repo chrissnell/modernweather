@@ -140,11 +140,14 @@ jobs:
         # One source of truth for the matrix. The workflow does not restate the target
         # list, so it cannot drift from the file the release actually uses.
         run: |
-          echo "matrix=$(cargo xtask targets)" >> "$GITHUB_OUTPUT"
-          echo "linux_matrix=$(cargo xtask targets --linux-only)" >> "$GITHUB_OUTPUT"
-          # The cargo profile the binary is built with, from the same file. The deb and rpm
-          # steps have to be told, because their asset paths are `target/release/...`.
-          echo "profile=$(cargo xtask targets --profile)" >> "$GITHUB_OUTPUT"
+          {
+            echo "matrix=$(cargo xtask targets)"
+            echo "linux_matrix=$(cargo xtask targets --linux-only)"
+            # The cargo profile the binary is built with, from the same file. The deb and
+            # rpm steps have to be told, because their asset paths are
+            # `target/release/...`.
+            echo "profile=$(cargo xtask targets --profile)"
+          } >> "$GITHUB_OUTPUT"
 
   # **D-58**: the bundle is built ONCE, natively, BEFORE the cross matrix.
   #

@@ -494,7 +494,12 @@ export interface components {
        */
       href: string;
       /**
-       * What it is: "Weather Underground", "Saving readings", "your Davis station".
+       * What it is: "Weather Underground", "Saving readings", "Davis station".
+       *
+       * A capitalised noun phrase with no article and no possessive, because this is the
+       * name column of a list of things rather than a sentence. The lowercase phrases in
+       * [`capability_as_a_thing`] are deliberately the other way round -- those are read
+       * inside a sentence ("waiting for the weather database") and stay lowercase.
        */
       name: string;
       /**
