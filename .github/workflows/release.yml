@@ -55,8 +55,10 @@ jobs:
       publish_release: ${{ steps.r.outputs.publish_release }}
       publish_containers: ${{ steps.r.outputs.publish_containers }}
       sign: ${{ steps.r.outputs.sign }}
+      tags: ${{ steps.r.outputs.tags }}
       matrix: ${{ steps.m.outputs.matrix }}
       linux_matrix: ${{ steps.m.outputs.linux_matrix }}
+      profile: ${{ steps.m.outputs.profile }}
       daemon_present: ${{ steps.r.outputs.daemon_present }}
     steps:
       - uses: actions/checkout@v4
@@ -93,6 +95,26 @@ jobs:
             echo "sign=$(enabled "${V_SIGN:-}")"
           } >> "$GITHUB_OUTPUT"
 
+          # The container tag list, computed here because two of the three are
+          # conditional and a `tags:` expression cannot drop a line it does not want.
+          #
+          # `:$version` is the release's own name. `:sha-<short>` is the only tag that
+          # is immutable -- `0.0.0-dev` is overwritten by the next rehearsal and
+          # `:latest` by the next release -- so it is what a deployment pins
+          # (packaging/helm/modernweather). `:latest` moves ONLY on a tag push: a
+          # rehearsal builds `0.0.0-dev`, and pointing `latest` at that would make
+          # `docker pull` of the obvious tag fetch something nobody released.
+          repo="ghcr.io/${GITHUB_REPOSITORY_OWNER}/modernweather"
+          {
+            echo "tags<<MW_TAGS"
+            echo "${repo}:${version}"
+            echo "${repo}:sha-${GITHUB_SHA::7}"
+            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+              echo "${repo}:latest"
+            fi
+            echo "MW_TAGS"
+          } >> "$GITHUB_OUTPUT"
+
           if [ -f crates/modernweather/Cargo.toml ]; then
             echo "daemon_present=true" >> "$GITHUB_OUTPUT"
           else
@@ -118,8 +140,14 @@ jobs:
         # One source of truth for the matrix. The workflow does not restate the target
         # list, so it cannot drift from the file the release actually uses.
         run: |
-          echo "matrix=$(cargo xtask targets)" >> "$GITHUB_OUTPUT"
-          echo "linux_matrix=$(cargo xtask targets --linux-only)" >> "$GITHUB_OUTPUT"
+          {
+            echo "matrix=$(cargo xtask targets)"
+            echo "linux_matrix=$(cargo xtask targets --linux-only)"
+            # The cargo profile the binary is built with, from the same file. The deb and
+            # rpm steps have to be told, because their asset paths are
+            # `target/release/...`.
+            echo "profile=$(cargo xtask targets --profile)"
+          } >> "$GITHUB_OUTPUT"
 
   # **D-58**: the bundle is built ONCE, natively, BEFORE the cross matrix.
   #
@@ -207,6 +235,17 @@ jobs:
           # --no-build: the binary is already cross-compiled above, and cargo-deb cannot
           # cross-compile it itself. --no-strip because the dist profile already strips
           # debug info and cargo-deb's strip is the host's, which cannot touch an ARM ELF.
+          #
+          # --profile, and this is the flag whose absence broke the first green
+          # cross-compile. Both tools resolve `target/release/<binary>` from
+          # [package.metadata], rewriting `release` to `<triple>/release` when --target is
+          # given -- but `ci/release.toml` builds with `profile = "dist"`, so the binary is
+          # in `target/<triple>/dist/` and the tools looked one directory away from it:
+          #
+          #   error: Can't resolve asset: target/x86_64-unknown-linux-musl/release/modernweather
+          #
+          # The value comes from `cargo xtask targets --profile` rather than being spelled
+          # `dist` here, so there is still one place that says what the profile is.
           # Explicit --output filenames, and this is load-bearing rather than
           # tidiness. cargo-deb derives the Debian architecture from the target
           # triple, and both arm-unknown-linux-musleabihf and
@@ -217,9 +256,11 @@ jobs:
           # packaging layer. `label` is already unique per target.
           cargo deb --no-build --no-strip -p modernweather \
             --target ${{ matrix.triple }} \
+            --profile ${{ needs.config.outputs.profile }} \
             --output "dist/modernweather_${{ needs.config.outputs.version }}_${{ matrix.label }}.deb"
           cargo generate-rpm -p crates/modernweather \
             --target ${{ matrix.triple }} \
+            --profile ${{ needs.config.outputs.profile }} \
             --output "dist/modernweather-${{ needs.config.outputs.version }}-1.${{ matrix.rpm_arch }}.rpm"
       - name: List what was produced
         if: needs.config.outputs.daemon_present == 'true'
@@ -310,9 +351,7 @@ jobs:
           build-args: |
             VERSION=${{ needs.config.outputs.version }}
             REVISION=${{ github.sha }}
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/modernweather:${{ needs.config.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/modernweather:latest
+          tags: ${{ needs.config.outputs.tags }}
       - name: Say what was not pushed
         if: needs.config.outputs.publish_containers != 'true'
         run: |

@@ -1,0 +1,48 @@
+{{- /*
+One Service, not two.
+
+The hand-applied setup had a ClusterIP `modernweather` that nothing used and a
+LoadBalancer `mw-preview` that the Ingress was repointed at by hand. A LoadBalancer
+Service already has a cluster IP, so one object does both jobs and there is no second
+backend name for an Ingress to drift away from.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "modernweather.fullname" . }}
+  labels:
+    {{- include "modernweather.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- if eq .Values.service.type "LoadBalancer" }}
+  {{- with .Values.service.loadBalancerIP }}
+  loadBalancerIP: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerClass }}
+  loadBalancerClass: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+  {{- if and .Values.service.externalTrafficPolicy (ne .Values.service.type "ClusterIP") }}
+  externalTrafficPolicy: {{ .Values.service.externalTrafficPolicy }}
+  {{- end }}
+  selector:
+    {{- include "modernweather.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.ports.http }}
+      targetPort: http
+      protocol: TCP
+    - name: management
+      port: {{ .Values.service.ports.management }}
+      targetPort: management
+      protocol: TCP
+    {{- if .Values.service.grpc.enabled }}
+    - name: grpc
+      port: {{ .Values.service.ports.grpc }}
+      targetPort: grpc
+      protocol: TCP
+    {{- end }}

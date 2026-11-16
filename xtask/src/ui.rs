@@ -589,7 +589,9 @@ fn blank_raw_calls(text: &str) -> String {
     while let Some(at) = rest.find("raw(") {
         out.push_str(&rest[..at + 4]);
         rest = &rest[at + 4..];
-        let Some(quote) = rest.chars().next() else { break };
+        let Some(quote) = rest.chars().next() else {
+            break;
+        };
         if quote != '\'' && quote != '"' && quote != '`' {
             continue;
         }
@@ -970,11 +972,39 @@ pub fn build(root: &Path) -> Result<(), String> {
     run(&ui, &["run", "lint"])?;
     run(&ui, &["run", "test"])?;
     run(&ui, &["run", "build"])?;
+    restore_gitkeep(&ui.join("build"))?;
     println!(
         "ui: built {}",
         ui.join("build").strip_prefix(root).unwrap_or(&ui).display()
     );
     Ok(())
+}
+
+/// Put `ui/build/.gitkeep` back after `adapter-static` has emptied the directory.
+///
+/// `ui/build/.gitkeep` is **committed**, and `ui/.gitignore` says why: `rust-embed`
+/// resolves `mw-api-mgmt`'s `#[folder = "../../ui/build/"]` while the derive expands, so
+/// the path has to exist before any Rust is compiled. Without it a fresh clone cannot
+/// build -- including `cargo xtask ui` itself, because `xtask` links `mw-api-mgmt` to emit
+/// the management OpenAPI document, so the one command that would have created the
+/// directory is the one that cannot compile without it.
+///
+/// `adapter-static` empties its output directory, which deletes the file. That leaves the
+/// tree with a deletion staged against it, and committing that deletion restores the
+/// bootstrap failure -- so the build puts it back rather than relying on anyone noticing.
+fn restore_gitkeep(build: &Path) -> Result<(), String> {
+    let keep = build.join(".gitkeep");
+    if keep.exists() {
+        return Ok(());
+    }
+    std::fs::write(&keep, b"").map_err(|e| {
+        format!(
+            "the bundle was built but {} could not be restored: {e}. It is committed \
+             because `rust-embed` needs the directory to exist before anything compiles; \
+             re-create it before committing.",
+            keep.display()
+        )
+    })
 }
 
 fn run(dir: &Path, args: &[&str]) -> Result<(), String> {

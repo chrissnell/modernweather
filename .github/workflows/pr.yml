@@ -85,6 +85,15 @@ jobs:
         with:
           toolchain: ${{ env.RUST_STABLE }}
       - uses: Swatinem/rust-cache@v2
+      # `socat` is a TEST DEPENDENCY of mw-station, not a convenience. W3 D-83 requires the
+      # serial path to be exercised over a real character device, and a pty pair is how --
+      # `crates/mw-station/src/stream.rs` panics with that sentence and the install command
+      # when it is missing. GitHub's runner image does not carry it, so three tests failed
+      # on the first run after this workflow was re-enabled and took `cargo test` and
+      # `coverage ratchet` down with them. The alternative the panic offers,
+      # `--skip pty`, would be dropping the check D-83 asks for.
+      - name: Install socat, which mw-station's pty tests need
+        run: sudo apt-get update && sudo apt-get install -y socat
       - run: cargo test --workspace --all-features --locked
 
   race:
@@ -106,6 +115,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: tsan
+      # `socat` is a TEST DEPENDENCY of mw-station, not a convenience. W3 D-83 requires the
+      # serial path to be exercised over a real character device, and a pty pair is how --
+      # `crates/mw-station/src/stream.rs` panics with that sentence and the install command
+      # when it is missing. GitHub's runner image does not carry it, so three tests failed
+      # on the first run after this workflow was re-enabled and took `cargo test` and
+      # `coverage ratchet` down with them. The alternative the panic offers,
+      # `--skip pty`, would be dropping the check D-83 asks for.
+      - name: Install socat, which mw-station's pty tests need
+        run: sudo apt-get update && sudo apt-get install -y socat
       # One exclusion, and it is a cfg rather than a narrowed command so that the set of
       # excluded targets is visible in the source and guarded below.
       # `crates/modernweather/tests/boot.rs` spawns the daemon as a CHILD process and
@@ -681,6 +699,15 @@ jobs:
             (cd "$dir" && go vet ./...)
             echo "::endgroup::"
           done
+      # The fourth job that needs `socat`, and the only one where it was hidden: this job
+      # died at the gofmt step above, so the gate below had never run. With that fixed,
+      # `emulator_davis.rs` and `emulator_campbell.rs` both failed with the same sentence
+      # the `test` job's step quotes -- W3 D-83 wants the serial path over a real character
+      # device, and here the pty is bridged to the pinned emulator's TCP port. Two of the
+      # six declared emulators are serial, so without this the gate can only ever report
+      # four.
+      - name: Install socat, which the serial emulators need
+        run: sudo apt-get update && sudo apt-get install -y socat
       - run: cargo xtask gate driver-emulators
 
   serial-bridge:
@@ -979,6 +1006,15 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
+      # `socat` is a TEST DEPENDENCY of mw-station, not a convenience. W3 D-83 requires the
+      # serial path to be exercised over a real character device, and a pty pair is how --
+      # `crates/mw-station/src/stream.rs` panics with that sentence and the install command
+      # when it is missing. GitHub's runner image does not carry it, so three tests failed
+      # on the first run after this workflow was re-enabled and took `cargo test` and
+      # `coverage ratchet` down with them. The alternative the panic offers,
+      # `--skip pty`, would be dropping the check D-83 asks for.
+      - name: Install socat, which mw-station's pty tests need
+        run: sudo apt-get update && sudo apt-get install -y socat
       # A ratchet, not a threshold: the prompt for this work item is explicit that a fixed
       # target invites tests written to hit a number. See xtask/src/coverage.rs.
       #

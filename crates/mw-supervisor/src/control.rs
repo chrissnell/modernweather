@@ -124,6 +124,16 @@ impl ComponentControl for Control {
     }
 
     /// The publication's own signal, which is the one place a state change is committed.
+    ///
+    /// **Absent under `--cfg loom`, which is the trait's default and not a gap.**
+    /// [`crate::publish::Publication`] carries the version channel only on the non-loom
+    /// path -- the loom build models the cell's memory ordering and links a `loom` runtime
+    /// rather than tokio's, so there is no `watch` to subscribe to. `ComponentControl`
+    /// defaults this to `None` and documents what that means: "an implementation that
+    /// publishes nothing has no change to report", which is exactly true of a build with
+    /// no runtime to carry the notification. Calling it unconditionally is what broke the
+    /// loom job's compile.
+    #[cfg(not(loom))]
     fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         Some(self.published.changes())
     }

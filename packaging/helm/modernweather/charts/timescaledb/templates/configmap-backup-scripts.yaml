@@ -1,0 +1,27 @@
+{{- if .Values.backup.enabled }}
+{{- /*
+`ci/db/offsite-backup.sh`, mounted rather than fetched.
+
+The script's own header says why it cannot be downloaded at backup time: "it must not
+depend on GitHub being up at backup time". So the backup job gets it from a ConfigMap.
+
+`files/offsite-backup.sh` is a SYMLINK to `ci/db/offsite-backup.sh`, not a copy. Helm's
+chart loader follows symlinks and inlines the content when packaging -- `helm package`
+says so out loud ("Contents of linked file included and used") -- so the repository holds
+exactly one copy of an 817-line shell script and there is no second one to drift. A copy
+with a drift gate beside it was the alternative; this needs neither.
+
+The restore REHEARSAL deliberately does not use this. It fetches `main` at run time,
+because its question is whether today's restore path can read the archive you have, and a
+pinned script would freeze that question. See cronjob-restore-rehearsal.yaml.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "%s-backup-scripts" (include "timescaledb.fullname" .) }}
+  labels:
+    {{- include "timescaledb.labels" . | nindent 4 }}
+data:
+  offsite-backup.sh: |
+{{ .Files.Get "files/offsite-backup.sh" | indent 4 }}
+{{- end }}

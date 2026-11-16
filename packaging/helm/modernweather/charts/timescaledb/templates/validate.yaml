@@ -1,0 +1,52 @@
+{{- /* Renders nothing. `fail` aborts the render, so the message is the output. */ -}}
+
+{{- if not .Values.auth.existingSecret -}}
+{{- fail (printf "timescaledb.auth.existingSecret is required. The chart does not generate the superuser password: a generated one would rotate on every `helm upgrade`, and this database holds a decade of observations. Create it once:\n\n  kubectl create secret generic %s-superuser -n <namespace> --from-literal=password=\"$(openssl rand -base64 32)\"\n\nthen set timescaledb.auth.existingSecret to that name." (include "timescaledb.fullname" .)) -}}
+{{- end -}}
+
+{{- if .Values.persistence.local.enabled -}}
+{{- if not .Values.persistence.local.node -}}
+{{- fail "timescaledb.persistence.local.node is required when local.enabled: a `local` PersistentVolume is pinned to one machine by nodeAffinity, and a volume with no node is a pod that stays Pending with no explanation. Set it to false and give persistence.storageClass a dynamic provisioner to opt out -- but read charts/timescaledb/Chart.yaml first, because the local volume is a measured decision." -}}
+{{- end -}}
+{{- if and .Values.persistence.local.createPersistentVolume (not .Values.persistence.local.path) -}}
+{{- fail "timescaledb.persistence.local.path is required when local.createPersistentVolume: it is the directory on the node that holds the database. A Talos user volume is mounted under /var/mnt." -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+`persistence.storageClass` is required on BOTH branches, and the earlier version of this
+guard only covered one. With `local.enabled: true` and the class empty, storage.yaml
+rendered a StorageClass called `''` -- which the API server rejects -- and a
+volumeClaimTemplate with no `storageClassName` at all, so the 350Gi claim fell to the
+cluster default. That is the exact outcome this check exists to prevent, in the branch it
+did not cover.
+*/ -}}
+{{- if not .Values.persistence.storageClass -}}
+{{- if .Values.persistence.local.enabled -}}
+{{- fail "timescaledb.persistence.storageClass is empty while local.enabled is true. It names the StorageClass this chart creates and the volumeClaimTemplate binds through; empty renders a StorageClass with no name and a claim that falls to the cluster default." -}}
+{{- else -}}
+{{- fail "local.enabled is false and persistence.storageClass is empty, so the claim would fall to the cluster's default StorageClass. Name it: this volume is the single point of failure for the whole deployment and should not be chosen by whatever happens to be default." -}}
+{{- end -}}
+{{- end -}}
+
+{{- if and .Values.backup.enabled (not .Values.service.readWriteAlias) -}}
+{{- /*
+`backup.enabled` with `readWriteAlias: false` renders clean and then fails at 04:00 on a
+Sunday: both jobs dial `<fullname>-rw`, which is the Service that flag deletes. The
+headless Service is not a substitute -- it answers with pod IPs, and a connection pool
+resolves the host once.
+*/ -}}
+{{- fail "timescaledb.service.readWriteAlias is false while backup.enabled is true. Both backup jobs connect through the `-rw` Service that flag removes, so they would start and fail to resolve their host." -}}
+{{- end -}}
+
+{{- if .Values.backup.enabled -}}
+{{- if not .Values.backup.bucket -}}
+{{- fail "timescaledb.backup.bucket is required when backup.enabled. Off-site backups are docs/reconciliation.md §7.5's condition for accepting a single replica on a `local` volume, so they are on by default -- set backup.enabled=false to decline them deliberately rather than by leaving the bucket empty." -}}
+{{- end -}}
+{{- if not .Values.backup.credentials.existingSecret -}}
+{{- fail (printf "timescaledb.backup.credentials.existingSecret is required when backup.enabled. It needs three keys -- %s, %s and %s -- and the endpoint belongs in the Secret rather than in values because it contains the Cloudflare account id." .Values.backup.credentials.accessKeyIdKey .Values.backup.credentials.secretAccessKeyKey .Values.backup.credentials.endpointKey) -}}
+{{- end -}}
+{{- if and .Values.backup.rehearsal.enabled (eq .Values.backup.rehearsal.database .Values.auth.database) -}}
+{{- fail (printf "backup.rehearsal.database is %q, which is the live database. `restore-rehearsal.sh` DROPS and recreates its target." .Values.backup.rehearsal.database) -}}
+{{- end -}}
+{{- end -}}

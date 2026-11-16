@@ -63,6 +63,10 @@
 #   MW_BACKUP_REMOTE    the archive. Required by --from-archive; ignored otherwise.
 #   RCLONE_CONFIG       rclone's own variable, for --from-archive.
 #   MW_REHEARSAL_DB_SRC / _DST   scratch database names.
+#   MW_REHEARSAL_YEARS  space-separated raw years to restore under --from-archive, e.g.
+#                       "2026". Unset restores EVERY year in the archive, which is the
+#                       honest default for a tool run by hand and the wrong one for a
+#                       scheduled job -- see the note at the restore step below.
 
 # `-E` so the ERR trap below is inherited by shell functions. Without it the trap fires only
 # at top level, and a psql failure inside `seed`, `reconcile` or `apply_migrations` exits with
@@ -644,7 +648,29 @@ else
   suspend_jobs "$DST"
 
   step "restore"
-  DATABASE_URL="$BASE_URL/$DST" ci/db/offsite-backup.sh restore --into "$DST" 2>&1 | sed 's/^/  /'
+  # MW_REHEARSAL_YEARS, and it is a safety bound rather than a speed one.
+  #
+  # `offsite-backup.sh restore` with no --year restores EVERY year, UNCOMPRESSED, into a
+  # second database on the server it is pointed at -- which for the in-cluster CronJob is
+  # the same single `local` PersistentVolume production is on. A decade of raw is ~19 GB a
+  # year raw against ~3.6 GB compressed (7.5), so an unbounded monthly rehearsal can fill
+  # the volume underneath a database that CANNOT RESCHEDULE (7.4). ENOSPC there is a worse
+  # outcome than never rehearsing.
+  #
+  # One year still exercises the whole restore path: the manifest, the layout version, the
+  # per-year objects, the column lists, the config.db bytes and the phase-1 rebuild. What it
+  # does not do is prove the older objects are readable, so a full restore stays worth
+  # running by hand, with somewhere to put it.
+  years=()
+  if [ -n "${MW_REHEARSAL_YEARS:-}" ]; then
+    for y in $MW_REHEARSAL_YEARS; do years+=(--year "$y"); done
+    printf 'restoring years: %s\n' "$MW_REHEARSAL_YEARS"
+  else
+    warn "MW_REHEARSAL_YEARS is unset, so every year in the archive will be restored. On a
+      server whose volume also holds production that can exhaust it; see the note in this
+      script at the restore step."
+  fi
+  DATABASE_URL="$BASE_URL/$DST" ci/db/offsite-backup.sh restore --into "$DST" "${years[@]}" 2>&1 | sed 's/^/  /'
 fi
 
 reconcile "$MANIFEST" "$DST"

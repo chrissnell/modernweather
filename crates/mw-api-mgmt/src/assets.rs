@@ -28,6 +28,13 @@
 //! rather than an empty page: the thing that is supposed to prevent it reaching a release
 //! is `cargo xtask dist`, which builds the bundle natively before the cross matrix and
 //! fails if it is missing or stale (**D-58**).
+//!
+//! **Empty is not the same as absent.** `rust-embed` resolves `folder` while the derive
+//! expands, and a path that is not there is a compile error, not an empty embed -- so
+//! `ui/build/.gitkeep` is committed and `ui/.gitignore` ignores only the contents. Without
+//! it a fresh clone cannot build anything at all, `cargo xtask ui` included, because
+//! `xtask` links this crate to emit the management OpenAPI document. `cargo xtask ui`
+//! re-creates the file after `adapter-static` empties the directory.
 
 use std::path::PathBuf;
 
@@ -146,7 +153,11 @@ fn base64(bytes: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         for i in 0..4 {
             if i <= chunk.len() {
@@ -178,7 +189,9 @@ fn document_csp(assets: &Assets) -> &'static str {
                 let after = &rest[open..];
                 let Some(gt) = after.find('>') else { break };
                 let (tag, body) = after.split_at(gt + 1);
-                let Some(end) = body.find("</script>") else { break };
+                let Some(end) = body.find("</script>") else {
+                    break;
+                };
                 // A script with a `src` loads from the origin and is covered by `'self'`.
                 if !tag.contains(" src") {
                     let digest = <sha2::Sha256 as sha2::Digest>::digest(&body.as_bytes()[..end]);

@@ -1,0 +1,37 @@
+# The chart is in THIS repository rather than in `kube-cluster-helm-values`, and the
+# reason is the split `.gitignore` already draws: `/deploy/` is ignored there because
+# "they name nodes, host paths and addresses, and this repository is public". A chart
+# names none of those -- its *values* do. So the chart ships with the image it deploys
+# and is versioned alongside it, and the file that says `lil-bulky`,
+# `/var/mnt/modernweather-db` and `preview.suncrestweather.com` stays private.
+# packaging/helm/modernweather/README.md has the whole argument and the values file.
+apiVersion: v2
+name: modernweather
+description: Weather station data collection and distribution, with its TimescaleDB
+type: application
+
+# The chart's own version. Bumped when the templates change, independently of the daemon.
+version: 0.1.0
+
+# The daemon. Overridden per install by `image.tag`; prefer the immutable `sha-<short>`
+# tag the release workflow publishes for every build over either this or `latest`.
+appVersion: "0.0.0-dev"
+
+# `local` PersistentVolumes with `nodeAffinity`, `fsGroupChangePolicy` and
+# `persistentVolumeClaimRetentionPolicy` are all long-stable; the floor is the oldest
+# version the templates are written against rather than the oldest that would work.
+kubeVersion: ">=1.29.0-0"
+
+home: https://github.com/chrissnell/modernweather
+sources:
+  - https://github.com/chrissnell/modernweather
+
+dependencies:
+  # Vendored under charts/ rather than pulled from a repository. The database is not a
+  # generic dependency: it is a single-replica StatefulSet on a `local` PersistentVolume
+  # pinned to one machine, because the workload is fsync-latency bound
+  # (docs/reconciliation.md §7.4). charts/timescaledb/Chart.yaml records why no upstream
+  # chart was used instead.
+  - name: timescaledb
+    version: 0.1.0
+    condition: timescaledb.enabled

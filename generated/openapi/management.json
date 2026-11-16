@@ -2852,7 +2852,7 @@
           },
           "name": {
             "type": "string",
-            "description": "What it is: \"Weather Underground\", \"Saving readings\", \"your Davis station\"."
+            "description": "What it is: \"Weather Underground\", \"Saving readings\", \"Davis station\".\n\nA capitalised noun phrase with no article and no possessive, because this is the\nname column of a list of things rather than a sentence. The lowercase phrases in\n[`capability_as_a_thing`] are deliberately the other way round -- those are read\ninside a sentence (\"waiting for the weather database\") and stay lowercase."
           },
           "qualifier": {
             "type": [

@@ -817,14 +817,23 @@ mod tests {
     #[test]
     fn the_sentence_form_keeps_its_article() {
         let v = Vocabulary::new(&cfg());
-        assert_eq!(v.thing_in_sentence(&id("db:postgres")), "the weather database");
-        assert_eq!(v.thing_in_sentence(&id("snapshot:latest")), "current conditions");
+        assert_eq!(
+            v.thing_in_sentence(&id("db:postgres")),
+            "the weather database"
+        );
+        assert_eq!(
+            v.thing_in_sentence(&id("snapshot:latest")),
+            "current conditions"
+        );
         assert_eq!(
             v.thing_in_sentence(&id("almanac:records")),
             capability_as_a_thing(Capability::AlmanacCache)
         );
         // Named by the operator, so it is already correct mid-sentence.
-        assert_eq!(v.thing_in_sentence(&id("wu:backyard")), "Weather Underground (Backyard)");
+        assert_eq!(
+            v.thing_in_sentence(&id("wu:backyard")),
+            "Weather Underground (Backyard)"
+        );
     }
 
     /// §2.3's worked example, exactly: `wu:backyard` renders as "Weather Underground" /

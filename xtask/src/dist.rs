@@ -50,8 +50,18 @@ fn load_config() -> Result<Config, String> {
 ///
 /// `--linux-only` drops targets that produce no container image or package, which is how
 /// the container job gets its platform list.
+///
+/// `--profile` prints `[release].profile` on its own instead, because `cargo deb` and
+/// `cargo generate-rpm` need it and a workflow that hardcoded `dist` would be a second
+/// place for the profile to be written. It was the first place it went wrong: the packaging
+/// step looked in `target/<triple>/release/` for a binary this file had built into
+/// `target/<triple>/dist/`, and the release failed after the cross-compile had succeeded.
 pub fn targets(args: &[String]) -> Result<(), String> {
     let cfg = load_config()?;
+    if args.iter().any(|a| a == "--profile") {
+        println!("{}", cfg.release.profile);
+        return Ok(());
+    }
     let linux_only = args.iter().any(|a| a == "--linux-only");
     let entries: Vec<String> = cfg
         .targets
