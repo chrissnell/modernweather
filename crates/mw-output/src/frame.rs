@@ -38,9 +38,11 @@
 //! is a character device or a socket is `mw_station::stream::open`'s business. The Go code
 //! half-discovered this already — `openKISSConnection` returns an `io.ReadWriteCloser` and
 //! both arms then run identical framing — and the reason to finish the thought here is that
-//! the serial open is the one `unsafe` block in this workspace
-//! (`mw_station::stream::serial`, which registers an `AsyncFd` over an owned `File`). A
-//! second copy of it in this crate would be a second safety argument to audit.
+//! the serial open is the one place in this workspace that configures a line:
+//! `mw_station::stream::serial` sets 8N1 and the rate with `tcsetattr`, and
+//! `ci/layers.toml`'s `serial-line-rate-only-where-the-line-is-opened` rule is what keeps it
+//! to one. A second copy here would be a second idea of what 9600 8N1 means — and a TNC
+//! that disagrees with its host about parity produces frames nothing decodes.
 //!
 //! That is also the whole of why this crate depends on `mw-station`: a `Transport`, a
 //! `ByteStream` and the function that turns one into the other. It plans no station, decodes
@@ -130,8 +132,11 @@ pub enum FrameSink {
     KissSerial {
         /// The device path.
         dev: PathBuf,
-        /// The configured line rate. **Recorded and not applied** — see
-        /// `mw_station::stream`'s module documentation and the D-32 amendment it names.
+        /// The line rate, applied to the device by `mw_station::stream::serial`
+        /// (amendment **A-M6-1-1**). It was recorded and not applied until GRA-788, which
+        /// mattered here as well as on the station side: a TNC is conventionally 9600 and a
+        /// Linux console defaults to 38400, so an unconfigured line put the beacon on the
+        /// radio as noise.
         baud: u32,
         /// The callsign this beacons as.
         source: Callsign,

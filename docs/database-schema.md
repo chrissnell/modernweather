@@ -346,6 +346,14 @@ second source of truth.
 
 W1 assumption 12: these are not an optimisation that could be removed. `/almanac` and `/snow` read
 them directly, and `/almanac` returns `{}` rather than computing anything when its cache is empty.
+
+**Each one needs a writer, and for two milestones only one of them had one.** `snow_totals_cache`
+is maintained by the four `snow:*` components; `almanac_cache` was maintained by nothing, so the
+table existed with the right shape, held zero rows, and `/almanac` answered `{}` with a `200` —
+which is this very paragraph's required behaviour for an empty cache, reached by a route nobody
+intended. `almanac:records` (`mw_pipeline::almanac`) is the writer; `docs/reconciliation.md`
+**A-M7-6-1** has the gap and the four checks that each failed to see it. A cache table in this
+section without a named writer should be read as a defect.
 W3 §2a.7's `snow:*` components write the second one.
 
 ```sql

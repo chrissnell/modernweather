@@ -18,6 +18,13 @@ mw-types.workspace = true
 mw-codec.workspace = true
 
 tokio.workspace = true
+# The line rate (amendment A-M6-1-1). `Transport::Serial { baud }` used to be carried this
+# far and dropped: `stream.rs` opened the character device and read it, so the discipline
+# was whatever the device already had. `tokio_serial::SerialStream` is the `AsyncFd` over an
+# owned descriptor that this module used to build by hand, with the `tcsetattr` that it
+# could not make. The only crate in the workspace that may name this (ci/layers.toml) --
+# `mw-output`'s KISS-serial TNC reaches it through `mw_station::stream::open`.
+tokio-serial.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 chrono.workspace = true

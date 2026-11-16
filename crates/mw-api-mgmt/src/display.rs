@@ -195,6 +195,9 @@ impl Vocabulary {
             "window" => "recent-conditions calculations".to_string(),
             "snapshot" => "current conditions".to_string(),
             "snow" => "snow calculations".to_string(),
+            // Matches `capability_as_a_thing(AlmanacCache)`, so "waiting for the almanac
+            // records" reads the same whichever side names it.
+            "almanac" => "the almanac records".to_string(),
             "ingest" => "readings from other RemoteWeathers".to_string(),
             "rain" => "the rainfall day boundary".to_string(),
             "mgmt" => "the admin screen".to_string(),
@@ -317,6 +320,12 @@ impl Vocabulary {
                 section: Section::System,
                 href: "/system/diagnostics".into(),
             },
+            "almanac" => Display {
+                name: "Almanac records".into(),
+                qualifier: None,
+                section: Section::System,
+                href: "/system/diagnostics".into(),
+            },
             "snow" => Display {
                 name: "Snow calculations".into(),
                 qualifier: None,
@@ -417,6 +426,7 @@ pub const fn capability_as_a_thing(cap: Capability) -> &'static str {
         Capability::ReadingStore => "the weather database",
         Capability::ForecastStore | Capability::AlertStore => "forecasts and alerts",
         Capability::SnowCache => "snow calculations",
+        Capability::AlmanacCache => "the almanac records",
         Capability::WindowedView => "recent-conditions calculations",
         Capability::LatestSnapshot => "current conditions",
         Capability::ConfigStore | Capability::ConfigAdmin => "the configuration",
@@ -761,6 +771,7 @@ mod tests {
 
         assert_eq!(name("db:postgres"), "Weather database");
         assert_eq!(name("ingest:grpc"), "Readings from other RemoteWeathers");
+        assert_eq!(name("almanac:records"), "Almanac records");
     }
 
     /// A name column is a list of things, so every name is a capitalised noun phrase with
@@ -779,6 +790,7 @@ mod tests {
             "snapshot:latest",
             "snapshot:warm",
             "ingest:grpc",
+            "almanac:records",
             "station:davis:backyard",
             "station:campbell:backyard",
             "station:wll:backyard",
@@ -807,6 +819,10 @@ mod tests {
         let v = Vocabulary::new(&cfg());
         assert_eq!(v.thing_in_sentence(&id("db:postgres")), "the weather database");
         assert_eq!(v.thing_in_sentence(&id("snapshot:latest")), "current conditions");
+        assert_eq!(
+            v.thing_in_sentence(&id("almanac:records")),
+            capability_as_a_thing(Capability::AlmanacCache)
+        );
         // Named by the operator, so it is already correct mid-sentence.
         assert_eq!(v.thing_in_sentence(&id("wu:backyard")), "Weather Underground (Backyard)");
     }

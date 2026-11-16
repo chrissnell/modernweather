@@ -106,6 +106,14 @@ const DECLARED: &[&str] = &[
     // the query `/span` actually issues, which is a different failure -- the Go bug is a
     // SQLSTATE rather than a wrong number.
     "a_span_over_a_station_with_no_wind_direction_returns_zero_rather_than_failing",
+    // The item that built `almanac:records` (A-M7-6-1). The component's record table and
+    // its carry-forward are unit-tested over a fake store; these two are the half a fake
+    // cannot establish -- that `(metric, agg)` resolves to the column the registry
+    // declares at the level asked for, that Go's `> 0` and `IS NOT NULL` filters select
+    // different rows, and that every `record` name the writer can produce satisfies
+    // `almanac_cache`'s `CHECK`.
+    "the_almanac_extremes_are_the_argmax_of_the_history",
+    "the_almanac_cache_replaces_rows_and_accepts_every_permitted_record_name",
 ];
 
 /// The panic messages `crates/mw-store/tests/db.rs`'s own harness produces when the

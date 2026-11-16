@@ -10,7 +10,15 @@ use std::fmt;
 use crate::id::ComponentId;
 use crate::routes::RouteManifest;
 
-/// The twelve capabilities of W2a §2.1, each justified by something that exists today.
+/// The thirteen capabilities of W2a §2.1, each justified by something that exists today.
+///
+/// Twelve were W2a's. [`Capability::AlmanacCache`] is the thirteenth and it is an addition
+/// rather than a reading of that section: §2.1 names `almanac_cache` as a precomputed table
+/// and gives no component the job of precomputing it, which is the gap
+/// `docs/reconciliation.md` **A-M7-6-1** records. A capability rather than a method on
+/// [`Capability::ReadingStore`] for `AlertStore`'s reason, one table over -- the writer and
+/// the reader are different components with different failure modes, and `api:legacy`
+/// already declares the three cache capabilities `Soft` independently.
 ///
 /// A closed enum, not a string: a capability is a compile-time fact about this program,
 /// and the capability a component requires is written in that component's crate rather
@@ -44,6 +52,11 @@ pub enum Capability {
     AlertStore,
     /// Snow depth / event / smoothing cache rows.
     SnowCache,
+    /// The all-time extremes `/almanac` serves. **Write-only**, like
+    /// [`Capability::AlertStore`]: the read half is `ReadingStore::almanac`, which the
+    /// frozen handler has been using since M4-2 and which is keyed the way every other
+    /// aggregate read on that trait is.
+    AlmanacCache,
 
     // --- provided by ordinary components ---
     /// `(Metric, Window, Agg)` resolution over recent aggregate buckets (W2a §4b).
@@ -83,6 +96,7 @@ impl Capability {
         Capability::ForecastStore,
         Capability::AlertStore,
         Capability::SnowCache,
+        Capability::AlmanacCache,
         Capability::WindowedView,
         Capability::LatestSnapshot,
         Capability::HttpRoutes,
@@ -101,6 +115,7 @@ impl Capability {
             Capability::ForecastStore => "ForecastStore",
             Capability::AlertStore => "AlertStore",
             Capability::SnowCache => "SnowCache",
+            Capability::AlmanacCache => "AlmanacCache",
             Capability::WindowedView => "WindowedView",
             Capability::LatestSnapshot => "LatestSnapshot",
             Capability::HttpRoutes => "HttpRoutes",
@@ -287,12 +302,13 @@ mod tests {
                 | Capability::ForecastStore
                 | Capability::AlertStore
                 | Capability::SnowCache
+                | Capability::AlmanacCache
                 | Capability::WindowedView
                 | Capability::LatestSnapshot
                 | Capability::HttpRoutes => {}
             }
         }
-        assert_eq!(Capability::ALL.len(), 12);
+        assert_eq!(Capability::ALL.len(), 13);
     }
 
     #[test]

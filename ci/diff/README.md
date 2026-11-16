@@ -247,7 +247,7 @@ harness reported as `go-only` and `uneven` buckets), five things no decision pre
 | **1-ulp `float32` differences** | on `ohum`, `otemp`, `bar`, `extratemp1`, `solarwatts`, `stationbatteryvoltage` and `windch`, in a small minority of buckets. In every case examined the two sides hold the **identical** `float8` value and it lies **exactly** on a `float32` tie point: e.g. `observations_1h` gives `38947.830963134766 / 720`, which is precisely the midpoint of two adjacent `float32`s; the Go server emits the upper neighbour and the new side rounds half to even and emits the lower. A serialisation tie-break, contract-visible in the last digit, and **not in the deviation ledger**. The conformance suite does not catch it because no fixture happens to sit on a tie |
 | **`/span`'s `rainincremental`** | `0` on the Go side against `0.04` on the new side, on nine of twenty-nine daily buckets. The Go daily view carries no value here and the DTO zero-fills it; the new side serves the stored statistic |
 | **`/latest`** | `stationname` is `""` and `stationtype` is absent on the new side where the Go side sends `"CSI"` and `"campbell"`; `monthrain` and `yearrain` are `0` where the Go side sends 1.54 and 15.11 inches. **The first half is fixed by M5-5**: both values were NULL in the migrated rows, and the read path no longer looks there — `stationname` comes from `config.stations.name` and `stationtype` from `stations.reported_type`. Re-check it on the next (c) run against a daemon built from that change and strike it if it is gone. `monthrain`/`yearrain` are untouched and still open |
-| **`/almanac`** | `{}` on the new side — fourteen records against none, so the endpoint compared nothing. The migration carries no `almanac_cache` and nothing has populated it. Two consequences, and the second is a cutover decision rather than a defect: the cache has to be built before the endpoint serves anything, and the Go cache holds records from **2025-08-19** — earlier than the first imported reading of 2025-10-30 — so those all-time extremes are not reproducible from the migrated data and would reset at cutover |
+| **`/almanac`** | `{}` on the new side — fourteen records against none, so the endpoint compared nothing. The migration carries no `almanac_cache` and nothing has populated it. Two consequences, and the second is a cutover decision rather than a defect: the cache has to be built before the endpoint serves anything, and the Go cache holds records from **2025-08-19** — earlier than the first imported reading of 2025-10-30 — so those all-time extremes are not reproducible from the migrated data and would reset at cutover. **Resolved by M7-6 and the finding was bigger than this row**: nothing in the program wrote that table at all (A-M7-6-1), and the Go cache turned out to be the stale one — see below |
 
 `/snow` is the only endpoint green on both sides, and it is green because both return
 `404 snow data not enabled for this website`. That is a real agreement and the harness says
@@ -258,3 +258,64 @@ investigation: a class `float32_tie_break` whose predicate is "the two literals 
 `float32` neighbours", scoped to `/span` and `/latest` with `keys = ["*"]`. It is deliberately
 **not** in `expected.toml`: the ledger entry has to exist first, because a rule with no
 decision behind it is the thing this file is designed to make impossible.
+
+## What M7-6 found about `/almanac`, 2026-11-14
+
+The row above read the empty `/almanac` as a migration consequence. It is not: **nothing in
+the program wrote `almanac_cache`** (`docs/reconciliation.md` **A-M7-6-1**), and once
+`almanac:records` was computing the twelve records from the migrated history, the comparison
+against the live Go server became possible for the first time. It was done by evaluating each
+record's query against the preview's database and comparing the result with
+`GET https://suncrestweather.com/almanac?station=CSI`, taken a minute apart.
+
+**The headline: the Go server's almanac is the stale one.** Four of its records are beaten by
+days that are *in its own history* and it has not noticed, which fixes a lower bound on how
+long its hourly job has been failing or unscheduled: `high_temp` is **95.73979 °F on
+2025-08-19**, and the same history holds **100.3874 °F on 2026-07-12**. A `refresh_almanac_cache`
+that had run since that day would have replaced it, because its first statement is
+`DELETE FROM almanac_cache WHERE stationname = $1`. So **the Go cache has not been successfully
+refreshed since at least 2026-07-12** — four months. Its mixed dates say the same thing from
+the other side: the newest timestamp anywhere in it is 2026-05-18, and `high_temp`'s 2025-08-19
+is now outside `weather_1d`'s own one-year window.
+
+Record by record, against the station's own history:
+
+| Record | Go serves | Computed here | |
+|---|---|---|---|
+| `low_temp` | 12.097401 @ 2026-02-18T17:00−07 | 12.097401 @ 2026-02-19T00:00Z | **equal**, and the same instant — the contract renders the UTC day bucket in the station's offset |
+| `high_solar` | 1514.0381 @ 2026-05-18T13:04:28.657385−06 | 1514.0381, same reading | **equal**, including the sub-second instant, which is what the two-step raw lookup is for |
+| `high_wind_speed` | 46.014404, `wind_dir` **184.01839** | 46.014404, `wind_dir` **184.01834** | the gust is equal; the direction differs in the **seventh significant digit**. Both are a circular mean over the same day's readings, accumulated in a different order — the same class as the `float32` tie-break row above, one function further in |
+| `high_pm25` | 731.13 @ 2026-01-19T17:00−07 | 731.13 @ 2026-01-20T00:00Z | **equal** |
+| `high_pm10_in` | 655.33, same instant | 655.33, same instant | **equal, and read from `extrafloat2`** — `pm10_in_aqin` returns no row at all for this device, which is migration 030's finding ("PM10 was always blank for AirGradient devices") confirmed against production data |
+| `high_co2` | 646 @ 2026-02-27T17:00−07 | 646 @ 2026-02-28T00:00Z | **equal** |
+| `high_tvoc` | 500 @ 2025-09-28 | 500 @ 2025-12-11 | **equal in value, different day.** 500 is the TVOC index's ceiling, so the record is a tie among many days and the earliest one Go holds predates the migrated history's first reading (2025-10-30) |
+| `high_temp` | 95.73979 @ 2025-08-19 | **100.3874 @ 2026-07-12** | Go is stale. The new value sits on a smooth distribution of July maxima (99.03, 98.62, 98.34, …), so it is weather and not a glitch |
+| `low_humidity` | 6.698 @ 2025-08-03 | **6.541 @ 2026-06-26** | Go is stale |
+| `max_rain_hour` | 0.23000003 @ 2026-04-28 | **0.53999996 @ 2026-08-14** | Go is stale. **Also the one record with a retention caveat**: `observations_1h` is kept for 90 days, so this is the record `almanac:records` carries forward rather than lowering (A-M7-6-1) |
+| `max_rain_day` | 0.90999943 @ 2025-10-03 | **0.94 @ 2026-10-12** | Go is stale |
+| `low_barometer` | 29.440966 @ 2026-02-17 | **6.147712 @ 2026-10-20** | **a data defect, not an implementation one — and it is user-visible.** The history holds thirteen consecutive readings of 6.147712 inHg over ninety seconds on 2026-10-20, which is not a pressure. Go's `> 0` filter does not exclude it either, so a Go server whose job was running would serve the same number; Go is spared only because its cache predates the glitch. The right fix is upstream of this endpoint — either those thirteen rows go, or ingress gains a plausibility range — and neither belongs to M7-6, which would have to invent a threshold the frozen contract does not have |
+
+**Two of these are worth carrying into the cutover conversation.** The almanac is the first
+endpoint where the **new** implementation is demonstrably more correct than the live one, so a
+cutover changes four visible numbers on that page for the better — and `low_barometer` changes
+one for the worse, from a stale-but-plausible 29.44 inHg to a current-and-absurd 6.15, until
+the thirteen rows or an ingress check deal with it.
+**One difference the table above does not list, because it applies to every row of it: the
+offset.** Go renders each `timestamp` in its database session's zone and this side renders it
+in UTC — `"2026-01-19T17:00:00-07:00"` against `"2026-01-20T00:00:00Z"`, which is the **same
+instant** written two ways. It is observable for the first time here, because `/almanac` is
+the only endpoint on this surface that marshals a `time.Time` at all and it has never had data
+to marshal.
+
+**No code change, and the reason is the contract rather than a preference.**
+`contract/fixtures/almanac-populated.json` was captured from a Go server and records
+`"2026-10-28T00:00:00Z"` — the capture rig's own session was UTC — so `Z` is what the frozen
+fixture says and what `mw_api_legacy::dto::go_rfc3339` emits. The production server's offset is
+a property of *its* session zone, not of the contract, and a client cannot tell the two apart:
+both are RFC 3339 and both parse to one instant. What would be wrong is to make the rendering
+depend on a database session's zone, which is how Go came to have two answers.
+
+**It belongs in `expected.toml` as a class rather than as twelve rows** — predicate "the two
+literals are RFC 3339 timestamps denoting the same instant", scoped to `/almanac` with
+`keys = ["*.timestamp"]`. It is deliberately not added here yet, for the same reason the
+`float32_tie_break` class above is not: the ledger entry has to exist first.

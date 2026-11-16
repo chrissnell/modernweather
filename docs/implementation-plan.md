@@ -1216,6 +1216,14 @@ and `monthrain` / `yearrain` as `0`; and `/almanac` serving `{}`, because the mi
 imported reading, so those all-time extremes are not reproducible from the migrated data and
 would reset at cutover.
 
+**That last finding was the symptom of something larger, and it took the owner to see it.** The
+reading above treats the empty cache as a migration consequence; the owner reported the endpoint
+as broken on 2026-11-14, and the cause turned out to be that **nothing in the program writes
+that table at all** — not the migration, and not any component. **M7-6** is the item; A-M7-6-1
+is the gap. It is exactly the G-5 shape this document keeps naming: a defect the harness merely
+*found* belongs in a work item, and this one sat in a paragraph for a day because the paragraph
+had an explanation that was true as far as it went.
+
 **The harness is cutover apparatus and the owner scoped it as such on 2026-11-13:** the two
 implementations have to be checked against each other once, as `suncrestweather.com` moves to
 the new service, and then the Go daemon is decommissioned. `ci/diff/README.md`'s "Lifetime"
@@ -1413,6 +1421,27 @@ Kubernetes, so Campbell must work over `TcpOut` against a `ser2net` bridge as we
 W2a §4a.5 already maps it as `Serial | TcpOut` and the Go version already dials TCP when
 `SerialDevice` is empty, so this is a test case rather than a new capability — but it is the one
 driver where the TCP path is load-bearing in production rather than a convenience.
+**The serial line rate is set as of 2026-11-14** — see `docs/reconciliation.md`'s **A-M6-1-1**, which
+this item filed as *proposed* on 2026-11-11 and GRA-788 accepted and applied. The `socat` pty pair
+this item builds could never have caught the gap it recorded: `transport_baud` was carried into
+`Transport::Serial { baud }` and never put on the line, so a directly attached Davis or Campbell
+console worked only where a `udev` rule or an `stty` had already configured it, and failed by
+producing frames that all fail CRC rather than by going quiet. D-32's crate table gains
+`tokio-serial`, confined to `mw-station` by `ci/layers.toml`. Two things a reader of this item should
+carry forward: the pty tests here are now **Linux-only** (macOS sets the rate with an ioctl that
+refuses a pseudo terminal), and the change is **unproven against hardware** — the owner's Campbell is
+served over the `ser2net` bridge, which does not exercise it.
+
+Two operational consequences the amendment did not predict, both recorded in full at A-M6-1-1. The
+serial open is now **exclusive** (`TIOCEXCL` + `flock`), which is kept deliberately — one line has
+one reader, and two readers split the stream rather than each getting it — but **nothing refuses two
+components naming one `transport_dev` at plan time**, so that configuration now fails at startup
+non-deterministically instead of silently splitting. Refusing it in `plan` is **GRA-796**. And
+`transport_baud` was decorative and is now **authoritative**, so a deployment whose `udev` rule or
+`stty` set the line correctly while the column was stale worked before this change and fails after;
+`uploader.aprs_kiss_serial_baud` is the sharper case, because `mw_output::plan` defaults a NULL to
+9600 and now puts that on the radio. **Release note, not a code fix.**
+
 **Decision point that lands here, not before:** **OQ-W4-3** — whether the registry gains a `jsonb`
 type so `observations.extra` can be a registry entry. W4's note is explicit that this is "worth
 deciding before W7 writes its first driver that receives an unknown field", and this is that moment.
@@ -1622,6 +1651,40 @@ every preceding milestone was ordered to preserve.
 `docs/reconciliation.md` §4 — the additive routes, the time-anchored endpoint that is the only thing
 that will ever read `observations_1d_legacy`, and the deprecation list. **N-2**, updating the Go
 provisioner, is independent of all of this and can land whenever.
+
+### M7-6 — the almanac records *(A-M7-6-1)*
+**Depends on:** M4-2 (the reader), M5-1 (history to read). **Ordered before M7-5** despite the
+number: cutover moves `suncrestweather.com` onto a daemon whose `/almanac` answers `{}`, which is
+a user-visible regression on a frozen endpoint.
+**Raised by:** the owner, 2026-11-14 — *"The almanac on the weather website is broken."*
+`/almanac?station=CSI` answered `{}` with a `200` against a Go server serving fourteen records.
+
+**What was wrong is not in any component.** `almanac_cache` was empty and **nothing in the
+program ever wrote to it**: W1 assumption 12 names it and `snow_totals_cache` as the two
+precomputed caches, M6-3 built four `snow:*` components for the second, and the first had a
+reader (`ReadingStore::almanac`, M4-2) and no writer. Every structural check passed, because
+every one of them was true — the route was mounted, the station resolved, the handler ran and
+the table's shape made no rows into `{}` rather than into an error. **A-M7-6-1** records the
+gap; the plan, not a component, is where it was.
+
+**The migration was ruled out as the other half, by reading it.**
+`ci/db/migrate-from-go/migrate-from-go.sh` names `almanac_cache` in exactly two places — the
+cascade that empties it during `reset-target`, and the row count it reports afterwards — and no
+step reads the Go table. §5.0's (c) had already measured why that is the right choice: the Go
+cache holds records from **2025-08-19**, earlier than the first imported reading, so those
+values are not derivable from the migrated data and the first refresh would overwrite them.
+
+**Done when:** `almanac:records` is planned for every enabled station on a node with a weather
+database, recomputing the twelve records
+`migrations/weather/030_almanac_airgradient_pm10.up.sql` writes, on the hourly period Go's
+`add_job('refresh_almanac_cache', '1 hour')` uses; `/almanac` on the preview answers the same
+record **set** as the live Go server for an equivalently-configured website, with each value
+either equal or explained in `ci/diff/README.md`; and the plan test in
+`crates/modernweather/src/boot.rs` fails if nothing in the plan writes the cache — which is the
+check that was missing, not the component.
+
+**A one-off backfill was explicitly not the answer.** Records imported once freeze at migration
+time and rot silently, which is `sun_times` over again (**A-M5-4-1**).
 
 ---
 

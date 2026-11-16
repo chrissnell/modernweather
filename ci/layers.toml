@@ -300,6 +300,31 @@ that differs per artefact. `rustls-native-certs` and `rustls-platform-verifier` 
 NOT substitutions that would be equivalent here, and either would be its own amendment."""
 
 [[dep_rule]]
+id = "serial-line-rate-only-where-the-line-is-opened"
+dependency = "tokio-serial"
+only = ["mw-station"]
+reason = """
+Added by GRA-788 and recorded as amendment A-M6-1-1 in docs/reconciliation.md: DESIGN.md
+D-32's table named no crate for serial port CONFIGURATION, so `transport_baud` was accepted,
+stored, displayed and then never applied to the line. A rate is `tcsetattr`, which needs
+`libc` or a serial-port crate, and `[workspace.lints.rust]`'s `unsafe_code` makes
+hand-rolling the `ioctl` a build error -- so the table gained a row rather than the module
+gaining an `unsafe`.
+
+Confined to `mw-station` because `mw_station::stream::open` is the ONE place in this
+workspace that turns a `Transport` into a `ByteStream`, and the whole reason `mw-output`
+depends on `mw-station` at all is to reach it (`mw_output::frame`'s module documentation has
+that argument, and it predates this rule). A second crate naming this would be a second
+serial open with its own idea of parity, stop bits and raw mode -- and the KISS-serial TNC
+path and the station path would then be able to disagree about what 9600 8N1 means.
+
+What this rule does NOT do is keep `libc` out: `tokio-serial` pulls it in transitively
+through `mio`, `nix` and `serialport`, as the gate's own "inspects `crates/*` manifests only"
+limit implies. That is not the property anybody wanted. `unsafe_code = "warn"` is, and it is
+still `warn` -- the audited `unsafe` block this change DELETED was the only one in the
+workspace, so a `grep` for one is now the gate it always read like."""
+
+[[dep_rule]]
 id = "one-logging-path"
 dependency = "log"
 only = []
@@ -308,7 +333,7 @@ docs/service-architecture.md §5.1: `tracing` macros only, nowhere a `log::` mac
 version has a package-global sugared logger AND an injected one, used interchangeably inside
 the same functions, which is why its output cannot be filtered per station. `mw-obs`
 installs `tracing_log::LogTracer` so that DEPENDENCY crates using `log` -- `sqlx`, `hyper`,
-`rustls` -- still land in the pipeline; a workspace crate declaring `log` itself is the
+`rustls`, `mio-serial` -- still land in the pipeline; a workspace crate declaring `log` itself is the
 second path reappearing."""
 
 # ---------------------------------------------------------------------------------------

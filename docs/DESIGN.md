@@ -558,6 +558,14 @@ entry. The derivation of every one is in `docs/reconciliation.md`.
 
 **Nothing here was decided by W6 except where an entry says so.** W6's own additions are *decisions*
 (D-47 – D-67), not amendments: they fill holes between documents rather than contradicting anything.
+
+**Entries after 2026-10-30 are implementation items', and there is one.** The paragraph above counts
+W6's pass and nothing later. An implementation item that finds a gap files its amendment in
+`docs/reconciliation.md`'s *Proposed amendments* and carries on under the existing decision; it
+appends here only when it is the item that **owns** the ledger entry and has applied it, which is
+what "applied" means in this file — the entry, plus the `Status` cell in the ledger pointing at it.
+Twenty-one such amendments stand *proposed* in `reconciliation.md`; **A-M6-1-1** (below) is the one
+that has been applied, by GRA-788 on 2026-11-14.
 The two exceptions are A-W6-1 and A-W6-2, both of which extend a decision's scope rather than
 changing its content.
 
@@ -829,6 +837,47 @@ ARMv6 and affects `sqlx`'s own feature flags, which name the provider explicitly
 daemon rather than test infrastructure. The same decision needs the converse: it should be complete
 for the daemon, or it is a list that answers some questions and silently delegates others.
 
+### A-M6-1-1 — 2026-11-14 — D-32's crate table gains a serial-configuration row. *Source: implementation-plan.md M6-1, applied by GRA-788.*
+
+**What was found.** D-32's table names no crate for **configuring a serial port**, and A-W3-1 above
+added seven rows on the principle that the table "should be complete for the daemon, or it is a list
+that answers some questions and silently delegates others". Opening a port needs only a file
+descriptor; setting its **line rate** needs `tcsetattr`, which needs either `libc` or a serial-port
+crate, and the table named neither. `[workspace.lints.rust]` sets `unsafe_code = "warn"` and CI runs
+`-D warnings`, so hand-rolling the `ioctl` was not available either.
+
+The consequence shipped for three days and was recorded rather than hidden: `transport_baud` was
+accepted by configuration, stored, displayed and **never applied to the line**, so a directly
+attached Davis or Campbell console worked only where a `udev` rule or an `stty` had already
+configured it. The failure it produced was not silence but frames that all fail CRC-16 — a station
+that looks connected and reports nothing decodable.
+
+**What replaces it.** Nothing is replaced; the table gains one row:
+
+| Concern | Crate | Why this one |
+|---|---|---|
+| Serial port configuration | **`tokio-serial`** | the `tokio` idiom for a `tcsetattr`-configured port; wraps `mio-serial`/`serialport`, so one crate covers the open, the line rate and the async read. `default-features = false`: the `libudev` feature links a C library, for port enumeration nothing here calls, and every Linux target in `ci/release.toml` is a static musl build that cannot link it |
+
+`ci/layers.toml`'s `serial-line-rate-only-where-the-line-is-opened` rule confines it to
+`mw-station`, which is the one crate that turns a `Transport` into a `ByteStream` —
+`mw-output`'s KISS-serial TNC reaches it from there.
+
+**Why this is more than inconvenient.** It was the one transport in W2a §4a.5's table the daemon
+could not fully serve, and the failure mode is the shape of defect this programme keeps finding. It
+also **removed the only `unsafe` block in the workspace**: `tokio_serial::SerialStream` is itself an
+`AsyncFd` over an owned descriptor, so the safety argument that lived at `mw_station::stream`'s
+registration call site is now the dependency's. `unsafe_code` is still `warn` and no `unsafe` was
+added.
+
+**Three things this row does not license**, because they were measured after the amendment was
+written and the amendment was wrong about two of them. It is **not** a one-line change — the
+`ByteStream` impl changes shape, because `SerialStream` is `AsyncRead + AsyncWrite`. It does **not**
+keep `libc` out of the graph — the crate brings it transitively through `mio`, `nix` and
+`serialport`; what it keeps out is an `unsafe` block in this workspace, which was the property that
+mattered. And it is **unproven against hardware**: the test asserts the `termios` state of a real
+tty, which is what catches the defect, but no apparatus here clocks bits at a rate.
+`docs/reconciliation.md`'s A-M6-1-1 carries all seven corrections and the upgrade hazard.
+
 ### A-W3-3 — 2026-10-28 — D-38 records *how* the config payload is delivered. *Source: W3.*
 
 **What was found.** W1's A-3 already asked D-38 to name the nine values. Implementing it surfaces a
@@ -1047,7 +1096,7 @@ Read the `Status` column. A decision is **never edited in place** (see `## Amend
 | **D-30a** | A durable sink must not lose data. Because a source is never blocked by a sink, a durable sink is served by a **local durable spool** at the fan-out point rather than an in-memory channel; a slow sink falls behind on disk, never upstream. **A durable sink must not lose data *while the spool has room*** — the spool is bounded, and at the bound the policy is to refuse at the edge, counted, logged and visible as a component failure. `max_lag` must be reachable before the ceiling at the node's observed rate; a configuration where it is not is a startup warning. | W2a (A-W2a-1), extended by W7 (A-W7-4) | |
 | **D-30b** | Rate-limited outputs are **not stream sinks.** They are scheduled producers with a declared period, and each declares the **windowed values** it needs as `(Metric, Window, Agg)`, resolved by rolling up aggregate buckets. Rate limiting is therefore structural — a component that does not wake more often than allowed needs no queue, no buffer and no coalescing. | W2a (A-W2a-1) | |
 | **D-31** | Transport is orthogonal to role; gRPC and REST are codecs, not kinds of component. | W0 §5 | **extended** → A-W3-4 (the singular unit is the **router and route table**, not the socket) |
-| **D-32** | The crate list in §6 is the default choice for each named idiom; substitutions are allowed but must be recorded as amendments. | W0 §6 | **extended** → A-4 (it governs the daemon, not test infrastructure), A-W3-1 (seven additions) |
+| **D-32** | The crate list in §6 is the default choice for each named idiom; substitutions are allowed but must be recorded as amendments. | W0 §6 | **extended** → A-4 (it governs the daemon, not test infrastructure), A-W3-1 (seven additions), A-M6-1-1 (serial port configuration: `tokio-serial`) |
 | **D-33** | Secrets use a redacting wrapper type and credentials are compared in constant time. | W0 §7 | **extended** → A-W5-3 (the management API's transport defaults) |
 | **D-34** | Errors are typed per module and preserve their cause chain. | W0 §7 | |
 | **D-35** | Administrative authentication is a username and password — one administrator, no roles, Argon2id, sessions distinct from credentials, no default password; W5 §3 owns the design. | W0 §7 | **extended** → A-W5-1 (one *identity*, several revocable sessions) |

@@ -75,8 +75,8 @@ use crate::spool;
 /// down to its `if con.Type == "management" { continue }`.
 ///
 /// Rule 2's own wording is "each component crate contributes one `fn register(cfg, out)`",
-/// and three crates here contribute more than one: `mw-pipeline` through `Rollup`, `Snow`
-/// and `Snapshot`, `mw-output` through `Outputs` and `Aeris`, and `mw-station` through
+/// and three crates here contribute more than one: `mw-pipeline` through `Rollup`, `Snow`,
+/// `Almanac` and `Snapshot`, `mw-output` through `Outputs` and `Aeris`, and `mw-station` through
 /// `Stations` and `SnowGauges`. Each split is one configuration table against another --
 /// `uploader` against `aeris_account`, the station rows against the ingest rows -- and the
 /// reason is the same every time: one registrar reading two tables is one `RegisterError`
@@ -93,6 +93,7 @@ const REGISTRARS: &[&dyn Registrar<Config>] = &[
     &Database,
     &Rollup,
     &Snow,
+    &Almanac,
     &Snapshot,
     &Legacy,
     &Outputs,
@@ -400,6 +401,38 @@ impl Registrar<Config> for Snow {
         out: &mut Vec<mw_component::ComponentSpec>,
     ) -> Result<(), RegisterError> {
         mw_pipeline::snow::register(cfg, out)
+            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
+    }
+}
+
+/// `almanac:records` -- the all-time extremes behind `/almanac`.
+///
+/// An adapter here for `Rollup`'s reason, and a **fourth** registrar over `mw-pipeline`
+/// beside `Rollup`, `Snow` and `Snapshot`. Separate from `Snow` rather than folded into it,
+/// which is the `uploader`-against-`aeris_account` split applied to two component families
+/// that happen to share a crate: a snow gauge with no calibration and a station with no
+/// history are unrelated refusals, and one registrar answering for both would report the
+/// wrong one.
+///
+/// Every decision belongs to `mw_pipeline::almanac::register`, and there are only two: a
+/// node with no weather database plans nothing (**D-44**), and a node with no station plans
+/// nothing. There is no third -- unlike the snow components this one needs neither a
+/// calibration nor a time zone, because an all-time extreme has no local boundary to be
+/// measured from.
+#[derive(Debug)]
+struct Almanac;
+
+impl Registrar<Config> for Almanac {
+    fn name(&self) -> &'static str {
+        "mw-pipeline (the almanac records)"
+    }
+
+    fn register(
+        &self,
+        cfg: &Config,
+        out: &mut Vec<mw_component::ComponentSpec>,
+    ) -> Result<(), RegisterError> {
+        mw_pipeline::almanac::register(cfg, out)
             .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
     }
 }
@@ -2623,6 +2656,25 @@ mod tests {
         pool.close().await;
     }
 
+    /// **The two spellings of `airgradient`, asserted from the one crate that may name
+    /// both.**
+    ///
+    /// `mw_pipeline::almanac` keys two of the twelve records on the configured station type
+    /// -- `high_pm10_in` reads `extrafloat2` on an AirGradient and `pm10_in_aqin` on
+    /// everything else, which is the whole of Go's migration 030 -- and it cannot name
+    /// `mw_station::airgradient::STATION_TYPE` to do it, because the two crates are in the
+    /// same layer (`ci/layers.toml`). So the string is duplicated, and this is what stops
+    /// the duplicate drifting: a rename on either side fails here rather than silently
+    /// making every AirGradient's PM10 record blank, which is the exact defect migration 030
+    /// was written to fix.
+    #[test]
+    fn the_almanac_and_the_driver_agree_on_what_an_airgradient_is_called() {
+        assert_eq!(
+            mw_pipeline::almanac::AIRGRADIENT,
+            mw_station::airgradient::STATION_TYPE
+        );
+    }
+
     /// **The production shape: a weather database *and* a spool.**
     ///
     /// This is the only configuration that emits `writer:timescale`, and it is the one
@@ -2700,11 +2752,22 @@ mod tests {
         );
         // And the surface that reads them, planned unconditionally.
         assert!(ids.contains(&"api:legacy"), "got {ids:?}");
+        // **The writer behind `/almanac`, which is the one component whose absence was
+        // invisible.** `almanac_cache` had a reader and no writer, so the endpoint answered
+        // `200` with `{}` and every structural check passed: the route was mounted, the
+        // station resolved, the handler ran. This assertion is what makes that
+        // unrepresentable -- a plan in which nothing writes the cache no longer type-checks
+        // as a passing test (`docs/reconciliation.md` A-M7-6-1).
+        assert!(
+            ids.contains(&"almanac:records"),
+            "a cache that a frozen endpoint reads and nothing writes is a silent 200: got \
+             {ids:?}"
+        );
         // The station's listener, its re-arm (the fixture's station has a
         // `transport_host`), the pool, the writer, the rollup, the rollover, the two
-        // snapshot components, `api:legacy`, the **one** listener, the website and the
-        // asset tree.
-        assert_eq!(ids.len(), 12, "got {ids:?}");
+        // snapshot components, the almanac records, `api:legacy`, the **one** listener, the
+        // website and the asset tree.
+        assert_eq!(ids.len(), 13, "got {ids:?}");
         assert!(
             ids.contains(&"http:listener") && ids.contains(&"web:static"),
             "both are planned unconditionally: got {ids:?}"
@@ -3392,6 +3455,7 @@ mod tests {
         // | the `rest` controller | `api:legacy`, `web:site:1`, `web:static`, `http:listener` |
         // | the `aerisweather` controller | two forecast periods, the alert fetch and its sweep |
         // | the `snowcache` controller | `snow:depth`, `snow:events`, `snow:smoothing`, `snow:season:snow` |
+        // | `add_job('refresh_almanac_cache', '1 hour')` -- **a database job, not a controller** | `almanac:records` |
         // | *nothing*: Go truncates the day in the database session's zone | one `rain:rollover:<station>` each |
         // | *nothing*: Go reads the database on every request | `snapshot:latest`, `snapshot:warm`, `window:rollup` |
         //
@@ -3400,6 +3464,15 @@ mod tests {
         // server's zone, and **D-27**'s snapshot replacing a read-through. Every row above
         // them is one-for-one, and the three station ids carry the keys the data migration
         // wrote the history under.
+        //
+        // **The almanac row is the one that was missing, and its Go side is why.** Every
+        // other row above pairs a component with a Go *controller*; `refresh_almanac_cache`
+        // is a TimescaleDB background job registered by
+        // `migrations/weather/005_create_almanac_cache.up.sql`, so an audit that walked
+        // `managers/controller.go` could not see it. The cache was carried forward, the
+        // reader was carried forward, and the writer was in a file nobody was comparing
+        // against -- which is how `/almanac` came to serve `{}` with a `200`
+        // (`docs/reconciliation.md` A-M7-6-1).
         assert_eq!(
             ids,
             vec![
@@ -3407,6 +3480,7 @@ mod tests {
                 "aeris:alerts:gc",
                 "aeris:forecast:csi:24",
                 "aeris:forecast:csi:240",
+                "almanac:records",
                 "api:legacy",
                 "db:postgres",
                 "http:listener",
