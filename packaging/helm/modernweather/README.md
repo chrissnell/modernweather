@@ -136,7 +136,8 @@ the release named `modernweather`:
 
 | Rendered | Existing |
 |---|---|
-| `Deployment/modernweather`, `Service/modernweather`, `PVC/modernweather` | same |
+| `Service/modernweather`, `PVC/modernweather` | same |
+| `Deployment/modernweather` | same name, but **deleted and re-created rather than adopted** — step 2 |
 | `CronJob/modernweather-db-backup`, `CronJob/modernweather-db-restore-rehearsal` | same |
 | `StatefulSet/modernweather-db`, `Service/modernweather-db`, `Service/modernweather-db-rw` | same |
 | `StorageClass/modernweather-db-local`, `PV/modernweather-db-lil-bulky` | same |
@@ -154,7 +155,32 @@ helm template modernweather packaging/helm/modernweather -n modernweather -f val
   | kubectl diff -n modernweather -f -
 ```
 
-**2. Move the daemon's state off the preview's volume, THEN remove the preview.**
+**2. Delete `Deployment/modernweather`. Do not adopt it.**
+
+```
+kubectl delete -n modernweather deployment/modernweather
+```
+
+Adoption is a three-way merge against the chart's manifest, and on a first install Helm has
+no previous manifest of its own to diff against — so a field that is in the LIVE object and
+absent from the chart's is not removed. It is kept. For every other object here that is
+harmless, because the chart renders what is already there. For this one it is fatal: the
+hand-applied Deployment carries the `seed-config` init container and its `seed` volume, and
+adopting it installs the chart *with the crash loop the chart exists to delete* —
+`apk add sqlite` as non-root under `restricted` Pod Security, `Init:CrashLoopBackOff`, and a
+`--wait` that burns its whole timeout before saying so.
+
+Deleting it costs nothing and is **first** for a second reason: it is what releases
+`PVC/modernweather`, which is `ReadWriteOnce` and which step 3 has to mount. The Deployment
+holds no state of its own — `config.db` and the spool live on that claim, which is adopted
+and is annotated `helm.sh/resource-policy: keep`.
+
+Step 1's `kubectl diff` does not show this class of problem: a diff of live against the
+chart's manifest shows what the chart would ADD, and what bites here is what it would fail
+to take away. Any other object applied by hand with fields the chart does not render wants
+the same treatment.
+
+**3. Move the daemon's state off the preview's volume, THEN remove the preview.**
 
 `pvc/mw-preview` does **not** hold "a kubectl-cp'd binary only", which is what this file
 used to say and is the one sentence in it that could have cost something. It holds
@@ -166,11 +192,24 @@ with no station and a re-read spool.
 Nothing here is a re-type: the file is carried across as it is, so the values an operator
 corrected through the management UI survive the move, and so does their password.
 
+**The daemon has to be stopped first, and gracefully.** `config.db` is `journal_mode = WAL`
+(`crates/mw-store/src/config_db.rs`), so a copy of the main file alone is only complete once
+the last writer has closed and checkpointed it. A `scale --replicas=0` is a SIGTERM and the
+daemon checkpoints on its way out; a `delete pod --force` is not, and would leave committed
+rows in a `config.db-wal` this copy does not take — silently, because `PRAGMA
+integrity_check` on the truncated main file still answers `ok`.
+
 ```
-# The daemon must be STOPPED first, or config.db is copied mid-write.
 kubectl -n modernweather scale deployment/mw-preview --replicas=0
 kubectl -n modernweather wait --for=delete pod -l app=mw-preview --timeout=120s
+```
 
+The label is the hand-applied Deployment's own selector (`app: mw-preview`), not one of the
+chart's — check it against the live object rather than against this repository, which does
+not contain the manifest that set it. A `wait` with a selector that matches nothing returns
+success immediately, and the next step would then copy from under a running daemon.
+
+```
 # A pod that mounts both claims. Both are ReadWriteOnce, so one pod is also the only
 # way to have them attached at the same time.
 kubectl -n modernweather run mw-transplant --image=busybox:1.37 --restart=Never \
@@ -183,7 +222,14 @@ kubectl -n modernweather run mw-transplant --image=busybox:1.37 --restart=Never 
   "persistentVolumeClaim":{"claimName":"mw-preview"}},{"name":"dest",
   "persistentVolumeClaim":{"claimName":"modernweather"}}]}}'
 kubectl -n modernweather wait --for=condition=Ready pod/mw-transplant --timeout=120s
-kubectl -n modernweather exec mw-transplant -- cp -a /src/spool /dest/spool
+
+# The destination must be empty. `cp -a /src/spool /dest` nests to /dest/spool/spool if a
+# spool is already there, and a config.db already there is a DIFFERENT daemon's identity --
+# in both cases stop and decide, rather than merging two states.
+kubectl -n modernweather exec mw-transplant -- sh -c \
+  'ls -A /dest | grep -q . && { echo "destination is not empty:"; ls -la /dest; exit 1; }; :'
+
+kubectl -n modernweather exec mw-transplant -- cp -a /src/spool /dest/
 ```
 
 `node.spool_path` has to be rewritten on the way across, and that is not cosmetic: the
@@ -191,11 +237,17 @@ preview mounted its volume at `/data`, the chart mounts it at `dir(configPath)` 
 `/var/lib/modernweather` — and the daemon container has `readOnlyRootFilesystem: true`, so
 a daemon still pointed at `/data/spool` cannot create it and does not start.
 
+Check the copy BEFORE writing to it — an `integrity_check` run after the `UPDATE` is a
+check of a file you have already mutated — and gate on the answer rather than reading past
+it:
+
 ```
 kubectl -n modernweather cp mw-transplant:/src/config.db ./config.db
-sqlite3 ./config.db \
-  "UPDATE node SET spool_path = '/var/lib/modernweather/spool';" \
-  'PRAGMA integrity_check;'
+# No -wal or -shm came across, so an `ok` here means the main file is self-contained.
+[ "$(sqlite3 ./config.db 'PRAGMA integrity_check;')" = ok ] || { echo "STOP"; exit 1; }
+sqlite3 ./config.db "UPDATE node SET spool_path = '/var/lib/modernweather/spool';"
+sqlite3 ./config.db 'SELECT spool_path FROM node;'
+
 kubectl -n modernweather cp ./config.db mw-transplant:/dest/config.db
 kubectl -n modernweather delete pod mw-transplant --wait=true
 ```
@@ -210,42 +262,20 @@ kubectl delete -n modernweather deployment/mw-preview service/mw-preview
 kubectl delete -n modernweather pvc/mw-preview
 ```
 
-**3. Delete `Deployment/modernweather`. Do not adopt it.**
-
-```
-kubectl delete -n modernweather deployment/modernweather
-```
-
-Adoption is a three-way merge against the chart's manifest, and on a first install Helm has
-no previous manifest of its own to diff against — so a field that is in the LIVE object and
-absent from the chart's is not removed. It is kept. For every other object here that is
-harmless, because the chart renders what is already there. For this one it is fatal: the
-hand-applied Deployment carries the `seed-config` init container and its `seed` volume, and
-adopting it installs the chart *with the crash loop the chart exists to delete* —
-`apk add sqlite` as non-root under `restricted` Pod Security, `Init:CrashLoopBackOff`, and
-a `--wait` that burns its whole timeout before saying so.
-
-Deleting it costs nothing. The Deployment holds no state — `config.db` and the spool are on
-`PVC/modernweather`, which is adopted and is annotated `helm.sh/resource-policy: keep` — and
-by this point it is scaled to 0 and serving nothing. Helm then creates it from the chart
-alone, with no inherited fields.
-
-The same reasoning would apply to any other adopted object that was applied by hand with
-fields the chart does not render. Step 1's `kubectl diff` does not show these: a diff of
-live against the chart's manifest shows what the chart would ADD, and the problem is what
-it would fail to take away.
-
 **4. Let Helm take ownership of the objects that stay.** Helm refuses to adopt a resource
 it did not create unless it is labelled as its own:
 
 ```
-# `serviceaccount/modernweather` and `configmap/modernweather-db-backup-scripts` are NOT
-# in this list: the chart renders names that nothing applied by hand, so Helm creates them
-# rather than adopting them. The two CronJobs ARE -- they were applied by hand from
-# `kube-cluster-helm-values` before the subchart took them over, and a `kubectl annotate`
-# of a name that does not exist fails the loop under `set -e`.
+# Every name here must EXIST and must not be one step 2 deleted: `kubectl annotate` of a
+# missing object fails, and under `set -e` that abandons the loop with the remaining
+# objects still unowned -- which the install then refuses on.
+#
+# `deployment/modernweather` is absent because step 2 deleted it; Helm creates it.
+# `serviceaccount/modernweather` and `configmap/modernweather-db-backup-scripts` are absent
+# because the chart renders names nothing applied by hand. The two CronJobs ARE here: they
+# were applied from `kube-cluster-helm-values` before the subchart took them over.
 for kind_name in \
-  deployment/modernweather service/modernweather pvc/modernweather \
+  service/modernweather pvc/modernweather \
   statefulset/modernweather-db service/modernweather-db service/modernweather-db-rw \
   cronjob/modernweather-db-backup cronjob/modernweather-db-restore-rehearsal \
   ingress/modernweather
@@ -264,9 +294,15 @@ do
 done
 ```
 
-**5. Install.** Then delete the old ReplicaSets, the `modernweather-config-seed-*`
-ConfigMap and the hash-suffixed `modernweather-db-backup-script-*` ConfigMap the subchart's
-`modernweather-db-backup-scripts` replaces — nothing references any of them any more.
+**5. Install**, then verify by request rather than by pod status — `/latest`,
+`/almanac?station=<name>`, `/span/1h?station=<name>` and the management UI on `:8081` all
+answer, and `mw_spool_cursor_skipped_envelopes_total` on `/metrics` is `0`, which is what
+says the transplanted writer cursor was read rather than re-read.
+
+Then delete the `modernweather-config-seed-*` ConfigMap and the hash-suffixed
+`modernweather-db-backup-script-*` ConfigMap the subchart's
+`modernweather-db-backup-scripts` replaces — nothing references either any more. (Step 2
+took the old ReplicaSets with the Deployment, so there are none left to clean up.)
 
 ### What never gets deleted
 
