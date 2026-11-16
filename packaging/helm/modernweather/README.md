@@ -137,6 +137,7 @@ the release named `modernweather`:
 | Rendered | Existing |
 |---|---|
 | `Deployment/modernweather`, `Service/modernweather`, `PVC/modernweather` | same |
+| `CronJob/modernweather-db-backup`, `CronJob/modernweather-db-restore-rehearsal` | same |
 | `StatefulSet/modernweather-db`, `Service/modernweather-db`, `Service/modernweather-db-rw` | same |
 | `StorageClass/modernweather-db-local`, `PV/modernweather-db-lil-bulky` | same |
 
@@ -153,21 +154,100 @@ helm template modernweather packaging/helm/modernweather -n modernweather -f val
   | kubectl diff -n modernweather -f -
 ```
 
-**2. Remove the preview, which this chart replaces.** A `LoadBalancer` Service cannot take
-an address another Service holds, so this is before the install and not after:
+**2. Move the daemon's state off the preview's volume, THEN remove the preview.**
+
+`pvc/mw-preview` does **not** hold "a kubectl-cp'd binary only", which is what this file
+used to say and is the one sentence in it that could have cost something. It holds
+`config.db` — the administrator credential, the node identity, the station, the website and
+the weather-database URL — and `spool/`, which holds the writer cursor and any readings not
+yet in TimescaleDB. Deleting it before copying is how you arrive at an unclaimed instance
+with no station and a re-read spool.
+
+Nothing here is a re-type: the file is carried across as it is, so the values an operator
+corrected through the management UI survive the move, and so does their password.
+
+```
+# The daemon must be STOPPED first, or config.db is copied mid-write.
+kubectl -n modernweather scale deployment/mw-preview --replicas=0
+kubectl -n modernweather wait --for=delete pod -l app=mw-preview --timeout=120s
+
+# A pod that mounts both claims. Both are ReadWriteOnce, so one pod is also the only
+# way to have them attached at the same time.
+kubectl -n modernweather run mw-transplant --image=busybox:1.37 --restart=Never \
+  --overrides='{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":65532,
+  "runAsGroup":65532,"fsGroup":65532,"seccompProfile":{"type":"RuntimeDefault"}},
+  "containers":[{"name":"staging","image":"busybox:1.37","command":["sleep","1800"],
+  "securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,
+  "capabilities":{"drop":["ALL"]}},"volumeMounts":[{"name":"src","mountPath":"/src"},
+  {"name":"dest","mountPath":"/dest"}]}],"volumes":[{"name":"src",
+  "persistentVolumeClaim":{"claimName":"mw-preview"}},{"name":"dest",
+  "persistentVolumeClaim":{"claimName":"modernweather"}}]}}'
+kubectl -n modernweather wait --for=condition=Ready pod/mw-transplant --timeout=120s
+kubectl -n modernweather exec mw-transplant -- cp -a /src/spool /dest/spool
+```
+
+`node.spool_path` has to be rewritten on the way across, and that is not cosmetic: the
+preview mounted its volume at `/data`, the chart mounts it at `dir(configPath)` —
+`/var/lib/modernweather` — and the daemon container has `readOnlyRootFilesystem: true`, so
+a daemon still pointed at `/data/spool` cannot create it and does not start.
+
+```
+kubectl -n modernweather cp mw-transplant:/src/config.db ./config.db
+sqlite3 ./config.db \
+  "UPDATE node SET spool_path = '/var/lib/modernweather/spool';" \
+  'PRAGMA integrity_check;'
+kubectl -n modernweather cp ./config.db mw-transplant:/dest/config.db
+kubectl -n modernweather delete pod mw-transplant --wait=true
+```
+
+Only now is the preview removable. A `LoadBalancer` Service cannot take an address another
+Service holds, so this is before the install and not after:
 
 ```
 kubectl delete -n modernweather deployment/mw-preview service/mw-preview
-kubectl delete -n modernweather pvc/mw-preview          # holds a kubectl-cp'd binary only
+# AFTER the release is verified -- it is the rollback until then, and it still holds the
+# binary the preview ran.
+kubectl delete -n modernweather pvc/mw-preview
 ```
 
-**3. Let Helm take ownership of the objects that stay.** Helm refuses to adopt a resource
+**3. Delete `Deployment/modernweather`. Do not adopt it.**
+
+```
+kubectl delete -n modernweather deployment/modernweather
+```
+
+Adoption is a three-way merge against the chart's manifest, and on a first install Helm has
+no previous manifest of its own to diff against — so a field that is in the LIVE object and
+absent from the chart's is not removed. It is kept. For every other object here that is
+harmless, because the chart renders what is already there. For this one it is fatal: the
+hand-applied Deployment carries the `seed-config` init container and its `seed` volume, and
+adopting it installs the chart *with the crash loop the chart exists to delete* —
+`apk add sqlite` as non-root under `restricted` Pod Security, `Init:CrashLoopBackOff`, and
+a `--wait` that burns its whole timeout before saying so.
+
+Deleting it costs nothing. The Deployment holds no state — `config.db` and the spool are on
+`PVC/modernweather`, which is adopted and is annotated `helm.sh/resource-policy: keep` — and
+by this point it is scaled to 0 and serving nothing. Helm then creates it from the chart
+alone, with no inherited fields.
+
+The same reasoning would apply to any other adopted object that was applied by hand with
+fields the chart does not render. Step 1's `kubectl diff` does not show these: a diff of
+live against the chart's manifest shows what the chart would ADD, and the problem is what
+it would fail to take away.
+
+**4. Let Helm take ownership of the objects that stay.** Helm refuses to adopt a resource
 it did not create unless it is labelled as its own:
 
 ```
+# `serviceaccount/modernweather` and `configmap/modernweather-db-backup-scripts` are NOT
+# in this list: the chart renders names that nothing applied by hand, so Helm creates them
+# rather than adopting them. The two CronJobs ARE -- they were applied by hand from
+# `kube-cluster-helm-values` before the subchart took them over, and a `kubectl annotate`
+# of a name that does not exist fails the loop under `set -e`.
 for kind_name in \
-  deployment/modernweather service/modernweather pvc/modernweather serviceaccount/modernweather \
+  deployment/modernweather service/modernweather pvc/modernweather \
   statefulset/modernweather-db service/modernweather-db service/modernweather-db-rw \
+  cronjob/modernweather-db-backup cronjob/modernweather-db-restore-rehearsal \
   ingress/modernweather
 do
   kubectl -n modernweather annotate --overwrite "$kind_name" \
@@ -184,8 +264,9 @@ do
 done
 ```
 
-**4. Install.** Then delete `Deployment/modernweather`'s old ReplicaSets and the
-`modernweather-config-seed-*` ConfigMap, which nothing references any more.
+**5. Install.** Then delete the old ReplicaSets, the `modernweather-config-seed-*`
+ConfigMap and the hash-suffixed `modernweather-db-backup-script-*` ConfigMap the subchart's
+`modernweather-db-backup-scripts` replaces — nothing references any of them any more.
 
 ### What never gets deleted
 
