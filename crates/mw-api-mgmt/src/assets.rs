@@ -187,12 +187,20 @@ fn document_csp(assets: &Assets) -> &'static str {
                 rest = &body[end..];
             }
         }
+        // `style-src 'self' 'unsafe-inline'`, and the asymmetry with `script-src` is
+        // deliberate: Svelte emits a `style="..."` attribute for any value it computes,
+        // and a style *attribute* cannot be hashed without `'unsafe-hashes'` plus a hash
+        // per distinct value -- not something a dynamic UI can enumerate. Inline style
+        // is also a far smaller gun than inline script: it executes nothing. The
+        // directive that matters stays `'self'` plus the bundle's own two hashes.
+        //
+        // Checked in a browser by `tests/e2e/99-csp`, not by reading: the first version
+        // of this policy had no `style-src` and silently blocked every inline style.
         format!(
-            "default-src 'self'; script-src 'self'{hashes}; frame-ancestors 'none'; \
-             base-uri 'none'; form-action 'self'"
+            "default-src 'self'; script-src 'self'{hashes}; \
+             style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
+             frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
         )
-        .replace("\
-             ", "")
     })
 }
 
