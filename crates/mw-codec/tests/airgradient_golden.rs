@@ -1,20 +1,29 @@
 //! Level 1 of W3 **D-82**'s three, for AirGradient: the pure codec against **captured**
 //! bodies.
 //!
-//! The three bodies were captured from `tests/emulators/airgradient`, which is written in
-//! this repository — so unlike the Davis and Campbell fixtures they pin the decoder against
-//! an emulator written beside the driver, and cannot catch a misunderstanding the two share.
-//! `frames/README.md` records that and `tests/emulators/manifest.toml` is where the
-//! `driver-emulators` gate prints it on every run.
+//! Three of the four bodies were captured from `tests/emulators/airgradient`, which is
+//! written in this repository — so unlike the Davis and Campbell fixtures they pin the
+//! decoder against an emulator written beside the driver, and cannot catch a
+//! misunderstanding the two share. `frames/README.md` records that and
+//! `tests/emulators/manifest.toml` is where the `driver-emulators` gate prints it on every
+//! run.
 //!
 //! What they *do* pin is the two firmware shapes, which is where the Go driver stores a
 //! plausible wrong number.
+//!
+//! **The fourth is from hardware**, and it is the one that closes the gap the other three
+//! leave: `airgradient-o-1pst.json` is one `GET /measures/current` from the monitor
+//! ModernWeather collects in production, on a model and a firmware the emulator does not
+//! reproduce. It carries five keys no emulator body has, so "the decoder tolerates what it
+//! does not read" is asserted against a real device rather than against our own idea of
+//! one.
 
 use mw_codec::{AirGradientJson, Codec, CodecError, Frame, MEASURES_CURRENT};
 
 const CURRENT: &str = include_str!("frames/airgradient-current.json");
 const OLD_FIRMWARE: &str = include_str!("frames/airgradient-old-firmware.json");
 const NO_SENSOR: &str = include_str!("frames/airgradient-no-sensor.json");
+const O_1PST: &str = include_str!("frames/airgradient-o-1pst.json");
 
 fn decode(body: &str) -> mw_types::Reading {
     let batch = AirGradientJson
@@ -47,8 +56,11 @@ fn a_current_firmware_body_fills_every_metric_the_table_names() {
     assert!(r.pm25.is_some(), "the compensated particulate");
     // The nine `extrafloat` and three `extratext` slots, which are the Go driver's filing
     // and are carried forward verbatim.
-    assert!(r.extra_float1.is_some(), "pm01");
-    assert!(r.extra_float2.is_some(), "pm10");
+    // Exact, and not `is_some()`: `pm01` and `pm10` are adjacent columns fed by adjacent
+    // keys, and this is the only fixture where the two values differ -- so a swap between
+    // them is catchable here and nowhere else.
+    assert_eq!(r.extra_float1, Some(1.08), "pm01");
+    assert_eq!(r.extra_float2, Some(4.25), "pm10");
     assert!(r.extra_float3.is_some(), "tvocIndex");
     assert!(r.extra_float4.is_some(), "noxIndex");
     assert_eq!(r.extra_float5, Some(-58.0), "the WiFi signal, in dBm");
@@ -99,6 +111,78 @@ fn a_body_with_no_temperature_module_stores_no_temperature() {
         "the particulate sensor is a separate device"
     );
     assert!(r.co2.is_some(), "and so is the CO2 one");
+}
+
+/// **The production monitor's own body, an Open Air `O-1PST` on firmware 3.7.1.** The one
+/// fixture here that came off hardware rather than out of `tests/emulators/airgradient`,
+/// and the reason it earns a test of its own is that the emulator reproduces neither this
+/// model nor this firmware.
+///
+/// **Seven of its twenty-six keys have no field on `Measures`**, and five of those appear
+/// in no emulator body: `pm01Standard`, `pm02Standard`, `pm10Standard` (the
+/// uncompensated-reference particulates) and `boot`/`bootCount` (the uptime counter). Be
+/// precise about what that catches, because the obvious claim is wrong: `deny_unknown_fields`
+/// on `Measures` would fail **all four** AirGradient fixtures, since `tvocRaw` and `noxRaw`
+/// are undeclared in every one of them. What only this fixture catches is the narrower
+/// change — one that declares those two and then stops tolerating whatever else a device
+/// sends. In production either is every occurrence failing, three times a second.
+///
+/// **A compensated particulate of exactly zero** is clean air and not a missing sensor, so
+/// `pm25` is `Some(0.0)` and not `None` — the same confusion the 32 °F defect is made of,
+/// one field over. Note what this body cannot pin, since `pm02` is zero here too: the
+/// `pm02_compensated.or(pm02)` precedence is `airgradient-current.json`'s to assert, where
+/// the two differ.
+///
+/// **One value is substituted.** `serialno` is the device's WiFi MAC and this repository is
+/// public, so the fixture carries `d83bda000000` — the vendor's OUI with the unique half
+/// zeroed. Every other key, value and spelling is the capture, and nothing here asserts
+/// more than that the string reaches `extratext1`.
+#[test]
+fn the_production_monitors_own_body_decodes_with_every_field_in_the_right_column() {
+    for key in [
+        "pm01Standard",
+        "pm02Standard",
+        "pm10Standard",
+        "boot",
+        "bootCount",
+    ] {
+        assert!(
+            O_1PST.contains(key),
+            "the fixture is the one carrying keys the decoder declares no field for, and \
+             `{key}` is not in it: {O_1PST}"
+        );
+    }
+
+    let r = decode(O_1PST);
+    // `atmpCompensated` is 15.79 degC, and the compensated field is the one read.
+    let temp = r.out_temp.expect("a temperature");
+    assert!((temp - 60.422).abs() < 0.001, "15.79 degC in degF: {temp}");
+    assert_eq!(r.out_humidity, Some(49.33), "`rhumCompensated`, not `rhum`");
+    assert_eq!(r.co2, Some(422.67));
+    assert_eq!(
+        r.pm25,
+        Some(0.0),
+        "clean air is a reading of zero and not an absent sensor"
+    );
+    assert_eq!(r.extra_float1, Some(0.0), "pm01");
+    assert_eq!(r.extra_float2, Some(0.0), "pm10");
+    assert_eq!(r.extra_float3, Some(433.0), "tvocIndex");
+    assert_eq!(r.extra_float4, Some(1.0), "noxIndex");
+    assert_eq!(r.extra_float5, Some(-55.0), "the WiFi signal, in dBm");
+    assert_eq!(r.extra_float6, Some(57.17), "pm003Count");
+    assert_eq!(r.extra_float7, Some(53.0), "pm005Count");
+    assert_eq!(r.extra_float8, Some(5.83), "pm01Count");
+    assert_eq!(r.extra_float9, Some(0.17), "pm02Count");
+    assert_eq!(r.extra_text1.as_deref(), Some("d83bda000000"));
+    assert_eq!(r.extra_text2.as_deref(), Some("O-1PST"));
+    assert_eq!(r.extra_text3.as_deref(), Some("3.7.1"));
+    // The seven undeclared keys land on no metric in either implementation: `tvocRaw` and
+    // `noxRaw` are in the Go struct and on no column, and the three `*Standard`
+    // particulates and the boot counter are in neither.
+    assert_eq!(r.extra_float10, None);
+    // The AQI columns are the enrich stage's (DEV-9), not this codec's.
+    assert_eq!(r.aqi_pm25_in, None);
+    assert_eq!(r.aqi_pm25_aqin, None);
 }
 
 /// A body that is not the JSON this decodes is a counted drop, which is what a device
