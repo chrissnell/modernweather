@@ -173,11 +173,13 @@ fn base64(bytes: &[u8]) -> String {
 /// §3.5's policy for the **document**, with the bundle's own inline bootstrap allowed by
 /// hash rather than by opening the policy.
 ///
-/// `app.html` carries exactly one inline script -- the theme pin, which has to run before
-/// first paint or every load flashes the wrong theme -- so `'self'` alone would block it.
-/// Naming its SHA-256 keeps `unsafe-inline` out. The digest is taken from the **embedded
-/// document that is actually served**, so it cannot drift from the bundle the way a
-/// constant checked in beside it would.
+/// `app.html` carries inline scripts that have to run before the application's modules do
+/// -- the theme pin, which has to be before first paint or every load flashes the wrong
+/// theme, and the `crypto.randomUUID` fallback this UI needs because it is served over
+/// plain HTTP -- so `'self'` alone would block them. Naming their SHA-256 keeps
+/// `unsafe-inline` out. Every inline script in the document is hashed, however many there
+/// are, and the digests are taken from the **embedded document that is actually served**,
+/// so they cannot drift from the bundle the way a constant checked in beside it would.
 fn document_csp(assets: &Assets) -> &'static str {
     static CSP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     CSP.get_or_init(|| {
@@ -205,7 +207,7 @@ fn document_csp(assets: &Assets) -> &'static str {
         // and a style *attribute* cannot be hashed without `'unsafe-hashes'` plus a hash
         // per distinct value -- not something a dynamic UI can enumerate. Inline style
         // is also a far smaller gun than inline script: it executes nothing. The
-        // directive that matters stays `'self'` plus the bundle's own two hashes.
+        // directive that matters stays `'self'` plus the bundle's own hashes.
         //
         // Checked in a browser by `tests/e2e/99-csp`, not by reading: the first version
         // of this policy had no `style-src` and silently blocked every inline style.
