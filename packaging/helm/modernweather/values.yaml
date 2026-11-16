@@ -1,0 +1,195 @@
+# Defaults for the modernweather chart.
+#
+# What is a value and what is not
+# -------------------------------
+# A value is something that differs between installs: the image, where the data lives,
+# which node, which hostname, which addresses to bind. The STATION and WEBSITE
+# configuration is deliberately NOT here. It lives in the daemon's own SQLite
+# configuration database, written through the management UI, and that is not an oversight
+# -- see README.md "Configuration is not chart values".
+
+# -- Image ------------------------------------------------------------------------------
+
+image:
+  repository: ghcr.io/chrissnell/modernweather
+  # Empty means `.Chart.AppVersion`. Prefer an immutable tag: the release workflow
+  # publishes `sha-<short>` for every build, and `0.0.0-dev` is overwritten by the next
+  # rehearsal.
+  tag: ""
+  # `sha256:...`. Wins over `tag` when both are set, which is what pinning means.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# -- The daemon -------------------------------------------------------------------------
+
+# `--config <path>`. The daemon creates this file if it is absent and applies its
+# migrations on every start, so nothing has to seed it.
+configPath: /var/lib/modernweather/config.db
+
+# `--setup-listen <addr>`: where the management API binds WHILE THIS DAEMON HAS NO
+# ADMINISTRATOR ACCOUNT. The default bind is 127.0.0.1, which in a container means
+# nothing outside the pod can reach it -- and the first-run claim has to come from
+# outside the pod, because there is no shell in the image to run `kubectl port-forward`
+# against a loopback-only socket from within.
+#
+# This widens the unclaimed-instance window deliberately, and the daemon logs a WARN
+# naming the risk. It is IGNORED once an account exists, from which point
+# `listener.management_listen_addr` in the configuration database is the answer -- so set
+# that to 0.0.0.0 in the management UI if the UI is to stay reachable after claiming.
+#
+# Empty disables the flag. `0.0.0.0` is the value for a Kubernetes install.
+setupListen: ""
+
+# `--log-level`, in RUST_LOG syntax. Adjustable at run time through the management API;
+# this is only the value the process starts with.
+logLevel: info
+
+# `--log-format`: pretty | json. JSON is the container default anyway (no terminal), and
+# stating it means a `kubectl logs` pipeline cannot be surprised by a tty.
+logFormat: json
+
+# Appended to the command line verbatim, after everything above.
+extraArgs: []
+
+# Extra environment for the daemon container, in the Kubernetes `env` shape.
+extraEnv: []
+
+# -- Ports ------------------------------------------------------------------------------
+
+# The ports the daemon binds inside the pod. These must match the `listener` row in the
+# configuration database, whose own defaults are 8080 / 8081 / 50051 -- the chart cannot
+# write that row, so changing a port here means changing it in the management UI too.
+containerPorts:
+  http: 8080
+  management: 8081
+  grpc: 50051
+
+service:
+  # ClusterIP, or LoadBalancer for a MetalLB address of its own.
+  type: ClusterIP
+  annotations: {}
+  # Only read when `type: LoadBalancer`.
+  loadBalancerIP: ""
+  loadBalancerClass: ""
+  externalTrafficPolicy: ""
+  ports:
+    http: 80
+    management: 8081
+    grpc: 50051
+  # The gRPC listener carries the collector uplink and peer enrolment. Off by default
+  # because a single-node install has no peer to talk to, and a Service port in front of
+  # an unbound socket is a connection that hangs rather than one that is refused.
+  grpc:
+    enabled: false
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  path: /
+  pathType: Prefix
+  # The public site, not the management API. The management API behind an ingress is a
+  # separate decision and a separate host; `ingress.managementHost` is not provided
+  # because W5 §3.4's threat model is a LAN-reachable admin surface, not an internet one.
+  tls: []
+
+# -- The daemon's own state -------------------------------------------------------------
+
+# `config.db` and the reading spool. Small (a few hundred kB of configuration plus
+# whatever the spool holds while the database is unreachable) and irreplaceable:
+# docs/reconciliation.md §7.5 lists it as a thing a human cannot re-derive.
+persistence:
+  enabled: true
+  # Reuse a claim that already exists instead of creating one. The point of this is
+  # adopting an install that was made by hand.
+  existingClaim: ""
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 5Gi
+  annotations: {}
+
+# -- Pod ---------------------------------------------------------------------------------
+
+# Recreate, not RollingUpdate, and this is load-bearing rather than conservative: the
+# configuration database is SQLite on a ReadWriteOnce volume, so two daemons cannot hold
+# it at once and a surge would deadlock on the volume attach.
+updateStrategy: Recreate
+
+podAnnotations: {}
+podLabels: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # The daemon talks to no Kubernetes API.
+  automountServiceAccountToken: false
+
+# `restricted` Pod Security Standards: non-root, no privilege escalation, no
+# capabilities, RuntimeDefault seccomp. 65532 is the uid baked into the image's
+# /etc/passwd, chosen in packaging/docker/Dockerfile so an existing bind-mounted data
+# directory keeps working.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+
+# `/metrics` on the HTTP listener, which is served whether or not a weather database is
+# configured -- so these answer on a fresh install, before anything has been set up.
+startupProbe:
+  httpGet:
+    path: /metrics
+    port: http
+  periodSeconds: 5
+  failureThreshold: 24
+readinessProbe:
+  httpGet:
+    path: /metrics
+    port: http
+  periodSeconds: 10
+  failureThreshold: 3
+livenessProbe:
+  httpGet:
+    path: /metrics
+    port: http
+  periodSeconds: 20
+  failureThreshold: 3
+
+terminationGracePeriodSeconds: 30
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+# -- The database -----------------------------------------------------------------------
+
+# Everything under here belongs to charts/timescaledb. `enabled: false` points the daemon
+# at a database somewhere else; the URL is still configured through the management UI,
+# because the chart cannot write the daemon's configuration database.
+timescaledb:
+  enabled: true

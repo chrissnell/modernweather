@@ -1,0 +1,18 @@
+.DS_Store
+.git/
+.gitignore
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+# A site values file, if anybody leaves a copy in here: it names a node, a host path and
+# a hostname, and this repository is public. README.md says to keep it in
+# `kube-cluster-helm-values` instead. `values-example.yaml`, which names nothing real, is
+# deliberately outside this pattern so that it ships with the chart.
+#
+# There is no `!`-negated exemption anywhere in this file, because Helm's .helmignore is
+# NOT gitignore: `pkg/ignore` has no negation, and a line beginning with `!` breaks the
+# rest of the file silently -- `helm show chart` then reports "Chart.yaml file is
+# missing", which is a confusing way to be told about a typo in an ignore rule.
+values-site*.yaml

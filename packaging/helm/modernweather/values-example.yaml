@@ -1,0 +1,43 @@
+# A complete, renderable install — every value the chart refuses to guess, with nothing
+# real in it. `helm template -f values-example.yaml` is what CI and a reviewer run.
+#
+# THIS IS NOT THE SITE VALUES FILE. The real one names a machine, a host path on that
+# machine and a public hostname, and it belongs in `kube-cluster-helm-values`; this
+# repository is public, which is the same reason `/deploy/` is in its .gitignore. Copy
+# this, fill it in, keep it there.
+
+image:
+  # Prefer the immutable tag over `latest` or a `0.0.0-dev` that the next rehearsal
+  # overwrites. The release workflow publishes `sha-<short>` for every build.
+  tag: sha-0000000
+
+# Required for a Kubernetes first run: the management API binds 127.0.0.1 until an
+# administrator account exists, and the image has no shell to reach loopback from.
+setupListen: "0.0.0.0"
+
+service:
+  type: LoadBalancer
+  loadBalancerIP: "192.0.2.10"
+
+ingress:
+  enabled: true
+  className: cloudflare-tunnel
+  host: weather.example.com
+
+persistence:
+  storageClass: example-nfs-csi
+  size: 5Gi
+
+timescaledb:
+  enabled: true
+  auth:
+    # `kubectl create secret generic modernweather-db-superuser \
+    #    --from-literal=password="$(openssl rand -base64 32)"`
+    existingSecret: modernweather-db-superuser
+  persistence:
+    size: 350Gi
+    local:
+      # The machine the database can run on, and the directory on it. On Talos the data
+      # disk is a user volume under /var/mnt.
+      node: example-node
+      path: /var/mnt/modernweather-db

@@ -1,0 +1,18 @@
+{{- /* Renders nothing. `fail` aborts the render, so the message is the output. */ -}}
+
+{{- if not .Values.auth.existingSecret -}}
+{{- fail (printf "timescaledb.auth.existingSecret is required. The chart does not generate the superuser password: a generated one would rotate on every `helm upgrade`, and this database holds a decade of observations. Create it once:\n\n  kubectl create secret generic %s-superuser -n <namespace> --from-literal=password=\"$(openssl rand -base64 32)\"\n\nthen set timescaledb.auth.existingSecret to that name." (include "timescaledb.fullname" .)) -}}
+{{- end -}}
+
+{{- if .Values.persistence.local.enabled -}}
+{{- if not .Values.persistence.local.node -}}
+{{- fail "timescaledb.persistence.local.node is required when local.enabled: a `local` PersistentVolume is pinned to one machine by nodeAffinity, and a volume with no node is a pod that stays Pending with no explanation. Set it to false and give persistence.storageClass a dynamic provisioner to opt out -- but read charts/timescaledb/Chart.yaml first, because the local volume is a measured decision." -}}
+{{- end -}}
+{{- if and .Values.persistence.local.createPersistentVolume (not .Values.persistence.local.path) -}}
+{{- fail "timescaledb.persistence.local.path is required when local.createPersistentVolume: it is the directory on the node that holds the database. A Talos user volume is mounted under /var/mnt." -}}
+{{- end -}}
+{{- end -}}
+
+{{- if and (not .Values.persistence.local.enabled) (not .Values.persistence.storageClass) -}}
+{{- fail "local.enabled is false and persistence.storageClass is empty, so the claim would fall to the cluster's default StorageClass. Name it: this volume is the single point of failure for the whole deployment and should not be chosen by whatever happens to be default." -}}
+{{- end -}}

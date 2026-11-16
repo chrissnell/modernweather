@@ -1,0 +1,53 @@
+{{- /*
+The headless Service the StatefulSet names, which gives the pod its stable DNS name.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "timescaledb.fullname" . }}
+  labels:
+    {{- include "timescaledb.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    {{- include "timescaledb.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: postgresql
+      port: {{ .Values.service.port }}
+      targetPort: postgresql
+      protocol: TCP
+{{- if .Values.service.readWriteAlias }}
+---
+{{- /*
+`<fullname>-rw`: the name the daemon's weather-database URL actually dials.
+
+Not the headless Service above, and the difference matters: a headless Service answers
+with pod IPs, which change on every reschedule, and sqlx's pool resolves the host once.
+The `-rw` suffix is for the deployment this might become rather than the one it is -- if a
+read replica is ever added, the URL already says which endpoint it wants.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ printf "%s-rw" (include "timescaledb.fullname" .) }}
+  labels:
+    {{- include "timescaledb.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "timescaledb.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: postgresql
+      port: {{ .Values.service.port }}
+      targetPort: postgresql
+      protocol: TCP
+{{- end }}

@@ -1,0 +1,28 @@
+{{- /*
+`config.db` and the spool. Kept on uninstall: docs/reconciliation.md §7.5 lists config.db
+among the things a human cannot re-derive -- station calibration, certificates, website
+configuration -- and a `helm uninstall` that deleted it would be a worse outcome than any
+it was run to fix. Delete the claim by hand when that is what is meant.
+*/ -}}
+{{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "modernweather.fullname" . }}
+  labels:
+    {{- include "modernweather.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+    {{- with .Values.persistence.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size | quote }}
+  {{- if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  {{- end }}
+{{- end }}

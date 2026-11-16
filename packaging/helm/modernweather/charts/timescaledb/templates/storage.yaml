@@ -1,0 +1,65 @@
+{{- /*
+The two cluster-scoped objects a `local` volume needs.
+
+CLUSTER-SCOPED OBJECTS IN A CHART, DELIBERATELY. Both are named after the release and
+neither is shared, so there is nothing for a second install to collide with -- and the
+alternative, documenting two `kubectl apply`s as a prerequisite, is exactly the
+copy-this-by-hand step this chart exists to remove.
+
+BOTH CARRY `helm.sh/resource-policy: keep`. The PersistentVolume is `Retain` and holds the
+only copy of the observations; a `helm uninstall`, or a failed upgrade that Helm rolls
+back, must not be able to take it. The cost of that is that re-creating them later needs
+either an adoption or a delete by hand, which README.md writes out.
+*/ -}}
+{{- if and .Values.persistence.local.enabled .Values.persistence.local.createStorageClass }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.persistence.storageClass | quote }}
+  labels:
+    {{- include "timescaledb.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+# `no-provisioner`: there is nothing to provision. The volume is a directory that already
+# exists on one machine.
+provisioner: kubernetes.io/no-provisioner
+reclaimPolicy: Retain
+# WaitForFirstConsumer, which is not a tuning choice. With Immediate binding the scheduler
+# would place the pod before the volume was bound and could place it on a node the volume
+# cannot follow -- the pod would then be Pending with a message about node affinity rather
+# than about scheduling.
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: false
+{{- end }}
+{{- if and .Values.persistence.local.enabled .Values.persistence.local.createPersistentVolume }}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ include "timescaledb.pvName" . }}
+  labels:
+    {{- include "timescaledb.labels" . | nindent 4 }}
+    node: {{ .Values.persistence.local.node }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  capacity:
+    storage: {{ .Values.persistence.size | quote }}
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  volumeMode: Filesystem
+  local:
+    path: {{ .Values.persistence.local.path | quote }}
+  # The whole reason this is a `local` volume and not a `hostPath` one: the scheduler reads
+  # this and will not place the pod anywhere the data is not.
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - {{ .Values.persistence.local.node }}
+{{- end }}

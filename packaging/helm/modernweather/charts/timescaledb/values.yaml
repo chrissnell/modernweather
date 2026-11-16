@@ -1,0 +1,144 @@
+# The database. Read charts/timescaledb/Chart.yaml first — it says why these are the
+# values they are, and most of them should not be changed without reading
+# docs/reconciliation.md §7.
+enabled: true
+
+# Empty means `<release>-db`, which is what the hand-applied StatefulSet is called. That
+# matters more than it looks: a StatefulSet's volumeClaimTemplate produces
+# `data-<name>-0`, so the name is what decides whether this chart adopts the existing
+# 350 GiB of observations or provisions an empty volume beside them.
+fullnameOverride: ""
+
+image:
+  # NOT the plain `timescale/timescaledb` image: the `-ha` one carries
+  # `timescaledb_toolkit`, which D-2 requires.
+  repository: timescale/timescaledb-ha
+  tag: pg17
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+auth:
+  database: modernweather
+  username: postgres
+  # REQUIRED. The chart does not generate a password, and that is deliberate: a generated
+  # superuser password would rotate on `helm upgrade` unless the chart read back its own
+  # previous Secret, and a database holding a decade of irreplaceable observations is the
+  # wrong place to find out that it did. Create the Secret once, out of band.
+  existingSecret: ""
+  secretKey: password
+  # `scram-sha-256` rather than the image default. `md5` is what an old client expects and
+  # this deployment has exactly one client.
+  hostAuthMethod: scram-sha-256
+  # Checksums cost a few percent of write throughput and are the only thing that detects
+  # a `local` volume going bad underneath a single replica.
+  initdbArgs: --data-checksums
+
+persistence:
+  # Where PGDATA lives inside the mount. The image's entrypoint refuses a PGDATA that is
+  # the mount point itself when the volume has a `lost+found`.
+  mountPath: /var/lib/postgresql
+  pgData: /var/lib/postgresql/pgdata
+  size: 350Gi
+  storageClass: modernweather-db-local
+  accessModes:
+    - ReadWriteOnce
+
+  # The `local` volume, and the two cluster-scoped objects it needs.
+  #
+  # Both are created with `helm.sh/resource-policy: keep`, so neither a failed upgrade nor
+  # an uninstall can take the PersistentVolume -- and therefore the data -- with it. Set
+  # either to false when the objects already exist and are not to be adopted.
+  local:
+    enabled: true
+    createStorageClass: true
+    createPersistentVolume: true
+    # The host path on `node`. A Talos user volume, mounted under /var/mnt.
+    path: ""
+    # REQUIRED when local.enabled. The one machine this volume — and therefore this
+    # database — can run on.
+    node: ""
+    # Empty means `<fullname>-<node>`, matching what was applied by hand.
+    persistentVolumeName: ""
+
+service:
+  port: 5432
+  # A second, non-headless Service called `<fullname>-rw`.
+  #
+  # Its name is the point: the daemon's weather-database URL names a writable endpoint, and
+  # spelling that `-rw` means a later move to a replicated setup changes what the name
+  # resolves to rather than every URL that uses it. A headless Service is the wrong thing
+  # for a connection pool to dial — it answers with pod IPs, which change.
+  readWriteAlias: true
+  annotations: {}
+
+# Sized from the measured workload (docs/reconciliation.md §7.4): the heaviest operation
+# is a single-session aggregate refresh, so single-thread speed matters and core count does
+# not. The memory limit is the node's, less headroom; the request is `shared_buffers` plus
+# the hot uncompressed chunks.
+resources:
+  requests:
+    cpu: "2"
+    memory: 4Gi
+  limits:
+    memory: 24Gi
+
+# No CPU limit, deliberately: a throttled aggregate refresh misses its deadline, and the
+# node is tainted so there is nothing to protect it from.
+
+# The node is tainted so that nothing else lands on it (§7.4). Both halves are needed —
+# the toleration to be allowed on, the selector to be sent there.
+nodeSelector:
+  workload-class: database
+tolerations:
+  - key: workload-class
+    operator: Equal
+    value: database
+    effect: NoSchedule
+affinity: {}
+priorityClassName: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  # NOT true. The image's entrypoint writes postgresql.conf and the socket directory into
+  # paths that are not the data volume; /var/run/postgresql and /tmp are emptyDirs for
+  # that reason, but the entrypoint also touches its own /etc.
+  readOnlyRootFilesystem: false
+
+# Five minutes, because a shutdown that is cut short is a crash: PostgreSQL would come back
+# replaying WAL, and on a hypertable mid-compression that is a long replay.
+terminationGracePeriodSeconds: 300
+
+# `pg_isready` against the real database rather than a TCP check, so a server that is up
+# but still replaying WAL reads as not ready.
+startupProbe:
+  periodSeconds: 5
+  failureThreshold: 60
+readinessProbe:
+  periodSeconds: 10
+  failureThreshold: 3
+livenessProbe:
+  periodSeconds: 30
+  failureThreshold: 6
+
+# Extra environment for the postgres container, in the Kubernetes `env` shape. The
+# server's own tuning (`shared_buffers`, `synchronous_commit`, `max_worker_processes`)
+# goes here as the image's `POSTGRES_INITDB_ARGS`/`PGOPTIONS` or in a mounted
+# postgresql.conf, not as chart values: §7 does not fix those numbers, and inventing
+# defaults for them in a chart would freeze a guess.
+extraEnv: []

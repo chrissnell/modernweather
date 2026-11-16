@@ -1,0 +1,57 @@
+{{ .Chart.Name }} {{ .Chart.Version }} — {{ include "modernweather.image" . }}
+
+Nothing has to be copied into the pod and no SQLite file has to be seeded. The daemon
+creates {{ .Values.configPath }} on its first start and applies its own migrations; the
+database, the stations and the websites are configured through the management UI.
+
+1. The first start issues a one-time setup code to stderr, ONCE. Read it:
+
+     kubectl logs -n {{ .Release.Namespace }} deploy/{{ include "modernweather.fullname" . }} | grep -A4 'not set up yet'
+
+   If it has scrolled away, issue a fresh one — the binary is statically linked, so this
+   works even though the image has no shell:
+
+     kubectl exec -n {{ .Release.Namespace }} deploy/{{ include "modernweather.fullname" . }} -- \
+       modernweather reset-setup-token --config {{ .Values.configPath }}
+
+2. Reach the management API and enter the code.
+{{- if .Values.setupListen }}
+
+   --setup-listen {{ .Values.setupListen }} is set, so it is bound where the Service can
+   reach it:
+{{- if eq .Values.service.type "LoadBalancer" }}
+
+     http://{{ .Values.service.loadBalancerIP | default "<pending>" }}:{{ .Values.service.ports.management }}/
+{{- else }}
+
+     kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "modernweather.fullname" . }} {{ .Values.service.ports.management }}:{{ .Values.service.ports.management }}
+{{- end }}
+
+   THAT FLAG STOPS APPLYING THE MOMENT AN ACCOUNT EXISTS. From then on the bind address
+   is `listener.management_listen_addr` in the configuration database, whose default is
+   127.0.0.1 — so set it to 0.0.0.0 in the management UI during this first session, or the
+   UI becomes unreachable until you set `setupListen` aside and reset the password.
+{{- else }}
+
+   setupListen is empty, so the management API is bound to 127.0.0.1 INSIDE THE POD. The
+   image has no shell, so `kubectl port-forward` reaches the Service, not loopback, and
+   there is nothing to connect from. Set `setupListen: 0.0.0.0` for the first install.
+{{- end }}
+
+3. In the UI, set the weather database URL. {{ if .Values.timescaledb.enabled }}This install has its own:
+
+     postgresql://{{ .Values.timescaledb.auth.username | default "postgres" }}:<password>@{{ include "modernweather.dbFullname" . }}-rw.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.timescaledb.service.port }}/{{ .Values.timescaledb.auth.database | default "modernweather" }}
+
+   The password is the one in the secret you named as timescaledb.auth.existingSecret:
+
+     kubectl get secret -n {{ .Release.Namespace }} {{ .Values.timescaledb.auth.existingSecret }} -o jsonpath='{.data.{{ .Values.timescaledb.auth.secretKey | default "password" }}}' | base64 -d
+
+   Percent-encode it if it contains any of : / ? # [ ] @ % + = & or a space — it goes
+   into a URL, and the `weather_database` row stores one URL rather than seven columns.
+{{- else }}The chart's own database is disabled, so point it at the existing one.
+{{- end }}
+{{ if not .Values.persistence.enabled }}
+persistence.enabled is FALSE. {{ .Values.configPath }} is on an emptyDir, so the next
+restart loses the administrator account, the stations and the unsent spool. This is a
+render-only setting.
+{{ end }}

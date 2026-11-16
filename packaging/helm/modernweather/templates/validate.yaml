@@ -1,0 +1,32 @@
+{{- /*
+Checks that are cheaper to fail at render time than to diagnose in a pod.
+
+This file renders nothing. `fail` aborts the whole render, so the message is the output.
+*/ -}}
+
+{{- $p := .Values.containerPorts -}}
+{{- $ports := list $p.http $p.management -}}
+{{- if .Values.service.grpc.enabled -}}
+{{- $ports = append $ports $p.grpc -}}
+{{- end -}}
+{{- if ne (len $ports) (len (uniq $ports)) -}}
+{{- /*
+The `listener` table CHECKs the same thing, so a collision here would be rejected by the
+configuration database too -- but only after the image has been pulled and the pod has
+started, and the message would name a column rather than a value.
+*/ -}}
+{{- fail (printf "containerPorts collide: http=%v management=%v grpc=%v. The daemon's `listener` row CHECKs that these three differ." $p.http $p.management $p.grpc) -}}
+{{- end -}}
+
+{{- if and .Values.setupListen (not (regexMatch "^[0-9a-fA-F:.]+$" (toString .Values.setupListen))) -}}
+{{- /*
+`--setup-listen` takes an IP ADDRESS, not a host:port and not a hostname -- the daemon
+parses it as `std::net::IpAddr` and refuses to start otherwise. `0.0.0.0` is the value
+for a Kubernetes install.
+*/ -}}
+{{- fail (printf "setupListen must be a bare IP address, not %q. The daemon parses it as an address and takes its port from `listener.management_port`." .Values.setupListen) -}}
+{{- end -}}
+
+{{- if and .Values.ingress.enabled (eq .Values.service.type "ClusterIP") (not .Values.ingress.className) -}}
+{{- fail "ingress.enabled is true with no ingress.className: the default IngressClass is a cluster-wide setting this chart cannot see, so name the class explicitly" -}}
+{{- end -}}

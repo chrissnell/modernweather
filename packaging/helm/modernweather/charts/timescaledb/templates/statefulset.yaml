@@ -1,0 +1,131 @@
+{{- /*
+One replica, and `replicas` is not a value.
+
+docs/reconciliation.md §7.4: "Not a second replica. A single replica on a `local` volume
+CANNOT RESCHEDULE -- if the node is down the pod is Pending, because that is what `local`
+volumes mean. The owner has accepted that explicitly, and §7.5 is the condition that makes
+it safe." A second replica here would not be high availability; it would be a second
+PersistentVolume on a node that does not exist, and a pod Pending forever.
+*/ -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "timescaledb.fullname" . }}
+  labels:
+    {{- include "timescaledb.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  serviceName: {{ include "timescaledb.fullname" . }}
+  {{- /*
+  Retain on both, because the volume IS the database. `whenDeleted: Retain` is what makes
+  `helm uninstall` survivable and `whenScaled: Retain` is what makes a mistaken
+  `kubectl scale --replicas=0` survivable.
+  */}}
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      {{- include "timescaledb.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "timescaledb.podLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: db
+          image: {{ printf "%s:%s" .Values.image.repository .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: PGDATA
+              value: {{ .Values.persistence.pgData | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.auth.database | quote }}
+            - name: POSTGRES_HOST_AUTH_METHOD
+              value: {{ .Values.auth.hostAuthMethod | quote }}
+            - name: POSTGRES_INITDB_ARGS
+              value: {{ .Values.auth.initdbArgs | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret | quote }}
+                  key: {{ .Values.auth.secretKey | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: postgresql
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          startupProbe:
+            {{- include "timescaledb.isready" . | nindent 12 }}
+            {{- toYaml .Values.startupProbe | nindent 12 }}
+          readinessProbe:
+            {{- include "timescaledb.isready" . | nindent 12 }}
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          livenessProbe:
+            {{- include "timescaledb.isready" . | nindent 12 }}
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            {{- /*
+            The unix socket directory and the temp space. Both are outside PGDATA and both
+            are written on every start, so they are emptyDirs rather than part of the
+            volume that gets backed up.
+            */}}
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        volumeMode: Filesystem

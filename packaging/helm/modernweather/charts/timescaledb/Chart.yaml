@@ -1,0 +1,38 @@
+# Why this is a vendored subchart and not a dependency on somebody else's chart.
+#
+# The owner's instinct -- "I assume we deploy that with helm subchart?" -- is right, and
+# the question that follows is whose subchart. The answer is this one, because the
+# deployment the chart has to reproduce is a set of deliberate, measured choices that a
+# general-purpose PostgreSQL chart is built to abstract away:
+#
+#   - A SINGLE REPLICA on a `local` PersistentVolume with `nodeAffinity` to one machine.
+#     Chosen because the workload is fsync-latency bound: ~47% of a durable aggregate
+#     refresh is WAL fsync, and the 1-minute refresh has 6.8 s of slack against its
+#     deadline (docs/reconciliation.md §7.4). A chart that swapped that for a dynamically
+#     provisioned PVC would undo a measured decision and look like it had changed nothing.
+#     It also CANNOT RESCHEDULE -- if the node is down the pod is Pending -- which the
+#     owner accepted explicitly, on the condition of off-site backups (§7.5).
+#   - `timescale/timescaledb-ha:pg17`, not a plain PostgreSQL image. The plain one lacks
+#     `timescaledb_toolkit`, which D-2 requires, and this is also the image family CI uses
+#     (W8 D-17).
+#   - CloudNativePG was considered and DECLINED in §7.4: TimescaleDB needs a custom image
+#     and CNPG's HA story wants >= 2 replicas on replicated storage, which fights the
+#     single-local-volume decision rather than serving it.
+#
+# Bitnami's `postgresql` chart can be bent into most of this -- `primary.persistence.
+# existingClaim`, an image override, a node selector -- but the image override is the part
+# that matters and overriding it drops its init scripts, its `pg_hba` templating and its
+# metrics exporter into a configuration nobody upstream tests. The shape here is 180 lines
+# of templates that say exactly what runs. The reason to depend on an upstream chart is to
+# inherit decisions; there are no decisions here to inherit.
+#
+# WHAT THIS CHART DOES NOT OWN: the backup CronJob and its `ExternalSecret`. Those live in
+# `kube-cluster-helm-values` under `apps/modernweather-db/backup/` and carry R2
+# credentials; docs/backup-and-restore.md §4 is the reference. They are deliberately not
+# moved here, because a public chart is the wrong place for the shape of a credential.
+apiVersion: v2
+name: timescaledb
+description: The single-replica TimescaleDB that holds the observations
+type: application
+version: 0.1.0
+appVersion: "pg17"
