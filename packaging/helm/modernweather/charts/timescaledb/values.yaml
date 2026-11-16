@@ -238,7 +238,21 @@ backup:
     # whether TODAY's restore path can read the archive you have; a pinned script freezes
     # that question. cronjob-restore-rehearsal.yaml has the full argument.
     sourceRepo: chrissnell/modernweather
+    # A branch name, a tag or a commit sha -- it is passed to codeload verbatim.
     sourceRef: main
+    # Which raw years to restore. `current` is the current calendar year; `all` restores
+    # every year in the archive; anything else is passed through as a space-separated list
+    # of years.
+    #
+    # NOT `all` by default, and this is a safety bound rather than a speed one. The
+    # rehearsal restores into a second database on the SAME server, which here means the
+    # same single `local` volume production is on -- and a restore is uncompressed, ~19 GB
+    # a year against ~3.6 GB in the archive (§7.5). A decade of it can exhaust the volume
+    # underneath a database that cannot reschedule (§7.4), and ENOSPC there is a worse
+    # outcome than never rehearsing. One year still exercises every part of the restore
+    # path except whether the older objects are readable; that is worth a run by hand, with
+    # somewhere to put it.
+    years: current
     activeDeadlineSeconds: 7200
     # BOUNDED, unlike the backup's. The rehearsal downloads the archive and restores it,
     # so /tmp is real data -- and this emptyDir is on the node's root filesystem, which on

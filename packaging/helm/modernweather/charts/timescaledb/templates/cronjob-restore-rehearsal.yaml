@@ -60,6 +60,19 @@ spec:
                   export PATH="/shared:$PATH"
                   export MW_BACKUP_REMOTE="{{ .Values.backup.remoteName }}:${MW_BACKUP_BUCKET}/{{ .Values.backup.prefix }}"
                   export MW_REHEARSAL_DB_DST={{ .Values.backup.rehearsal.database | quote }}
+                  {{- if eq (toString .Values.backup.rehearsal.years) "current" }}
+                  # The current calendar year only. An unbounded restore puts every year
+                  # of raw, UNCOMPRESSED, into a second database on THIS server -- which is
+                  # the same single `local` volume production is on. ~19 GB a year raw
+                  # against ~3.6 GB compressed (§7.5), so a decade can exhaust the volume
+                  # underneath a database that cannot reschedule (§7.4). ENOSPC there is a
+                  # worse outcome than never rehearsing. One year still exercises the
+                  # manifest, the layout version, the per-year objects, the column lists,
+                  # the config.db bytes and the phase-1 rebuild.
+                  export MW_REHEARSAL_YEARS="$(date -u +%Y)"
+                  {{- else if ne (toString .Values.backup.rehearsal.years) "all" }}
+                  export MW_REHEARSAL_YEARS={{ .Values.backup.rehearsal.years | quote }}
+                  {{- end }}
                   # PGPASSWORD rather than a password in the URL; cronjob-backup.yaml has
                   # the whole reason. Connects to `postgres`, not to the weather database,
                   # because the script creates and drops its own target.
@@ -67,16 +80,23 @@ spec:
 
                   cd /tmp
                   curl -fsSL -o src.tar.gz \
-                    "https://codeload.github.com/{{ .Values.backup.rehearsal.sourceRepo }}/tar.gz/refs/heads/{{ .Values.backup.rehearsal.sourceRef }}"
+                    "https://codeload.github.com/{{ .Values.backup.rehearsal.sourceRepo }}/tar.gz/{{ .Values.backup.rehearsal.sourceRef }}"
+                  # The directory name is NOT derived here, and that is the fix for two
+                  # bugs at once. codeload rewrites `/` to `-` in the ref, so a
+                  # `release/1.0` branch unpacks as `modernweather-release-1.0` and a
+                  # hand-built `<repo>-<ref>` missed it -- failing with a bare `No such
+                  # file or directory` before the NO VERDICT guard below, which exists to
+                  # prevent exactly that message. Asking tar what it wrote cannot drift.
+                  src="$(tar tzf src.tar.gz | head -1 | cut -d/ -f1)"
                   tar xzf src.tar.gz
-                  cd "{{ (splitList "/" .Values.backup.rehearsal.sourceRepo) | last }}-{{ .Values.backup.rehearsal.sourceRef }}"
+                  cd "$src"
 
                   # Exit 2 is the script's own code for "reached no verdict", and a
                   # checkout that does not carry the rehearsal is exactly that rather
                   # than a failed restore. Without this, bash reports `No such file or
                   # directory` about a path nobody can place in context.
                   if [ ! -x ci/db/restore-rehearsal.sh ]; then
-                    echo "NO VERDICT: {{ .Values.backup.rehearsal.sourceRef }} does not carry" >&2
+                    echo "NO VERDICT: $src does not carry" >&2
                     echo "  ci/db/restore-rehearsal.sh, so there is nothing to rehearse" >&2
                     echo "  with. Nothing was restored." >&2
                     exit 2
@@ -106,9 +126,16 @@ spec:
             - name: shared
               emptyDir: {}
             - name: tmp
+              {{- /*
+              `emptyDir: {}` when there is no limit, not a bare `emptyDir:`. An omitted
+              mapping is a NULL VolumeSource: the API server defaults it and accepts the
+              object, but kubeconform, admission policies and a GitOps dry-run all see a
+              volume with no type.
+              */}}
               emptyDir:
                 {{- with .Values.backup.rehearsal.tmpSizeLimit }}
                 sizeLimit: {{ . | quote }}
+                {{- else }} {}
                 {{- end }}
           {{- with .Values.backup.nodeSelector }}
           nodeSelector:

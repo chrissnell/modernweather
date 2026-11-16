@@ -13,8 +13,30 @@
 {{- end -}}
 {{- end -}}
 
-{{- if and (not .Values.persistence.local.enabled) (not .Values.persistence.storageClass) -}}
+{{- /*
+`persistence.storageClass` is required on BOTH branches, and the earlier version of this
+guard only covered one. With `local.enabled: true` and the class empty, storage.yaml
+rendered a StorageClass called `''` -- which the API server rejects -- and a
+volumeClaimTemplate with no `storageClassName` at all, so the 350Gi claim fell to the
+cluster default. That is the exact outcome this check exists to prevent, in the branch it
+did not cover.
+*/ -}}
+{{- if not .Values.persistence.storageClass -}}
+{{- if .Values.persistence.local.enabled -}}
+{{- fail "timescaledb.persistence.storageClass is empty while local.enabled is true. It names the StorageClass this chart creates and the volumeClaimTemplate binds through; empty renders a StorageClass with no name and a claim that falls to the cluster default." -}}
+{{- else -}}
 {{- fail "local.enabled is false and persistence.storageClass is empty, so the claim would fall to the cluster's default StorageClass. Name it: this volume is the single point of failure for the whole deployment and should not be chosen by whatever happens to be default." -}}
+{{- end -}}
+{{- end -}}
+
+{{- if and .Values.backup.enabled (not .Values.service.readWriteAlias) -}}
+{{- /*
+`backup.enabled` with `readWriteAlias: false` renders clean and then fails at 04:00 on a
+Sunday: both jobs dial `<fullname>-rw`, which is the Service that flag deletes. The
+headless Service is not a substitute -- it answers with pod IPs, and a connection pool
+resolves the host once.
+*/ -}}
+{{- fail "timescaledb.service.readWriteAlias is false while backup.enabled is true. Both backup jobs connect through the `-rw` Service that flag removes, so they would start and fail to resolve their host." -}}
 {{- end -}}
 
 {{- if .Values.backup.enabled -}}

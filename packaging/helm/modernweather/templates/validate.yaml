@@ -27,6 +27,12 @@ for a Kubernetes install.
 {{- fail (printf "setupListen must be a bare IP address, not %q. The daemon parses it as an address and takes its port from `listener.management_port`." .Values.setupListen) -}}
 {{- end -}}
 
-{{- if and .Values.ingress.enabled (eq .Values.service.type "ClusterIP") (not .Values.ingress.className) -}}
-{{- fail "ingress.enabled is true with no ingress.className: the default IngressClass is a cluster-wide setting this chart cannot see, so name the class explicitly" -}}
+{{- if and .Values.ingress.enabled (not .Values.ingress.className) -}}
+{{- /*
+NOT conditioned on `service.type`. An earlier version of this guard was, which made it
+useless: IngressClass resolution has nothing to do with how the backend Service is exposed,
+and `values-example.yaml` recommends `type: LoadBalancer` -- so the one configuration the
+chart documents was the one the guard skipped.
+*/ -}}
+{{- fail "ingress.enabled is true with no ingress.className: the default IngressClass is a cluster-wide setting this chart cannot see, so an Ingress with no class silently takes whatever it happens to be. Name the class." -}}
 {{- end -}}

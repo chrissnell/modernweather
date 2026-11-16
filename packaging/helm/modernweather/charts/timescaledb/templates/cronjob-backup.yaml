@@ -111,9 +111,16 @@ spec:
             - name: shared
               emptyDir: {}
             - name: tmp
+              {{- /*
+              `emptyDir: {}` when there is no limit, not a bare `emptyDir:`. An omitted
+              mapping is a NULL VolumeSource: the API server defaults it and accepts the
+              object, but kubeconform, admission policies and a GitOps dry-run all see a
+              volume with no type.
+              */}}
               emptyDir:
                 {{- with .Values.backup.tmpSizeLimit }}
                 sizeLimit: {{ . | quote }}
+                {{- else }} {}
                 {{- end }}
             - name: backup-scripts
               configMap:
