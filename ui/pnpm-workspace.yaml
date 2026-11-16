@@ -1,0 +1,9 @@
+# pnpm 10+ reads project settings from here rather than from package.json.
+#
+# esbuild is Vite's bundler. Its install script puts the platform binary where the
+# `esbuild` CLI expects it; the JS API Vite uses resolves `@esbuild/<platform>` directly,
+# so the build works either way -- but an unanswered prompt makes `pnpm install` exit
+# non-zero, which fails the `ui` CI job before anything has been checked. Answered
+# explicitly so the install is reproducible rather than interactive.
+allowBuilds:
+  esbuild: true

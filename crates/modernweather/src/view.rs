@@ -346,7 +346,11 @@ pub async fn into_store_change(
         ApiChange::PutForecasts { forecasts } => mw_store::Change::PutAeris(mw_store::AerisWrite {
             enabled: forecasts.enabled,
             client_id: blank_to_none(&forecasts.client_id),
-            client_secret: forecasts.client_secret.clone(),
+            // `.filter`, like `api_key`, `aprs_passcode` and `protocol_secret`: for a
+            // credential `None` means "keep" and `Some("")` would mean "store an empty
+            // secret", and `config_admin`'s `.or(kept)` reads the latter as a write. An
+            // API client sending `"client_secret": ""` destroyed a working account.
+            client_secret: forecasts.client_secret.clone().filter(|v| !v.is_empty()),
             api_endpoint: blank_to_none(&forecasts.api_endpoint),
             refresh_interval_seconds: forecasts.refresh_interval_seconds,
             stations: forecasts.stations.clone(),

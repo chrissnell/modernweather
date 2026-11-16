@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use mw_api_mgmt::error::ApiError;
 use mw_api_mgmt::host::{
-    LogEntry, LogField, LogSource, LogsView, Machine, SerialPort, SerialPortsView, Stream,
+    LogEntry, LogField, LogSink, LogSource, LogsView, Machine, SerialPort, SerialPortsView, Stream,
     SystemInfoView,
 };
 use mw_component::BoxFuture;
@@ -24,6 +24,45 @@ impl Rings {
     /// Over the rings `mw_obs::install` returned.
     pub fn new(rings: Arc<mw_obs::LogRings>) -> Self {
         Self(rings)
+    }
+}
+
+/// Converts one `mw-obs` record into the API's entry.
+///
+/// One function rather than two copies, because the backfill and the live tap must produce
+/// the **same** shape: a client that gets a differently-rendered record after the
+/// `caught_up` marker than before it has a seam in the middle of its log view.
+fn entry(r: &mw_obs::Record) -> LogEntry {
+    LogEntry {
+        ts: r.ts,
+        level: r.level.to_string(),
+        stream: r.stream.as_str().to_string(),
+        target: r.target.to_string(),
+        spans: r.spans.iter().map(|s| (*s).to_string()).collect(),
+        message: r.message.clone(),
+        causes: r.causes.clone(),
+        fields: r
+            .fields
+            .iter()
+            .map(|(name, value)| LogField {
+                name: (*name).to_string(),
+                value: value.to_string(),
+            })
+            .collect(),
+    }
+}
+
+/// Adapts `mw-obs`'s tap to the management API's sink.
+///
+/// Two traits rather than one because neither crate may name the other's: `mw-obs` is
+/// `pure` and keeps no runtime, and `mw-api-mgmt` may not depend on `mw-obs` -- M7-1 makes
+/// it the API over `ConfigAdmin` and `ComponentControl` only. The binary is where both may
+/// be named, which is this file's whole job.
+struct Adapter(Arc<dyn LogSink>);
+
+impl mw_obs::LogTap for Adapter {
+    fn record(&self, record: &Arc<mw_obs::Record>) {
+        self.0.entry(entry(record));
     }
 }
 
@@ -58,28 +97,15 @@ impl LogSource for Rings {
         // the tail, and reversing here would make the client reverse it back.
         let start = records.len().saturating_sub(limit);
         LogsView {
-            entries: records[start..]
-                .iter()
-                .map(|r| LogEntry {
-                    ts: r.ts,
-                    level: r.level.to_string(),
-                    stream: r.stream.as_str().to_string(),
-                    target: r.target.to_string(),
-                    spans: r.spans.iter().map(|s| (*s).to_string()).collect(),
-                    message: r.message.clone(),
-                    causes: r.causes.clone(),
-                    fields: r
-                        .fields
-                        .iter()
-                        .map(|(name, value)| LogField {
-                            name: (*name).to_string(),
-                            value: value.to_string(),
-                        })
-                        .collect(),
-                })
-                .collect(),
+            entries: records[start..].iter().map(|r| entry(r)).collect(),
             dropped,
         }
+    }
+
+    /// Register the SSE endpoint's live subscriber (§5.7's follow-on half).
+    fn tap(&self, sink: Arc<dyn LogSink>) {
+        self.0
+            .tap(Arc::new(Adapter(sink)) as Arc<dyn mw_obs::LogTap>);
     }
 }
 

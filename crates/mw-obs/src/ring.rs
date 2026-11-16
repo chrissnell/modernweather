@@ -13,12 +13,17 @@
 //! and constant**, which is affordable on the 512 MB target and is stated here so nobody
 //! has to guess.
 //!
-//! **What is not here: the live subscription.** §5.7's `subscribe()` merges both rings in
-//! timestamp order and then follows with live records, and a broadcast channel needs
-//! `tokio`, which `ci/layers.toml` forbids this crate -- the same boundary that keeps a
-//! codec golden-testable. So this file owns the buffer and the structure, and the SSE
-//! route that follows it belongs with the management API that serves it
-//! (implementation-plan.md M7-1). The backfill half is [`LogRings::merged`] and is here.
+//! **The live half is a tap, not a channel.** §5.7's `subscribe()` merges both rings in
+//! timestamp order and then follows with live records. The backfill half is
+//! [`LogRings::merged`]; the follow-on half is [`LogRings::tap`], which is a registered
+//! callback rather than a `tokio::sync::broadcast` **so that this crate keeps no runtime
+//! dependency at all** -- the same boundary that keeps a codec golden-testable, held here
+//! by choice rather than by the manifest.
+//!
+//! The channel, the per-connection fan-out and the SSE framing belong with the management
+//! API that serves them (implementation-plan.md M7-3): it registers one tap and owns
+//! everything downstream of it. What this crate owes that consumer is every record, once,
+//! on the thread that emitted it -- which is what a tap is.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,7 +68,11 @@ impl Ring {
     }
 
     /// Append, evicting the oldest record if the ring is full.
-    pub fn push(&self, record: Record) {
+    ///
+    /// Returns the shared record, because [`RingLayer`] hands the same `Arc` to
+    /// [`LogRings::tap`]'s subscribers: a live subscriber and the ring must see the
+    /// **same** record, or "backfill then follow" has a seam in it.
+    pub fn push(&self, record: Record) -> Arc<Record> {
         // `Arc` rather than the record itself, because [`Ring::snapshot`] is the UI's
         // backfill and it runs while every event in the process is trying to push: a deep
         // clone of 16,384 records -- thousands of allocations and ~5 MB for the access
@@ -73,7 +82,7 @@ impl Ring {
         let record = Arc::new(record);
         let mut q = self.lock();
         let evicted = q.len() == self.capacity && q.pop_front().is_some();
-        q.push_back(record);
+        q.push_back(Arc::clone(&record));
         // The counter is touched outside the lock: the recorder takes locks of its own,
         // and the ring is on every event's path. Counted and exported rather than logged,
         // because a log line about the log buffer overflowing is one more record in the
@@ -84,6 +93,7 @@ impl Ring {
             metrics::counter!("mw_ring_dropped_total", "stream" => self.stream.as_str())
                 .absolute(dropped);
         }
+        record
     }
 
     /// How many records have been evicted since the process started.
@@ -127,11 +137,35 @@ impl Ring {
     }
 }
 
+/// Something that wants every record as it is emitted (§5.7's follow-on half).
+///
+/// A trait rather than a channel so that the buffer keeps no runtime dependency: the
+/// consumer that needs a `broadcast` -- the SSE endpoint -- owns it, on its own side of the
+/// boundary.
+///
+/// **Called on the emitting thread, inside the logging path.** An implementation must be
+/// non-blocking and must not log: a tap that logs re-enters this layer, and a tap that
+/// blocks stalls whatever was trying to record an event. The management API's tap is a
+/// `broadcast::Sender::send`, which does neither.
+pub trait LogTap: Send + Sync + 'static {
+    /// One record, shared with the ring it was just appended to.
+    fn record(&self, record: &Arc<Record>);
+}
+
 /// The two rings (§5.7).
 #[derive(Debug)]
 pub struct LogRings {
     app: Ring,
     access: Ring,
+    /// Registered live subscribers. Empty in every test and in every process that has no
+    /// management UI connected, which is why the notify path checks before it locks.
+    taps: Mutex<Vec<Arc<dyn LogTap>>>,
+}
+
+impl std::fmt::Debug for dyn LogTap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LogTap")
+    }
 }
 
 impl LogRings {
@@ -151,6 +185,27 @@ impl LogRings {
         LogRings {
             app: Ring::new(Stream::App, app),
             access: Ring::new(Stream::Access, access),
+            taps: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Register a live subscriber. Idempotent only in the sense that two registrations
+    /// receive two copies; the caller registers once.
+    pub fn tap(&self, tap: Arc<dyn LogTap>) {
+        self.taps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(tap);
+    }
+
+    /// Hand one record to every tap. Called by [`RingLayer`] after the append.
+    fn notify(&self, record: &Arc<Record>) {
+        let taps = self
+            .taps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for tap in taps.iter() {
+            tap.record(record);
         }
     }
 
@@ -269,8 +324,10 @@ where
                 return;
             }
         }
-        self.rings
-            .ring(self.stream)
-            .push(Record::from_event(event, &ctx, self.stream));
+        let record =
+            self.rings
+                .ring(self.stream)
+                .push(Record::from_event(event, &ctx, self.stream));
+        self.rings.notify(&record);
     }
 }

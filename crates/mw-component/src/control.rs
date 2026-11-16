@@ -93,6 +93,23 @@ pub trait ComponentControl: Send + Sync + 'static {
 
     /// The runtime log-level handle (**D-52**).
     fn log_control(&self) -> &dyn LogControl;
+
+    /// A receiver that fires whenever the published state table is replaced.
+    ///
+    /// Added by implementation-plan.md **M7-3** so that the management UI can push
+    /// component state instead of polling for it (§5.6: "no page polls"). It is the
+    /// supervisor's own publication signal, which means the UI learns of a state change
+    /// at the moment the supervisor commits it rather than up to a tick later -- and it
+    /// means the process acquires no second clock, which is §3.3's whole argument.
+    ///
+    /// **Defaulted to `None`**, which every test double therefore inherits: an
+    /// implementation that publishes nothing has no change to report. The live stream
+    /// still serves §5.3's full snapshot and still draws the `caught_up` boundary in that
+    /// case; what it does not do is follow. Stated rather than implied, because a stream
+    /// that silently never updates is the kind of thing that passes a test.
+    fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
 }
 
 impl CapabilityHandle for std::sync::Arc<dyn ComponentControl> {

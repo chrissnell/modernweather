@@ -286,9 +286,11 @@ pub fn component(
                 let display = w.provider.as_ref().map(|p| vocab.describe(p));
                 Blocker {
                     provider: w.provider.as_ref().map(|p| p.as_str().to_string()),
-                    provider_display: display.as_ref().map_or_else(
+                    // The sentence form, not the name column's: this is read as
+                    // "waiting for <this>", where "Weather database" does not fit.
+                    provider_display: w.provider.as_ref().map_or_else(
                         || display::capability_as_a_thing(w.capability).to_string(),
-                        Display::one_line,
+                        |p| vocab.thing_in_sentence(p),
                     ),
                     href: display.map(|d| d.href),
                 }

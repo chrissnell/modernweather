@@ -60,6 +60,8 @@ thiserror = "2"
 # the part `ci/layers.toml` enforces.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "fs", "io-util", "sync", "signal", "process"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+# `wrappers::BroadcastStream`, for the management API's SSE endpoint (M7-3).
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 # The serial line rate, which a file descriptor alone cannot set. Amendment **A-M6-1-1**,
 # recorded in docs/reconciliation.md and accepted 2026-11-14 on the owner's delegation:

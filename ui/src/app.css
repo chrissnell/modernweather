@@ -1,0 +1,234 @@
+/* chonky's tokens first, then its component styles, then this application's few rules. */
+@import '@chrissnell/chonky-ui/tokens';
+@import '@chrissnell/chonky-ui/css';
+
+/* W5 §6.3 gap G9: the toolkit names the family and ships no font. Two weights, woff2
+   only, Latin subset -- src/lib/fonts/README.md has the whole argument. Relative urls so
+   Vite hashes them into /assets/ with the rest of the bundle. */
+@font-face {
+  font-family: 'Inconsolata';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url('./lib/fonts/inconsolata-latin-400-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Inconsolata';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 700;
+  src: url('./lib/fonts/inconsolata-latin-700-normal.woff2') format('woff2');
+}
+
+/* The toolkit's scale tops out at 0.9rem for body text and drops to 0.72rem for hints,
+   which is small for a console read at arm's length. These are plain custom properties,
+   so raising them here lifts every chonky component at once rather than forking any of
+   them. The small end moves most: a hint nobody can read is not a hint.
+
+   The colours below are chonky's, carried here until the fix ships. chrissnell/chonky#4
+   makes all of them upstream and adds a check that keeps them that way; delete these
+   three blocks and bump the dependency once it is released. Values are identical to
+   that PR's, so nothing shifts when they come from the package instead.
+
+   chonky's --color-primary is #ffaa00, which is 1.80:1 on --color-surface -- under half
+   of what WCAG asks of body text, and it is the colour every link on every page is
+   painted in. The light theme gets the same hue dark enough to read, with
+   --color-primary-fg flipped to white so the pair still works where primary is a fill.
+   The dark theme keeps #ffaa00, which has ~9.9:1 against #111 and was never the
+   problem. */
+:root {
+  --text-xs: 0.9rem;
+  --text-sm: 1rem;
+  --text-base: 1.0625rem;
+  --text-lg: 1.2rem;
+  --text-xl: 1.5rem;
+  --text-2xl: 1.9rem;
+
+  --color-primary: #8a5500; /* 5.85:1 on the panel; #ffaa00 was 1.80:1 */
+  --color-primary-hover: #6b4200;
+  --color-primary-fg: #fff; /* 6.21:1 on the fill above */
+  --color-primary-muted: rgba(138, 85, 0, 0.1);
+  --color-warning: #8a5500;
+  --color-warning-fg: #fff;
+  --color-warning-muted: rgba(138, 85, 0, 0.12);
+  --color-text-dim: #717171; /* 4.60:1; #999 was 2.68:1, and #767676 only 4.28:1 */
+}
+
+/* Both of chonky's dark selectors, because the block above lands on :root and would
+   otherwise follow the page into the dark theme and paint every link dark brown on
+   near-black. The greys, green and red here were failing on their own account. */
+[data-theme='dark'] {
+  --color-primary: #ffaa00;
+  --color-primary-hover: #ffbb33;
+  --color-primary-fg: #000;
+  --color-primary-muted: rgba(255, 170, 0, 0.12);
+  --color-warning: #ffaa00;
+  --color-warning-fg: #000;
+  --color-warning-muted: rgba(255, 170, 0, 0.15);
+  --color-text-muted: #8a8a8a; /* 5.47:1; #555 was 2.53:1 */
+  --color-text-dim: #808080; /* 4.78:1; #444 was 1.94:1, and #6f6f6f only 3.8:1 */
+  --color-accent: #34a334; /* 5.79:1; #2a8a2a was 4.29:1 */
+  --color-danger: #ef4444; /* 5.02:1; #d60202 was 3.48:1 */
+  --color-danger-hover: #f87171;
+  --color-success: #34a334;
+  /* A fill light enough to read on #111 is too light to carry white text. */
+  --color-danger-fg: #0a0a0a;
+  --color-info-fg: #0a0a0a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --color-primary: #ffaa00;
+    --color-primary-hover: #ffbb33;
+    --color-primary-fg: #000;
+    --color-primary-muted: rgba(255, 170, 0, 0.12);
+    --color-warning: #ffaa00;
+    --color-warning-fg: #000;
+    --color-warning-muted: rgba(255, 170, 0, 0.15);
+    --color-text-muted: #8a8a8a; /* 5.47:1; #555 was 2.53:1 */
+    --color-text-dim: #808080; /* 4.78:1; #444 was 1.94:1, and #6f6f6f only 3.8:1 */
+    --color-accent: #34a334; /* 5.79:1; #2a8a2a was 4.29:1 */
+    --color-danger: #ef4444; /* 5.02:1; #d60202 was 3.48:1 */
+    --color-danger-hover: #f87171;
+    --color-success: #34a334;
+    /* A fill light enough to read on #111 is too light to carry white text. */
+    --color-danger-fg: #0a0a0a;
+    --color-info-fg: #0a0a0a;
+  }
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-size: var(--text-base);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* A Box stacks its children with no gap of its own, so a status badge and the sentence
+   explaining it end up flush against each other. Give every Box a vertical rhythm.
+   Adjacent margins collapse, so anything that already spaces itself is left alone, and
+   inline badges sitting side by side are excluded.
+
+   The second selector carries the `.box` ancestor it does not strictly need: the page
+   components each scope a `.dim { margin: 0 0 0.75rem }` rule of their own, and without
+   the extra class this would tie with them on specificity and lose. */
+.box:not(.box--titled) > * + *:not(.badge),
+.box .box-body > * + *:not(.badge) {
+  margin-block-start: 0.75rem;
+}
+
+/* A page title, its one-line summary and the first panel under them were running
+   together. chonky gives .box a bottom margin and no top one; adding a top margin here
+   separates the header from the first panel, and collapses against the existing bottom
+   margin between two stacked panels rather than doubling it. */
+.box {
+  margin-block-start: 1.5rem;
+}
+
+/* The three rules below are chonky's, carried here until the fix ships.
+   chrissnell/chonky#3 adds all of them upstream; delete this block and bump the
+   dependency once it is released.
+
+   1. td.actions was right-aligned and th.actions was not, so an action column's header
+      and its cells sat at opposite ends of the same column.
+   2. Spacing two buttons in a cell by making it `display: flex` discards that alignment,
+      and then a row with one button and a row with two stop lining up with each other.
+      Providing the gap means the cell can stay inline and keep its alignment.
+   3. A control inside a table cell should not carry the stacked-form bottom margin; in a
+      row it only pushes the control off the baseline of whatever sits beside it. */
+th.actions {
+  text-align: right;
+}
+
+td.actions > * + * {
+  margin-inline-start: 0.4rem;
+}
+
+td :is(input, select, textarea) {
+  margin-bottom: 0;
+}
+
+/* A control and the button that acts on it, on one line and actually aligned: `input`
+   and `select` carry `margin-bottom: 1rem` for stacked forms and `.btn` does not, which
+   leaves the button half a rem high against the control it belongs to. */
+.control-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.control-row > :is(input, select, textarea, .btn, button) {
+  margin-bottom: 0;
+}
+
+.control-row > :is(input, select, textarea) {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Rows need a little more height now that the text in them is larger. */
+th {
+  padding-block: 0.4rem;
+}
+
+td {
+  padding-block: 0.55rem;
+}
+
+/* The toolkit strips the underline from every link, which leaves colour as the only cue
+   that a station name in a table is the way into that station. Put it back for content
+   links; the sidebar and anything styled as a button opt out. */
+a {
+  color: var(--color-primary);
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
+nav a,
+a.btn,
+a[role='button'],
+a[data-no-underline] {
+  text-decoration: none;
+}
+
+/* §7.4: every control is at least a 44px touch target, because checking a station from
+   the garden on a phone is the real case. */
+@media (pointer: coarse) {
+  button,
+  a[role='button'],
+  input,
+  select {
+    min-height: 44px;
+  }
+}
+
+/* §7.4: prefers-reduced-motion stops the Backoff countdown's and the live Dot's
+   animation. The countdown still counts; it just does not pulse. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+.mw-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}

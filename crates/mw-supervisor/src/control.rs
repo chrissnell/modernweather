@@ -122,4 +122,9 @@ impl ComponentControl for Control {
     fn log_control(&self) -> &dyn LogControl {
         &*self.log
     }
+
+    /// The publication's own signal, which is the one place a state change is committed.
+    fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.published.changes())
+    }
 }

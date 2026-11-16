@@ -102,6 +102,34 @@ pub fn main(args: &[String]) -> Result<(), String> {
         ));
     }
 
+    // **D-58**: the management UI's bundle is built **once, natively, before** the cross
+    // matrix, and this command fails if it is missing or stale.
+    //
+    // It is deliberately not built here. `dist` runs once per target, so building the
+    // bundle inside it would build architecture-independent static files N times -- and it
+    // would put a Node toolchain in every `cross` container, which is the thing D-58 calls
+    // "strictly harder". `cargo xtask ui` is the one place that builds it, the release
+    // workflow runs that once and carries the result into the matrix, and what is enforced
+    // here is the invariant: a release artefact can never contain a stale bundle.
+    match crate::ui::stale(&root) {
+        Ok(None) => println!("ui: the committed bundle is current"),
+        Ok(Some(source)) => {
+            return Err(format!(
+                "the UI bundle is stale: {} is newer than ui/build/index.html.\n  \
+                 A release artefact containing a stale bundle is the defect D-58 exists to \
+                 prevent, so this fails rather than packaging it. Run `cargo xtask ui`.",
+                source.display()
+            ))
+        }
+        Err(e) => {
+            return Err(format!(
+                "{e}.\n  `cargo xtask dist` embeds the management UI, so the bundle has to \
+                 exist first. Run `cargo xtask ui` -- once, natively, before the matrix \
+                 (D-58)."
+            ))
+        }
+    }
+
     let builder = builder_for(&triple);
     println!(
         "building {} for {triple} with {}",

@@ -68,6 +68,8 @@
 
 /// `ConfigAdmin`, the preview/save pair, and the plan outline a change answers with.
 pub mod admin;
+/// The management UI's bundle, embedded, with the single-page fallback (**M7-3**, §6.4).
+pub mod assets;
 /// W5 §3 as code: Argon2id, the session, the setup claim, and `AuthStore` (**M7-2**).
 pub mod auth;
 /// What a write sends, and the validation that answers in the operator's words (§7.2, §8.5).
@@ -76,6 +78,8 @@ pub mod change;
 pub mod display;
 /// One error body, with field paths rather than a banner (§8.5).
 pub mod error;
+/// §5's SSE endpoint: one connection, several channels, one reconnect story (**M7-3**).
+pub mod events;
 /// W2a Decision 20's data presence, rendered separately from component state (§0.4).
 pub mod freshness;
 /// The CSRF pair, the CORS allowlist, the security headers and the session gate (**M7-2**).
@@ -90,14 +94,17 @@ pub mod runtime;
 pub mod view;
 
 pub use admin::{Applied, Commit, ConfigAdmin, PlanOutline};
+pub use assets::Assets;
 pub use auth::{AuthStore, Minted, NewAccount, NewSession, SetupCode, StoredCredential};
 pub use change::Change;
 pub use display::{Display, Section, Vocabulary};
 pub use error::{ApiError, Body, ErrorBody, FieldError};
+pub use events::{Channel, Hub, Live, Sources};
 pub use freshness::{render, FreshnessView, Subject};
 pub use guard::{Current, Guard, Peer};
 pub use host::{
-    LogEntry, LogField, LogSource, LogsView, Machine, SerialPort, SerialPortsView, Stream,
+    EnrolmentToken, EnrolmentView, Fleet, FleetView, LatestReading, LogEntry, LogField, LogSink,
+    LogSource, LogsView, Machine, PeerView, SerialPort, SerialPortsView, SpoolView, Stream,
 };
 pub use routes::{router, ApiDoc, Mgmt};
 pub use view::{ConfigView, Credential, Named};
