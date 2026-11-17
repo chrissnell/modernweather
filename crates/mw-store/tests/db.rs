@@ -2079,8 +2079,26 @@ async fn a_closed_bucket_the_aggregate_has_not_caught_up_to_is_still_returned() 
     let w = writer(&pool, station);
     let reader = TimescaleReader::new(pool.clone());
 
-    // 2026-01-19T00:00:00Z, away from every other test's window.
-    let base = 1_768_780_800i64;
+    // **Relative to now, and that is load-bearing.** This was `1_768_780_800` —
+    // 2026-01-19T00:00:00Z — chosen to sit away from every other test's window, and it
+    // worked until the date aged out: the `1m` level carries a **7-day** retention policy
+    // (`timescaledb_information.jobs`, `drop_after`), so a bucket 302 days old is dropped as
+    // fast as `refresh_continuous_aggregate` materialises it. The assertion below then reads
+    // the view as holding **nothing**, which is what CI failed on: `left: 0, right: 7`.
+    //
+    // The test is about a refresh that has not caught up, not about a date, so the window is
+    // two days back, floored to a UTC day so the `1d` level's outward rounding in
+    // `materialise` lands where the comments above expect. Two days is inside every
+    // retention window this schema sets and far enough back that nothing is still filling.
+    //
+    // Every other test in this file still pins a fixed epoch. They survive because none of
+    // them asserts the view's exact contents — but the same clock is under all of them, so
+    // do not add one that does.
+    let base = {
+        let now = chrono::Utc::now().timestamp();
+        let two_days_back = now - 2 * 86_400;
+        two_days_back - two_days_back.rem_euclid(86_400)
+    };
     let mut batch: Vec<Envelope> = Vec::new();
     for minute in 0..10i64 {
         batch.push(envelope(

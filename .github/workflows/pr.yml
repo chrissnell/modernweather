@@ -194,7 +194,17 @@ jobs:
       - name: Assert every sanitizer exclusion is declared
         if: always()
         run: |
-          expected="crates/modernweather/tests/boot.rs"
+          # Every file that opts out of the sanitizer, as one sorted list. The check exists so
+          # an exclusion cannot be added quietly; when it fires, the fix is to justify the new
+          # file in its own module documentation and then add it here -- which is what
+          # `tests/auth.rs` and `tests/management.rs` did, both for `tests/boot.rs`' reason:
+          # the subject is a CHILD PROCESS, so a report inside it surfaces in the parent as a
+          # connection reset rather than as a race, and the sanitizer cannot see the thing it
+          # would need to see. It is not a way to silence a report in our own code.
+          expected=$(printf '%s\n' \
+            crates/modernweather/tests/auth.rs \
+            crates/modernweather/tests/boot.rs \
+            crates/modernweather/tests/management.rs)
           found=$(grep -rl "cfg(not(mw_sanitizer))" crates/ --include="*.rs" | sort)
           if [ "$found" != "$expected" ]; then
             echo "::error::sanitizer exclusions changed"
