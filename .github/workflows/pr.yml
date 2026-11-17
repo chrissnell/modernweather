@@ -1002,6 +1002,23 @@ jobs:
       # different things (over budget / no verdict / a violated prohibition).
       - run: cargo xtask gate ui-bundle
       - run: cargo xtask gate ui-copy
+      # The station website's own JavaScript, which is plain files under
+      # `crates/mw-web/assets/js/` rather than part of the `ui/` bundle, and whose
+      # `node --test` suites had never run anywhere. They ride this job because it is
+      # the one that already has a Node toolchain; they need no install step, since
+      # the suites use `node:test` and `node:assert` only.
+      #
+      # `weather-radar.test.js` is the reason this matters: it pins the radar palette's
+      # dichromacy separation numerically, and that contract is worth nothing if the
+      # only thing that runs it is a person remembering to.
+      #
+      # `failglob` because an unmatched glob is otherwise left literal, Node then finds
+      # nothing to run and the step exits 0 reporting `# tests 0` -- so renaming or
+      # moving these suites would silently retire the only thing that runs them.
+      - name: Station website asset tests
+        run: |
+          shopt -s failglob
+          node --test crates/mw-web/assets/js/*.test.js
 
   coverage:
     name: coverage ratchet
