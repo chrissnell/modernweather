@@ -2907,7 +2907,8 @@ because "`tcsetattr` returned" and "the line is at 115200" are not the same clai
   `TIOCEXCL` **and** an exclusive `flock` (`posix/tty.rs:134-137`) where `OpenOptions::open` took
   neither. It is kept — written out as `.exclusive(true)` rather than inherited — because one
   serial line has one reader and two readers *split* the stream rather than each getting it, which
-  is the failure `tests/serial_bridge.rs` exists to prove `ser2net` does not have. The cost is
+  is the failure the fan-out proof existed to rule out, measured in production rather than in
+  CI since 2026-11-17. The cost is
   that **two components naming one `transport_dev` no longer both start**, and nothing refuses that
   at plan time: neither `mw_station::plan` nor `mw_output::plan` compares device paths, so a station
   and an APRS `kiss-serial` sink may both name `/dev/ttyUSB0` and whichever is built second gets

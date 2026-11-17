@@ -21,7 +21,7 @@ Two reasons to want it:
 | Configuration | [`ser2net.yaml.example`](ser2net.yaml.example) → `/etc/ser2net/<station>.yaml` |
 | Unit | [`campbell-serial-bridge.service`](campbell-serial-bridge.service) → `/etc/systemd/system/` |
 | Moving an existing `remoteweather` onto it | [`cutover.sh`](cutover.sh), which writes its own rollback first |
-| Proof | `crates/mw-station/tests/serial_bridge.rs`, run by `ci/serial-bridge/prove.sh` |
+| Proof | **measured against this bridge in production**, 2026-11-12: an agent read the live Campbell JSON from `10.50.0.35:7001` while `remoteweather` was connected to the same port, and both received the stream. The automated proof that used to live in `crates/mw-station/tests/serial_bridge.rs` was **removed on 2026-11-17** at the owner's direction: it tested `ser2net`'s behaviour rather than this project's, and it existed for the migration's side-by-side comparison, which is done |
 
 **Everything here is an example, and no file in this directory describes a real
 installation.** The device path, the line rate and the listen address are site-specific;
@@ -31,7 +31,7 @@ than a file that refuses to load.
 
 ## What was measured
 
-Everything in this table is asserted by `crates/mw-station/tests/serial_bridge.rs` against a
+Everything in this table was asserted by the fan-out proof (removed 2026-11-17) against a
 real `ser2net` over a real character device, with a `socat` pty pair standing in for the
 station — so it is reproducible on any machine and needs no hardware. Run on **two**
 versions, because distributions do not agree: **4.6.4** (Debian trixie) and **4.6.8** (Arch
@@ -103,7 +103,7 @@ systemctl enable --now campbell-serial-bridge
 
 The gap is bounded by the daemon's own retry — `connectToNetworkStation` loops with a 5 s
 sleep — so it costs a few readings and not a restart. **Do it once**, not repeatedly while
-iterating: iterate against a `socat` pty and `ci/serial-bridge/prove.sh`, which needs no
+iterating: iterate against a `socat` pty, which needs no
 hardware and no station.
 
 ## Verify, by value and not by liveness

@@ -576,7 +576,7 @@ impl Drop for PtyBridge {
 /// reader, so feeding two daemons the same readings means a multiplexer — and if
 /// that multiplexer hands bytes to whichever client reads first instead of broadcasting
 /// every byte to all of them, the two daemons silently split the stream and both produce
-/// gap-ridden data that still parses. `tests/serial_bridge.rs` is the assertion that it
+/// gap-ridden data that still parses. `packaging/serial-bridge/README.md` records the evidence that it
 /// broadcasts; this is what that assertion runs against.
 ///
 /// # Why the real binary and not a double
@@ -826,7 +826,7 @@ pub const SENTINEL: &[u8] = b"{\"airtemp_f\":32.0,\"rh\":50.0}\n";
 /// client until it had been quiet for 300 ms, which is the one assumption in this harness
 /// that a loaded machine can falsify — and when it does, a leftover sentinel prefixes the
 /// payload, both clients get the *same* wrong bytes (it is a fan-out), and
-/// `tests/serial_bridge.rs`' identity assertion passes while "the stream was not delivered
+/// the removed fan-out proof's identity assertion passed while "the stream was not delivered
 /// whole" fails. That reads as a bridge that split the stream and is not one.
 ///
 /// A complete Campbell record, for [`SENTINEL`]'s reason. `-99.9` °F appears in no sentinel

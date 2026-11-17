@@ -1142,7 +1142,7 @@ weather, which makes it the worst available outcome and strictly worse than havi
 station at all. `ser2net`'s documentation says `max-connections` broadcasts; the documentation is
 not the measurement.
 
-**Done when:** `ci/serial-bridge/prove.sh` is green — two clients connected at once receive the
+**Done when:** two clients connected at once receive the
 identical byte stream, asserted byte for byte over a known sequence pushed through a `socat` pty, so
 the whole proof runs with no hardware and without touching a live station; the bridge runs as a unit
 that survives a reboot; the Go daemon reads it over TCP with its site serving current readings,
