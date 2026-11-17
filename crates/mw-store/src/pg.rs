@@ -44,6 +44,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 
+use crate::coverage;
 use crate::frozen::FrozenReads;
 use crate::store::TimescaleStore;
 use crate::version::{self, VersionError};
@@ -89,9 +90,26 @@ const FAILURES_BEFORE_REVOKE: u32 = 3;
 /// capability bus — because `config:sqlite` has no work item and the binary owns the
 /// snapshot as a root resource (`crate::registry`'s module documentation has the whole of
 /// that note).
+///
+/// `configured` is `config.stations` reduced to the three fields [`crate::coverage`] needs,
+/// and it travels as data rather than through `registry` for the reason that module gives:
+/// a [`StationRegistry`] is keyed for *resolution* and has no enumeration to borrow. It is
+/// a snapshot of configuration exactly as `url` is, so it belongs in the closure beside it.
+///
+/// **It is not in the digest, and the reason is not "so a station change does not restart
+/// the pool".** It would not have that effect: `modernweather::boot`'s `shared_fingerprint`
+/// covers every station's key, `enabled`, transport and coordinates, and `boot::stamp`
+/// folds that epoch into *every* spec's digest -- so adding, re-keying or disabling a
+/// station restarts this component already. What the exclusion actually decides is the one
+/// column the fingerprint deliberately leaves out: `config.stations.name`, kept out so that
+/// a rename does not restart the whole plan. So a display-name-only rename leaves a running
+/// pool reporting the previous name in a coverage warning until something else re-plans it.
+/// That is the right trade in that direction -- a plan restart is every component, and this
+/// is a word in a diagnostic -- and it is stated rather than left to be rediscovered.
 pub fn spec(
     url: secrecy::SecretString,
     registry: Arc<dyn StationRegistry>,
+    configured: Vec<coverage::Configured>,
 ) -> Result<ComponentSpec, mw_component::ComponentIdError> {
     let id = ComponentId::new(ID)?;
     // Before the closure takes the URL, because the closure takes it.
@@ -102,6 +120,7 @@ pub fn spec(
         Builder::serve(move |cx| {
             let url = url.clone();
             let registry = Arc::clone(&registry);
+            let configured = configured.clone();
             async move {
                 let publisher = cx.publisher::<Arc<dyn Store>>()?;
                 let forecasts = cx.publisher::<Arc<dyn ForecastStore>>()?;
@@ -111,6 +130,7 @@ pub fn spec(
                 Ok(Pool {
                     url,
                     registry,
+                    configured,
                     publisher,
                     forecasts,
                     alerts,
@@ -171,6 +191,7 @@ fn url_digest_input(url: &secrecy::SecretString) -> &str {
 struct Pool {
     url: secrecy::SecretString,
     registry: Arc<dyn StationRegistry>,
+    configured: Vec<coverage::Configured>,
     publisher: Publisher<Arc<dyn Store>>,
     forecasts: Publisher<Arc<dyn ForecastStore>>,
     alerts: Publisher<Arc<dyn AlertStore>>,
@@ -370,7 +391,10 @@ impl Pool {
             }
         };
         match self.assert_version(&pool).await {
-            Ok(()) => Ok(pool),
+            Ok(()) => {
+                self.report_coverage(&pool).await;
+                Ok(pool)
+            }
             Err(e) => {
                 pool.close().await;
                 Err(Err(ComponentError::tick(
@@ -378,6 +402,55 @@ impl Pool {
                     e,
                 )))
             }
+        }
+    }
+
+    /// Say whether the configured station keys and the recorded ones are the same set.
+    ///
+    /// **Here because here is the first moment both facts exist.** The configuration is
+    /// read before `plan()` and the database may legitimately be unreachable then (**D-27**),
+    /// so the boot sequence cannot do this; the first usable connection can, and it is
+    /// already where the version assertion's second half lives for precisely that reason.
+    ///
+    /// Returns nothing and fails at nothing. [`crate::coverage`]'s closing section has the
+    /// argument for warning rather than refusing; what matters at this call site is the
+    /// weaker claim that a check which has never found anything must not be able to stop a
+    /// daemon, so a query failure here is a line in the log and not a `Failed` component.
+    async fn report_coverage(&self, pool: &PgPool) {
+        let mut conn = match pool.acquire().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // One line, at debug: the pool was usable a moment ago, this is a
+                // diagnostic rather than a dependency, and the probe loop below is what
+                // reports a pool that has genuinely stopped answering.
+                tracing::debug!(err = %e, "the station-key coverage check could not acquire \
+                                           a connection; it is a diagnostic and is skipped");
+                return;
+            }
+        };
+        let recorded = match coverage::recorded(&mut conn).await {
+            Ok(recorded) => recorded,
+            Err(e) => {
+                tracing::debug!(err = %e, "the station-key coverage check could not read \
+                                           the `stations` projection; it is skipped");
+                return;
+            }
+        };
+        for problem in coverage::problems(&self.configured, &recorded) {
+            // One line per problem, each naming its key, exactly as the registry's secret
+            // problems are reported at startup: a station whose history is addressed by
+            // another key is working correctly and is invisible to every counter, so the
+            // only thing that will ever say so is a sentence.
+            // `station` is not decoration: `mw_obs::dedupe` keys repetition control on the
+            // callsite, the level and that field, so without it every problem shares one
+            // bucket and the policy's burst of three is the most that ever reaches the
+            // log. `CoverageProblem::station` has the measurement.
+            warn!(
+                station = %problem.station(),
+                problem = %problem,
+                "a configured station key and the history in the weather database do not \
+                 line up"
+            );
         }
     }
 
@@ -501,6 +574,9 @@ mod tests {
                 registry: Arc::new(crate::ConfigRegistry::new(
                     crate::RegistrySnapshot::default(),
                 )),
+                // Nothing configured: the tests here never reach a database, so the
+                // coverage check has nothing to say and no connection to say it over.
+                configured: Vec::new(),
                 publisher,
                 forecasts,
                 alerts,
@@ -570,6 +646,7 @@ mod tests {
             Arc::new(crate::ConfigRegistry::new(
                 crate::RegistrySnapshot::default(),
             )),
+            Vec::new(),
         )
         .expect("`db:postgres` is a valid component id");
         assert_eq!(spec.id.as_str(), ID);
@@ -599,17 +676,42 @@ mod tests {
     /// it at a different server, and not otherwise.
     #[test]
     fn the_digest_follows_the_configured_url() {
-        let of = |url: &str| {
+        let of = |url: &str, configured: Vec<coverage::Configured>| {
             spec(
                 secrecy::SecretString::from(url.to_string()),
                 Arc::new(crate::ConfigRegistry::new(
                     crate::RegistrySnapshot::default(),
                 )),
+                configured,
             )
             .expect("valid")
             .config_digest
         };
-        assert_eq!(of("postgresql://a/mw"), of("postgresql://a/mw"));
-        assert_ne!(of("postgresql://a/mw"), of("postgresql://b/mw"));
+        assert_eq!(
+            of("postgresql://a/mw", Vec::new()),
+            of("postgresql://a/mw", Vec::new())
+        );
+        assert_ne!(
+            of("postgresql://a/mw", Vec::new()),
+            of("postgresql://b/mw", Vec::new())
+        );
+        // The station list is carried for the coverage check and is deliberately NOT in
+        // this digest. `spec`'s own documentation has the whole of why, and the part worth
+        // an assertion is that it is genuinely absent: a key, a name or an `enabled` flag
+        // changing here moves nothing. What restarts the pool on a real station change is
+        // `boot::stamp` folding the shared epoch in afterwards, which is a different
+        // digest and a different test.
+        assert_eq!(
+            of("postgresql://a/mw", Vec::new()),
+            of(
+                "postgresql://a/mw",
+                vec![coverage::Configured {
+                    station: mw_types::StationKey::new("csi"),
+                    name: "CSI".to_owned(),
+                    collecting: true,
+                }]
+            ),
+            "the configured stations are not part of this spec's digest"
+        );
     }
 }
