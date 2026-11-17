@@ -730,6 +730,159 @@ a trailing edge of zero for `csi` and for `snow`, and `suncrest-air-quality`'s r
 
 ---
 
+## 2e. The second station-key split, merged onto `suncrest-air-quality`, 2026-11-17
+
+**§2c happened again, one station later.** The AirGradient was configured through the admin UI on
+2026-11-16 with the key `airgradient`, and the 10.7 M readings of its own history are under
+`suncrest-air-quality` — the key `w9.station_key('Suncrest Air Quality')` derived and `w9.station_map`
+records. Both keys are legal, the station collected correctly under the new one for three hours, and
+the only symptom was that `/span/720h` for the air-quality station returned **two buckets** against a
+year of history. §2c was caught because `CSI` could not be a station key at all; this one could not
+be caught that way, and the daemon now looks for it on every connection to the weather
+database — `mw_store::coverage`, and the subsection at the end of this one.
+
+### The direction, and why it is not the convenient one
+
+| | |
+|---|---|
+| **`suncrest-air-quality`** | what `w9.station_map` derived, what §2c settled on, what 10,700,767 rows carry, and the key the station was asked to be configured with |
+| `airgradient` | what the live station wrote for three hours — 3,302 rows — and what the website was bound to |
+
+The two agree, and the cheap direction is the one the migration's own mapping declares. **Checked
+before committing to it**, because two mappings for one fact is how this keeps happening:
+`w9.station_map` holds `Suncrest Air Quality → suncrest-air-quality`, and the `stations` projection,
+`station_metrics` and the four aggregate levels all carried the same key. Nothing in the tree
+nominates `airgradient` except the configuration row the owner saved.
+
+### `UPDATE` without a time bound dies, and the error is the one to know about
+
+`station_id` is `observations`' **compression `segmentby` column**, so an unbounded
+
+```sql
+UPDATE observations SET station_id = 'suncrest-air-quality' WHERE station_id = 'airgradient';
+```
+
+is considered against every chunk and fails with `tuple decompression limit exceeded ... tuples
+decompressed: 10360529` — it had decompressed the whole station's history before giving up. The
+transaction rolled back and nothing was lost, but an operator who had raised
+`timescaledb.max_tuples_decompressed_per_dml_transaction` instead of bounding the predicate would
+have rewritten 53 compressed chunks to move 3,302 rows.
+
+All 3,302 rows were inside `_hyper_1_140_chunk` (2026-11-12 → 2026-11-19, **uncompressed**), which
+the statement asserts rather than assumes:
+
+```sql
+SELECT count(*) FROM observations                      -- 0
+ WHERE station_id = 'airgradient' AND (time < '2026-11-12' OR time >= '2026-11-19');
+UPDATE observations SET station_id = 'suncrest-air-quality'
+ WHERE station_id = 'airgradient' AND time >= '2026-11-12' AND time < '2026-11-19';   -- 3302
+DELETE FROM stations WHERE station_id = 'airgradient';                                --    1
+```
+
+The `DELETE` is one statement for four tables: `station_metrics` (18 rows) and `almanac_cache`
+(5 rows) reference `stations(station_id)` `ON DELETE CASCADE`, and both are derived from readings.
+`observations` has no foreign key to `stations` (W4 §2.1 records why), which is why it is moved
+first. No unique-key collision was possible and it was measured rather than assumed: the two keys'
+instants do not overlap at all — `suncrest-air-quality` ended 19:53:02 and `airgradient` began
+23:24:19.
+
+### The configuration
+
+`PUT /api/v1/stations/{key}` takes the key from the path and the key is not renameable, so the API
+path is delete-and-re-add and the owner had been asked for it twice. It was done in the configuration
+database instead, under a scale-to-zero window, because that preserves the row's id, its transport
+and its stored secret where delete-and-re-add does not:
+
+```sql
+UPDATE stations SET station_key = 'suncrest-air-quality' WHERE station_key = 'airgradient';
+UPDATE website  SET air_quality_station_key = 'suncrest-air-quality'
+ WHERE air_quality_station_key = 'airgradient';
+```
+
+`PRAGMA foreign_key_check` afterwards, because `station_service.station_key` and the website's three
+station columns all reference `stations(station_key)` with no `ON UPDATE` clause. A backup of
+`config.db` was taken with SQLite's own `backup` API first — not `cp`, which is not a consistent read
+of a database in WAL mode.
+
+### The hole the merge opened, and the four fills
+
+Merging the keys makes the air-quality series continuous *except* between the last imported reading
+and the first live one, because for three and a half hours nothing wrote under `suncrest-air-quality`
+at all. `pitcairn`'s Go daemon never stopped collecting, so it is fillable like any other gap:
+
+| station | range (UTC) | length | readings | what it was |
+|---|---|---|---|---|
+| `suncrest-air-quality` | 2026-11-16 19:53:02 → 23:24:19 | 3 h 31 m | 4,214 | between §2d's last import and the station's first reading under the new key |
+| `csi` | 2026-11-17 00:07:28 → 00:08:17 | 50 s | 10 | the `sha-248b63d` rollout |
+| `suncrest-air-quality` | 2026-11-17 00:07:31 → 00:08:16 | 45 s | 15 | the same rollout |
+| `csi` | 2026-11-17 02:10:33 → 02:14:08 | 3 m 35 s | 43 | this run's own scale-to-zero |
+| `suncrest-air-quality` | 2026-11-17 02:10:34 → 02:14:05 | 3 m 32 s | 71 | the same |
+
+**The 2026-11-13 01:41:43 → 02:45:13 window on `csi` is still open and still unfillable**, which is
+what §2d already recorded and what this run re-measured rather than took on trust. `pitcairn` holds
+**zero** readings in it; the readings that bound it are identical on both sides to the microsecond;
+and the same query widened by an hour on each side returns 1,441 rows, so the source is dense either
+side of it and the hole is the station's own outage. There is nothing to fill. `csi`'s 2026-11-13
+daily bucket is 16,514 readings against a settled day's 17,280, and the 765-reading shortfall is that
+hour exactly.
+
+### Afterwards
+
+`rebuild-aggregates.sh --from '2026-11-16 00:00:00+00' --to '2026-11-18 00:00:00+00'`, all four
+levels bottom-up. The refresh is what **removes** the `airgradient` buckets as well as adding the
+merged ones: a bounded refresh recomputes the range and drops materialised rows whose source rows are
+gone. `observations_1m`, `_5m`, `_1h` and `_1d` all hold **0** rows for `airgradient` afterwards, and
+both stations have the full 24 hourly buckets on each of 11-12 through 11-16.
+
+| | before | after |
+|---|---|---|
+| `observations` under `airgradient` | 3,302 | **0** |
+| `observations` under `suncrest-air-quality` | 10,700,767 | **10,708,369** |
+| `/span/720h?station=AirGradient OpenAir` | **2 buckets** | **31**, 2026-10-18 → 2026-11-17 |
+| `/span/8760h?station=AirGradient OpenAir` | 2 | **365**, 2025-11-17 → 2026-11-17 |
+
+Per UTC day, against `pitcairn` for the same days, the two databases agree: 28,782 / 28,775 / 28,589
+/ 28,782 / 28,785 on 11-11 through 11-15 on both sides. 11-16 is target 28,757 against source 28,762,
+and the five are not a hole — past 23:24 the two daemons poll the same device on their own cadences,
+so the instants differ and the counts are within a poll of each other. `report --min-gap '7 seconds'`
+over that day lists no air-quality gap the source can fill.
+
+### The check, so that there is not a third one
+
+Two occurrences with one shape is a pattern. The inputs that would have caught either of them were
+all present on both days and nothing compared them, so `mw_store::coverage` now does, on
+`db:postgres`' first usable connection — beside **D-62**'s second version assertion, and for the same
+reason that one is there: the configuration is read before `plan()`, when the database may legitimately
+be unreachable (**D-27**), so the boot sequence cannot make this comparison and the first connection
+can.
+
+It reports **both** directions, because they are different sentences and neither implies the other:
+
+| | |
+|---|---|
+| `NoHistory` | a station is collecting under a key the database holds no readings for — and the message **names the keys that do have history nobody writes under**, which is the line that turns "my chart is short" into "your readings are under `suncrest-air-quality`" |
+| `NoStation` | history under a key no configured station carries, with its extent. On this deployment that is `snow`, whose gauge is not configured here and whose readings stop on 2026-10-02 — a true finding, not a false positive |
+
+Three things about it are deliberate and each is a test:
+
+- **It reads the `stations` projection, not `SELECT DISTINCT station_id`.** One row per station
+  against a full scan of seventeen million, and it is the same set rather than an approximation of
+  it: `mw_store::writer` upserts the projection in the same transaction as the readings and before
+  them, so there is no window in which `observations` has rows for a station `stations` does not.
+- **It does not read `w9.station_map`.** That schema is scaffolding this migration leaves behind and
+  cutover removes, so a product check that depended on it would silently stop checking. The map can
+  only ever *explain* a disagreement the configuration and the projection have already found.
+- **It warns; it does not refuse.** Unlike `ZoneProblem`, both halves here are internally consistent
+  and only the operator can say which key is right. A daemon that refused to start over it would be
+  unstartable in the window somebody was trying to fix it in.
+
+Each line records `station`, which is not decoration: `mw_obs::dedupe` keys repetition control on the
+callsite, the level and that field, so without it every finding shares one bucket and the policy's
+burst of three is all that ever reaches the log. Measured against a database holding twenty-one
+problems: three lines before, twenty-one after.
+
+---
+
 ## 3. The history decision
 
 **The decision is the owner's. Here are the two options, the cost of each, and a recommendation.**

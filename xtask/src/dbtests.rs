@@ -87,6 +87,9 @@ const DECLARED: &[&str] = &[
     "the_projections_reflect_what_has_been_written",
     "a_station_the_registry_does_not_know_is_still_stored",
     "a_vanished_configuration_row_does_not_erase_the_projection",
+    // The station-key split, twice over: `mw_store::coverage`'s query against a real
+    // `stations` projection. The comparison is unit-tested; the column names are not.
+    "a_station_configured_away_from_its_own_history_is_reported_against_a_real_projection",
     // implementation-plan.md M3-4's first done-criterion, and the two reads the rest of
     // the window rollup is built on.
     "a_ten_minute_mean_over_the_rolled_up_buckets_equals_the_mean_from_raw",

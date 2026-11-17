@@ -21,6 +21,8 @@ pub mod config_admin;
 pub mod config_db;
 /// The **Go** configuration database, and its translation onto this schema (M7-4).
 pub mod config_go;
+/// A configured station key against the history the database already holds under it.
+pub mod coverage;
 /// `ForecastStore` and `SnowCache`: the frozen REST surface's own two reads.
 pub mod frozen;
 /// Minting this node's `NodeId` and an enrolment token, with no UUID or RNG crate (W7 D-5).
@@ -50,6 +52,7 @@ pub use crate::config_admin::{
     restore, snapshot, AerisWrite, Change, ConfigAdminError, ListenerWrite, Pairing, ServiceWrite,
     StationWrite, WebsiteWrite,
 };
+pub use crate::coverage::{Configured, CoverageProblem, Recorded};
 pub use crate::frozen::FrozenReads;
 pub use crate::peers::{EnrolmentTokenRow, FleetPeer, PeerSnapshot, PeerStore};
 pub use crate::reader::TimescaleReader;

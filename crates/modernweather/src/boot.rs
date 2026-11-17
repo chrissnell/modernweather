@@ -275,8 +275,21 @@ impl Registrar<Config> for Database {
                  nothing to copy the read-side projection from",
             )
         })?;
+        // `config.stations`, reduced to what the coverage check reads. Built here rather
+        // than inside the component because this is the registrar that already holds the
+        // configuration, and `mw_store::coverage` says why it is not taken off the
+        // registry snapshot instead.
+        let configured: Vec<mw_store::Configured> = cfg
+            .stations
+            .iter()
+            .map(|s| mw_store::Configured {
+                station: mw_types::StationKey::new(s.station_key.as_str()),
+                name: s.name.clone(),
+                collecting: s.enabled,
+            })
+            .collect();
         out.push(
-            mw_store::pg::spec(db.url.clone(), Arc::clone(registry))
+            mw_store::pg::spec(db.url.clone(), Arc::clone(registry), configured)
                 .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))?,
         );
         if cfg.ingress.is_some() {

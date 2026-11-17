@@ -2653,3 +2653,112 @@ async fn the_almanac_cache_replaces_rows_and_accepts_every_permitted_record_name
     )
     .await;
 }
+
+// ---------------------------------------------------------------------------------------
+// The check that would have caught the station-key splits (GRA-795, GRA-806)
+// ---------------------------------------------------------------------------------------
+
+/// **`mw_store::coverage::recorded`'s query against a real `stations` projection.**
+///
+/// The comparison [`mw_store::coverage::problems`] makes is a pure function with its own
+/// table of cases, for the reason every pure function in this tree has one. What a unit
+/// test over hand-built structs cannot say anything about is the half this asserts: that
+/// `station_id`, `first_seen` and `last_seen` are the columns the row is read back under,
+/// that they decode as `String` and two `Option<DateTime<Utc>>`, and that the projection
+/// the **writer** maintains is populated by the time a reading is visible in
+/// `observations` — which is the assumption that lets the check read one row per station
+/// instead of `SELECT DISTINCT station_id` over the whole hypertable.
+///
+/// A typo in any of those three names is a check that returns an error on every database,
+/// including a correct one, and `db:postgres` deliberately swallows that error so a
+/// diagnostic cannot stop a daemon. So it would be silent, permanently, and the defect it
+/// exists to catch would go back to being invisible. That is what this test is for.
+#[tokio::test]
+#[ignore = "needs a real TimescaleDB; run `cargo xtask db-tests`"]
+async fn a_station_configured_away_from_its_own_history_is_reported_against_a_real_projection() {
+    // Two keys: one the readings are under, one the configuration names. The 2026-11-16
+    // defect in miniature -- both are legal keys, both would work, and nothing but this
+    // relates them.
+    let history = "db-tests:coverage-history";
+    let live = "db-tests:coverage-live";
+    let pool = prepare(&[history, live]).await;
+
+    let w = writer(&pool, history);
+    w.store(&[envelope(
+        history,
+        at(1_767_571_200),
+        1,
+        Reading {
+            out_temp: Some(44.0),
+            ..Reading::default()
+        },
+    )])
+    .await
+    .expect("stores");
+
+    let mut conn = pool.acquire().await.expect("a connection");
+    let all = mw_store::coverage::recorded(&mut conn)
+        .await
+        .expect("the projection reads back");
+
+    // `stations` is shared by every test in this file -- isolation here is by station key
+    // (see this file's header) -- so the comparison is fed this test's own two keys and
+    // not whatever else the run has left behind.
+    let recorded: Vec<mw_store::Recorded> = all
+        .into_iter()
+        .filter(|r| r.station == history || r.station == live)
+        .collect();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "one reading under `{history}` and none under `{live}`, but the projection says \
+         {recorded:?}"
+    );
+    assert_eq!(recorded[0].station, history);
+    // The instants are the half that would be `None` on every row if the column names
+    // were wrong but the query still parsed -- `SELECT station_id, NULL, NULL` is a
+    // passing query and a useless check.
+    assert_eq!(
+        recorded[0].first_seen,
+        Some(at(1_767_571_200)),
+        "`first_seen` decodes as the instant the writer stored"
+    );
+    assert_eq!(recorded[0].last_seen, Some(at(1_767_571_200)));
+
+    let configured = |key: &str| {
+        vec![mw_store::Configured {
+            station: StationKey::new(key),
+            name: "Air Quality".to_owned(),
+            collecting: true,
+        }]
+    };
+
+    let split = mw_store::coverage::problems(&configured(live), &recorded);
+    let rendered: Vec<String> = split.iter().map(ToString::to_string).collect();
+    assert_eq!(rendered.len(), 2, "both directions, in {rendered:?}");
+    assert!(
+        rendered[0].contains(live) && rendered[0].contains(history),
+        "the configured station names the key its history is actually under: {}",
+        rendered[0]
+    );
+    assert!(
+        rendered[1].contains(history),
+        "the orphaned history is reported in its own right: {}",
+        rendered[1]
+    );
+
+    // And the fixed configuration -- the same station keyed onto its own history -- is
+    // silent. Without this half the test would pass against a check that reported
+    // everything.
+    assert_eq!(
+        mw_store::coverage::problems(&configured(history), &recorded),
+        Vec::new(),
+        "a station keyed onto its own history has nothing to report"
+    );
+
+    touched(
+        &pool,
+        "a_station_configured_away_from_its_own_history_is_reported_against_a_real_projection",
+    )
+    .await;
+}
