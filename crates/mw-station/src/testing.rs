@@ -489,6 +489,24 @@ async fn answers(port: u16) -> bool {
     false
 }
 
+/// [`answers`], but keeping the connection that answered.
+///
+/// For [`Ser2netBridge::spawn`], whose next question is whether the listener on a guessed
+/// port is its own bridge -- which it establishes by delivering bytes to a client of it.
+/// Two connections where one will do costs a `max-connections: 1` bridge its only slot
+/// twice; see the call site.
+async fn connect_once_listening(port: u16) -> Option<tokio::net::TcpStream> {
+    for _ in 0..60 {
+        if let Ok(stream) =
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await
+        {
+            return Some(stream);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    None
+}
+
 /// A `socat` bridge from a pty to a TCP port: a **serial** station whose other end is a
 /// network emulator.
 ///
@@ -606,9 +624,12 @@ impl Ser2netBridge {
     /// `crate::stream`'s module documentation has why that makes the pty the honest
     /// stand-in for a bridge and not for a directly attached console.
     ///
-    /// Returns once a throwaway client has **received a byte that this apparatus put into
-    /// this pty**, which is the only check that distinguishes a working bridge of ours from
-    /// a listener on a recycled port that belongs to something else.
+    /// Returns once a throwaway client has **received bytes that this apparatus put into
+    /// this pty**, up to [`PREAMBLE_END`], which is the only check that distinguishes a
+    /// working bridge of ours from a listener on a guessed port that belongs to something
+    /// else. The marker rather than any byte: a *foreign* bridge whose slots are full
+    /// answers the probe with `Port already in use`, which is bytes, and used to pass for
+    /// proof of ownership.
     pub async fn spawn(name: &str, max_connections: u32) -> Option<Self> {
         let dir = std::env::temp_dir().join(format!(
             "mw-ser2net-{}-{name}-{max_connections}",
@@ -695,21 +716,23 @@ impl Ser2netBridge {
             .stderr(std::process::Stdio::null())
             .spawn()
             .ok()?;
-            if answers(port).await {
-                let ours =
-                    match tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
-                        .await
-                    {
-                        Ok(mut probe) => {
-                            let mut one: [&mut tokio::net::TcpStream; 1] = [&mut probe];
-                            deliver_sentinels(&station_side, &mut one).await
-                        }
-                        Err(_) => false,
-                    };
-                if ours {
-                    chosen = Some((ser2net, port));
-                    break;
+            // ONE connection for both halves of the question -- is anything listening, and
+            // is it ours -- rather than a throwaway probe and then a real one. `ser2net`
+            // frees a client slot when it processes the close, not when the client calls
+            // it, so on a bridge configured with ONE slot the second connection can meet
+            // its own bridge still holding the first and be answered `Port already in use`.
+            // That refusal is indistinguishable from a foreign bridge's, so a healthy
+            // bridge would be killed and the port retried. Held, there is no such window.
+            let ours = match connect_once_listening(port).await {
+                Some(mut probe) => {
+                    let mut one: [&mut tokio::net::TcpStream; 1] = [&mut probe];
+                    deliver_sentinels(&station_side, &mut one).await
                 }
+                None => false,
+            };
+            if ours {
+                chosen = Some((ser2net, port));
+                break;
             }
             let _ = ser2net.start_kill();
             let _ = ser2net.wait().await;
@@ -755,11 +778,13 @@ impl Ser2netBridge {
     /// client connection rather than at startup, and a byte that arrives while the device
     /// is closed is dropped, because this is a fan-out and not a spool. So readiness is
     /// established the only way that cannot be wrong — by delivering bytes — and the
-    /// sentinels are then drained so that what follows is only what the test sent.
+    /// preamble is then consumed up to [`PREAMBLE_END`], so that what follows is only what
+    /// the test sent.
     ///
     /// Pass **only the clients that are supposed to be wired**. A client beyond
-    /// `max_connections` never receives the stream, and draining it would throw away the
-    /// refusal a test wants to assert on.
+    /// `max_connections` is answered with a refusal and then closed, so it never reaches
+    /// [`PREAMBLE_END`] and this returns `false` — and the refusal a test wants to assert
+    /// on would have been read away besides.
     pub async fn wait_until_delivering(&self, clients: &mut [&mut tokio::net::TcpStream]) -> bool {
         deliver_sentinels(&self.station_side, clients).await
     }
@@ -790,6 +815,23 @@ impl Drop for Ser2netBridge {
 /// Public because a test whose other client is a *driver* has to establish that client's
 /// readiness through its admissions, and so has to push the same bytes itself.
 pub const SENTINEL: &[u8] = b"{\"airtemp_f\":32.0,\"rh\":50.0}\n";
+
+/// The record that **closes** the preamble, written once after every client has been seen
+/// to receive something.
+///
+/// It exists so that the end of the preamble is an *observation* rather than a timeout. A
+/// device is written sequentially, so nothing fed before this record can arrive after it:
+/// a client that has read these bytes has, by ordering, read every sentinel too, and its
+/// socket holds nothing else the apparatus put there. The previous version drained each
+/// client until it had been quiet for 300 ms, which is the one assumption in this harness
+/// that a loaded machine can falsify — and when it does, a leftover sentinel prefixes the
+/// payload, both clients get the *same* wrong bytes (it is a fan-out), and
+/// `tests/serial_bridge.rs`' identity assertion passes while "the stream was not delivered
+/// whole" fails. That reads as a bridge that split the stream and is not one.
+///
+/// A complete Campbell record, for [`SENTINEL`]'s reason. `-99.9` °F appears in no sentinel
+/// and in no test's payload, so a driver client can also pick it out of its admissions.
+pub const PREAMBLE_END: &[u8] = b"{\"airtemp_f\":-99.9,\"rh\":1.0}\n";
 
 fn feed(station_side: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
@@ -827,16 +869,49 @@ async fn deliver_sentinels(
             }
         }
     }
-    // Every sentinel is now accounted for, so a test's next read sees only what the test
-    // sent. Quiet rather than counted, because how many sentinels each client received
-    // depends on when it was wired.
+    // Every client has now had a byte from this pty, so the device is open and the fan-out
+    // is wired to all of them -- which is what makes the next write deliverable rather
+    // than droppable, and is why this phase cannot be skipped in favour of the marker
+    // alone.
+    //
+    // The preamble is closed by reading each client up to and including `PREAMBLE_END`.
+    // How many sentinels a client received depends on when it was wired and is not
+    // knowable here, so the end of the preamble is found rather than counted or waited
+    // out. The marker is the LAST thing written to the device, so a client that has it has
+    // nothing else of ours pending: a test's next read sees only what the test sent.
+    if feed(station_side, PREAMBLE_END).is_err() {
+        return false;
+    }
+    // Its own budget rather than whatever the phase above left: by here every client has
+    // been SEEN to receive a byte from this pty, so what remains is one write and one
+    // delivery over a path already proved to work -- milliseconds, measured. A sentinel
+    // phase that nearly spent the fifteen seconds would otherwise leave nothing to read
+    // the marker with and fail a bridge that is merely slow, which the drain this replaced
+    // did not do.
+    let marker_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     for client in clients.iter_mut() {
-        let mut buf = [0_u8; 16 * 1024];
-        while let Ok(Ok(n)) =
-            tokio::time::timeout(std::time::Duration::from_millis(300), client.read(&mut buf)).await
-        {
-            if n == 0 {
-                break;
+        // Only the tail is kept: the marker may arrive split across reads, or glued to the
+        // sentinels ahead of it, and nothing can follow it.
+        let mut tail: Vec<u8> = Vec::new();
+        while !tail.ends_with(PREAMBLE_END) {
+            let left = marker_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let mut buf = [0_u8; 16 * 1024];
+            match tokio::time::timeout(left, client.read(&mut buf)).await {
+                // A client that is wired cannot run out of bytes before the marker. EOF is
+                // `ser2net` having closed the connection, which is what a client beyond
+                // `max-connections` gets after its refusal line -- so this is also the
+                // check that stops `spawn` from adopting a *foreign* bridge whose slots
+                // are full: "Port already in use\r\n" is bytes, and bytes alone used to be
+                // proof enough that the port belonged to this apparatus.
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return false,
+                Ok(Ok(n)) => {
+                    tail.extend_from_slice(&buf[..n]);
+                    let keep = tail.len().saturating_sub(PREAMBLE_END.len());
+                    tail.drain(..keep);
+                }
             }
         }
     }

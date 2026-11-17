@@ -54,10 +54,20 @@ echo "serial-bridge: $("$ser2net" -v), socat $(socat -V | sed -n 's/^socat versi
 
 out=$(mktemp)
 trap 'rm -f "$out"' EXIT
+# Under `timeout`, because every hazard this proof points at is a pty that stops moving and
+# the harness's own deadlines cannot cover a `write(2)` into a wedged chain -- `write_all`
+# takes no timeout, so a wedge here used to be a job that ran until the CI runner's own
+# limit rather than a job that failed. Ten minutes is about thirty times the measured run.
 set +e
-SER2NET="$ser2net" cargo test -p mw-station --test serial_bridge -- --ignored 2>&1 | tee "$out"
+SER2NET="$ser2net" timeout 600 \
+  cargo test -p mw-station --test serial_bridge -- --ignored 2>&1 | tee "$out"
 status=${PIPESTATUS[0]}
 set -e
+if [ "$status" -eq 124 ]; then
+  echo "serial-bridge: the proof did not finish in 600s -- something in the pty chain or" >&2
+  echo "  the bridge stopped moving. The test names above that stopped are where to look." >&2
+  exit 1
+fi
 [ "$status" -eq 0 ] || { echo "serial-bridge: the proof failed" >&2; exit 1; }
 
 # `test result: ok. N passed; 0 failed; ...` -- N is what has to be EXPECTED. A filter that

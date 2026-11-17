@@ -97,7 +97,8 @@ async fn bridge_or_fail(name: &str, slots: u32) -> Ser2netBridge {
 async fn delivering(bridge: &Ser2netBridge, clients: &mut [&mut tokio::net::TcpStream]) {
     assert!(
         bridge.wait_until_delivering(clients).await,
-        "the bridge never delivered a byte to every client that should have been wired to it"
+        "the bridge never delivered the preamble, end marker and all, to every client that \
+         should have been wired to it"
     );
 }
 
@@ -120,6 +121,29 @@ async fn read_until_quiet(stream: &mut tokio::net::TcpStream, want: usize) -> Ve
         }
     }
     got
+}
+
+/// Byte-for-byte, but legible when it fails.
+///
+/// `assert_eq!` on twenty kilobytes of `Vec<u8>` prints both of them and still does not say
+/// where they parted, which is the one thing that tells an operator what happened: a stream
+/// that is *shorter* and shares a prefix is a bridge that stopped mid-delivery, while one
+/// that is the right length but differs from byte 0 is the apparatus having left something
+/// in front of the payload. Those two want opposite fixes, so the shape is printed.
+#[track_caller]
+fn assert_same_bytes(got: &[u8], want: &[u8], what: &str) {
+    if got == want {
+        return;
+    }
+    let first = got.iter().zip(want).position(|(a, b)| a != b);
+    let head = |b: &[u8]| String::from_utf8_lossy(&b[..b.len().min(96)]).into_owned();
+    panic!(
+        "{what}\n  got {} bytes, want {} bytes, first difference at {first:?}\n  got:  {:?}\n  want: {:?}",
+        got.len(),
+        want.len(),
+        head(got),
+        head(want),
+    );
 }
 
 async fn connect(port: u16) -> tokio::net::TcpStream {
@@ -151,18 +175,20 @@ async fn both_clients_receive_the_identical_byte_stream() {
         read_until_quiet(&mut b, sent.len())
     );
 
-    assert_eq!(
-        got_a,
-        got_b,
-        "the two clients did not receive the same bytes: {} vs {} bytes. If this is red, \
-         mechanism (b) on the Campbell station is not available by this route, because the \
-         two daemons are being handed different halves of one stream.",
-        got_a.len(),
-        got_b.len()
+    assert_same_bytes(
+        &got_a,
+        &got_b,
+        "the two clients did not receive the same bytes. If this is red, mechanism (b) on \
+         the Campbell station is not available by this route, because the two daemons are \
+         being handed different halves of one stream.",
     );
     // And the identity is of the *whole* stream rather than of a shared prefix: two clients
     // that each received the first eleven bytes and nothing else would also be equal.
-    assert_eq!(got_a, sent, "the stream was not delivered whole");
+    //
+    // This is the assertion that fails when the two clients agree but the payload does not
+    // start where it should, which is NOT a split stream -- see
+    // `mw_station::testing::PREAMBLE_END` for the apparatus bug that used to produce it.
+    assert_same_bytes(&got_a, &sent, "the stream was not delivered whole");
     assert_eq!(
         got_a.iter().filter(|b| **b == b'\n').count(),
         200,
@@ -193,9 +219,10 @@ async fn the_control_bites_when_the_bridge_has_only_one_client_slot() {
         read_until_quiet(&mut b, sent.len())
     );
 
-    assert_eq!(
-        got_a, sent,
-        "the client that holds the one slot still gets everything"
+    assert_same_bytes(
+        &got_a,
+        &sent,
+        "the client that holds the one slot did not get everything",
     );
     assert_ne!(
         got_a, got_b,
@@ -272,16 +299,38 @@ async fn two_readers_of_one_character_device_do_not_both_get_the_stream() {
     );
 
     let sent = records(200);
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&station)
-        .and_then(|mut d| std::io::Write::write_all(&mut d, &sent))
-        .expect("the station writes to the line");
+    // **Written while the readers drain, and not before them.** Two hundred records is
+    // more than the pty chain holds: the test writes into the station pty, `socat` relays
+    // into the line pty, and the line pty's input queue is where it stops if nobody is
+    // reading. Write it all first and the chain wedges for good -- `socat` blocked in
+    // `tty_write_lock`, the writer blocked in the station pty, and `write_all` has no
+    // timeout, so `ci/serial-bridge/prove.sh` hangs rather than fails. It used to survive
+    // only because three buffers happened to add up to more than twenty kilobytes, which
+    // on a machine with one spare core they do not: measured wedged on Ubuntu 24.04 with
+    // the gate's seven tests pinned to a single CPU.
+    //
+    // `spawn_blocking` rather than a thread of its own: `std::thread::spawn` is on
+    // `clippy.toml`'s disallowed list, and the blocking pool is already here.
+    let writer = {
+        let station = station.clone();
+        let sent = sent.clone();
+        tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&station)
+                .and_then(|mut d| std::io::Write::write_all(&mut d, &sent))
+        })
+    };
 
-    // Drain both for a while. Non-blocking, so `WouldBlock` is "nothing right now".
+    // Drain both for a while. Non-blocking, so `WouldBlock` is "nothing right now". The
+    // floor is three seconds and the ceiling is the writer finishing, because a drain that
+    // stopped first would recreate the wedge it exists to prevent.
     let mut got = [Vec::new(), Vec::new()];
     let until = tokio::time::Instant::now() + Duration::from_secs(3);
-    while tokio::time::Instant::now() < until {
+    let ceiling = tokio::time::Instant::now() + DEADLINE;
+    while (tokio::time::Instant::now() < until || !writer.is_finished())
+        && tokio::time::Instant::now() < ceiling
+    {
         for (slot, reader) in [&mut first, &mut second].into_iter().enumerate() {
             let mut buf = [0_u8; 16 * 1024];
             match reader.read(&mut buf) {
@@ -292,8 +341,20 @@ async fn two_readers_of_one_character_device_do_not_both_get_the_stream() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // Checked before the apparatus is torn down, and checked rather than `await`ed: a
+    // writer still blocked here is the wedge described above, and awaiting it would hang
+    // the gate instead of reporting it.
+    assert!(
+        writer.is_finished(),
+        "the station's write never drained: the pty chain wedged, which is the apparatus \
+         and not the device under test"
+    );
     let _ = socat.start_kill();
     std::fs::remove_dir_all(&dir).ok();
+    writer
+        .await
+        .expect("the writing task")
+        .expect("the station writes to the line");
 
     assert_ne!(
         got[0], got[1],
@@ -327,8 +388,8 @@ async fn a_client_over_the_limit_is_refused_and_the_readers_already_connected_ar
         read_until_quiet(&mut b, sent.len()),
         read_until_quiet(&mut c, sent.len())
     );
-    assert_eq!(got_a, sent, "the first client kept its stream");
-    assert_eq!(got_b, sent, "the second client kept its stream");
+    assert_same_bytes(&got_a, &sent, "the first client did not keep its stream");
+    assert_same_bytes(&got_b, &sent, "the second client did not keep its stream");
     assert_eq!(String::from_utf8_lossy(&got_c), "Port already in use\r\n");
 }
 
@@ -359,7 +420,7 @@ async fn a_client_that_stops_reading_does_not_starve_the_other() {
         "the reading client lost {} bytes while its peer read nothing",
         sent.len().saturating_sub(got.len())
     );
-    assert_eq!(got, sent);
+    assert_same_bytes(&got, &sent, "the reading client's stream was not whole");
     drop(stalled);
 }
 
@@ -436,9 +497,10 @@ async fn the_campbell_driver_reads_the_bridge_while_a_second_client_reads_the_sa
     token.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(10), driving).await;
 
-    assert_eq!(
-        got_peer, sent,
-        "the second client received the whole stream"
+    assert_same_bytes(
+        &got_peer,
+        &sent,
+        "the second client did not receive the whole stream",
     );
     let admissions = ingress.admissions();
     assert_eq!(

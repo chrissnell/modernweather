@@ -1,0 +1,76 @@
+# ThreadSanitizer suppressions for the `race` job in .github/workflows/pr.yml.
+#
+# THREE entries covering TWO mechanisms, and the bar for a fourth is the bar these met: the
+# report has to be shown to be third-party, with the crate and version named here, and the
+# mechanism written down. A `race:` pattern broad enough to cover our own code would make
+# this job report green while seeing nothing, which is docs/reconciliation.md G-1.
+#
+# `print_suppressions=1` is set alongside this file so the job prints which entries matched
+# and how often. An entry that stops matching is an entry to delete, and the log is where
+# that becomes visible.
+#
+# ------------------------------------------------------------------------------------------
+# tokio 1.54.1 (with mio 1.x): the `ScheduledIo` an I/O registration publishes through epoll
+#
+# `tokio::runtime::io::registration_set::RegistrationSet::allocate` allocates a
+# `ScheduledIo` on whichever thread registers a source, and hands the I/O driver a POINTER
+# TO IT as the `epoll_ctl` token. The driver thread reads that pointer back out of
+# `epoll_wait` and writes through it in `ScheduledIo::set_readiness`. The two accesses are
+# ordered -- `epoll_ctl` happens before any `epoll_wait` that can return the token -- but
+# ThreadSanitizer does not model either syscall as synchronisation, so it reports the
+# allocating `memcpy` against the driver's atomic load of the readiness word and calls it a
+# data race on `core::sync::atomic::atomic_load::<usize, false>`.
+#
+# No tokio release fixes this. It needs `__tsan_acquire`/`__tsan_release` annotations
+# wherever the pointer crosses the kernel boundary, which tokio does not carry.
+#
+# IT TAKES TWO THINGS TOGETHER: a multi-threaded runtime (so the registration and the
+# driver are different threads) and a SOCKET (so `Handle::add_source` allocates on the
+# registering thread). Either alone is green -- which is why most of this workspace never
+# meets it, and why `.github/workflows/pr.yml`'s guidance for a new test is still to prefer
+# `current_thread` when it only needs a socket. This entry is for the tests that genuinely
+# need both:
+#
+#   crates/modernweather/tests/collector_two_node.rs -- `tokio::task::block_in_place`, which
+#   PANICS on a current_thread runtime, is how it starts and drops the collector's own
+#   runtime and how it injects the partition. The sockets are tonic's: the write side of the
+#   report is `TcpStream::connect` inside `hyper_util`'s connector under
+#   `tonic::transport::channel::service::reconnect`, and nothing in `crates/` appears in
+#   either stack.
+#
+# Scoped to the ALLOCATING frame rather than to `race:tokio::runtime::io::` or to the
+# `atomic_load` symbol: a `race` pattern matches any frame of either stack, so this one
+# entry covers the report in both orders while still being narrow enough that a race of
+# ours is only hidden if it runs through tokio's registration set, which ours do not.
+race:tokio::runtime::io::registration_set::RegistrationSet
+
+# ------------------------------------------------------------------------------------------
+# libsqlite3-sys 0.30.1 (SQLite's own amalgamation): the WAL index, which is shared memory
+# guarded by POSIX advisory file locks
+#
+# In WAL mode SQLite keeps its index in a shared-memory block (the `-shm` file) and
+# serialises access to it with `fcntl` byte-range locks. ThreadSanitizer does not model
+# `fcntl` locking as synchronisation at all, so every `walIndexHdr` read on one connection's
+# thread is reported against the write on another's -- it even says so, attributing the only
+# ordering it could see to the `nanosleep` in SQLite's busy handler ("As if synchronized via
+# sleep", `unixSleep`). Three frames: `walIndexWriteHdr`, `walIndexTryHdr` and
+# `walTryBeginRead`, all inside `sqlite3/sqlite3.c`, reached from two `sqlx-sqlite-worker`
+# threads of one `SqlitePool`.
+#
+# It is not ours and it is not fixable here: `sqlx` gives each connection its own thread by
+# design, the schema wants WAL, and SQLite's locking is correct -- it is simply invisible to
+# this tool. Reproduction: `cargo test -p mw-store --test peers` under the job's options.
+#
+# Scoped to the WAL-index functions rather than to `sqlite3.c`, and that distinction is the
+# point: a race from OUR misuse of a connection -- sharing one across threads, say -- would
+# be reported inside `sqlite3Step` or `sqlite3VdbeExec`, which these patterns do not cover.
+#
+# The set is measured rather than guessed. Ten runs of the test with suppressions off
+# produced twenty reports; `walIndexWriteHdr` is in every one of them, paired nineteen times
+# with `walIndexTryHdr` and once with `walTryBeginRead`, and no other SQLite frame appeared.
+# A `race` entry matches any frame of either stack, so `walIndex` alone would have covered
+# all twenty -- `walTryBeginRead` is here because it was observed and may yet pair with
+# something else, not because it has had to fire. If a new WAL frame appears, add it with
+# the same evidence; do not widen this to the file.
+race:walIndex
+race:walTryBeginRead
