@@ -43,6 +43,35 @@
 # entry covers the report in both orders while still being narrow enough that a race of
 # ours is only hidden if it runs through tokio's registration set, which ours do not.
 race:tokio::runtime::io::registration_set::RegistrationSet
+#
+# ...and the same race reported through the OTHER side of the same pair, which is what CI hit
+# on 2026-11-16 and what the entry above does not match.
+#
+# `collector_two_node` failed with the allocation reported against the IO driver's read, and
+# `RegistrationSet` is in neither stack of that report. The reading stack is, frame for frame:
+#
+#   #0  core::sync::atomic::atomic_load::<usize, false>
+#   #5  <tokio::runtime::io::scheduled_io::ScheduledIo>::set_readiness
+#   #6  tokio::runtime::io::driver::dispatch_event
+#   #7  <tokio::runtime::io::driver::Driver>::turn
+#
+# and the write is the heap allocation of that `ScheduledIo` on the registering thread --
+# `posix_memalign` through `alloc::alloc::Global`, with no project frame in it. Same
+# mechanism, same absence of `__tsan_acquire`/`release` where the pointer crosses the kernel,
+# different frame name: the registration set is where the handle is *parked*, and
+# `scheduled_io` is where its readiness is *written*.
+#
+# Scoped to the module rather than to `set_readiness`, because the racing access appears
+# inside two closures named after it (`try_update` and `fetch_update` monomorphised over
+# `ScheduledIo`) and a symbol-level pattern would have to list all three. Still narrow: a race
+# of ours is only hidden by this if it runs through tokio's own readiness word, which nothing
+# in `crates/` touches.
+#
+# NOT scoped to tonic, hyper or tower, although every project-visible frame in that report is
+# one of those. The bug is not in the gRPC stack -- it is this tokio pair, reached that time
+# through tonic's reconnect. Suppressing `race:tonic` would hide every future race in every
+# gRPC path, including ours, to silence a tokio one.
+race:tokio::runtime::io::scheduled_io
 
 # ------------------------------------------------------------------------------------------
 # libsqlite3-sys 0.30.1 (SQLite's own amalgamation): the WAL index, which is shared memory

@@ -62,7 +62,8 @@ machine's configuration is kept.
 ### (b) readings
 
 Both daemons receive the same frames — a WeatherLink Live station broadcasts over UDP, and a
-serial station broadcasts through the `ser2net` fan-out M5-1a measured (`ci/serial-bridge/`).
+serial station broadcasts through the `ser2net` fan-out M5-1a measured
+(`packaging/serial-bridge/README.md`).
 Each writes to its own database, so this compares two tables.
 
 ```sh

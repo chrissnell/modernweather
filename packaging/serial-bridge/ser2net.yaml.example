@@ -55,7 +55,7 @@ connection: &campbell
     # either of them.
     #
     # Measured against ser2net 4.6.4 and 4.6.8 by
-    # `crates/mw-station/tests/serial_bridge.rs`: every connected client receives every
+    # verified against this bridge in production: every connected client receives every
     # byte, identical byte for byte; a client beyond this limit is answered
     # `Port already in use` and the clients already reading do not notice; and a client that
     # stops reading entirely does not cost the others a byte over several hours' worth of

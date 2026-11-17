@@ -267,7 +267,7 @@ pub async fn open(transport: &Transport, station: &str) -> Result<Box<dyn ByteSt
 /// **It is on purpose and it is the second defect this change fixes.** One serial line has
 /// one reader. Two readers do not each get the stream; they split it, and both ends then
 /// produce gap-ridden data that still parses — which is the exact failure
-/// `tests/serial_bridge.rs` exists to prove `ser2net` does *not* have, and the reason
+/// `packaging/serial-bridge/README.md` records `ser2net` does *not* have, and the reason
 /// **N-20** terminates the line outside the pod rather than opening it twice. A refusal an
 /// operator can read in `ComponentStatus::last_error` is strictly better than two components
 /// silently halving each other's frames.
