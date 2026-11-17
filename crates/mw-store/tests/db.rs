@@ -2683,47 +2683,33 @@ async fn a_station_configured_away_from_its_own_history_is_reported_against_a_re
     let live = "db-tests:coverage-live";
     let pool = prepare(&[history, live]).await;
 
-    let w = writer(&pool, history);
-    w.store(&[envelope(
-        history,
-        at(1_767_571_200),
-        1,
-        Reading {
-            out_temp: Some(44.0),
-            ..Reading::default()
-        },
-    )])
-    .await
-    .expect("stores");
-
-    let mut conn = pool.acquire().await.expect("a connection");
-    let all = mw_store::coverage::recorded(&mut conn)
+    let ended = at(1_767_571_200);
+    let began = at(1_767_574_800); // an hour later: the handover
+    writer(&pool, history)
+        .store(&[envelope(
+            history,
+            ended,
+            1,
+            Reading {
+                out_temp: Some(44.0),
+                ..Reading::default()
+            },
+        )])
         .await
-        .expect("the projection reads back");
+        .expect("stores");
 
     // `stations` is shared by every test in this file -- isolation here is by station key
-    // (see this file's header) -- so the comparison is fed this test's own two keys and
+    // (see this file's header) -- so each comparison is fed this test's own two keys and
     // not whatever else the run has left behind.
-    let recorded: Vec<mw_store::Recorded> = all
-        .into_iter()
-        .filter(|r| r.station == history || r.station == live)
-        .collect();
-    assert_eq!(
-        recorded.len(),
-        1,
-        "one reading under `{history}` and none under `{live}`, but the projection says \
-         {recorded:?}"
-    );
-    assert_eq!(recorded[0].station, history);
-    // The instants are the half that would be `None` on every row if the column names
-    // were wrong but the query still parsed -- `SELECT station_id, NULL, NULL` is a
-    // passing query and a useless check.
-    assert_eq!(
-        recorded[0].first_seen,
-        Some(at(1_767_571_200)),
-        "`first_seen` decodes as the instant the writer stored"
-    );
-    assert_eq!(recorded[0].last_seen, Some(at(1_767_571_200)));
+    async fn mine(pool: &PgPool, a: &str, b: &str) -> Vec<mw_store::Recorded> {
+        let mut conn = pool.acquire().await.expect("a connection");
+        mw_store::coverage::recorded(&mut conn)
+            .await
+            .expect("the projection reads back")
+            .into_iter()
+            .filter(|r| r.station == a || r.station == b)
+            .collect()
+    }
 
     let configured = |key: &str| {
         vec![mw_store::Configured {
@@ -2733,8 +2719,27 @@ async fn a_station_configured_away_from_its_own_history_is_reported_against_a_re
         }]
     };
 
-    let split = mw_store::coverage::problems(&configured(live), &recorded);
-    let rendered: Vec<String> = split.iter().map(ToString::to_string).collect();
+    // --- Before the misconfigured station has written anything.
+    let recorded = mine(&pool, history, live).await;
+    assert_eq!(
+        recorded.len(),
+        1,
+        "one reading under `{history}` and none under `{live}`, but the projection says \
+         {recorded:?}"
+    );
+    assert_eq!(recorded[0].station, history);
+    // The instants are the half that would be wrong-but-passing if the column names were
+    // swapped or defaulted -- `SELECT station_id, now(), NULL` parses and says nothing.
+    assert_eq!(
+        recorded[0].first_seen, ended,
+        "`first_seen` decodes as the instant the writer stored"
+    );
+    assert_eq!(recorded[0].last_seen, Some(ended));
+
+    let rendered: Vec<String> = mw_store::coverage::problems(&configured(live), &recorded)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
     assert_eq!(rendered.len(), 2, "both directions, in {rendered:?}");
     assert!(
         rendered[0].contains(live) && rendered[0].contains(history),
@@ -2747,13 +2752,58 @@ async fn a_station_configured_away_from_its_own_history_is_reported_against_a_re
         rendered[1]
     );
 
-    // And the fixed configuration -- the same station keyed onto its own history -- is
+    // --- And after it has. **The state the deployment was actually in** on the day
+    // somebody went looking: the station is writing, so it has a projection row and the
+    // no-history arm is silent. What is left is the handover in the instants, and those
+    // come out of the real projection here rather than out of a hand-built struct.
+    writer(&pool, live)
+        .store(&[envelope(
+            live,
+            began,
+            1,
+            Reading {
+                out_temp: Some(45.0),
+                ..Reading::default()
+            },
+        )])
+        .await
+        .expect("stores");
+
+    let recorded = mine(&pool, history, live).await;
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    let problems = mw_store::coverage::problems(&configured(live), &recorded);
+    assert!(
+        !problems
+            .iter()
+            .any(|p| matches!(p, mw_store::CoverageProblem::NoHistory { .. })),
+        "the station has readings now: {problems:?}"
+    );
+    let split = problems
+        .iter()
+        .find(|p| matches!(p, mw_store::CoverageProblem::Split { .. }))
+        .unwrap_or_else(|| panic!("the split is still visible: {problems:?}"))
+        .to_string();
+    assert!(split.contains(live) && split.contains(history), "{split}");
+
+    // And the fixed configuration -- both keys carried by configured stations -- is
     // silent. Without this half the test would pass against a check that reported
     // everything.
+    let both = vec![
+        mw_store::Configured {
+            station: StationKey::new(history),
+            name: "Air Quality".to_owned(),
+            collecting: true,
+        },
+        mw_store::Configured {
+            station: StationKey::new(live),
+            name: "Air Quality (new key)".to_owned(),
+            collecting: true,
+        },
+    ];
     assert_eq!(
-        mw_store::coverage::problems(&configured(history), &recorded),
+        mw_store::coverage::problems(&both, &recorded),
         Vec::new(),
-        "a station keyed onto its own history has nothing to report"
+        "two stations, each keyed onto its own history, have nothing to report"
     );
 
     touched(

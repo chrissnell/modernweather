@@ -279,13 +279,20 @@ impl Registrar<Config> for Database {
         // than inside the component because this is the registrar that already holds the
         // configuration, and `mw_store::coverage` says why it is not taken off the
         // registry snapshot instead.
+        //
+        // `collecting` is `rollup_stations`' filter and not `enabled` alone, which is one
+        // clause this file already owns: a row with no `transport_kind` is a station this
+        // node knows about and does not read -- a peer's, registered under W7 §5.1 -- and
+        // `enabled` defaults to 1 on it. Taking `enabled` by itself would report every
+        // received station as "collecting with no readings here", each one carrying the
+        // whole candidate list, which is a check that is loudest where it is most wrong.
         let configured: Vec<mw_store::Configured> = cfg
             .stations
             .iter()
             .map(|s| mw_store::Configured {
                 station: mw_types::StationKey::new(s.station_key.as_str()),
                 name: s.name.clone(),
-                collecting: s.enabled,
+                collecting: s.enabled && s.transport_kind.is_some(),
             })
             .collect();
         out.push(

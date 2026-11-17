@@ -94,9 +94,18 @@ const FAILURES_BEFORE_REVOKE: u32 = 3;
 /// `configured` is `config.stations` reduced to the three fields [`crate::coverage`] needs,
 /// and it travels as data rather than through `registry` for the reason that module gives:
 /// a [`StationRegistry`] is keyed for *resolution* and has no enumeration to borrow. It is
-/// a snapshot of configuration exactly as `url` is, so it belongs in the closure beside it
-/// -- and not in [`url_digest_input`], because a station added elsewhere in the
-/// configuration must not restart the pool.
+/// a snapshot of configuration exactly as `url` is, so it belongs in the closure beside it.
+///
+/// **It is not in the digest, and the reason is not "so a station change does not restart
+/// the pool".** It would not have that effect: `modernweather::boot`'s `shared_fingerprint`
+/// covers every station's key, `enabled`, transport and coordinates, and `boot::stamp`
+/// folds that epoch into *every* spec's digest -- so adding, re-keying or disabling a
+/// station restarts this component already. What the exclusion actually decides is the one
+/// column the fingerprint deliberately leaves out: `config.stations.name`, kept out so that
+/// a rename does not restart the whole plan. So a display-name-only rename leaves a running
+/// pool reporting the previous name in a coverage warning until something else re-plans it.
+/// That is the right trade in that direction -- a plan restart is every component, and this
+/// is a word in a diagnostic -- and it is stated rather than left to be rediscovered.
 pub fn spec(
     url: secrecy::SecretString,
     registry: Arc<dyn StationRegistry>,
@@ -687,9 +696,11 @@ mod tests {
             of("postgresql://b/mw", Vec::new())
         );
         // The station list is carried for the coverage check and is deliberately NOT in
-        // the digest: a station added or renamed restarts the components that collect it,
-        // and restarting the pool as well would take every other station's writer, the
-        // frozen surface's four reads and the rollup down with it for a diagnostic.
+        // this digest. `spec`'s own documentation has the whole of why, and the part worth
+        // an assertion is that it is genuinely absent: a key, a name or an `enabled` flag
+        // changing here moves nothing. What restarts the pool on a real station change is
+        // `boot::stamp` folding the shared epoch in afterwards, which is a different
+        // digest and a different test.
         assert_eq!(
             of("postgresql://a/mw", Vec::new()),
             of(
@@ -700,7 +711,7 @@ mod tests {
                     collecting: true,
                 }]
             ),
-            "the configured stations are not part of what restarts the pool"
+            "the configured stations are not part of this spec's digest"
         );
     }
 }

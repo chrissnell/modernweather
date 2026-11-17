@@ -109,9 +109,19 @@ pub struct Configured {
 pub struct Recorded {
     /// `stations.station_id`.
     pub station: String,
-    /// `stations.first_seen`.
-    pub first_seen: Option<DateTime<Utc>>,
-    /// `stations.last_seen`.
+    /// `stations.first_seen`, which the schema declares `NOT NULL DEFAULT now()`.
+    ///
+    /// Not an `Option`, because the column cannot be one: a projection row exists only
+    /// because the writer upserted it beside a batch of readings, and that upsert supplies
+    /// the instant. Modelling it as absent would mean a `None` arm no database can reach
+    /// and a test pinning a sentence nothing can produce.
+    pub first_seen: DateTime<Utc>,
+    /// `stations.last_seen`, which **is** nullable.
+    ///
+    /// The asymmetry is the schema's (`migrations/20261029234500_w4_...`): `first_seen`
+    /// has a default and this does not, so a row written by anything other than the
+    /// writer's upsert -- `w9.populate_stations()` during the migration, for one -- has a
+    /// beginning and no end.
     pub last_seen: Option<DateTime<Utc>>,
 }
 
@@ -134,7 +144,7 @@ pub enum CoverageProblem {
         station: StationKey,
         /// `config.stations.name`, as the operator typed it.
         name: String,
-        /// Rendered by [`CoverageProblem::whence`]; the keys that do have history.
+        /// The clause naming the keys that do have history, pre-rendered.
         whence: String,
     },
     /// The weather database holds history under a key no configured station writes to.
@@ -148,8 +158,35 @@ pub enum CoverageProblem {
     NoStation {
         /// The recorded `station_id`.
         station: String,
-        /// Rendered by [`CoverageProblem::span`]; the extent of what is there.
+        /// The extent of what is there, pre-rendered.
         span: String,
+    },
+    /// A collecting station and an orphaned key that look like one series, split in two.
+    ///
+    /// **The variant the 2026-11-16 defect actually needed.** [`CoverageProblem::NoHistory`]
+    /// stops firing the moment the first reading lands under the wrong key -- which on that
+    /// day was three seconds after the save, and hours before anybody looked. What survives
+    /// is the shape: a station whose history *begins* where an unclaimed key's history
+    /// *ends*.
+    #[error(
+        "station `{station}` ({name}) has been collecting since {began}, and `{orphan}` \
+         has history that ends at {ended} and that no configured station carries. One \
+         series under two keys looks exactly like this -- a station key is \
+         `observations.station_id`, so re-keying a station leaves its past addressed \
+         by the old key and nothing pointing at it. If they are the same device the \
+         two keys have to become one; if they are not, `{orphan}` is a retired device."
+    )]
+    Split {
+        /// The configured key.
+        station: StationKey,
+        /// `config.stations.name`, as the operator typed it.
+        name: String,
+        /// When the configured key's own history begins.
+        began: DateTime<Utc>,
+        /// The unclaimed key whose history ends just before that.
+        orphan: String,
+        /// When the unclaimed key's history ends.
+        ended: DateTime<Utc>,
     },
 }
 
@@ -167,14 +204,14 @@ impl CoverageProblem {
     /// in the key so one failing device does not suppress another's identical error"*.
     pub fn station(&self) -> &str {
         match self {
-            Self::NoHistory { station, .. } => station.as_str(),
+            Self::NoHistory { station, .. } | Self::Split { station, .. } => station.as_str(),
             Self::NoStation { station, .. } => station.as_str(),
         }
     }
 
     /// The clause that names where the history actually is.
     ///
-    /// **This is the useful half of [`CoverageProblem::NoHistory`]**, and it is built from
+    /// **This is the useful half of `NoHistory`**, and it is built from
     /// the other direction's findings rather than from a second query: a key with history
     /// nobody writes under, in a database that also has a station with no history, is very
     /// likely the same station under its previous name. Likely, not certain — so the
@@ -205,20 +242,34 @@ impl CoverageProblem {
         }
     }
 
-    /// The extent of a recorded station, in the two instants the projection carries.
+    /// The extent of a recorded station.
     ///
-    /// A projection row with no instants is possible — `first_seen` and `last_seen` are
-    /// nullable columns — and "has history (unknown .. unknown)" is a worse sentence than
-    /// saying the row is there and dateless, so that case gets its own words.
-    fn span(first: Option<DateTime<Utc>>, last: Option<DateTime<Utc>>) -> String {
-        match (first, last) {
-            (Some(f), Some(l)) => format!("{f} .. {l}"),
-            (Some(f), None) => format!("from {f}"),
-            (None, Some(l)) => format!("up to {l}"),
-            (None, None) => "the projection row carries no instants".to_owned(),
+    /// `last_seen` is nullable where `first_seen` is not, so the open-ended case is the one
+    /// that needs words: *"has history (2025-10-30 .. )"* reads as a rendering bug, and a
+    /// row written by `w9.populate_stations()` during the migration genuinely has a
+    /// beginning and no end until the writer touches it.
+    fn span(first: DateTime<Utc>, last: Option<DateTime<Utc>>) -> String {
+        match last {
+            Some(l) => format!("{first} .. {l}"),
+            None => format!("from {first}, with no last reading recorded"),
         }
     }
 }
+
+/// How far apart an orphan's last reading and a station's first may be and still be called
+/// one series.
+///
+/// The two occurrences this module exists for measured **3 h 31 m** (the AirGradient: the
+/// migration's import ended at 19:53 and the station's first live reading was at 23:24) and
+/// very nearly zero (the 2026-11-13 re-key, where the live station started as the migrated
+/// history ended). A week is generous against both and is the figure that keeps the one
+/// standing orphan on this deployment out of it: `snow` ends 2026-10-02 and no station is
+/// configured within a week either side of that.
+///
+/// A bound rather than none at all, because the alternative pairs every station added from
+/// now on with every device ever retired -- which is a sentence that is wrong more often
+/// than it is right, said on every boot.
+const HANDOVER: chrono::TimeDelta = chrono::TimeDelta::days(7);
 
 /// Compare the two sets and say what does not line up.
 ///
@@ -230,43 +281,57 @@ impl CoverageProblem {
 /// key — because the caller writes one log line per problem and an unordered `Vec` would
 /// reorder a boot log between restarts for no reason.
 pub fn problems(configured: &[Configured], recorded: &[Recorded]) -> Vec<CoverageProblem> {
-    let has_history = |key: &str| recorded.iter().any(|r| r.station == key);
+    let history = |key: &str| recorded.iter().find(|r| r.station == key);
     // Every configured key claims its own, enabled or not: a station switched off through
     // the admin UI has not given up its history.
     let claimed = |key: &str| configured.iter().any(|c| c.station.as_str() == key);
 
-    // The orphans, computed once: they are the other direction's answer AND the candidate
-    // list every `NoHistory` message carries.
-    let orphans: Vec<&str> = {
-        let mut keys: Vec<&str> = recorded
-            .iter()
-            .filter(|r| !claimed(&r.station))
-            .map(|r| r.station.as_str())
-            .collect();
-        keys.sort_unstable();
-        keys
-    };
+    // The orphans, computed once. They are the other direction's answer, the candidate list
+    // every `NoHistory` message carries, and the right-hand side of every `Split`.
+    let mut orphans: Vec<&Recorded> = recorded.iter().filter(|r| !claimed(&r.station)).collect();
+    orphans.sort_unstable_by(|a, b| a.station.cmp(&b.station));
+    let orphan_keys: Vec<&str> = orphans.iter().map(|r| r.station.as_str()).collect();
 
     let mut out = Vec::new();
-    let mut missing: Vec<&Configured> = configured
-        .iter()
-        .filter(|c| c.collecting && !has_history(c.station.as_str()))
-        .collect();
-    missing.sort_unstable_by(|a, b| a.station.as_str().cmp(b.station.as_str()));
-    for c in missing {
-        out.push(CoverageProblem::NoHistory {
-            station: c.station.clone(),
-            name: c.name.clone(),
-            whence: CoverageProblem::whence(&orphans),
-        });
+    let mut collecting: Vec<&Configured> = configured.iter().filter(|c| c.collecting).collect();
+    collecting.sort_unstable_by(|a, b| a.station.as_str().cmp(b.station.as_str()));
+    for c in collecting {
+        match history(c.station.as_str()) {
+            // No readings at all under this key.
+            None => out.push(CoverageProblem::NoHistory {
+                station: c.station.clone(),
+                name: c.name.clone(),
+                whence: CoverageProblem::whence(&orphan_keys),
+            }),
+            // Readings under this key, and an unclaimed key whose own readings stop just
+            // before they start. **This is the arm that matters**: the station is working,
+            // `NoHistory` has gone quiet, and the pairing is still visible in the instants.
+            //
+            // The nearest qualifying orphan rather than all of them -- the shape being
+            // reported is a handover, and a handover has one predecessor. A second line
+            // naming a second candidate would be a guess competing with a measurement.
+            Some(mine) => {
+                let nearest = orphans
+                    .iter()
+                    .filter_map(|o| o.last_seen.map(|ended| (o, ended)))
+                    .filter(|(_, ended)| {
+                        *ended <= mine.first_seen && mine.first_seen - *ended <= HANDOVER
+                    })
+                    .max_by_key(|(_, ended)| *ended);
+                if let Some((o, ended)) = nearest {
+                    out.push(CoverageProblem::Split {
+                        station: c.station.clone(),
+                        name: c.name.clone(),
+                        began: mine.first_seen,
+                        orphan: o.station.clone(),
+                        ended,
+                    });
+                }
+            }
+        }
     }
 
-    let mut unclaimed: Vec<&Recorded> = recorded
-        .iter()
-        .filter(|r| !claimed(&r.station))
-        .collect::<Vec<_>>();
-    unclaimed.sort_unstable_by(|a, b| a.station.cmp(&b.station));
-    for r in unclaimed {
+    for r in orphans {
         out.push(CoverageProblem::NoStation {
             station: r.station.clone(),
             span: CoverageProblem::span(r.first_seen, r.last_seen),
@@ -290,7 +355,7 @@ pub async fn recorded(conn: &mut sqlx::PgConnection) -> Result<Vec<Recorded>, sq
     #[derive(sqlx::FromRow)]
     struct Row {
         station_id: String,
-        first_seen: Option<DateTime<Utc>>,
+        first_seen: DateTime<Utc>,
         last_seen: Option<DateTime<Utc>>,
     }
 
@@ -327,13 +392,32 @@ mod tests {
         }
     }
 
-    fn rec(k: &str) -> Recorded {
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(secs, 0).expect("in range")
+    }
+
+    /// A station recorded over a long span ending at `end`.
+    fn rec_until(k: &str, end: i64) -> Recorded {
         Recorded {
             station: k.to_owned(),
-            first_seen: Some(DateTime::from_timestamp(1_700_000_000, 0).expect("in range")),
-            last_seen: Some(DateTime::from_timestamp(1_760_000_000, 0).expect("in range")),
+            first_seen: at(end - 31_536_000),
+            last_seen: Some(at(end)),
         }
     }
+
+    /// A station recorded from `start` to a little after it -- a young series.
+    fn rec_from(k: &str, start: i64) -> Recorded {
+        Recorded {
+            station: k.to_owned(),
+            first_seen: at(start),
+            last_seen: Some(at(start + 3_600)),
+        }
+    }
+
+    /// 2026-11-16 19:53 UTC, where the AirGradient's imported history ends.
+    const IMPORT_END: i64 = 1_794_858_782;
+    /// 2026-11-16 23:24 UTC, where it started writing under the other key.
+    const LIVE_START: i64 = 1_794_871_459;
 
     /// The ordinary deployment: every configured station has history and every recorded
     /// station is configured. Silence is the correct output and the one this will produce
@@ -342,20 +426,26 @@ mod tests {
     fn a_configuration_that_matches_its_history_reports_nothing() {
         let problems = problems(
             &[cfg("csi", true), cfg("suncrest-air-quality", true)],
-            &[rec("csi"), rec("suncrest-air-quality")],
+            &[
+                rec_until("csi", IMPORT_END),
+                rec_until("suncrest-air-quality", IMPORT_END),
+            ],
         );
         assert_eq!(problems, Vec::new());
     }
 
-    /// **The 2026-11-16 defect, exactly.** A legal key, a station that collects, and a
-    /// year of history addressed by a key nothing points at. Both problems are reported,
-    /// and the first one names the second one's key -- which is the sentence that would
-    /// have turned a three-hour mistake into a thirty-second one.
+    /// **The 2026-11-16 defect before the station had written anything.** A legal key, no
+    /// readings yet, and a year of history addressed by a key nothing points at. The
+    /// message names the key the history is under, which is the sentence that would have
+    /// turned a three-hour mistake into a thirty-second one.
     #[test]
-    fn a_station_keyed_away_from_its_own_history_names_the_key_the_history_is_under() {
+    fn a_station_with_no_readings_yet_names_the_key_the_history_is_under() {
         let problems = problems(
             &[cfg("csi", true), cfg("airgradient", true)],
-            &[rec("csi"), rec("suncrest-air-quality")],
+            &[
+                rec_until("csi", LIVE_START),
+                rec_until("suncrest-air-quality", IMPORT_END),
+            ],
         );
         let rendered: Vec<String> = problems.iter().map(ToString::to_string).collect();
         assert_eq!(rendered.len(), 2, "both directions, in {rendered:?}");
@@ -372,12 +462,103 @@ mod tests {
         );
     }
 
-    /// History under a key nothing is configured for, with **no** station missing its
-    /// history -- `snow` on this deployment. Only one direction fires, and the message
-    /// does not invite a pairing that does not exist.
+    /// **The same defect three seconds later, which is when it was actually discoverable.**
+    /// The station has written, so there IS a projection row under `airgradient` and
+    /// `NoHistory` has gone quiet -- the state the deployment was in for the whole of the
+    /// day somebody went looking. The pairing survives in the instants: one series stops
+    /// at 19:53 and another starts at 23:24 under a key nobody configured.
+    #[test]
+    fn the_pairing_survives_the_first_reading_landing_under_the_wrong_key() {
+        let problems = problems(
+            &[cfg("csi", true), cfg("airgradient", true)],
+            &[
+                rec_until("csi", LIVE_START),
+                rec_from("airgradient", LIVE_START),
+                rec_until("suncrest-air-quality", IMPORT_END),
+            ],
+        );
+        assert!(
+            !problems
+                .iter()
+                .any(|p| matches!(p, CoverageProblem::NoHistory { .. })),
+            "the station has readings now, so the no-history arm is silent: {problems:?}"
+        );
+        let split = problems
+            .iter()
+            .find(|p| matches!(p, CoverageProblem::Split { .. }))
+            .unwrap_or_else(|| panic!("the split is still visible: {problems:?}"));
+        let rendered = split.to_string();
+        assert!(
+            rendered.contains("`airgradient`") && rendered.contains("`suncrest-air-quality`"),
+            "{rendered}"
+        );
+        assert_eq!(split.station(), "airgradient");
+    }
+
+    /// The bound is what keeps the pairing a measurement rather than a guess. A station
+    /// configured long after a device was retired is not that device under a new key, and
+    /// saying so on every boot is how a check stops being read.
+    #[test]
+    fn a_station_configured_long_after_a_device_retired_is_not_paired_with_it() {
+        let month_later = IMPORT_END + 30 * 86_400;
+        let problems = problems(
+            &[cfg("newgauge", true)],
+            &[
+                rec_from("newgauge", month_later),
+                rec_until("snow", IMPORT_END),
+            ],
+        );
+        assert!(
+            !problems
+                .iter()
+                .any(|p| matches!(p, CoverageProblem::Split { .. })),
+            "a month apart is not a handover: {problems:?}"
+        );
+        assert_eq!(problems.len(), 1, "only `snow`'s own line: {problems:?}");
+    }
+
+    /// The nearest predecessor, not all of them: the shape being reported is a handover and
+    /// a handover has one. A second candidate would be a guess competing with a
+    /// measurement.
+    #[test]
+    fn the_split_names_the_nearest_predecessor_only() {
+        let problems = problems(
+            &[cfg("live", true)],
+            &[
+                rec_from("live", LIVE_START),
+                rec_until("far", LIVE_START - 500_000),
+                rec_until("near", IMPORT_END),
+            ],
+        );
+        let split = problems
+            .iter()
+            .find_map(|p| match p {
+                CoverageProblem::Split { orphan, .. } => Some(orphan.as_str()),
+                _ => None,
+            })
+            .expect("a split");
+        assert_eq!(split, "near");
+        assert_eq!(
+            problems
+                .iter()
+                .filter(|p| matches!(p, CoverageProblem::Split { .. }))
+                .count(),
+            1
+        );
+    }
+
+    /// History under a key nothing is configured for, with **no** station to pair it with
+    /// -- `snow` on this deployment. Only one direction fires, and the message does not
+    /// invite a pairing that does not exist.
     #[test]
     fn retired_history_is_reported_without_a_station_to_blame_it_on() {
-        let problems = problems(&[cfg("csi", true)], &[rec("csi"), rec("snow")]);
+        let problems = problems(
+            &[cfg("csi", true)],
+            &[
+                rec_until("csi", IMPORT_END),
+                rec_until("snow", IMPORT_END - 4_000_000),
+            ],
+        );
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(matches!(
             &problems[0],
@@ -390,13 +571,15 @@ mod tests {
     /// message says so, and the candidate clause says there is nowhere else to look.
     #[test]
     fn a_brand_new_station_is_reported_as_having_no_past_rather_than_a_misplaced_one() {
-        let problems = problems(&[cfg("csi", true), cfg("newgauge", true)], &[rec("csi")]);
+        let problems = problems(
+            &[cfg("csi", true), cfg("newgauge", true)],
+            &[rec_until("csi", IMPORT_END)],
+        );
         assert_eq!(problems.len(), 1, "{problems:?}");
         let rendered = problems[0].to_string();
         assert!(
             rendered.contains(
-                "a station with no past rather than a station looking in the \
-                               wrong place"
+                "a station with no past rather than a station looking in the wrong place"
             ),
             "{rendered}"
         );
@@ -407,12 +590,12 @@ mod tests {
     }
 
     /// A station switched off through the admin UI keeps its claim on its key, so its
-    /// history is not reported as orphaned -- and it is not reported as having none
-    /// either, because a station that is not collecting is not expected to be writing.
+    /// history is not reported as orphaned -- and it is not asked for readings either,
+    /// because a station that is not collecting is not expected to be writing.
     #[test]
     fn a_disabled_station_claims_its_key_and_is_not_asked_for_readings() {
         assert_eq!(
-            problems(&[cfg("csi", false)], &[rec("csi")]),
+            problems(&[cfg("csi", false)], &[rec_until("csi", IMPORT_END)]),
             Vec::new(),
             "a disabled station with history is nobody's problem"
         );
@@ -441,7 +624,9 @@ mod tests {
     /// being read.
     #[test]
     fn the_candidate_list_is_capped_and_counts_what_it_leaves_out() {
-        let orphans: Vec<Recorded> = (0..19).map(|i| rec(&format!("orphan-{i:02}"))).collect();
+        let orphans: Vec<Recorded> = (0..19)
+            .map(|i| rec_until(&format!("orphan-{i:02}"), IMPORT_END - 4_000_000))
+            .collect();
         let problems = problems(&[cfg("newgauge", true)], &orphans);
         let rendered = problems[0].to_string();
         assert!(
@@ -461,26 +646,70 @@ mod tests {
     fn every_problem_names_the_station_the_dedupe_layer_keys_on() {
         let problems = problems(
             &[cfg("airgradient", true)],
-            &[rec("suncrest-air-quality"), rec("snow")],
+            &[
+                rec_from("airgradient", LIVE_START),
+                rec_until("suncrest-air-quality", IMPORT_END),
+                rec_until("snow", IMPORT_END - 4_000_000),
+            ],
         );
         let keys: Vec<&str> = problems.iter().map(CoverageProblem::station).collect();
         assert_eq!(keys, ["airgradient", "snow", "suncrest-air-quality"]);
     }
 
-    /// A projection row with no instants renders words rather than an empty parenthesis,
-    /// because `stations.first_seen` and `stations.last_seen` are nullable columns and the
-    /// sentence has to survive both of them being absent.
+    /// **No message contains a double space.** A `\`-continued string literal in an
+    /// `#[error]` attribute strips the newline and the next line's indentation, and one
+    /// that loses its continuation silently bakes ten spaces into the middle of a
+    /// sentence. That happened to the split message once, reached a log, and is invisible
+    /// in a diff -- so it is asserted rather than re-read.
     #[test]
-    fn a_dateless_projection_row_still_renders_a_sentence() {
-        let bare = Recorded {
+    fn no_rendered_message_has_a_run_of_spaces_in_it() {
+        let every = problems(
+            &[cfg("airgradient", true), cfg("newgauge", true)],
+            &[
+                rec_from("airgradient", LIVE_START),
+                rec_until("suncrest-air-quality", IMPORT_END),
+                Recorded {
+                    station: "open-ended".to_owned(),
+                    first_seen: at(IMPORT_END),
+                    last_seen: None,
+                },
+            ],
+        );
+        // Every variant is present, so the assertion below covers all of them.
+        assert!(every
+            .iter()
+            .any(|p| matches!(p, CoverageProblem::NoHistory { .. })));
+        assert!(every
+            .iter()
+            .any(|p| matches!(p, CoverageProblem::Split { .. })));
+        assert!(every
+            .iter()
+            .any(|p| matches!(p, CoverageProblem::NoStation { .. })));
+        for p in &every {
+            let rendered = p.to_string();
+            assert!(
+                !rendered.contains("  "),
+                "a run of spaces in a rendered message: {rendered:?}"
+            );
+        }
+    }
+
+    /// `last_seen` is the nullable one, and the open-ended case needs words rather than an
+    /// empty half of a range: a row `w9.populate_stations()` wrote during the migration has
+    /// a beginning and no end until the writer touches it.
+    #[test]
+    fn a_projection_row_with_no_last_reading_still_renders_a_sentence() {
+        let open = Recorded {
             station: "ghost".to_owned(),
-            first_seen: None,
+            first_seen: at(IMPORT_END),
             last_seen: None,
         };
-        let problems = problems(&[], &[bare]);
+        let problems = problems(&[], &[open]);
         assert_eq!(problems.len(), 1);
         assert!(
-            problems[0].to_string().contains("carries no instants"),
+            problems[0]
+                .to_string()
+                .contains("with no last reading recorded"),
             "{}",
             problems[0]
         );

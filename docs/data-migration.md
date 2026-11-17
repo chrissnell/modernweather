@@ -856,12 +856,19 @@ reason that one is there: the configuration is read before `plan()`, when the da
 be unreachable (**D-27**), so the boot sequence cannot make this comparison and the first connection
 can.
 
-It reports **both** directions, because they are different sentences and neither implies the other:
+It reports **three** things, because they are different sentences and none implies another:
 
 | | |
 |---|---|
 | `NoHistory` | a station is collecting under a key the database holds no readings for — and the message **names the keys that do have history nobody writes under**, which is the line that turns "my chart is short" into "your readings are under `suncrest-air-quality`" |
+| `Split` | a station is collecting, it *does* have history, and an unclaimed key's history **ends where its own begins**. This is the variant the 2026-11-16 defect actually needed: `NoHistory` went quiet three seconds after the save, when the first reading landed under `airgradient`, and stayed quiet for the whole of the day somebody went looking. What survives is the handover in the instants — 19:53 to 23:24 — and that is what is reported |
 | `NoStation` | history under a key no configured station carries, with its extent. On this deployment that is `snow`, whose gauge is not configured here and whose readings stop on 2026-10-02 — a true finding, not a false positive |
+
+The pairing is bounded at a week (`HANDOVER`), which is the one number here and it is measured rather
+than chosen: the two real occurrences are **3 h 31 m** apart and very nearly zero. Unbounded, it
+would pair every station added from now on with every device ever retired — `snow` against anything
+configured after October — which is a sentence that is wrong more often than it is right, said on
+every boot.
 
 Three things about it are deliberate and each is a test:
 
@@ -875,6 +882,10 @@ Three things about it are deliberate and each is a test:
 - **It warns; it does not refuse.** Unlike `ZoneProblem`, both halves here are internally consistent
   and only the operator can say which key is right. A daemon that refused to start over it would be
   unstartable in the window somebody was trying to fix it in.
+- **"Collecting" is `enabled AND has a transport`**, which is `Config::rollup_stations`' own filter
+  rather than `enabled` alone. A row with no `transport_kind` is a station this node knows about and
+  does not read — a peer's, registered under W7 §5.1 — and `enabled` defaults to 1 on it, so the
+  looser predicate would report every received station as collecting-with-no-readings-here.
 
 Each line records `station`, which is not decoration: `mw_obs::dedupe` keys repetition control on the
 callsite, the level and that field, so without it every finding shares one bucket and the policy's
