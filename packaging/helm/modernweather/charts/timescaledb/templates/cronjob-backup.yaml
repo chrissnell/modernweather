@@ -65,10 +65,12 @@ spec:
                   # The superuser password is `openssl rand -base64 36`, so it contains
                   # `/` and `+`, and a `/` ends the authority component of a URL: libpq
                   # parsed the rest of the password as the port and the first real run
-                  # died with `invalid integer value "aZr1mD0tc" for connection option
-                  # "port"`. PGPASSWORD is already in the environment and libpq uses it
-                  # whenever the URL carries no password, so the secret never reaches a
-                  # URL parser at all.
+                  # died with `invalid integer value "<redacted>" for connection option
+                  # "port"`. The quoted value in that error WAS the password's first nine
+                  # characters, and this comment carried them in a public repository until
+                  # it was redacted -- see GRA-801. PGPASSWORD is already in the
+                  # environment and libpq uses it whenever the URL carries no password, so
+                  # the secret never reaches a URL parser at all.
                   export DATABASE_URL="postgresql://{{ .Values.auth.username }}@{{ include "timescaledb.rwHost" . }}/{{ .Values.auth.database }}"
                   echo "layout version $(/backup/offsite-backup.sh layout-version)"
                   /backup/offsite-backup.sh plan
