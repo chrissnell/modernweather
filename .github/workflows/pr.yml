@@ -134,15 +134,16 @@ jobs:
       # The in-process concurrency this job exists for is `mw-supervisor`'s, and
       # `crates/mw-supervisor/tests/concurrency.rs` is where TSan can see it.
       #
-      # There is also a standing false positive on the one path only that binary takes:
-      # `tokio` publishes a `ScheduledIo` to its I/O driver as an `epoll_ctl` token and
+      # There is also a standing false positive, and it is no longer only on that binary's
+      # path: `tokio` publishes a `ScheduledIo` to its I/O driver as an `epoll_ctl` token and
       # reads it back from `epoll_wait`, and TSan does not model those syscalls as
       # synchronisation, so it reports the allocating write against the driver thread's
       # atomic load. No `tokio` release fixes that: it needs
-      # `__tsan_acquire`/`release` annotations wherever the pointer crosses the kernel. If a
-      # suppression file is ever wanted instead, `race:tokio::runtime::io::` is the frame,
-      # and the reproduction is `cargo test -p modernweather --test boot` with
-      # `--cfg mw_sanitizer` removed.
+      # `__tsan_acquire`/`release` annotations wherever the pointer crosses the kernel.
+      # `ci/tsan/suppressions.txt` is the one suppression for it, scoped to the allocating
+      # frame and argued for in that file; the `TSAN_OPTIONS` below load it and print what it
+      # matched. The reproduction is `cargo test -p modernweather --test boot` with
+      # `--cfg mw_sanitizer` removed, or `--test collector_two_node` as it stands.
       #
       # IT TAKES TWO THINGS TOGETHER, AND THAT IS A RULE FOR NEW TESTS RATHER THAN A NOTE.
       # The registration and the driver have to be two threads -- a **multi-threaded
@@ -158,10 +159,20 @@ jobs:
       # `Handle::add_source::<mio::net::udp::UdpSocket>`, exactly as described above. It is
       # `current_thread` now. **A test that needs a socket does not need worker threads**: a
       # `Serve` body and a test body interleave at every await on one thread. If a future
-      # test genuinely needs both, the suppression frame above is the answer, not a narrowed
+      # test genuinely needs both, the suppression file above is the answer, not a narrowed
       # command -- and `crates/mw-station/tests/emulator.rs` is multi-threaded and binds
       # sockets but is `#[ignore]`d, so this job does not run it; un-ignoring it here would
       # need the same treatment.
+      #
+      # `crates/modernweather/tests/collector_two_node.rs` is the test that genuinely needs
+      # both, and is why the suppression file exists rather than remaining a note. It cannot
+      # be `current_thread`: it starts and drops the collector's own runtime, and injects the
+      # partition by dropping the listener, inside `tokio::task::block_in_place` -- which
+      # PANICS on a current_thread runtime. Its sockets are tonic's, so the report's write
+      # side is a `TcpStream::connect` in `hyper_util`'s connector and nothing in `crates/`
+      # appears in either stack. A `cfg(not(mw_sanitizer))` on it would have been the wrong
+      # answer twice over: an in-process gRPC test is what this job is FOR, and the allow-list
+      # below exists to stop exactly that from being added quietly.
       - name: cargo test under ThreadSanitizer
         env:
           RUSTFLAGS: -Zsanitizer=thread --cfg mw_sanitizer
@@ -180,7 +191,20 @@ jobs:
           RUSTDOCFLAGS: -Zsanitizer=thread --cfg mw_sanitizer
           # A leak at process exit is not a race, and TSan's leak checker fires on
           # perfectly ordinary Box::leak of a static.
-          TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 detect_leaks=0
+          #
+          # `suppressions` is two mechanisms' worth of entries and `ci/tsan/suppressions.txt`
+          # is where each argues for itself. An ABSOLUTE path, because cargo runs a test binary with its cwd at the
+          # PACKAGE root rather than the workspace root, so a relative path resolves
+          # differently per crate -- and TSan aborts on a suppressions file it cannot open,
+          # which is the right direction but a confusing way to find that out.
+          #
+          # `print_suppressions=1` so the log says which entries matched and how many times.
+          # A suppression nobody can see the effect of is how a sanitizer job stops
+          # sanitizing (docs/reconciliation.md G-1); an entry that has stopped matching is an
+          # entry to delete, and this is what makes that visible.
+          TSAN_OPTIONS: >-
+            halt_on_error=1 second_deadlock_stack=1 detect_leaks=0 print_suppressions=1
+            suppressions=${{ github.workspace }}/ci/tsan/suppressions.txt
           # Set explicitly, because rust-toolchain.toml otherwise wins and cargo runs on
           # stable, where -Z is rejected outright. Installing a nightly toolchain is not
           # the same as selecting it.
