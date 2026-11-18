@@ -25,6 +25,13 @@
 //! the daemon's own reason, stated at `a_missing_configuration_is_refused_rather_than_defaulted`
 //! below: a program that invents a path creates a database somewhere nobody looked and then
 //! reports that it has no administrator.
+//!
+//! **`discover` is the one command that is not like that**, and it is the only thing here
+//! that is not W5 §3.6's. It opens nothing — one multicast question, a table, exit
+//! (`crate::discover`) — so requiring a path would be requiring a file it never reads, and
+//! being handed one would mean nothing had been done with it. It is therefore checked
+//! *before* `--config` is required, and a `--config` given with it is refused rather than
+//! ignored.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -113,6 +120,13 @@ pub enum Parsed {
     /// The migration's report is dozens of lines about a deployment and belongs in the
     /// journal, so it installs the subscriber first and logs. Two plumbings, two variants.
     MigrateConfig(MigrateArgs),
+    /// `discover` — browse the LAN for snow gauges and exit.
+    ///
+    /// Its own variant and **the one subcommand with no `--config`**: it opens no database,
+    /// reads no configuration and changes nothing, so there is no path for it to require
+    /// (`crate::discover`). Like W5 §3.6's commands it runs before any subscriber, which is
+    /// why what it prints goes to the console.
+    Discover,
     /// `--help` or `--version` was asked for and has been printed.
     Printed,
 }
@@ -149,13 +163,22 @@ pub enum ArgsError {
     },
     /// `{words}` is not a command this binary has.
     #[error(
-        "`{words}` is not a command; expected reset-password, reset-setup-token, \
+        "`{words}` is not a command; expected discover, reset-password, reset-setup-token, \
              `sessions revoke --all` or migrate-config"
     )]
     NoSuchCommand {
         /// What was typed.
         words: String,
     },
+    /// `discover` with a `--config`.
+    ///
+    /// Refused rather than ignored, which is this file's rule everywhere: a flag that was
+    /// accepted and did nothing reads as having been used.
+    #[error(
+        "`discover` takes no --config: it opens no database and configures nothing. What \
+         it finds is an address to put in a station you add afterwards"
+    )]
+    DiscoverTakesNoConfig,
     /// `migrate-config` with no source to read.
     #[error(
         "`migrate-config` needs --from <path>: the RemoteWeather daemon's own \
@@ -177,6 +200,7 @@ const USAGE: &str = "\
 modernweather - weather station data collection and distribution
 
 Usage: modernweather --config <path> [options]
+       modernweather discover
        modernweather reset-password --config <path> [--username <name>]
        modernweather reset-setup-token --config <path>
        modernweather sessions revoke --all --config <path>
@@ -194,8 +218,14 @@ Options:
   -h, --help               Print this and exit.
   -V, --version            Print the version and exit.
 
-Commands, all run on this machine and all needing only read/write access to the
-configuration database:
+Commands, all run on this machine. `discover` needs nothing at all; the rest need only
+read/write access to the configuration database:
+  discover                 Browse the LAN over mDNS for snow gauges and print each one's
+                           hostname, address, firmware version and OTA slot, with the
+                           address to configure it as. Opens no database and takes no
+                           --config. Finding nothing is not a failure: mDNS usually does
+                           not reach a server or a container, and a gauge needs none of it
+                           to be collected from.
   reset-password           Set a new administrator password and sign out everywhere.
                            Prompts twice on a terminal; otherwise reads the new password
                            from standard input. --username also renames the account.
@@ -301,8 +331,32 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, ArgsEr
             }
         }
     }
-    let config = config.ok_or(ArgsError::NoConfig)?;
     let joined = words.join(" ");
+    // **Before `--config` is required**, because this is the one command that needs none.
+    if joined == "discover" {
+        if config.is_some() {
+            return Err(ArgsError::DiscoverTakesNoConfig);
+        }
+        reject_daemon_flags(setup_listen.is_some(), all)?;
+        if username.is_some() {
+            return Err(ArgsError::WrongCommand {
+                flag: "--username",
+                command: "reset-password",
+            });
+        }
+        if from.is_some() || dry_run {
+            return Err(ArgsError::WrongCommand {
+                flag: if from.is_some() {
+                    "--from"
+                } else {
+                    "--dry-run"
+                },
+                command: "migrate-config",
+            });
+        }
+        return Ok(Parsed::Discover);
+    }
+    let config = config.ok_or(ArgsError::NoConfig)?;
     match joined.as_str() {
         "" => {
             // The daemon. The command-only flags are rejected rather than ignored: silently
@@ -616,6 +670,40 @@ mod tests {
         );
     }
 
+    /// `discover` is the one command with no `--config`, and being handed one is refused
+    /// rather than ignored — because a path that was accepted and never opened reads as
+    /// having been used.
+    #[test]
+    fn discover_takes_no_config_and_refuses_one() {
+        assert!(matches!(
+            parse(["discover"].iter().map(OsString::from)),
+            Ok(Parsed::Discover)
+        ));
+        assert_eq!(
+            parse_err(&["discover", "--config", "/tmp/a.db"]),
+            ArgsError::DiscoverTakesNoConfig
+        );
+        // The flags that belong to something else are refused with the command they belong
+        // to, which is this parser's rule everywhere.
+        assert_eq!(
+            parse_err(&["discover", "--username", "chris"]),
+            ArgsError::WrongCommand {
+                flag: "--username",
+                command: "reset-password"
+            }
+        );
+        assert_eq!(
+            parse_err(&["discover", "--from", "/tmp/go.db"]),
+            ArgsError::WrongCommand {
+                flag: "--from",
+                command: "migrate-config"
+            }
+        );
+        // And the daemon still needs its path: `discover` is the exception, not a new
+        // default.
+        assert_eq!(parse_err(&[]), ArgsError::NoConfig);
+    }
+
     /// Every way of getting a command wrong, including the two that would otherwise be
     /// silently accepted and read as having done something.
     #[test]
@@ -793,5 +881,14 @@ mod tests {
     fn the_usage_names_the_migration() {
         assert!(USAGE.contains("migrate-config --from <path>"));
         assert!(USAGE.contains("--dry-run"));
+    }
+
+    /// The usage has to name `discover` and say that it takes no `--config`, because that
+    /// is the surprising half.
+    #[test]
+    fn the_usage_names_discover_and_that_it_needs_no_configuration() {
+        assert!(USAGE.contains("modernweather discover"));
+        assert!(USAGE.contains("takes no"));
+        assert!(USAGE.contains("mDNS"));
     }
 }

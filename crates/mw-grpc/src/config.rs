@@ -3,13 +3,18 @@
 //! One trait per concern, for `mw_station::config`'s reason: `register` is generic over the
 //! configuration type and the binary chooses it (docs/service-architecture.md §1.3, rule 2),
 //! so a registrar takes `&C`. The **rows** are declared by the crate that owns what they
-//! are — `mw_station::StationRow` for a station, [`IngestRow`] here for the one table no
-//! other crate reads — and the `SELECT` stays in `mw-store`, which may not name this crate.
+//! are — [`IngestRow`] here for the one table no other crate reads — and the `SELECT` stays
+//! in `mw-store`, which may not name this crate.
+//!
+//! There used to be a second trait here, `SnowGaugeConfig`, because the snow gauge's driver
+//! lived in this crate: the gauge spoke gRPC and `ci/layers.toml` forbids `mw-station` from
+//! naming `tonic`. Its firmware serves JSON over plain HTTP now, so the driver is
+//! `mw_station::snowgauge` and the rows it reads are `mw_station::StationConfig`'s like
+//! every other station's.
 
 use std::sync::Arc;
 
 use mw_component::Ingress;
-use mw_station::StationRow;
 
 /// One `config.ingest` row: what makes this node a collector (W7 **D-44**).
 ///
@@ -58,22 +63,4 @@ pub trait GrpcIngestConfig {
     /// knows. What changes is that an **unauthenticated** one cannot reach the method at
     /// all.
     fn ingest_tls_available(&self) -> bool;
-}
-
-/// What `crate::snowgauge`'s registrar reads.
-///
-/// Separate from [`GrpcIngestConfig`] because the two registrars plan from different tables
-/// and a node legitimately has one and not the other: a satellite with a snow gauge and no
-/// `ingest` row is the ordinary case.
-pub trait SnowGaugeConfig {
-    /// Every `config.stations` row, in the shape `mw-station` declares.
-    ///
-    /// The same rows `mw_station::register` reads, and deliberately the same type: the two
-    /// registrars dispatch on the same `type` column and `mw_station::plan` is what refuses
-    /// a malformed gauge row, so a second row type here would be a second answer to what a
-    /// station is.
-    fn stations(&self) -> &[StationRow];
-
-    /// The write end of the reading pipeline, when this process has one.
-    fn ingress(&self) -> Option<&Arc<dyn Ingress>>;
 }

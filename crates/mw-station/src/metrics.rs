@@ -39,11 +39,27 @@ pub enum FrameOutcome {
     /// says it cannot be.
     ///
     /// One producer: a snow gauge reporting a distance greater than its configured base
-    /// distance (`mw_codec::SnowGaugeProto`). **DEV-9** makes that discard this item's
+    /// distance (`mw_codec::SnowGaugeData`). **DEV-9** makes that discard this item's
     /// constraint, and a separate label is what makes it visible: a gauge whose base
     /// distance is set two metres short otherwise reports nothing, counts nothing under a
     /// name an operator would look at, and logs a line per reading.
     Implausible,
+    /// The frame decoded and carried **nothing new**: a measurement this station has
+    /// already stored, or none at all.
+    ///
+    /// Distinct from every other outcome because the device is *working*. One producer:
+    /// `mw_station::snowgauge`, where three states look like this — a gauge whose sensor
+    /// has sent no frame since boot (`status: "no_data"`), a gauge polled faster than its
+    /// sensor produces samples, and a gauge whose UART link to the sensor has died
+    /// mid-run. The first two are ordinary and the third is a fault, and what separates
+    /// them is how long the state lasts rather than what one frame looks like — so the
+    /// frames are counted here and the driver's own streak counter is what fails the
+    /// station (`mw_station::snowgauge::SILENT_OCCURRENCES`).
+    ///
+    /// Counted rather than silent, because the alternative is a station whose readings stop
+    /// arriving with nothing moving: `undecodable` would be wrong (the body was perfect)
+    /// and `decoded` would be a lie (nothing was stored).
+    Stale,
 }
 
 impl FrameOutcome {
@@ -55,6 +71,7 @@ impl FrameOutcome {
             FrameOutcome::UnknownStation => "unknown_station",
             FrameOutcome::Refused => "refused",
             FrameOutcome::Implausible => "implausible",
+            FrameOutcome::Stale => "stale",
         }
     }
 
@@ -66,6 +83,7 @@ impl FrameOutcome {
         FrameOutcome::UnknownStation,
         FrameOutcome::Refused,
         FrameOutcome::Implausible,
+        FrameOutcome::Stale,
     ];
 }
 
@@ -148,7 +166,7 @@ mod tests {
         assert_eq!(labels.len(), before, "two outcomes share a label");
         assert_eq!(
             FrameOutcome::ALL.len(),
-            5,
+            6,
             "a new FrameOutcome needs a line in ALL"
         );
         assert_eq!(FrameOutcome::Decoded.to_string(), "decoded");

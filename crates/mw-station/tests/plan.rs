@@ -147,7 +147,8 @@ fn ambient(key: &str, claim: &str, mount: &str) -> StationRow {
     }
 }
 
-/// A snow gauge, which this crate validates and does not plan.
+/// A snow gauge: `http_out`, polling `/data`, with the base distance its codec discards
+/// against.
 fn snowgauge(key: &str, url: &str) -> StationRow {
     StationRow {
         key: key.into(),
@@ -157,9 +158,8 @@ fn snowgauge(key: &str, url: &str) -> StationRow {
         identity_kind: "fixed".into(),
         snow_base_distance_mm: Some(1500.0),
         transport: Some(TransportColumns {
-            kind: "grpc_out".into(),
+            kind: "http_out".into(),
             url: Some(url.into()),
-            streaming: Some(true),
             ..TransportColumns::default()
         }),
         ..StationRow::default()
@@ -898,14 +898,23 @@ async fn an_ambient_station_on_a_node_with_no_listener_is_refused() {
     assert!(matches!(e, StationPlanError::NoUploadState { .. }), "{e}");
 }
 
-/// The snow gauge: validated here, planned by `mw-grpc`, and **present in the receiver
-/// list** -- which is what makes its `Fixed` frames resolve.
+/// The snow gauge: **planned here**, like every other station, and present in the receiver
+/// list -- which is what makes its `Fixed` frames resolve.
+///
+/// It used to be the one row `register` validated and emitted nothing for, because its
+/// driver spoke gRPC and lived in `mw-grpc`. One function mints the id now, so the
+/// agreement this used to assert across two crates is structural.
 #[tokio::test]
-async fn a_snow_gauge_is_validated_here_and_has_a_receiver_that_nothing_here_emits() {
-    let cfg = Cfg::new(vec![snowgauge("suncrest:gauge", "http://gauge.lan:50051")]);
-    assert!(
-        register(&cfg).expect("a valid gauge row").is_empty(),
-        "the component is `mw_grpc::snowgauge`'s"
+async fn a_snow_gauge_is_planned_here_and_is_its_own_receiver() {
+    let cfg = Cfg::new(vec![snowgauge(
+        "suncrest:gauge",
+        "http://snowgauge-f878.local",
+    )]);
+    let planned = register(&cfg).expect("a valid gauge row");
+    assert_eq!(
+        ids(&planned),
+        vec!["station:snowgauge:suncrest:gauge"],
+        "one poll, planned by this crate"
     );
     let receivers = plan::fixed_receivers(&cfg).expect("a valid gauge row");
     assert_eq!(receivers.len(), 1);
@@ -916,21 +925,36 @@ async fn a_snow_gauge_is_validated_here_and_has_a_receiver_that_nothing_here_emi
     assert_eq!(receivers[0].station.as_str(), "suncrest:gauge");
 }
 
+/// The transport the predecessor used. A `grpc_out` gauge row is a row this build has no
+/// mode for, and it is refused by name rather than planned as something else -- which is
+/// what an operator with a migrated-but-unedited configuration meets.
 #[tokio::test]
-async fn a_snow_gauge_that_is_not_streaming_is_refused_here() {
+async fn a_snow_gauge_configured_for_the_old_grpc_transport_is_refused() {
     let mut row = snowgauge("suncrest:gauge", "http://gauge.lan:50051");
-    row.transport.as_mut().expect("a transport").streaming = Some(false);
-    let e = register(&Cfg::new(vec![row])).expect_err("no gauge answers one request");
+    let columns = row.transport.as_mut().expect("a transport");
+    columns.kind = "grpc_out".into();
+    columns.streaming = Some(true);
+    let e = register(&Cfg::new(vec![row])).expect_err("the gauge speaks HTTP now");
     assert!(
         matches!(
             e,
-            StationPlanError::Missing {
-                column: "transport_streaming",
+            StationPlanError::WrongTransport {
+                transport: "grpc_out",
                 ..
             }
         ),
         "{e}"
     );
+}
+
+/// An `https` gauge is refused for `refuse_tls`'s reason: the device serves plain HTTP on
+/// port 80 and no station transport here speaks TLS, so an address that can never answer is
+/// a plan error rather than a component in permanent `Backoff`.
+#[tokio::test]
+async fn a_snow_gauge_behind_https_is_refused_at_plan_time() {
+    let row = snowgauge("suncrest:gauge", "https://snowgauge-f878.local");
+    let e = register(&Cfg::new(vec![row])).expect_err("no station transport speaks TLS");
+    assert!(matches!(e, StationPlanError::NotTls { .. }), "{e}");
 }
 
 /// Every driver whose identity is `Fixed` has a receiver, and the Ambient endpoint does
@@ -944,7 +968,7 @@ async fn the_receiver_list_covers_every_fixed_driver_and_no_other() {
         campbell("suncrest:meadow", tcp("ser2net.lan", 3001)),
         airgradient("suncrest:aqmon", "http://aqmon.lan"),
         ambient("suncrest:orchard", "orchard", "/ingest/ambient"),
-        snowgauge("suncrest:gauge", "http://gauge.lan:50051"),
+        snowgauge("suncrest:gauge", "http://snowgauge-f878.local"),
     ]);
     register(&cfg).expect("a valid plan");
     let mut receivers: Vec<String> = plan::fixed_receivers(&cfg)
@@ -968,9 +992,11 @@ async fn the_receiver_list_covers_every_fixed_driver_and_no_other() {
 }
 
 /// Every component `register` emits for a `Fixed` station is in the receiver list, and
-/// every receiver names a component it emits -- **except** the snow gauge's, whose spec is
-/// another crate's. Two functions that mint the same ids independently are two functions
-/// that can disagree.
+/// every receiver names a component it emits. Two functions that mint the same ids
+/// independently are two functions that can disagree.
+///
+/// **The snow gauge used to be excepted here**, because its spec was `mw-grpc`'s; it is not
+/// any more, which is the one assertion in this file that got shorter.
 #[tokio::test]
 async fn the_receiver_list_and_the_plan_agree_about_every_component_they_share() {
     let cfg = Cfg::new(vec![
@@ -978,18 +1004,11 @@ async fn the_receiver_list_and_the_plan_agree_about_every_component_they_share()
         campbell("suncrest:meadow", tcp("ser2net.lan", 3001)),
         airgradient("suncrest:aqmon", "http://aqmon.lan"),
         polled("suncrest:roof", "http://192.168.1.50"),
-        snowgauge("suncrest:gauge", "http://gauge.lan:50051"),
+        snowgauge("suncrest:gauge", "http://snowgauge-f878.local"),
     ]);
     let planned = ids(&register(&cfg).expect("a valid plan"));
     for receiver in plan::fixed_receivers(&cfg).expect("a valid plan") {
         let id = receiver.component.as_str().to_string();
-        if id.starts_with("station:snowgauge:") {
-            assert!(
-                !planned.contains(&id),
-                "`{id}` is `mw-grpc`'s to emit (crate::snowgauge)"
-            );
-            continue;
-        }
         assert!(
             planned.contains(&id),
             "`{id}` is a receiver no planned component answers"

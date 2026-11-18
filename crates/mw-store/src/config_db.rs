@@ -1311,6 +1311,12 @@ mod tests {
                     .to_string(),
             ),
             (
+                // The schema still admits `grpc_out`, and no station driver has a mode for
+                // it: the snow gauge was the one and its firmware serves HTTP now, so
+                // `mw_station::plan` refuses such a row by name. What this case is about is
+                // the CHECK, which has to keep holding for whatever outbound gRPC station
+                // arrives next -- a storable row with no flag for `plan()` to read is the
+                // thing being made unrepresentable.
                 "a grpc_out transport with no streaming flag for plan() to read (W2a §4a.3)",
                 format!(
                     "INSERT INTO stations (station_key, owning_node_id, name, type,

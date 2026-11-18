@@ -25,6 +25,7 @@ mod args;
 mod authstore;
 mod boot;
 mod config;
+mod discover;
 mod hostinfo;
 mod live;
 mod logctl;
@@ -56,6 +57,17 @@ async fn main() -> ExitCode {
             }
         }
         Ok(args::Parsed::Printed) => return ExitCode::SUCCESS,
+        // `discover` opens nothing: one multicast question, a table, exit. It takes no
+        // `--config`, which is why it is its own variant rather than a `Command`.
+        Ok(args::Parsed::Discover) => {
+            return match discover::run(mw_station::snowgauge::DISCOVER_TIMEOUT).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    args::fatal(&format!("{e:#}"));
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // W5 §3.6's recovery commands. They run **instead of** the daemon and before any
         // subscriber exists, which is why their own output goes to the console directly and
         // why a failure here is reported through `args::fatal` rather than through

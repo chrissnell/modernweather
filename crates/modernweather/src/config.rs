@@ -786,18 +786,6 @@ impl mw_station::StationConfig for Config {
     }
 }
 
-impl mw_grpc::SnowGaugeConfig for Config {
-    fn stations(&self) -> &[mw_station::StationRow] {
-        // The same rows `mw_station::register` dispatches over, because the two registrars
-        // dispatch on the same `type` column (`mw_grpc::config`).
-        &self.declared_stations
-    }
-
-    fn ingress(&self) -> Option<&Arc<dyn Ingress>> {
-        self.ingress.as_ref()
-    }
-}
-
 impl mw_grpc::GrpcIngestConfig for Config {
     fn ingest(&self) -> &[mw_grpc::IngestRow] {
         &self.declared_ingest

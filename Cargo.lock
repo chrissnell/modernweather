@@ -1604,7 +1604,6 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "mw-types",
- "prost",
  "serde",
  "serde_json",
  "thiserror",
@@ -1662,7 +1661,6 @@ dependencies = [
  "axum",
  "chrono",
  "http",
- "mw-codec",
  "mw-component",
  "mw-http",
  "mw-proto",

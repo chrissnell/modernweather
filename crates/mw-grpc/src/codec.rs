@@ -1,22 +1,14 @@
-//! The two `tonic::codec::Codec` implementations this crate's services use, and why neither
-//! of them is a generated one.
+//! The `tonic::codec::Codec` implementation this crate's service uses, and why it is not a
+//! generated one.
 //!
 //! A `tonic` service is normally generated from a `.proto` by `tonic-prost-build`, which
 //! emits a client, a server trait, and a `ProstCodec` over message types it also emits.
-//! Neither service here is generated, and the reason is different for each.
 //!
-//! # The snow gauge: one schema, and it is `mw-codec`'s
-//!
-//! `mw_codec::SnowGaugeProto` **is** the snow gauge's schema (that module has why: the
-//! layer rule puts `mw-proto` in `mw-codec`'s own layer, so the codec declares the two
-//! fields it needs and `prost` discards the rest). Generating a second `Reading` here would
-//! be a second declaration of the same message, in a different crate, free to disagree with
-//! the one the golden tests are written against — and the only way to get a frame from one
-//! to the other would be to re-encode what had just been decoded.
-//!
-//! [`BytesCodec`] removes the question. The client asks `tonic` for the **message bytes**
-//! and hands them straight to the pure codec, so there is one schema, one decode, and no
-//! round trip.
+//! **There used to be two codecs here**, and the second was `BytesCodec`: a codec that did
+//! not decode, handing the snow gauge's message bytes straight to `mw-codec`'s pure decoder
+//! so that there was one declaration of `snowgauge.Reading` rather than two. The gauge's
+//! firmware serves JSON over plain HTTP now (`mw_station::snowgauge`), so there is no
+//! outbound gRPC call in this build and nothing that needs a byte-passthrough codec.
 //!
 //! # The gRPC receiver: the message is already generated, and `Empty` is not a message
 //!
@@ -34,68 +26,13 @@
 //! # What is given up by not generating
 //!
 //! The method **path** is a constant rather than something the generator derives from the
-//! service name, so a typo in it is a client that compiles and gets `Unimplemented`. Both
-//! paths are declared beside the schema they belong to — `mw_codec::STREAM_READING` for the
-//! gauge, [`crate::grpcrx::SEND_WEATHER_READINGS`] for the receiver — and each has a test
-//! asserting the exact string, because that string is a wire contract.
+//! service name, so a typo in it is a service that compiles and answers `Unimplemented`.
+//! It is declared beside the schema it belongs to ([`crate::grpcrx::SEND_WEATHER_READINGS`])
+//! and has a test asserting the exact string, because that string is a wire contract.
 
-use prost::bytes::{Buf, BufMut};
+use prost::bytes::Buf;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::Status;
-
-/// A codec that does not decode: the message's bytes, verbatim, in both directions.
-///
-/// `Encode` is a `Vec<u8>` so that a request message can be sent as the bytes it encodes
-/// to — which for the snow gauge's `StreamRequest` is none at all.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BytesCodec;
-
-impl Codec for BytesCodec {
-    type Encode = Vec<u8>;
-    type Decode = Vec<u8>;
-    type Encoder = BytesCodec;
-    type Decoder = BytesCodec;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        *self
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        *self
-    }
-}
-
-impl Encoder for BytesCodec {
-    type Item = Vec<u8>;
-    type Error = Status;
-
-    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
-        dst.put_slice(&item);
-        Ok(())
-    }
-}
-
-impl Decoder for BytesCodec {
-    type Item = Vec<u8>;
-    type Error = Status;
-
-    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
-        Ok(Some(take_all(src)))
-    }
-}
-
-/// The whole of what [`BytesCodec`] decodes, over any buffer.
-///
-/// A free function because `tonic::codec::DecodeBuf` has no public constructor, so the only
-/// way to test a `Decoder` impl is to run a gRPC call — which is the emulator level, not
-/// this one. Factoring the decision out means level 1 can assert it over a byte slice,
-/// which is what every other decoder in this workspace is tested as.
-fn take_all(src: &mut impl Buf) -> Vec<u8> {
-    // `tonic` has already removed the five-byte gRPC length prefix and handed over exactly
-    // one message, so "the rest of the buffer" is the message.
-    let len = src.remaining();
-    src.copy_to_bytes(len).to_vec()
-}
 
 /// `prost` in, nothing out: decodes [`mw_proto::wire::Reading`] and encodes the empty
 /// response message.
@@ -138,7 +75,12 @@ impl Decoder for ReadingCodec {
     }
 }
 
-/// The whole of what [`ReadingCodec`] decodes, over any buffer. [`take_all`]'s reason.
+/// The whole of what [`ReadingCodec`] decodes, over any buffer.
+///
+/// A free function because `tonic::codec::DecodeBuf` has no public constructor, so the only
+/// way to test a `Decoder` impl is to run a gRPC call — which is the emulator level, not
+/// this one. Factoring the decision out means level 1 can assert it over a byte slice,
+/// which is what every other decoder in this workspace is tested as.
 fn decode_reading(src: &mut impl Buf) -> Result<mw_proto::wire::Reading, Status> {
     // A message a satellite sent that this build cannot parse is `InvalidArgument` rather
     // than an `Internal`: the fault is in what arrived, and the sender is the only party
@@ -157,22 +99,6 @@ fn decode_reading(src: &mut impl Buf) -> Result<mw_proto::wire::Reading, Status>
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// What [`BytesCodec`] hands a driver, over a byte slice.
-    fn bytes(message: &[u8]) -> Vec<u8> {
-        let mut src = message;
-        take_all(&mut src)
-    }
-
-    #[test]
-    fn the_bytes_codec_hands_back_exactly_the_message() {
-        // A snow gauge reading on the wire: field 1 `stationName`, field 2 `distance`.
-        let message = [0x0a, 0x04, b'r', b'o', b'o', b'f', 0x10, 0xb0, 0x09];
-        assert_eq!(bytes(&message), message);
-        // An empty message is an empty frame, not an absent one -- protobuf's own
-        // all-defaults case, and what `mw_codec::SnowGaugeProto` decodes to a zero distance.
-        assert_eq!(bytes(&[]), Vec::<u8>::new());
-    }
 
     #[test]
     fn the_reading_codec_decodes_a_wire_reading() {
