@@ -47,14 +47,21 @@ pub enum FrameOutcome {
     /// The frame decoded and carried **nothing new**: a measurement this station has
     /// already stored, or none at all.
     ///
-    /// Distinct from every other outcome because the device is *working*. One producer:
-    /// `mw_station::snowgauge`, where three states look like this — a gauge whose sensor
-    /// has sent no frame since boot (`status: "no_data"`), a gauge polled faster than its
-    /// sensor produces samples, and a gauge whose UART link to the sensor has died
-    /// mid-run. The first two are ordinary and the third is a fault, and what separates
-    /// them is how long the state lasts rather than what one frame looks like — so the
-    /// frames are counted here and the driver's own streak counter is what fails the
-    /// station (`mw_station::snowgauge::SILENT_OCCURRENCES`).
+    /// Distinct from every other outcome because **the frame was the right shape**: the
+    /// device answered, the body decoded, and there was nothing in it to store. One
+    /// producer: `mw_station::snowgauge`, where four states look like this — a gauge whose
+    /// sensor has sent no frame since boot (`status: "no_data"`), a gauge polled faster
+    /// than its sensor produces samples, a gauge whose UART link to the sensor has died
+    /// mid-run, and a gauge reporting a `status` this build does not read. The first two
+    /// are ordinary, the third is a fault, and the fourth is a firmware newer than this
+    /// daemon; what separates them is how long the state lasts rather than what one frame
+    /// looks like — so the frames are counted here and the driver's own streak counter is
+    /// what fails the station (`mw_station::snowgauge::SILENT_OCCURRENCES`).
+    ///
+    /// The fourth is why this is not `undecodable`: a `status` of `"degraded"` from a
+    /// firmware that added one is a gauge this build cannot interpret rather than bytes it
+    /// cannot parse, and treating it as a parse failure would fail the station on the first
+    /// occurrence instead of giving the operator a minute's worth of counted evidence.
     ///
     /// Counted rather than silent, because the alternative is a station whose readings stop
     /// arriving with nothing moving: `undecodable` would be wrong (the body was perfect)

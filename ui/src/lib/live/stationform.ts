@@ -55,9 +55,11 @@ export interface KindShape {
    * `CHECK (transport_streaming IS NULL OR COALESCE(transport_kind, '') = 'grpc_out')`.
    *
    * **No kind here is `grpc_out` any more.** The snow gauge was the one, and its firmware
-   * serves JSON over plain HTTP now, so every entry below is `false` -- and
-   * `StationForm.svelte` still sends the field only for a `grpc_out` transport, because an
-   * operator editing a station stored by an older version must be able to save it back.
+   * serves JSON over plain HTTP now, so every entry below is `false`. `StationForm.svelte`
+   * therefore does NOT read this field for a stored `grpc_out` row -- it carries that row's
+   * own `streaming` through, because reading a `false` from here would rewrite a stored `1`
+   * to `0` on any save. This field is the default for a kind that streams, and there is not
+   * one; it stays because the next outbound-gRPC station (§4a.7 offers four) needs it.
    */
   readonly streams: boolean;
   /** The baud rate this hardware actually uses, offered as the default. */

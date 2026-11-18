@@ -1098,7 +1098,7 @@ from the registry rather than the device row.
 |---|---|---|---|---|---|---|
 | Davis | `Serial` \| `TcpOut` | wake + `LOOP n`, re-issue | `DavisLoop` — fixed little-endian struct + CRC16, decoded with `zerocopy` (D-32) | `Fixed` | `Service` | 1 |
 | Campbell | `Serial` \| `TcpOut` | command/response | `CampbellAscii` | `Fixed` | `Service` | 1 |
-| Snow gauge | `HttpOut { /data }` | none | `SnowGaugeData` | `Fixed` | `Every { 5s }` — the slow end of the device's own range | 1 | **Amended**: see §4.1 |
+| Snow gauge | `HttpOut { /data }` | none | `SnowGaugeData` | `Fixed` | `Every { 5s }` — the slow end of the device's own range (**amended**, see below) | 1 |
 | AirGradient | `HttpOut { /measures/current }` | none | `AirGradientJson` | `Fixed` | `Every { 3s }` — the measured default | 1 |
 | Ambient | `HttpIn { /ingest/ambient }` | none | `AmbientQuery` | `FromQuery { id: "ID", secret: Some("PASSWORD") }` | `Service` | **N** |
 | WeatherLink Live (broadcast) | `UdpIn { 22222 }` | none | `WllConditions` | `FromPayload(did)` | `Service` | **N** |

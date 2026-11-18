@@ -73,13 +73,13 @@ fn render(found: &[Discovered], timeout: Duration) -> Vec<String> {
     for gauge in found {
         lines.push(format!(
             "{:<24} {:<15} {:<8} {}",
-            gauge.host,
+            printable(&gauge.host),
             gauge
                 .addr
                 .map(|a| a.to_string())
                 .unwrap_or_else(|| "-".to_string()),
-            gauge.firmware.as_deref().unwrap_or("-"),
-            gauge.slot.as_deref().unwrap_or("-"),
+            printable(gauge.firmware.as_deref().unwrap_or("-")),
+            printable(gauge.slot.as_deref().unwrap_or("-")),
         ));
     }
     lines.push(String::new());
@@ -93,12 +93,38 @@ fn render(found: &[Discovered], timeout: Duration) -> Vec<String> {
             Ok(endpoint) => lines.push(format!("    transport_url = {endpoint}")),
             Err(e) => lines.push(format!(
                 "    {}: this gauge's advertised address is not one a station can hold: {}",
-                gauge.host,
+                printable(&gauge.host),
                 mw_types::DisplayChain(&e)
             )),
         }
     }
+    // **The caveat the empty answer already carried**, because the two halves of this
+    // command were recommending different things: a `.local` address is re-resolved by
+    // multicast on every poll, and the device's own documentation says multicast usually
+    // does not reach a daemon like this one. Discovery working once says nothing about it
+    // working every five seconds.
+    lines.push(String::new());
+    lines.push(
+        "A `.local` address is re-resolved by mDNS on every poll. If this daemon is in a \
+         container or on a server, reserve the gauge's DHCP lease by MAC and configure its \
+         address instead -- it always requests the same hostname."
+            .to_string(),
+    );
     lines
+}
+
+/// One LAN-supplied string, with anything unprintable replaced.
+///
+/// A hostname and a TXT value are **whatever a responder sent**: `mw_station::mdns` decodes
+/// them with `from_utf8_lossy`, so a control byte survives the decode intact and would
+/// otherwise be written straight into a terminal — where an ANSI escape can move the cursor
+/// and rewrite the table around it, and a carriage return can hide the row it belongs to.
+/// The `transport_url` lines need no filtering of their own, because they have been through
+/// `Endpoint::parse`; these three columns have been through nothing.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect()
 }
 
 #[cfg(test)]
@@ -149,6 +175,61 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains(":80"), "{text}");
+    }
+
+    /// A responder's own strings reach a terminal, so an escape sequence in one must not.
+    ///
+    /// **Two layers, and the first one is why the second exists.** A *hostname* carrying a
+    /// control byte never reaches this function at all — `mw_station::snowgauge::discover`
+    /// drops the instance, because `mw_station::mdns::is_resolvable` refuses the name and a
+    /// host this build cannot ask about is not a device it can reach. That filter was
+    /// added *because* of this test: the first version of it filtered only the table's
+    /// three columns, and the `transport_url` line below them went through
+    /// `Endpoint::parse`, which accepts a host with an escape in it.
+    ///
+    /// What is left for `printable` is the TXT values, which are free-form by design and
+    /// are printed rather than resolved.
+    #[test]
+    fn a_txt_value_carrying_control_bytes_cannot_rewrite_the_table() {
+        let lines = render(
+            &[Discovered {
+                host: "snowgauge-f878.local".into(),
+                addr: None,
+                port: 80,
+                firmware: Some("0.1.0\u{1b}[2K\u{1b}[A".into()),
+                slot: Some("ota_0\r".into()),
+            }],
+            snowgauge::DISCOVER_TIMEOUT,
+        );
+        let text = lines.join("\n");
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\r'),
+            "an escape reached the terminal: {text:?}"
+        );
+        // The printable part survives, because the row is still the useful answer.
+        assert!(text.contains("snowgauge-f878.local"), "{text}");
+        assert!(text.contains("0.1.0"), "{text}");
+        assert!(text.contains("ota_0"), "{text}");
+        // And exactly one header line, so a forged one cannot start a second table.
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("HOSTNAME")).count(),
+            1,
+            "{text}"
+        );
+    }
+
+    /// Both halves of the output say the same thing about a `.local` address, which they
+    /// did not: the success path recommended the form that needs multicast on every poll
+    /// and the empty path recommended the form that needs none.
+    #[test]
+    fn the_success_path_carries_the_same_caveat_the_empty_one_does() {
+        let lines = render(
+            &[gauge("snowgauge-f878.local", None, Some("0.1.0"))],
+            snowgauge::DISCOVER_TIMEOUT,
+        );
+        let text = lines.join("\n");
+        assert!(text.contains("re-resolved by mDNS on every poll"), "{text}");
+        assert!(text.contains("DHCP lease by MAC"), "{text}");
     }
 
     /// The expected answer in production, and the one that has to carry the fallback.

@@ -143,6 +143,14 @@ pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(1);
 /// documentation gives for `trim_mean` to land is not needed, because the raw `distance` is
 /// the fallback in that window and a booting gauge is only silent until its sensor's first
 /// frame; longer than a reboot is, and twelve covers one comfortably.
+///
+/// **The assumption, stated because the device documentation does not state the number it
+/// rests on**: the sensor produces frames faster than one a minute. Its `trim_mean` is
+/// documented as filling a thirty-sample window in "about a minute", which puts the frame
+/// rate near 2 Hz, so a minute of *no* new frame is a fault rather than a slow sensor. A
+/// gauge that genuinely reported less often than this would fail its station while healthy,
+/// and the fix then is this constant rather than the design -- neither it nor the period is
+/// configurable, for the reason this module's documentation gives.
 pub const SILENT_OCCURRENCES: u32 = 12;
 
 /// The component id of one station's poll.
@@ -216,6 +224,18 @@ pub async fn discover(timeout: Duration) -> Result<Vec<Discovered>, mdns::MdnsEr
             debug!(
                 instance = %instance.instance,
                 "an mDNS service that is not a snow gauge"
+            );
+            continue;
+        }
+        // **A host this build could not ask about is not a device it can reach.** A name
+        // decoded off the group is whatever a responder sent, and `crate::mdns::resolve`
+        // would refuse it at poll time -- so a row for it would offer an address that
+        // cannot work, and `Endpoint::parse` is not the filter: it accepts a host with
+        // control bytes in it, which is how this came to be checked here.
+        if !mdns::is_resolvable(host) {
+            debug!(
+                instance = %instance.instance,
+                "a snow gauge advertising a hostname this build cannot resolve"
             );
             continue;
         }
@@ -316,6 +336,9 @@ pub struct Poll {
     seen: Option<SnowLiveness>,
     /// How many occurrences in a row have carried no measurement.
     silent: u32,
+    /// The last `/health` sentence, so the failing occurrences between two reads of it
+    /// carry the same diagnosis rather than a shorter one. Empty until the first read.
+    telemetry: String,
 }
 
 impl fmt::Debug for Poll {
@@ -346,6 +369,7 @@ impl Poll {
             ingress,
             seen: None,
             silent: 0,
+            telemetry: String::new(),
         }
     }
 
@@ -367,11 +391,24 @@ impl Poll {
                     // nothing and counts nothing under a name an operator would look at.
                     CodecError::Implausible { .. } => FrameOutcome::Implausible,
                     // A well-formed body with no measurement in it: the first minute after
-                    // boot, or a sensor that has never spoken.
+                    // boot, a sensor that has never spoken, or a `status` this build does
+                    // not read.
                     CodecError::Incomplete { .. } => FrameOutcome::Stale,
                     _ => FrameOutcome::Undecodable,
                 };
                 m::frame(id, outcome);
+                // **A body that is not this body fails the occurrence at once**, where the
+                // two outcomes above are counted into a streak. The streak exists for
+                // states a *working* gauge passes through -- a fresh boot, a snowpack
+                // settling slower than the poll -- and bytes that are not a `/data`
+                // document are not one of them: a gauge answering HTML, or answering
+                // `/health` because something is pointed at the wrong path, will answer
+                // the same way for ever, so sixty seconds of silence before
+                // `last_error` says anything is sixty seconds wasted. This is
+                // `crate::airgradient`'s behaviour for the same input.
+                if outcome == FrameOutcome::Undecodable {
+                    return Err(ComponentError::tick("decoding a snow gauge response", e));
+                }
                 // Flattened before the await: `DisplayChain` borrows the error, is not
                 // `Sync`, and a `Tick` body has to be `Send`.
                 let reason = DisplayChain(&e).to_string();
@@ -480,9 +517,15 @@ impl Poll {
             );
             return Ok(());
         }
-        // The one place the happy path does not read `/health`, and the two numbers on it
-        // the device documentation sends an operator to.
-        let telemetry = self.telemetry().await;
+        // **`/health` is read on the occurrence that crosses the threshold, and then once
+        // per further window**, not on every failing occurrence. A gauge nobody has fixed
+        // keeps failing, and two requests every five seconds for ever is twice this
+        // driver's share of an appliance that serves seven sockets. The sentence is kept so
+        // that the ones in between carry the same diagnosis rather than a shorter one.
+        if self.silent.is_multiple_of(SILENT_OCCURRENCES) || self.telemetry.is_empty() {
+            self.telemetry = self.read_health().await;
+        }
+        let telemetry = self.telemetry.clone();
         warn!(
             station = %self.station,
             occurrences = self.silent,
@@ -503,10 +546,13 @@ impl Poll {
 
     /// `GET /health`, rendered as the sentence a fault path carries.
     ///
+    /// Named apart from the field it fills, because one is a request and the other is what
+    /// the last request said.
+    ///
     /// Never an error: this runs **because** something is already wrong, and a failed
     /// telemetry request must not replace the sentence about the sensor with a sentence
     /// about telemetry.
-    async fn telemetry(&self) -> String {
+    async fn read_health(&self) -> String {
         match http::request(
             &self.endpoint,
             HttpMethod::Get,
@@ -576,7 +622,7 @@ impl Tick for Poll {
                 // **The one place the decommissioned protocol is still named.** A bare
                 // `404` would read as a wrong address; this one has a documented meaning.
                 Err(HttpError::Status { status: 404, .. }) => {
-                    let telemetry = self.telemetry().await;
+                    let telemetry = self.read_health().await;
                     return Err(ComponentError::tick(
                         "polling a snow gauge",
                         OldFirmware {
@@ -763,16 +809,35 @@ mod tests {
         assert_eq!(ingress.admissions().len(), 1);
     }
 
-    /// A body the gauge should not have sent is a **failed occurrence** once the streak is
-    /// long enough, and a counted drop before that.
+    /// A body that is not a `/data` document **fails the occurrence at once**, where a
+    /// body that decoded and carried nothing is counted into the streak.
+    ///
+    /// The difference is whether a working gauge passes through the state. A fresh boot
+    /// does; answering HTML does not — so an immediate failure is sixty seconds sooner than
+    /// the streak, and it is also what `crate::airgradient` does for the same input.
     #[tokio::test]
-    async fn a_body_that_is_not_json_is_counted_as_undecodable() {
+    async fn a_body_that_is_not_this_body_fails_the_occurrence_at_once() {
         let ingress = RecordingIngress::accepting();
         let mut poll = poll(Arc::clone(&ingress) as Arc<dyn Ingress>);
-        poll.on_body(&id(), &Frame::new(b"<html>404</html>".to_vec()))
-            .await
-            .expect("one malformed body is a counted drop");
+        for bytes in [
+            &b"<html>404</html>"[..],
+            // The `/health` body on `/data`'s path: valid JSON, none of the keys.
+            br#"{"wifi":"connected","fw_version":"0.1.0"}"#,
+        ] {
+            let e = poll
+                .on_body(&id(), &Frame::new(bytes.to_vec()))
+                .await
+                .expect_err("not a measurement, and never will be");
+            let text = DisplayChain(&e).to_string();
+            assert!(text.contains("decoding a snow gauge response"), "{text}");
+        }
         assert!(ingress.admissions().is_empty());
+
+        // A body that DOES decode and carries nothing is still counted rather than failed,
+        // which is the half of this distinction the streak exists for.
+        poll.on_body(&id(), &body(0, "no_data", 0, "null", 4_000))
+            .await
+            .expect("a booting gauge is not a failure");
     }
 
     /// An unknown station is a counted refusal and **not** a failed occurrence: the

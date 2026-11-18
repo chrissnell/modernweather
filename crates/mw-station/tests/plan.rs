@@ -938,13 +938,24 @@ async fn a_snow_gauge_configured_for_the_old_grpc_transport_is_refused() {
     assert!(
         matches!(
             e,
-            StationPlanError::WrongTransport {
+            StationPlanError::LegacyTransport {
                 transport: "grpc_out",
                 ..
             }
         ),
         "{e}"
     );
+    // **A plan refusal is a daemon that will not start**, so the sentence is the whole
+    // instruction: an operator with a row written before the firmware changed reads which
+    // three columns to set and what to set them to, not just that this build has no mode
+    // for the transport.
+    let text = e.to_string();
+    assert!(text.contains("`suncrest:gauge`"), "{text}");
+    assert!(text.contains("decommissioned"), "{text}");
+    assert!(text.contains("transport_kind = 'http_out'"), "{text}");
+    assert!(text.contains("transport_url"), "{text}");
+    assert!(text.contains("transport_streaming"), "{text}");
+    assert!(text.contains("port 80"), "{text}");
 }
 
 /// An `https` gauge is refused for `refuse_tls`'s reason: the device serves plain HTTP on

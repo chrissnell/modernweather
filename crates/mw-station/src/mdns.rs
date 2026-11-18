@@ -69,6 +69,25 @@ pub const LOCAL_SUFFIX: &str = ".local";
 /// browses for (`crate::snowgauge::discover`).
 pub const HTTP_SERVICE: &str = "_http._tcp.local";
 
+/// The longest name this resolver will decode.
+///
+/// RFC 1035 §2.3.4's limit, and it is a **bound on untrusted input** rather than a
+/// formality: a name is assembled by following compression pointers, so without a cap its
+/// length is bounded only by the packet — a descending chain of labels in one 8 KiB
+/// datagram decodes to an 8 KB `String`, and [`walk`] can yield hundreds of records from
+/// that same datagram. Capping it here bounds every name in this module at once, including
+/// the ones [`resolve`] compares on the path the daemon takes every poll.
+const MAX_NAME_BYTES: usize = 255;
+
+/// How many service instances [`browse`] will retain from one browse.
+///
+/// The second bound on untrusted input. Every map in [`Found`] is keyed by a name a
+/// responder chose, so a host on the LAN advertising instances in a loop would otherwise
+/// have [`browse`] accumulate them for the whole window — and the instance list is deduped
+/// by a linear scan, which is quadratic in that count. Two hundred and fifty-six is far
+/// past any real LAN and small enough that the worst case is kilobytes.
+const MAX_INSTANCES: usize = 256;
+
 /// How many instances [`browse`] will chase missing records for.
 ///
 /// A responder that answers a `PTR` question with the matching `SRV`, `TXT` and `A` records
@@ -247,7 +266,12 @@ pub async fn browse(service: &str, timeout: Duration) -> Result<Vec<Instance>, M
     let mut found = Found::default();
     let mut asked_again = 0usize;
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut buf = vec![0u8; 8192];
+    // RFC 6762 §17 permits an mDNS message of up to 9000 bytes, which is more than a
+    // 1500-byte datagram and is what a responder packing many records into one answer may
+    // send. A shorter buffer would truncate such an advertisement in `recv_from`, and a
+    // truncated message fails `walk` and is dropped silently -- a device that answered and
+    // was not listed.
+    let mut buf = vec![0u8; 9000];
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -385,6 +409,7 @@ fn harvest(packet: &[u8], service: &str, found: &mut Found) {
                 if let Some((target, _)) = read_name(packet, rr.rdata) {
                     let target = target.trim_end_matches('.').to_string();
                     if !target.is_empty()
+                        && found.instances.len() < MAX_INSTANCES
                         && !found
                             .instances
                             .iter()
@@ -403,18 +428,21 @@ fn harvest(packet: &[u8], service: &str, found: &mut Found) {
                 let port = u16::from_be_bytes([rdata[4], rdata[5]]);
                 if let Some((host, _)) = read_name(packet, rr.rdata.saturating_add(6)) {
                     let host = host.trim_end_matches('.').to_string();
-                    if !host.is_empty() {
+                    // Capped like the instance list, and for the same reason: a record's
+                    // name is not required to be one of the instances this browse asked
+                    // about, so these maps take whatever the LAN sends.
+                    if !host.is_empty() && found.srv.len() < MAX_INSTANCES {
                         found.srv.insert(key, (port, host));
                     }
                 }
             }
             TYPE_TXT => {
                 let pairs = txt_pairs(rdata);
-                if !pairs.is_empty() {
+                if !pairs.is_empty() && found.txt.len() < MAX_INSTANCES {
                     found.txt.insert(key, pairs);
                 }
             }
-            TYPE_A if rdata.len() == 4 => {
+            TYPE_A if rdata.len() == 4 && found.addrs.len() < MAX_INSTANCES => {
                 found
                     .addrs
                     .insert(key, Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]));
@@ -532,6 +560,20 @@ fn question(name: &str, id: u16, qtype: u16) -> Result<Vec<u8>, MdnsError> {
     out.extend_from_slice(&qtype.to_be_bytes());
     out.extend_from_slice(&(CLASS_IN | UNICAST_RESPONSE).to_be_bytes());
     Ok(out)
+}
+
+/// Whether this resolver could ask about `name`.
+///
+/// **The filter a *decoded* name needs, which [`labels`] only ever applied to a configured
+/// one.** A name that came off the group is whatever a responder sent — `read_name` decodes
+/// it with `from_utf8_lossy`, so control bytes, ANSI escapes and spaces all survive — and a
+/// name this encoder cannot write is one [`resolve`] could never look up. So an instance
+/// carrying one is not a device this daemon can reach, whatever else is true of it, and a
+/// caller that printed it would be offering an address that cannot work and an escape
+/// sequence to whatever reads it.
+#[must_use]
+pub fn is_resolvable(name: &str) -> bool {
+    labels(name).is_ok()
 }
 
 /// Encode a name as a DNS label sequence.
@@ -665,6 +707,14 @@ fn read_name(packet: &[u8], start: usize) -> Option<(String, usize)> {
             0 => {
                 let from = at.checked_add(1)?;
                 let label = packet.get(from..from.checked_add(usize::from(len))?)?;
+                // **Before the push**, so the cap bounds the allocation rather than
+                // reporting it afterwards. A name longer than the protocol permits is a
+                // packet this resolver refuses, not one it truncates: a truncated name
+                // would be compared against a configured host and could match the wrong
+                // one.
+                if name.len() + 1 + label.len() > MAX_NAME_BYTES {
+                    return None;
+                }
                 if !name.is_empty() {
                     name.push('.');
                 }
@@ -1026,6 +1076,82 @@ mod tests {
             txt_pairs(b"\x05plain"),
             vec![("plain".to_string(), String::new())]
         );
+    }
+
+    /// **Both bounds on untrusted input**, which is what this module's one unvalidated
+    /// source needs: the packets come off the multicast group and any host on the LAN can
+    /// send them.
+    #[test]
+    fn a_name_longer_than_the_protocol_permits_is_refused_rather_than_decoded() {
+        // A descending chain of 63-byte labels in one packet. Without the cap the decoded
+        // name grows to about the packet's length -- kilobytes per record, with hundreds of
+        // records walkable out of one datagram.
+        let mut rdata = Vec::new();
+        for _ in 0..8 {
+            rdata.push(63u8);
+            rdata.extend_from_slice(&[b'x'; 63]);
+        }
+        rdata.push(0);
+        assert!(
+            read_name(&rdata, 0).is_none(),
+            "8 x 63 bytes is past the 255-byte limit"
+        );
+        // Four of them is 255 bytes of label plus three separators, which is inside it.
+        let mut legal = Vec::new();
+        for _ in 0..4 {
+            legal.push(60u8);
+            legal.extend_from_slice(&[b'x'; 60]);
+        }
+        legal.push(0);
+        let (name, _) = read_name(&legal, 0).expect("243 bytes is a legal name");
+        assert_eq!(name.len(), 243);
+        assert!(name.len() <= MAX_NAME_BYTES);
+    }
+
+    /// A responder advertising instances without limit cannot make a browse accumulate
+    /// them: the list is capped, and it is deduped by a linear scan, so an uncapped one
+    /// would be quadratic as well as unbounded.
+    #[test]
+    fn a_responder_advertising_without_limit_is_capped_rather_than_accumulated() {
+        let mut found = Found::default();
+        for n in 0..(MAX_INSTANCES + 50) {
+            harvest(
+                &advertisement(
+                    &format!("snowgauge-{n:04x}"),
+                    &format!("snowgauge-{n:04x}.local"),
+                    80,
+                    Ipv4Addr::new(10, 50, 0, 175),
+                    &["fw=0.1.0"],
+                ),
+                HTTP_SERVICE,
+                &mut found,
+            );
+        }
+        assert_eq!(found.instances.len(), MAX_INSTANCES);
+        assert!(found.srv.len() <= MAX_INSTANCES);
+        assert!(found.txt.len() <= MAX_INSTANCES);
+        assert!(found.addrs.len() <= MAX_INSTANCES);
+        // And what it did keep is still complete, so the cap costs the surplus rather than
+        // the answer.
+        let instances = found.into_instances();
+        assert_eq!(instances.len(), MAX_INSTANCES);
+        assert_eq!(instances[0].port, 80);
+        assert_eq!(instances[0].value("fw"), Some("0.1.0"));
+    }
+
+    /// The predicate a decoded name is filtered by, which is the encoder's own rule.
+    #[test]
+    fn a_name_this_resolver_could_not_ask_about_is_not_resolvable() {
+        assert!(is_resolvable("snowgauge-f878.local"));
+        assert!(is_resolvable("snowgauge-f878.local."));
+        // Everything `labels` refuses, which is what a decoded name can carry and a
+        // configured one cannot: `read_name` uses `from_utf8_lossy`, so these all survive
+        // a decode intact.
+        assert!(!is_resolvable("snowgauge-f878\u{1b}[2K.local"));
+        assert!(!is_resolvable("snow gauge.local"));
+        assert!(!is_resolvable("a..b"));
+        assert!(!is_resolvable(""));
+        assert!(!is_resolvable(&format!("{}.local", "x".repeat(64))));
     }
 
     #[test]

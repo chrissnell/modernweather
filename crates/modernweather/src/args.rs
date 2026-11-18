@@ -333,7 +333,14 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, ArgsEr
     }
     let joined = words.join(" ");
     // **Before `--config` is required**, because this is the one command that needs none.
-    if joined == "discover" {
+    //
+    // `starts_with` and then an equality test, rather than equality alone: `discover extra`
+    // would otherwise fall through to the `--config` requirement below and be reported as
+    // "needs --config", which is a sentence about the wrong mistake.
+    if joined == "discover" || joined.starts_with("discover ") {
+        if joined != "discover" {
+            return Err(ArgsError::NoSuchCommand { words: joined });
+        }
         if config.is_some() {
             return Err(ArgsError::DiscoverTakesNoConfig);
         }
@@ -702,6 +709,14 @@ mod tests {
         // And the daemon still needs its path: `discover` is the exception, not a new
         // default.
         assert_eq!(parse_err(&[]), ArgsError::NoConfig);
+        // A misspelling after the word is a misspelled COMMAND, not a missing path. It
+        // used to fall through to the `--config` requirement and report the wrong mistake.
+        assert_eq!(
+            parse_err(&["discover", "gauges"]),
+            ArgsError::NoSuchCommand {
+                words: "discover gauges".to_string()
+            }
+        );
     }
 
     /// Every way of getting a command wrong, including the two that would otherwise be

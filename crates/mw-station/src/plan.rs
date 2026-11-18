@@ -137,6 +137,34 @@ pub enum StationPlanError {
         transport: &'static str,
     },
 
+    /// A station configured for a transport this build used to serve and no longer does.
+    ///
+    /// **One producer, and it exists for the operator rather than for the plan.** A
+    /// `snowgauge` row written before the gauge's firmware was replaced carries
+    /// `transport_kind = 'grpc_out'`; [`StationPlanError::WrongTransport`] would refuse it
+    /// correctly and say only that the driver has no mode for that transport, which leaves
+    /// somebody reading a startup failure to work out which two columns to change. A plan
+    /// refusal is a daemon that will not start, so the sentence has to be the whole
+    /// instruction.
+    #[error(
+        "station `{station}` is a `{kind}` with a `{transport}` transport, which it used \
+         to have and no longer does: {because}. Set `transport_kind = 'http_out'`, \
+         `transport_url` to `http://<host>` (the gauge serves port 80) and \
+         `transport_streaming` to NULL — `modernweather discover` will find the host, and \
+         `migrate-config` writes those three for a configuration migrated from the Go \
+         daemon."
+    )]
+    LegacyTransport {
+        /// Which station.
+        station: String,
+        /// Its configured type.
+        kind: String,
+        /// The transport it still names.
+        transport: &'static str,
+        /// What changed, in words that say why rather than what.
+        because: Because,
+    },
+
     /// A `transport_*` column is not usable.
     #[error("station `{station}`: {source}")]
     Transport {
@@ -873,6 +901,20 @@ fn snowgauge_spec(
     ingress: Arc<dyn mw_component::Ingress>,
 ) -> Result<ComponentSpec, StationPlanError> {
     let Transport::HttpOut { url, .. } = transport else {
+        // The one transport worth its own sentence: `grpc_out` is what every gauge row
+        // written before the firmware was replaced still says, and a startup failure that
+        // did not name the three columns to change would leave an operator guessing.
+        if let Transport::GrpcOut { .. } = transport {
+            return Err(StationPlanError::LegacyTransport {
+                station: row.key.clone(),
+                kind: row.kind.clone(),
+                transport: transport.kind(),
+                because: Because(
+                    "the gauge's gRPC firmware has been decommissioned and the device now \
+                     serves `GET /data` over plain HTTP",
+                ),
+            });
+        }
         return Err(StationPlanError::WrongTransport {
             station: row.key.clone(),
             kind: row.kind.clone(),

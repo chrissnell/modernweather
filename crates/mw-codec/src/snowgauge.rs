@@ -47,6 +47,12 @@
 //! [`CodecError::Incomplete`] and not a reading, and `mw_station::snowgauge` is what
 //! decides how long a gauge may stay in that state before the station is failed.
 //!
+//! **The guard is on the value this codec selected, not on the raw field**, and the first
+//! version of it was not: a `trim_mean` of `0.0` is finite, so it was chosen as the
+//! measurement and admitted while `distance` was never consulted. The mean of thirty zeroes
+//! is a sensor fault by exactly the reading of the firmware's `0` above, and a negative
+//! mean is not a distance at all, so one branch refuses all three.
+//!
 //! # The discard, which is this item's inherited constraint
 //!
 //! **DEV-9**: `snowgauge/station.go:172-176` discarded a distance **greater than the
@@ -279,19 +285,24 @@ impl SnowGaugeData {
         // first minute after boot, before thirty have landed. A non-finite trimmed mean is
         // treated as absent rather than carried: it would reach a `float4` column as a NaN
         // whose aggregates are NaN too.
-        let distance = match data.trim_mean.filter(|mm| mm.is_finite()) {
-            Some(mm) => mm,
-            // Documented to mean "no reading has arrived yet", which is not a measurement
-            // of zero millimetres. This module's documentation has why it is refused
-            // rather than stored.
-            None if data.distance == 0 => {
-                return Err(CodecError::Incomplete {
-                    what: "snow-gauge distance: no reading has reached the gauge since \
-                           boot, so `distance` is still zero and `trim_mean` is null",
-                })
-            }
-            None => data.distance as f32,
-        };
+        let distance = data
+            .trim_mean
+            .filter(|mm| mm.is_finite())
+            .unwrap_or(data.distance as f32);
+        // **The test is on the value that would be STORED, not on the raw field**, and
+        // that distinction is load-bearing: a `trim_mean` of `0.0` is finite, so a guard
+        // that only looked at `distance` would admit it and write a 0 mm `snowdistance`
+        // into a column with `min`/`mean`/`max` aggregates over it — which is the exact
+        // contamination this module's documentation says is refused. The mean of thirty
+        // zeroes is a sensor fault by the same reading of the firmware's `0`, and so is a
+        // negative one, which no physical distance is.
+        if distance <= 0.0 {
+            return Err(CodecError::Incomplete {
+                what: "snow-gauge distance: no measurement has reached the gauge since \
+                       boot, or its sensor is reporting a distance of zero, which is the \
+                       firmware's own `no reading yet`",
+            });
+        }
         if let Some(base) = self.base_distance_mm {
             if distance > base {
                 return Err(CodecError::Implausible {
@@ -428,16 +439,51 @@ mod tests {
         let CodecError::Incomplete { what } = e else {
             panic!("expected an incomplete body, got {e}");
         };
-        assert!(what.contains("still zero"), "{what}");
+        assert!(what.contains("distance of zero"), "{what}");
         assert_eq!(
             e.to_string(),
-            "the device's answer carries no snow-gauge distance: no reading has reached \
-             the gauge since boot, so `distance` is still zero and `trim_mean` is null"
+            "the device's answer carries no snow-gauge distance: no measurement has \
+             reached the gauge since boot, or its sensor is reporting a distance of zero, \
+             which is the firmware's own `no reading yet`"
         );
         // A trimmed mean that HAS landed is a measurement even if the raw field is zero:
         // the mean is over the last thirty samples and the raw field is the last one.
         let batch = decode(&codec, &body(0, "ok", 40, "551.0", 70_000));
         assert_eq!(batch[0].values.snow_distance, Some(551.0));
+    }
+
+    /// **The hole the first version of this guard had.** The test was on the raw
+    /// `distance` field, and a `trim_mean` of `0.0` is *finite* — so a gauge whose sensor
+    /// reports zeroes for thirty samples admitted a 0 mm `snowdistance` into a column with
+    /// `min`/`mean`/`max` aggregates over it, which is the contamination the test above
+    /// says is refused. The guard is on the selected value now, so both spellings of zero
+    /// and a negative mean are refused by the same branch.
+    #[test]
+    fn a_zero_or_negative_trimmed_mean_is_refused_like_a_zero_raw_distance() {
+        let codec = SnowGaugeData::new(Some(1500.0));
+        for trim in ["0.0", "-0.0", "-120.5"] {
+            // The raw field is a plausible distance here, so a guard that read it instead
+            // of the value it had selected would admit the reading.
+            let e = codec
+                .decode(&body(1_200, "ok", 40, trim, 70_000))
+                .unwrap_err();
+            assert!(
+                matches!(e, CodecError::Incomplete { .. }),
+                "trim_mean {trim}: {e}"
+            );
+        }
+        // And an unconfigured gauge is no different: this is about the gauge having
+        // nothing to give, not about the base distance.
+        assert!(matches!(
+            SnowGaugeData::new(None).decode(&body(1_200, "ok", 40, "0.0", 70_000)),
+            Err(CodecError::Incomplete { .. })
+        ));
+        // A raw distance of zero with no trimmed mean is the same refusal, which is the
+        // branch that already worked.
+        assert!(matches!(
+            codec.decode(&body(0, "ok", 40, "null", 70_000)),
+            Err(CodecError::Incomplete { .. })
+        ));
     }
 
     /// The inherited constraint. The Go driver discarded at the device; this discards at

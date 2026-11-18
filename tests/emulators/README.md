@@ -22,10 +22,9 @@ commit.
 ## Re-deriving a captured frame
 
 `crates/mw-codec/tests/frames/` holds the level-1 golden inputs, and most of them were
-captured from the emulators here rather than written by hand — five recipes below, one per
-device. The recipes are below so that
-a reader can check a fixture against the device, and so that replacing one after a pin bump
-is a command rather than an investigation.
+captured from the emulators here rather than written by hand. The five recipes below — one
+per device — are here so that a reader can check a fixture against the device, and so that
+replacing one after a pin bump is a command rather than an investigation.
 
 Every recipe assumes the emulator has been built: `go build -o /tmp/<name> .` inside its
 directory.
