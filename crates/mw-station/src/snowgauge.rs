@@ -339,6 +339,10 @@ pub struct Poll {
     /// The last `/health` sentence, so the failing occurrences between two reads of it
     /// carry the same diagnosis rather than a shorter one. Empty until the first read.
     telemetry: String,
+    /// Whether the gauge reported a calibration last time, or `None` before the first
+    /// poll. Held only to log the **transition**: a gauge that has never been calibrated
+    /// would otherwise say so once per occurrence for ever.
+    calibrated: Option<bool>,
 }
 
 impl fmt::Debug for Poll {
@@ -347,7 +351,7 @@ impl fmt::Debug for Poll {
         f.debug_struct("Poll")
             .field("endpoint", &self.endpoint)
             .field("station", &self.station)
-            .field("base_distance_mm", &self.codec.base_distance_mm())
+            .field("calibrated", &self.calibrated)
             .field("seen", &self.seen)
             .field("silent", &self.silent)
             .finish_non_exhaustive()
@@ -356,20 +360,21 @@ impl fmt::Debug for Poll {
 
 impl Poll {
     /// The poll for one station.
-    pub fn new(
-        endpoint: Endpoint,
-        base_distance_mm: Option<f32>,
-        station: StationKey,
-        ingress: Arc<dyn Ingress>,
-    ) -> Self {
+    ///
+    /// **No base distance.** The gauge holds its own calibration in NVS — set through the
+    /// device's own web interface — and reports the depth derived from it, so there is no
+    /// per-station number to hand in and `crate::plan` no longer reads
+    /// `snow_base_distance_mm` to find one.
+    pub fn new(endpoint: Endpoint, station: StationKey, ingress: Arc<dyn Ingress>) -> Self {
         Self {
             endpoint,
             station,
-            codec: SnowGaugeData::new(base_distance_mm),
+            codec: SnowGaugeData,
             ingress,
             seen: None,
             silent: 0,
             telemetry: String::new(),
+            calibrated: None,
         }
     }
 
@@ -385,10 +390,12 @@ impl Poll {
             Ok(decoded) => decoded,
             Err(e) => {
                 let outcome = match &e {
-                    // DEV-9's discard: the gauge is working and this reading is a fault its
-                    // own configuration says it cannot be. A label of its own, because a
-                    // gauge whose base distance is set two metres short otherwise reports
-                    // nothing and counts nothing under a name an operator would look at.
+                    // **No producer since the gauge began reporting its own depth.** This
+                    // was DEV-9's discard, against a *configured* base distance that could
+                    // disagree with the device; the arm stays because `CodecError` is
+                    // shared with every other codec, and
+                    // `crate::metrics::FrameOutcome::Implausible` stays for the reason
+                    // stated there.
                     CodecError::Implausible { .. } => FrameOutcome::Implausible,
                     // A well-formed body with no measurement in it: the first minute after
                     // boot, a sensor that has never spoken, or a `status` this build does
@@ -415,6 +422,29 @@ impl Poll {
                 return self.nothing_to_store(outcome, &reason).await;
             }
         };
+
+        // **The calibration, logged on the transition only.** A gauge nobody has
+        // calibrated is working and is reporting a distance; what it cannot report is a
+        // depth, and the fix is at the device's own web interface rather than here. Said
+        // once per change instead of once per occurrence, which at a five-second period
+        // would be seventeen thousand lines a day.
+        if self.calibrated != Some(data.is_calibrated()) {
+            if data.is_calibrated() {
+                info!(
+                    station = %self.station,
+                    base_distance_mm = ?data.base_distance,
+                    "a snow gauge reported its calibration"
+                );
+            } else {
+                warn!(
+                    station = %self.station,
+                    "a snow gauge has no calibration, so it reports a distance and no \
+                     depth. Calibrate it from the gauge's own web interface; the depth \
+                     starts arriving on the next poll, with nothing to change here."
+                );
+            }
+            self.calibrated = Some(data.is_calibrated());
+        }
 
         // **Before the sensor test**, because a reboot restarts `readings` at zero and a
         // smaller count would otherwise read as a sensor that had stopped.
@@ -645,6 +675,20 @@ mod tests {
     use crate::testing::RecordingIngress;
     use mw_component::Reject;
 
+    /// A v0.1.0 `/data` body: calibrated to 1500 mm, with the depth the device would have
+    /// computed from the trimmed mean.
+    fn v1_body(trim: f32, readings: u64, uptime: u64) -> Frame {
+        Frame::new(
+            format!(
+                r#"{{"distance":{},"status":"ok","readings":{readings},"trim_mean":{trim},
+                     "base_distance":1500,"snow_depth":{},"rssi":-63,"uptime_ms":{uptime}}}"#,
+                trim as u32,
+                1500 - trim.round() as i32
+            )
+            .into_bytes(),
+        )
+    }
+
     /// A `/data` body, in the shape the device documentation prints.
     fn body(distance: u32, status: &str, readings: u64, trim: &str, uptime: u64) -> Frame {
         Frame::new(
@@ -659,7 +703,6 @@ mod tests {
     fn poll(ingress: Arc<dyn Ingress>) -> Poll {
         Poll::new(
             Endpoint::parse("http://snowgauge-f878.local").expect("a literal address"),
-            Some(1500.0),
             StationKey::new("suncrest:gauge"),
             ingress,
         )
@@ -792,23 +835,6 @@ mod tests {
         assert_eq!(admissions[0].batch[0].values.snow_distance, Some(1_210.0));
     }
 
-    /// DEV-9's discard, through the driver: counted, not admitted, and not a failure on its
-    /// own.
-    #[tokio::test]
-    async fn a_distance_past_the_base_is_discarded_and_the_station_keeps_polling() {
-        let ingress = RecordingIngress::accepting();
-        let mut poll = poll(Arc::clone(&ingress) as Arc<dyn Ingress>);
-        poll.on_body(&id(), &body(1_600, "ok", 40, "1600.0", 70_000))
-            .await
-            .expect("a discard is not an occurrence failure");
-        assert!(ingress.admissions().is_empty());
-        // And the next good sample is admitted, so the discard cost one reading.
-        poll.on_body(&id(), &body(1_400, "ok", 41, "1400.0", 75_000))
-            .await
-            .expect("admitted");
-        assert_eq!(ingress.admissions().len(), 1);
-    }
-
     /// A body that is not a `/data` document **fails the occurrence at once**, where a
     /// body that decoded and carried nothing is counted into the streak.
     ///
@@ -838,6 +864,52 @@ mod tests {
         poll.on_body(&id(), &body(0, "no_data", 0, "null", 4_000))
             .await
             .expect("a booting gauge is not a failure");
+    }
+
+    /// Both numbers reach the spool off one poll, and the depth is the device's.
+    #[tokio::test]
+    async fn a_reading_carries_the_distance_and_the_devices_own_depth() {
+        let ingress = RecordingIngress::accepting();
+        let mut poll = poll(Arc::clone(&ingress) as Arc<dyn Ingress>);
+        poll.on_body(&id(), &v1_body(1_429.0, 40, 70_000))
+            .await
+            .expect("admitted");
+        let r = &ingress.admissions()[0].batch[0].values;
+        assert_eq!(r.snow_distance, Some(1_429.0));
+        assert_eq!(
+            r.snow_depth,
+            Some(71.0),
+            "1500 - 1429, the device's arithmetic"
+        );
+    }
+
+    /// An uncalibrated gauge reports for ever without failing its station: it is working,
+    /// and the missing depth is fixed at the device rather than here. The distance is kept
+    /// — it is the series `/snow`'s history is made of.
+    #[tokio::test]
+    async fn an_uncalibrated_gauge_keeps_reporting_rather_than_failing() {
+        let ingress = RecordingIngress::accepting();
+        let mut poll = poll(Arc::clone(&ingress) as Arc<dyn Ingress>);
+        for n in 0..SILENT_OCCURRENCES + 2 {
+            let body = Frame::new(
+                format!(
+                    r#"{{"distance":1771,"status":"ok","readings":{},"trim_mean":1771.0,
+                         "base_distance":null,"snow_depth":null,"uptime_ms":{}}}"#,
+                    40 + n,
+                    70_000 + u64::from(n) * 5_000
+                )
+                .into_bytes(),
+            );
+            poll.on_body(&id(), &body).await.unwrap_or_else(|e| {
+                panic!("occurrence {n}: an uncalibrated gauge is still reporting: {e}")
+            });
+        }
+        let admissions = ingress.admissions();
+        assert_eq!(admissions.len() as u32, SILENT_OCCURRENCES + 2);
+        assert!(admissions
+            .iter()
+            .all(|a| a.batch[0].values.snow_distance == Some(1771.0)
+                && a.batch[0].values.snow_depth.is_none()));
     }
 
     /// An unknown station is a counted refusal and **not** a failed occurrence: the
@@ -987,7 +1059,7 @@ mod tests {
         let rendered = format!("{:?}", poll(RecordingIngress::accepting()));
         assert!(rendered.contains("snowgauge-f878.local"), "{rendered}");
         assert!(rendered.contains("suncrest:gauge"), "{rendered}");
-        assert!(rendered.contains("1500.0"), "{rendered}");
+        assert!(rendered.contains("calibrated"), "{rendered}");
         assert!(!rendered.contains("Ingress"), "{rendered}");
     }
 }

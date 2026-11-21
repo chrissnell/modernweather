@@ -891,8 +891,9 @@ fn airgradient_spec(
 ///
 /// The same shape as [`airgradient_spec`] and deliberately so — the gauge used to be the
 /// one `GrpcOut { streaming: true }` station and is now a poll like any other
-/// (`crate::snowgauge`). The one thing it carries that no other `http_out` row does is the
-/// station's `snow_base_distance_mm`, which the codec discards against (**DEV-9**).
+/// (`crate::snowgauge`). It carries nothing the AirGradient poll does not: the gauge holds
+/// its own calibration and reports the depth from it, so `snow_base_distance_mm` is read
+/// nowhere on this path any more.
 fn snowgauge_spec(
     row: &StationRow,
     transport: &Transport,
@@ -924,7 +925,6 @@ fn snowgauge_spec(
     refuse_tls(row, url)?;
     let id = component_id(row, crate::snowgauge::station_id)?;
     let url = url.clone();
-    let base = row.snow_base_distance_mm();
     let trigger = Trigger::Every {
         period: crate::snowgauge::DEFAULT_POLL,
         // Equal to the period, which is the largest `plan()` permits; the request's own
@@ -939,12 +939,8 @@ fn snowgauge_spec(
         id,
         trigger,
         Builder::tick(move |_cx| {
-            let body = crate::snowgauge::Poll::new(
-                url.clone(),
-                base,
-                station.clone(),
-                Arc::clone(&ingress),
-            );
+            let body =
+                crate::snowgauge::Poll::new(url.clone(), station.clone(), Arc::clone(&ingress));
             async move { Ok(body) }
         }),
     )

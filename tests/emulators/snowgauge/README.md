@@ -39,14 +39,35 @@ an error table in it, and every flag below is a row of that table.
 | Flag | What |
 |---|---|
 | `-port <n>` | the port; `0` lets the kernel choose and it is printed as `ready http=<n>` |
-| `-base <mm>` | the distance with no snow under it, which the daemon also has configured |
+| `-base <mm>` | the sensor-to-ground distance the snowpack model measures against, and what a calibrated gauge reports as `base_distance` |
+| `-calibrated` | whether the gauge has a calibration in NVS. `-calibrated=false` is a gauge nobody has calibrated: it **measures normally** and reports `base_distance` and `snow_depth` as `null`. Separate from `-base` for a reason the first draft got wrong — overloading `-base 0` underflowed the `u16` distance the snowpack model derives from it |
 | `-trim-after <n>` | how many sensor frames before `trim_mean` stops being `null`. **30 on a real gauge**, which is about a minute after boot; a test that wants the trimmed-mean regime in five polls passes `2` |
 | `-sensor all\|dead\|stalled` | `dead` is a sensor that never speaks — `status` stays `no_data`, `readings` stays `0`, `/health.bytes_rx` stays `0`. `stalled` is the UART link dying mid-run: `readings` freezes while `uptime_ms` keeps growing, which is the firmware documentation's own liveness test |
 | `-stall-after <n>` | how many frames `-sensor stalled` produces before it stops |
-| `-fault <n>` | every nth response reports a distance **greater** than `-base`, which is the fault **DEV-9** is about: stored, it is a negative snow depth in a column with `min`/`mean`/`max` aggregates over it |
+| `-fault <n>` | every nth response reports a distance **greater** than `-base`. This used to trigger **DEV-9**'s discard; as of firmware v0.1.0 it is simply a **negative `snow_depth`**, which the owner has asked to record (2026-11-21) because the firmware reports the sign to mean frost heave or a calibration coming due |
 | `-reboot <n>` | reboot every nth response: `uptime_ms` drops and `readings` restarts at zero, which is the state a driver that tested the sensor before the uptime would call a dead sensor |
 | `-firmware current\|old` | `old` is a gauge that predates `/data`: `404` there, and a `fw_version` from before the endpoint existed |
 | `-uptime-step <ms>` | how much `uptime_ms` advances per response, default `5000` |
+
+## What the device computes, and what this emulator therefore computes
+
+Firmware v0.1.0 holds a calibrated base distance in NVS and reports `snow_depth` itself, so
+this emulator does that subtraction too — **in the firmware's order**:
+
+```go
+depth := int32(base) - int32(math.Round(reading))
+```
+
+`base − round(reading)`, not `round(base − reading)`. They differ by up to a millimetre, and
+an oracle a millimetre off the device is an oracle that hides a millimetre of drift.
+`a_calibrated_gauge_reports_a_depth_the_device_computed` asserts it as equality rather than
+a tolerance for that reason.
+
+Two fields are set **before** the no-reading early return, because neither comes from the
+sensor: `rssi` is the WiFi driver's and `base_distance` is NVS's. So a calibrated gauge with
+a dead UART still reports what it is calibrated to — which is exactly when an operator goes
+looking for that number. `snow_depth` is `null` there, matching the firmware's own
+`(Some(base), None, "no_data") => null` arm.
 
 ## Why `uptime_ms` is not the wall clock
 

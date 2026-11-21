@@ -53,28 +53,30 @@
 //! is a sensor fault by exactly the reading of the firmware's `0` above, and a negative
 //! mean is not a distance at all, so one branch refuses all three.
 //!
-//! # The discard, which is this item's inherited constraint
+//! # The depth is the device's, and so is the calibration
 //!
-//! **DEV-9**: `snowgauge/station.go:172-176` discarded a distance **greater than the
-//! station's configured base distance** at the device, and M3-3 moved `snowdepth` to
-//! ingest — so without the discard such a reading stores a *negative* depth into a column
-//! with `min`/`mean`/`max` aggregates over it, where in Go it never reached storage at all.
-//! The enrich stage is the wrong layer (it is handed an already-admitted reading, and
-//! dropping a metric there would make it a filter rather than a transform), so the discard
-//! is here, where the base distance is configuration the codec holds and the reading is a
-//! fault the decoder can name.
+//! The gauge stores its calibrated sensor-to-ground distance in NVS — set through the
+//! device's own web interface, surviving a reboot and an OTA — and reports both that
+//! `base_distance` and the `snow_depth` it derives from it. So this codec does no
+//! arithmetic: it carries the gauge's depth onto the `snow_depth` metric, which
+//! `metrics/registry.toml` declares in millimetres exactly as the firmware reports it.
 //!
-//! It is a [`CodecError::Implausible`] rather than an empty batch, because an empty batch is
-//! indistinguishable from a frame that decoded to nothing: a gauge whose base distance is
-//! set two metres too short would otherwise report nothing, count nothing and log nothing.
-//! `mw_station::metrics::FrameOutcome::Implausible` is the counter.
+//! **That retires DEV-9.** The inherited constraint was that
+//! `snowgauge/station.go:172-176` discarded a distance greater than the station's
+//! *configured* base distance, because M3-3 moved `snowdepth` to ingest and a wrong
+//! configuration would otherwise store a negative depth into a column with
+//! `min`/`mean`/`max` aggregates over it. Two things dissolve it: the base distance is no
+//! longer configuration that can disagree with the device, and a negative depth is no
+//! longer a symptom of that disagreement. The firmware reports the sign deliberately — a
+//! stable reading that overshot the base is frost heave or a calibration coming due — and
+//! the owner's instruction is to record it rather than clamp it, because a zero would hide
+//! the thing worth seeing.
 //!
-//! **A station with no configured base distance discards nothing.** That was the one
-//! departure from Go and it still is: `config.DeviceData.BaseSnowDistance` is a
-//! non-nullable `float64` there, so an unconfigured gauge has a base of zero, every real
-//! reading is `distance > 0`, and the Go driver discarded **all** of them. The column here
-//! is nullable with a `CHECK (> 0)`, so "not configured" is expressible: the distance is
-//! stored, and `enrich` derives no depth from it because it has no base either.
+//! **An uncalibrated gauge still reports.** `base_distance` and `snow_depth` are both
+//! `null` until somebody calibrates, and the reading that carries a distance and no depth
+//! is a complete reading of a working device, not a refusal. `is_calibrated` is how a
+//! driver surfaces the state; the depth simply starts arriving once the calibration is
+//! done, with no configuration change and no restart.
 //!
 //! # `GET /health`
 //!
@@ -120,6 +122,39 @@ pub struct SnowData {
     /// The trimmed mean of the middle 24 of the last 30 samples, in millimetres.
     #[serde(default)]
     pub trim_mean: Option<f32>,
+    /// The gauge's calibrated sensor-to-ground distance, in millimetres.
+    ///
+    /// `None` until somebody calibrates it. Persisted in the device's NVS — the firmware
+    /// reads it back with `get_u16`, so it survives a reboot and an OTA — which is what
+    /// makes it the device's property rather than this daemon's.
+    #[serde(default)]
+    pub base_distance: Option<u32>,
+
+    /// The gauge's own `base_distance − current_reading`, in millimetres, **signed**.
+    ///
+    /// The firmware computes it as `base as i32 - trim_mean.round() as i32` when a trimmed
+    /// mean exists and against the raw distance otherwise — the same preference this codec
+    /// applies to the distance, which is why the two numbers in one reading agree about
+    /// which sample they describe.
+    ///
+    /// **A negative is a measurement, not a fault**, and it is stored as one: the firmware
+    /// documents it as a stable reading that overshot the calibrated base — frost heave, or
+    /// a calibration that is drifting — and the owner's instruction is to record it. The
+    /// predecessor of this field could not represent that at all.
+    ///
+    /// `None` when the gauge is uncalibrated or has no reading yet.
+    #[serde(default)]
+    pub snow_depth: Option<i32>,
+
+    /// Signal strength in dBm, which `/data` carries as of firmware v0.1.0.
+    ///
+    /// Not a stored metric — no registry entry describes one — and carried so that an
+    /// operator-facing read has it without a second request. **`0` is the firmware's
+    /// sentinel for "the access-point lookup failed"**, not a strong signal, so a consumer
+    /// has to filter it rather than render it.
+    #[serde(default)]
+    pub rssi: Option<i32>,
+
     /// Milliseconds since boot. A decrease is a reboot.
     pub uptime_ms: u64,
 }
@@ -175,6 +210,16 @@ impl SnowData {
     pub fn is_ok(&self) -> bool {
         self.status == SNOW_STATUS_OK
     }
+
+    /// Whether the gauge has a calibration, which is what makes a depth possible.
+    ///
+    /// An uncalibrated gauge is **working**: it reports a distance and no depth, and the
+    /// thing it cannot report is one a person fixes at the device's own web interface. So
+    /// this is a state to surface, not a reading to refuse.
+    #[must_use]
+    pub fn is_calibrated(&self) -> bool {
+        self.base_distance.is_some()
+    }
 }
 
 /// `GET /health`, as this build reads it.
@@ -222,33 +267,18 @@ pub fn snow_health(frame: &Frame) -> Result<SnowHealth, CodecError> {
     serde_json::from_str(frame.as_str()?).map_err(|source| CodecError::Json { source })
 }
 
-/// The snow gauge codec for one station's configured base distance.
+/// The snow gauge codec.
+///
+/// **Stateless, where it used to hold the station's configured base distance.** The gauge
+/// persists its own calibration and reports the depth derived from it, so there is nothing
+/// per-station to hold here and nothing to derive — which also retires **DEV-9**'s
+/// discard. That discard existed because a *configured* base distance could be wrong and a
+/// distance past it would store a negative depth; the device's calibration cannot disagree
+/// with itself, and a negative depth is now a measurement the owner has asked to keep.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct SnowGaugeData {
-    base_distance_mm: Option<f32>,
-}
+pub struct SnowGaugeData;
 
 impl SnowGaugeData {
-    /// The codec for a gauge mounted `base_distance_mm` above bare ground.
-    ///
-    /// `None` is a gauge whose `snow_base_distance_mm` column is NULL, which discards
-    /// nothing — see this module's documentation.
-    #[must_use]
-    pub fn new(base_distance_mm: Option<f32>) -> Self {
-        // A non-positive or non-finite base is not a base: the column's own `CHECK` is
-        // `> 0`, and a zero one here would discard every reading, which is the Go
-        // behaviour this type exists to avoid reproducing.
-        Self {
-            base_distance_mm: base_distance_mm.filter(|mm| mm.is_finite() && *mm > 0.0),
-        }
-    }
-
-    /// The base distance this codec discards against.
-    #[must_use]
-    pub fn base_distance_mm(&self) -> Option<f32> {
-        self.base_distance_mm
-    }
-
     /// Decode one `/data` body into the reading it carried **and** the body itself.
     ///
     /// The driver needs both halves of one parse: the batch to admit, and `readings` and
@@ -303,21 +333,23 @@ impl SnowGaugeData {
                        firmware's own `no reading yet`",
             });
         }
-        if let Some(base) = self.base_distance_mm {
-            if distance > base {
-                return Err(CodecError::Implausible {
-                    what: "snow sensor distance, in millimetres",
-                    value: f64::from(distance),
-                    limit: f64::from(base),
-                });
-            }
-        }
         Ok(vec![PartialReading::new(Reading {
             snow_distance: Some(distance),
-            // `snowdepth` is NOT set here. It is `base - distance`, the enrich stage
-            // computes it from the station's metadata for every station rather than for the
-            // driver that remembered to (DEV-9), and a codec that computed it would be the
-            // second implementation of one subtraction.
+            // **The device's depth, verbatim, sign and all.** It was the enrich stage's
+            // subtraction of a configured base distance (DEV-9); the gauge now holds its
+            // own calibration in NVS and does that arithmetic itself, so carrying its
+            // answer is the whole of the mapping.
+            //
+            // `mw_pipeline::enrich` is what makes this final rather than one of two
+            // numbers: `derive` fills a slot **only** where the reading left it `None`, so
+            // a station-reported depth is never recomputed and there is no second
+            // subtraction to disagree with this one.
+            //
+            // Negatives are kept deliberately (the owner's instruction, 2026-11-21): the
+            // firmware reports the sign to say that a stable reading overshot the base, and
+            // clamping it to zero would hide frost heave and a drifting calibration behind
+            // a plausible number.
+            snow_depth: data.snow_depth.map(|mm| mm as f32),
             ..Reading::default()
         })])
     }
@@ -346,11 +378,25 @@ mod tests {
                                   "hostname":"snowgauge-f878","bytes_rx":240,
                                   "heap_free":164228,"fw_version":"0.1.0","fw_slot":"ota_0"}"#;
 
+    /// A pre-v0.1.0 body: no `base_distance`, no `snow_depth`, no `rssi`. Kept as the
+    /// default helper because every guard around the *distance* is independent of them.
     fn body(distance: u32, status: &str, readings: u64, trim: &str, uptime: u64) -> Frame {
         Frame::new(
             format!(
                 r#"{{"distance":{distance},"status":"{status}","readings":{readings},
                      "trim_mean":{trim},"uptime_ms":{uptime}}}"#
+            )
+            .into_bytes(),
+        )
+    }
+
+    /// A v0.1.0 body. `base` and `depth` are JSON literals so a test can write `null`.
+    fn v1_body(distance: u32, trim: &str, base: &str, depth: &str) -> Frame {
+        Frame::new(
+            format!(
+                r#"{{"distance":{distance},"status":"ok","readings":1288,
+                     "trim_mean":{trim},"base_distance":{base},"snow_depth":{depth},
+                     "rssi":-63,"uptime_ms":2369755}}"#
             )
             .into_bytes(),
         )
@@ -362,7 +408,7 @@ mod tests {
 
     #[test]
     fn the_documented_body_decodes_to_the_trimmed_mean() {
-        let codec = SnowGaugeData::new(Some(1500.0));
+        let codec = SnowGaugeData;
         let (data, batch) = codec
             .read(&Frame::new(DATA_BODY.as_bytes().to_vec()))
             .expect("decodes");
@@ -390,7 +436,7 @@ mod tests {
     /// the fixture, so a codec reading the raw one is visible.
     #[test]
     fn the_trimmed_mean_wins_over_the_raw_distance_and_the_raw_one_is_the_fallback() {
-        let codec = SnowGaugeData::new(Some(1500.0));
+        let codec = SnowGaugeData;
         let batch = decode(&codec, &body(900, "ok", 40, "551.0", 70_825));
         assert_eq!(batch[0].values.snow_distance, Some(551.0));
         // The first minute after boot: fewer than thirty samples, so no trimmed mean yet.
@@ -405,7 +451,7 @@ mod tests {
     /// sentence has to send an operator to the wiring rather than to this daemon.
     #[test]
     fn a_gauge_whose_sensor_has_never_spoken_carries_no_reading() {
-        let codec = SnowGaugeData::new(Some(1500.0));
+        let codec = SnowGaugeData;
         let e = codec
             .decode(&body(0, "no_data", 0, "null", 4_000))
             .expect_err("no measurement");
@@ -432,7 +478,7 @@ mod tests {
     /// distance is a 1500 mm snowpack the moment the depth stops being NULL.
     #[test]
     fn a_gauge_that_has_not_measured_yet_carries_no_reading_rather_than_a_zero() {
-        let codec = SnowGaugeData::new(Some(1500.0));
+        let codec = SnowGaugeData;
         let e = codec
             .decode(&body(0, "ok", 0, "null", 900))
             .expect_err("no measurement");
@@ -460,7 +506,7 @@ mod tests {
     /// and a negative mean are refused by the same branch.
     #[test]
     fn a_zero_or_negative_trimmed_mean_is_refused_like_a_zero_raw_distance() {
-        let codec = SnowGaugeData::new(Some(1500.0));
+        let codec = SnowGaugeData;
         for trim in ["0.0", "-0.0", "-120.5"] {
             // The raw field is a plausible distance here, so a guard that read it instead
             // of the value it had selected would admit the reading.
@@ -475,7 +521,7 @@ mod tests {
         // And an unconfigured gauge is no different: this is about the gauge having
         // nothing to give, not about the base distance.
         assert!(matches!(
-            SnowGaugeData::new(None).decode(&body(1_200, "ok", 40, "0.0", 70_000)),
+            SnowGaugeData.decode(&body(1_200, "ok", 40, "0.0", 70_000)),
             Err(CodecError::Incomplete { .. })
         ));
         // A raw distance of zero with no trimmed mean is the same refusal, which is the
@@ -486,73 +532,78 @@ mod tests {
         ));
     }
 
-    /// The inherited constraint. The Go driver discarded at the device; this discards at
-    /// the decoder, and the number it would otherwise store is the one in the body.
+    /// The v0.1.0 shape: the gauge did the subtraction, and the codec carries both numbers
+    /// off one parse.
     #[test]
-    fn a_distance_past_the_base_is_a_named_discard_rather_than_a_negative_depth() {
-        let codec = SnowGaugeData::new(Some(1500.0));
-        let e = codec
-            .decode(&body(1600, "ok", 40, "1600.0", 70_000))
-            .expect_err("a fault");
-        let CodecError::Implausible { value, limit, .. } = e else {
-            panic!("expected an implausible distance, got {e}");
-        };
-        assert_eq!(value, 1600.0);
-        assert_eq!(limit, 1500.0);
-        assert_eq!(
-            e.to_string(),
-            "snow sensor distance, in millimetres is 1600 and the station's own limit is 1500"
-        );
-        // Bare ground is the boundary and is not a fault.
-        assert_eq!(
-            decode(&codec, &body(1500, "ok", 40, "1500.0", 70_000))[0]
-                .values
-                .snow_distance,
-            Some(1500.0)
-        );
-        // The discard is against the value that would be STORED, so a trimmed mean inside
-        // the base is admitted even when the latest raw sample is past it -- which is what
-        // the trimmed mean exists to do with an outlier echo.
-        assert_eq!(
-            decode(&codec, &body(1600, "ok", 40, "1480.0", 70_000))[0]
-                .values
-                .snow_distance,
-            Some(1480.0)
-        );
+    fn a_calibrated_gauge_reports_its_own_depth_and_the_codec_carries_it() {
+        let (data, batch) = SnowGaugeData
+            .read(&v1_body(1_771, "1700.0", "1771", "71"))
+            .expect("decodes");
+        assert_eq!(batch.len(), 1);
+        // The distance is still the trimmed mean, which is what `snowdistance` means and
+        // what the pre-cutover history is made of.
+        assert_eq!(batch[0].values.snow_distance, Some(1700.0));
+        // And the depth is the DEVICE's number, not `base - trim_mean` computed here.
+        assert_eq!(batch[0].values.snow_depth, Some(71.0));
+        assert_eq!(data.base_distance, Some(1_771));
+        assert_eq!(data.rssi, Some(-63));
+        assert!(data.is_calibrated());
     }
 
-    /// The one departure from Go, as the behaviour it replaces.
+    /// **The owner's instruction, 2026-11-21: record a negative depth.**
+    ///
+    /// The firmware reports the sign to say a stable reading overshot the calibrated base
+    /// — frost heave, or a calibration coming due. Clamping it to zero would hide exactly
+    /// that behind a plausible number, so it is stored as it arrives. Zero is a
+    /// measurement too: bare ground.
     #[test]
-    fn a_gauge_with_no_configured_base_distance_discards_nothing() {
-        for base in [None, Some(0.0), Some(-1.0), Some(f32::NAN)] {
-            let codec = SnowGaugeData::new(base);
-            assert_eq!(codec.base_distance_mm(), None, "{base:?}");
-            assert_eq!(
-                decode(&codec, &body(1600, "ok", 40, "1600.0", 70_000))[0]
-                    .values
-                    .snow_distance,
-                Some(1600.0),
-                "{base:?}: Go discards every reading for a base of zero"
-            );
+    fn a_negative_depth_is_recorded_rather_than_clamped_or_dropped() {
+        for (depth, expected) in [("-4", -4.0), ("-250", -250.0), ("0", 0.0)] {
+            let batch = SnowGaugeData
+                .decode(&v1_body(1_775, "1775.0", "1771", depth))
+                .unwrap_or_else(|e| panic!("depth {depth} is a reading, not a fault: {e}"));
+            assert_eq!(batch[0].values.snow_depth, Some(expected), "depth {depth}");
+            // And the distance that produced it is stored alongside, unaffected: the
+            // zero-distance guard is about the DISTANCE and says nothing about the depth.
+            assert_eq!(batch[0].values.snow_distance, Some(1775.0));
         }
     }
 
-    /// A `u16` field that arrives wider is a value the discard can *name*, rather than a
-    /// parse failure whose sentence is "not the JSON this codec decodes".
+    /// An uncalibrated gauge is a working gauge with nothing to subtract from. The reading
+    /// carries a distance and no depth, and that is a complete reading rather than a
+    /// refusal: the depth starts arriving when somebody calibrates, with no configuration
+    /// change and no restart.
     #[test]
-    fn a_distance_wider_than_the_wire_type_is_still_a_number_the_discard_reports() {
-        let e = SnowGaugeData::new(Some(1500.0))
-            .decode(&body(70_000, "ok", 40, "null", 70_000))
-            .expect_err("a fault");
-        let CodecError::Implausible { value, .. } = e else {
-            panic!("expected an implausible distance, got {e}");
-        };
-        assert_eq!(value, 70_000.0);
+    fn an_uncalibrated_gauge_reports_a_distance_and_no_depth() {
+        let (data, batch) = SnowGaugeData
+            .read(&v1_body(1_771, "1771.0", "null", "null"))
+            .expect("decodes");
+        assert_eq!(batch[0].values.snow_distance, Some(1771.0));
+        assert_eq!(
+            batch[0].values.snow_depth, None,
+            "nothing to derive it from"
+        );
+        assert_eq!(data.base_distance, None);
+        assert!(!data.is_calibrated());
+    }
+
+    /// A firmware that predates the three new keys still decodes, which is what makes the
+    /// upgrade orderless: this daemon can poll a gauge that has not been reflashed yet and
+    /// store its distance exactly as before.
+    #[test]
+    fn a_body_without_the_new_fields_still_decodes_to_a_distance() {
+        let (data, batch) = SnowGaugeData
+            .read(&body(1_771, "ok", 1_288, "1771.0", 2_369_755))
+            .expect("decodes");
+        assert_eq!(batch[0].values.snow_distance, Some(1771.0));
+        assert_eq!(batch[0].values.snow_depth, None);
+        assert_eq!(data.base_distance, None);
+        assert_eq!(data.rssi, None);
     }
 
     #[test]
     fn bytes_that_are_not_this_body_are_a_counted_drop() {
-        let codec = SnowGaugeData::new(Some(1500.0));
+        let codec = SnowGaugeData;
         for bytes in [
             &b"<html>404</html>"[..],
             // `/health`'s body on `/data`'s path: valid JSON, and none of the four
@@ -625,7 +676,7 @@ mod tests {
 
     #[test]
     fn the_codec_names_itself_claims_no_station_and_names_the_two_paths() {
-        let codec = SnowGaugeData::new(Some(1500.0));
+        let codec = SnowGaugeData;
         assert_eq!(codec.name(), "snowgauge-data");
         assert_eq!(
             codec.claimed_station(&Frame::new(DATA_BODY.as_bytes().to_vec())),

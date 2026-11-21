@@ -330,15 +330,22 @@ package = "mw-station"
 test_target = "emulator_snowgauge"
 test_names = [
     "every_occurrence_produces_a_reading_and_the_values_move",
+    "a_calibrated_gauge_reports_a_depth_the_device_computed",
+    "an_uncalibrated_gauge_reports_a_distance_and_no_depth",
     "a_gauge_whose_sensor_stops_stores_nothing_further_and_then_fails_the_station",
     "a_gauge_with_no_sensor_stores_no_zero_distance",
-    "a_distance_past_the_base_is_discarded_and_the_station_keeps_polling",
-    "an_unconfigured_gauge_still_reports_its_distance",
     "a_gauge_that_reboots_keeps_reporting",
     "old_firmware_is_named_as_an_upgrade_rather_than_a_not_found",
 ]
 note = """
-**Rewritten, and the entry lost its `[emulator.files]`.** The gauge used to speak gRPC, so
+**Firmware v0.1.0: the gauge computes its own depth.** The device persists a calibrated
+base distance in NVS and reports both it and the signed `snow_depth` on `/data`, so this
+emulator does that subtraction too -- see `a_calibrated_gauge_reports_a_depth_the_device_computed`
+for why it is asserted to the millimetre. `-fault` remains, and no longer has a discard to
+trigger: a distance past the calibration is now a NEGATIVE depth the owner has asked to
+record rather than a reading to drop (2026-11-21).
+
+**Rewritten once before, and the entry lost its `[emulator.files]`.** The gauge used to speak gRPC, so
 this entry carried the reference tree's own generated protobuf stubs -- vendored byte for
 byte and digest-verified -- which made its PROTOCOL independently defined even though its
 behaviour was not. `mw_codec::SnowGaugeProto` declared two fields of a four-field message BY
@@ -377,15 +384,20 @@ one of its rows rather than a case somebody imagined.
       documented to mean "no reading has arrived yet", and stored under a 1500 mm base
       distance it is a 1500 mm snowpack -- so it is a counted drop and not a reading. The
       gRPC predecessor stored it.
-  a_distance_past_the_base_is_discarded_and_the_station_keeps_polling
-      `-fault 3`, a distance GREATER than the configured base every third response.
-      **DEV-9's constraint on this item**: M3-3 moved `snowdepth` to ingest, so without the
-      discard such a reading stores a NEGATIVE depth into a column with min/mean/max
-      aggregates over it. Six readings out of nine occurrences, and no occurrence failed.
-  an_unconfigured_gauge_still_reports_its_distance
-      the same emulator flags with no base distance configured DO admit the faults, which is
-      what makes the test above non-vacuous. It is also the one departure from Go: an
-      unconfigured gauge there has a base of zero and reports nothing at all.
+  a_calibrated_gauge_reports_a_depth_the_device_computed
+      **the firmware v0.1.0 change.** The gauge holds its calibration in NVS and reports
+      `snow_depth` derived from it, so the driver carries that number instead of subtracting
+      a configured one. Asserted as EQUALITY against `base as i32 - reading.round() as i32`
+      -- the firmware's arithmetic in the firmware's order -- because a tolerance would hide
+      the millimetre that rounding the subtraction instead would cost, and hiding a
+      millimetre of drift is the one thing this oracle exists to prevent.
+  an_uncalibrated_gauge_reports_a_distance_and_no_depth
+      `-calibrated=false`: a gauge nobody has calibrated. It MEASURES normally and reports
+      `base_distance` and `snow_depth` as null, and every occurrence still produces a
+      reading -- the distance is the series `/snow`'s history is made of, and the missing
+      depth is fixed at the device's own web interface rather than in this daemon. The two
+      flags are separate for a reason the first draft got wrong: overloading `-base 0` as
+      "uncalibrated" underflowed the u16 distance the snowpack model derives from it.
   a_gauge_that_reboots_keeps_reporting
       `-reboot 3`. A reboot resets `readings` to zero as well as `uptime_ms`, so a driver
       that asked "did the sensor advance" before "did it reboot" would call a rebooted gauge

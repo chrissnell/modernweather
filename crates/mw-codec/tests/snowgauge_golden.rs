@@ -32,21 +32,19 @@ const DATA: &str = include_str!("frames/snowgauge-data.json");
 const WARMING: &str = include_str!("frames/snowgauge-warming.json");
 
 /// A gauge whose sensor has never spoken: `status` is `no_data` and `distance` is zero.
+/// **Calibrated**, so it still reports its `base_distance` — that number is NVS's, not the
+/// sensor's, which is what makes reading it off the device worth doing at all.
 const NO_DATA: &str = include_str!("frames/snowgauge-no-data.json");
+
+/// A gauge nobody has calibrated: it measures normally and reports `base_distance` and
+/// `snow_depth` as null.
+const UNCALIBRATED: &str = include_str!("frames/snowgauge-uncalibrated.json");
 
 /// `GET /health` from the same gauge.
 const HEALTH: &str = include_str!("frames/snowgauge-health.json");
 
-/// The base distance the fixtures' emulator was configured with, which is also the one the
-/// station would have in `snow_base_distance_mm`.
-const BASE: f32 = 1500.0;
-
-fn codec(base: Option<f32>) -> SnowGaugeData {
-    SnowGaugeData::new(base)
-}
-
-fn decode(base: Option<f32>, body: &str) -> Result<Vec<mw_types::PartialReading>, CodecError> {
-    codec(base).decode(&Frame::new(body.as_bytes().to_vec()))
+fn decode(body: &str) -> Result<Vec<mw_types::PartialReading>, CodecError> {
+    SnowGaugeData.decode(&Frame::new(body.as_bytes().to_vec()))
 }
 
 /// The trimmed mean is the measurement, and the raw `distance` in the same body is a
@@ -54,21 +52,23 @@ fn decode(base: Option<f32>, body: &str) -> Result<Vec<mw_types::PartialReading>
 /// untested.
 #[test]
 fn a_captured_body_decodes_to_the_trimmed_mean_and_not_the_raw_distance() {
-    let batch = decode(Some(BASE), DATA).expect("a captured body decodes");
+    let batch = decode(DATA).expect("a captured body decodes");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].values.snow_distance, Some(1351.4));
     assert_eq!(
         batch[0].observed_at, None,
         "`/data` is the gauge's current state and carries no instant"
     );
-    // The depth is the enrich stage's subtraction (DEV-9), not the codec's.
-    assert_eq!(batch[0].values.snow_depth, None);
+    // **The device's depth**, where it used to be the enrich stage's subtraction of a
+    // configured base distance (DEV-9). 1500 - round(1351.4) = 149, which is the
+    // firmware's arithmetic in the firmware's order.
+    assert_eq!(batch[0].values.snow_depth, Some(149.0));
     // And nothing else: a gauge measures one thing.
     assert_eq!(batch[0].values.out_temp, None);
     assert_eq!(batch[0].values.barometer, None);
 
     // The liveness pair the driver carries across occurrences comes out of the same parse.
-    let (data, _) = codec(Some(BASE))
+    let (data, _) = SnowGaugeData
         .read(&Frame::new(DATA.as_bytes().to_vec()))
         .expect("decodes");
     assert_eq!(
@@ -86,9 +86,9 @@ fn a_captured_body_decodes_to_the_trimmed_mean_and_not_the_raw_distance() {
 /// raw distance stands in.
 #[test]
 fn a_gauge_whose_window_has_not_filled_falls_back_to_the_raw_distance() {
-    let batch = decode(Some(BASE), WARMING).expect("a captured body decodes");
+    let batch = decode(WARMING).expect("a captured body decodes");
     assert_eq!(batch[0].values.snow_distance, Some(1384.0));
-    let (data, _) = codec(Some(BASE))
+    let (data, _) = SnowGaugeData
         .read(&Frame::new(WARMING.as_bytes().to_vec()))
         .expect("decodes");
     assert_eq!(data.trim_mean, None, "`null`, which is the fixture's value");
@@ -99,7 +99,7 @@ fn a_gauge_whose_window_has_not_filled_falls_back_to_the_raw_distance() {
 /// under a 1500 mm base distance a stored zero is a 1500 mm snowpack.
 #[test]
 fn a_gauge_whose_sensor_has_never_spoken_carries_no_reading() {
-    let e = decode(Some(BASE), NO_DATA).expect_err("no measurement");
+    let e = decode(NO_DATA).expect_err("no measurement");
     let CodecError::Incomplete { what } = e else {
         panic!("expected an incomplete body, got {e}");
     };
@@ -108,33 +108,43 @@ fn a_gauge_whose_sensor_has_never_spoken_carries_no_reading() {
     // An unconfigured gauge is refused for the same reason: the base distance is what the
     // discard needs and this is about the gauge having nothing to give.
     assert!(matches!(
-        decode(None, NO_DATA),
+        decode(NO_DATA),
         Err(CodecError::Incomplete { .. })
     ));
 }
 
-/// **DEV-9's discard**, against a body a device wrote: the same measurement against a base
-/// distance below it is a counted fault rather than a negative depth.
+/// A gauge nobody has calibrated, as a body a device wrote: a distance, and no depth.
 #[test]
-fn the_same_body_is_a_fault_against_a_base_distance_below_it() {
-    let e = decode(Some(1300.0), DATA).expect_err("1351.4 mm is past a 1300 mm base");
-    let CodecError::Implausible { value, limit, .. } = e else {
-        panic!("expected an implausible distance, got {e}");
-    };
-    assert_eq!(value, f64::from(1351.4f32));
-    assert_eq!(limit, 1300.0);
-    // Bare ground is the boundary and is not a fault.
-    assert!(decode(Some(1351.4), DATA).is_ok());
+fn an_uncalibrated_gauge_carries_a_distance_and_no_depth() {
+    let batch = decode(UNCALIBRATED).expect("a captured body decodes");
+    assert_eq!(batch[0].values.snow_distance, Some(1383.6));
+    assert_eq!(batch[0].values.snow_depth, None);
+    let (data, _) = SnowGaugeData
+        .read(&Frame::new(UNCALIBRATED.as_bytes().to_vec()))
+        .expect("decodes");
+    assert!(!data.is_calibrated());
+    assert_eq!(data.rssi, Some(-63));
 }
 
-/// A gauge whose base distance is not configured discards nothing — the one departure from
-/// Go, where an unconfigured gauge has a base of zero and reports nothing at all.
+/// **The calibration is NVS's, not the sensor's.** A gauge whose sensor has never spoken
+/// still reports what it is calibrated to — so the number an operator wants to see is
+/// readable off a gauge that is not currently measuring anything, which is exactly when
+/// they would go looking for it.
 #[test]
-fn an_unconfigured_gauge_admits_the_captured_distance() {
-    for base in [None, Some(0.0), Some(-1.0), Some(f32::NAN)] {
-        let batch = decode(base, DATA).unwrap_or_else(|e| panic!("{base:?}: {e}"));
-        assert_eq!(batch[0].values.snow_distance, Some(1351.4), "{base:?}");
-    }
+fn a_calibrated_gauge_reports_its_base_distance_even_with_a_dead_sensor() {
+    // The READING is refused, and rightly: `status` is `no_data`, so there is no distance
+    // to store. What survives the refusal is the body, so this asserts over the parse
+    // rather than over the batch.
+    assert!(decode(NO_DATA).is_err(), "no measurement in it");
+    let data: mw_codec::SnowData = serde_json::from_str(NO_DATA).expect("the body is JSON");
+    assert!(data.is_calibrated());
+    assert_eq!(
+        data.base_distance,
+        Some(1500),
+        "the calibration the fixtures' emulator was given"
+    );
+    assert_eq!(data.snow_depth, None, "no reading to subtract from");
+    assert_eq!(data.rssi, Some(-63), "the WiFi driver's, not the sensor's");
 }
 
 /// `/health` is telemetry and not a reading, and the captured body carries every field the
@@ -152,19 +162,16 @@ fn the_captured_health_body_carries_the_fields_a_fault_path_quotes() {
 
     // And it is **not** a `/data` body: the endpoints are not interchangeable, and a driver
     // that polled the wrong one gets a counted drop rather than a plausible reading.
-    assert!(matches!(
-        decode(Some(BASE), HEALTH),
-        Err(CodecError::Json { .. })
-    ));
+    assert!(matches!(decode(HEALTH), Err(CodecError::Json { .. })));
     assert!(snow_health(&Frame::new(DATA.as_bytes().to_vec())).is_ok(),);
 }
 
 #[test]
 fn decoding_is_a_function_of_the_body_alone() {
-    let first = decode(Some(BASE), DATA).expect("decodes");
-    let again = decode(Some(BASE), DATA).expect("decodes");
+    let first = decode(DATA).expect("decodes");
+    let again = decode(DATA).expect("decodes");
     assert_eq!(first, again);
-    assert_eq!(codec(Some(BASE)).name(), "snowgauge-data");
+    assert_eq!(SnowGaugeData.name(), "snowgauge-data");
     assert_eq!(mw_codec::SNOW_DATA, "/data");
     assert_eq!(mw_codec::SNOW_HEALTH, "/health");
 }

@@ -90,6 +90,9 @@ curl -s "http://127.0.0.1:<port>/health" > $F/snowgauge-health.json
 
 /tmp/sg -port 0 -sensor dead &                     # a sensor that never speaks
 curl -s "http://127.0.0.1:<port>/data" > $F/snowgauge-no-data.json
+
+/tmp/sg -port 0 -trim-after 1 -calibrated=false &  # a gauge nobody has calibrated
+curl -s "http://127.0.0.1:<port>/data" > $F/snowgauge-uncalibrated.json
 ```
 
 `uptime_ms` in these is a multiple of 5000 rather than a wall-clock figure, which is the

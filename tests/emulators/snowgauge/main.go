@@ -14,7 +14,10 @@
 // firmware's own error-handling table:
 //
 //	-port <n>          the port to listen on; 0 lets the kernel choose and the port is printed
-//	-base <mm>         the distance with no snow under it, which the daemon also has configured
+//	-base <mm>         the sensor-to-ground distance the snowpack model measures against
+//	-calibrated        whether the gauge has a calibration in NVS; `-calibrated=false` is a
+//	                   gauge nobody has calibrated, which still MEASURES normally and
+//	                   reports `base_distance` and `snow_depth` as null
 //	-trim-after <n>    how many sensor frames before `trim_mean` stops being null (30 on a
 //	                   real gauge, which is about a minute after boot)
 //	-sensor all|dead|stalled
@@ -48,11 +51,14 @@ import (
 // window has filled, which is the field's whole subtlety: a non-pointer `float64` would
 // serialise a zero and tell the daemon the snowpack had reached the sensor.
 type Data struct {
-	Distance uint16   `json:"distance"`
-	Status   string   `json:"status"`
-	Readings uint64   `json:"readings"`
-	TrimMean *float64 `json:"trim_mean"`
-	UptimeMs uint64   `json:"uptime_ms"`
+	Distance     uint16   `json:"distance"`
+	Status       string   `json:"status"`
+	Readings     uint64   `json:"readings"`
+	TrimMean     *float64 `json:"trim_mean"`
+	BaseDistance *uint16  `json:"base_distance"`
+	SnowDepth    *int32   `json:"snow_depth"`
+	RSSI         int32    `json:"rssi"`
+	UptimeMs     uint64   `json:"uptime_ms"`
 }
 
 // Health is `GET /health`.
@@ -83,6 +89,7 @@ type gauge struct {
 	fault      uint64
 	reboot     uint64
 	uptimeStep uint64
+	calibrated bool
 }
 
 // tick advances the device by one `/data` request and returns what it would answer.
@@ -122,9 +129,24 @@ func (g *gauge) tick() Data {
 		Readings: g.readings,
 		UptimeMs: g.sinceBoot * g.uptimeStep,
 	}
+
+	// **Set before the early return, because neither comes from the sensor.** `rssi` is the
+	// WiFi driver's and `base_distance` is NVS's, so the firmware reports both whatever the
+	// sensor is doing -- a calibrated gauge with a dead UART still tells you what it is
+	// calibrated to, which is the whole point of reading the number off the device. Never
+	// null on the wire: the firmware's `sta_rssi()` returns an i32 and yields 0 when the AP
+	// lookup fails.
+	d.RSSI = -63
+	if g.calibrated {
+		base := uint16(math.Round(g.base))
+		d.BaseDistance = &base
+	}
+
 	if g.readings == 0 {
 		// `distance` is 0 and `status` is `no_data` until the first frame arrives, which
-		// is the firmware's documented startup state and not a measurement of zero.
+		// is the firmware's documented startup state and not a measurement of zero. The
+		// DEPTH is null here even on a calibrated gauge, which is the firmware's own
+		// `(Some(b), None, "no_data") => null` arm.
 		return d
 	}
 	d.Status = "ok"
@@ -142,10 +164,24 @@ func (g *gauge) tick() Data {
 	}
 	d.Distance = uint16(math.Round(distance))
 	if g.readings >= g.trimAfter {
-		// Two decimals, so that a decoded `f32` compares against the number in the JSON
-		// rather than against a value with a longer tail than the wire had.
-		rounded := math.Round(trimmed*100) / 100
+		// One decimal, which is what the firmware's `format!("{v:.1}")` writes.
+		rounded := math.Round(trimmed*10) / 10
 		d.TrimMean = &rounded
+	}
+
+	// **The device's own depth.**
+	if g.calibrated {
+		base := uint16(math.Round(g.base))
+		// `base as i32 - reading.round() as i32`, in that order, which is the firmware's
+		// arithmetic verbatim (`server.rs`: `(b as i32 - m.round() as i32)`). Rounding the
+		// SUBTRACTION instead would differ by up to a millimetre, and an oracle that is a
+		// millimetre off the device is an oracle that hides a millimetre of drift.
+		reading := float64(d.Distance)
+		if d.TrimMean != nil {
+			reading = *d.TrimMean
+		}
+		depth := int32(base) - int32(math.Round(reading))
+		d.SnowDepth = &depth
 	}
 	return d
 }
@@ -175,7 +211,8 @@ func (g *gauge) health(firmware string) Health {
 func main() {
 	var (
 		port       = flag.Int("port", 0, "TCP port to listen on; 0 lets the kernel choose")
-		base       = flag.Float64("base", 1500, "the distance with no snow under it, in mm")
+		base       = flag.Float64("base", 1500, "sensor-to-ground distance in mm")
+		calibrated = flag.Bool("calibrated", true, "whether the gauge has a calibration in NVS")
 		trimAfter  = flag.Uint64("trim-after", 30, "sensor frames before `trim_mean` lands")
 		sensor     = flag.String("sensor", "all", "`all`, `dead` or `stalled`")
 		stallAfter = flag.Uint64("stall-after", 5, "frames before `-sensor stalled` stops")
@@ -205,6 +242,7 @@ func main() {
 		fault:      *fault,
 		reboot:     *reboot,
 		uptimeStep: *uptimeStep,
+		calibrated: *calibrated,
 	}
 
 	mux := http.NewServeMux()

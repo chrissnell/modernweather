@@ -27,9 +27,9 @@ use tokio_util::sync::CancellationToken;
 
 const EMULATOR: &str = "snowgauge";
 
-/// The base distance the emulator's snowpack is measured against, and the one the station
-/// is configured with. The two agreeing is what makes `-fault` a fault.
-const BASE: f32 = 1500.0;
+/// The calibration the emulator reports, which is also what its snowpack model measures
+/// against. The device owns this number now — the station is configured with nothing.
+const BASE: u32 = 1500;
 
 /// Start the emulator and read the one line it prints once its socket is up.
 async fn start(extra: &[&str]) -> (GoEmulator, Endpoint) {
@@ -65,15 +65,15 @@ fn cx() -> (Cx, CancellationToken) {
     )
 }
 
-fn driver(endpoint: Endpoint, base: Option<f32>, ingress: Arc<dyn Ingress>) -> Poll {
-    Poll::new(endpoint, base, StationKey::new("suncrest:gauge"), ingress)
+fn driver(endpoint: Endpoint, ingress: Arc<dyn Ingress>) -> Poll {
+    Poll::new(endpoint, StationKey::new("suncrest:gauge"), ingress)
 }
 
 /// Drive `occurrences` occurrences of the real `Tick` body against the emulator, requiring
 /// every one of them to succeed.
-async fn poll(endpoint: Endpoint, base: Option<f32>, occurrences: usize) -> Vec<Admission> {
+async fn poll(endpoint: Endpoint, occurrences: usize) -> Vec<Admission> {
     let ingress = RecordingIngress::accepting();
-    let mut body = driver(endpoint, base, Arc::clone(&ingress) as Arc<dyn Ingress>);
+    let mut body = driver(endpoint, Arc::clone(&ingress) as Arc<dyn Ingress>);
     let (context, _token) = cx();
     for n in 0..occurrences {
         tokio::time::timeout(Duration::from_secs(30), body.tick(&context))
@@ -92,7 +92,7 @@ async fn poll(endpoint: Endpoint, base: Option<f32>, occurrences: usize) -> Vec<
 #[ignore = "needs a Go toolchain; `cargo xtask emulator-tests` runs it"]
 async fn every_occurrence_produces_a_reading_and_the_values_move() {
     let (_emulator, endpoint) = start(&["-trim-after", "2"]).await;
-    let admissions = poll(endpoint, Some(BASE), 5).await;
+    let admissions = poll(endpoint, 5).await;
     assert_eq!(admissions.len(), 5, "five occurrences, five readings");
 
     let distances: Vec<Option<f32>> = admissions
@@ -109,12 +109,13 @@ async fn every_occurrence_produces_a_reading_and_the_values_move() {
         let r = &admission.batch[0].values;
         let mm = r.snow_distance.expect("a distance");
         assert!(
-            (1_300.0..=BASE).contains(&mm),
-            "a settling snowpack under a {BASE} mm base: {mm}"
+            (1_300.0..=BASE as f32).contains(&mm),
+            "a settling snowpack under a {BASE} mm calibration: {mm}"
         );
-        // The depth is the enrich stage's subtraction (DEV-9), and a gauge measures one
-        // thing.
-        assert_eq!(r.snow_depth, None);
+        // The depth is the **device's** now, where it used to be the enrich stage's
+        // subtraction of a configured base distance (DEV-9).
+        assert!(r.snow_depth.is_some(), "a calibrated gauge reports one");
+        // And a gauge still measures one thing: these two and nothing else.
         assert_eq!(r.out_temp, None);
     }
 }
@@ -139,11 +140,7 @@ async fn a_gauge_whose_sensor_stops_stores_nothing_further_and_then_fails_the_st
     ])
     .await;
     let ingress = RecordingIngress::accepting();
-    let mut body = driver(
-        endpoint,
-        Some(BASE),
-        Arc::clone(&ingress) as Arc<dyn Ingress>,
-    );
+    let mut body = driver(endpoint, Arc::clone(&ingress) as Arc<dyn Ingress>);
     let (context, _token) = cx();
 
     // The three frames the sensor produces, then the window of counted staleness.
@@ -194,11 +191,7 @@ async fn a_gauge_whose_sensor_stops_stores_nothing_further_and_then_fails_the_st
 async fn a_gauge_with_no_sensor_stores_no_zero_distance() {
     let (_emulator, endpoint) = start(&["-sensor", "dead"]).await;
     let ingress = RecordingIngress::accepting();
-    let mut body = driver(
-        endpoint,
-        Some(BASE),
-        Arc::clone(&ingress) as Arc<dyn Ingress>,
-    );
+    let mut body = driver(endpoint, Arc::clone(&ingress) as Arc<dyn Ingress>);
     let (context, _token) = cx();
     for n in 0..(SILENT_OCCURRENCES as usize - 1) {
         body.tick(&context)
@@ -223,41 +216,52 @@ async fn a_gauge_with_no_sensor_stores_no_zero_distance() {
     );
 }
 
-/// **DEV-9's discard**, against a device that sends the fault: every third response reports
-/// a distance *past* the configured base distance, which stored would be a negative depth.
-/// The discard costs those readings and nothing else.
+/// **The depth is the device's arithmetic, asserted exactly.**
+///
+/// The firmware computes `base as i32 - trim_mean.round() as i32`, in that order, and the
+/// emulator does the same — so this is equality, not a tolerance. A tolerance here would
+/// hide the millimetre a rounded subtraction differs by, which is the one thing an oracle
+/// written beside the driver is for.
 #[tokio::test]
 #[ignore = "needs a Go toolchain; `cargo xtask emulator-tests` runs it"]
-async fn a_distance_past_the_base_is_discarded_and_the_station_keeps_polling() {
-    let (_emulator, endpoint) = start(&["-trim-after", "2", "-fault", "3"]).await;
-    let admissions = poll(endpoint, Some(BASE), 9).await;
-    assert_eq!(
-        admissions.len(),
-        6,
-        "nine occurrences, three of them faults, and no occurrence failed"
-    );
+async fn a_calibrated_gauge_reports_a_depth_the_device_computed() {
+    let (_emulator, endpoint) = start(&["-trim-after", "2", "-base", "1500"]).await;
+    let admissions = poll(endpoint, 5).await;
+    assert_eq!(admissions.len(), 5);
+    let mut depths = Vec::new();
     for admission in &admissions {
-        let mm = admission.batch[0].values.snow_distance.expect("a distance");
-        assert!(mm <= BASE, "a discarded fault reached storage: {mm}");
+        let r = &admission.batch[0].values;
+        let distance = r.snow_distance.expect("a distance");
+        let depth = r.snow_depth.expect("a calibrated gauge reports one");
+        assert_eq!(
+            depth,
+            (BASE as i32 - distance.round() as i32) as f32,
+            "distance {distance} against a {BASE} mm calibration"
+        );
+        depths.push(depth);
     }
+    // And it moves, so a driver that admitted the first depth and replayed it is visible.
+    assert!(
+        depths.windows(2).any(|pair| pair[0] != pair[1]),
+        "every reading carried the same depth: {depths:?}"
+    );
 }
 
-/// And the same emulator with **no base distance configured** admits the faults, which is
-/// what makes the test above non-vacuous. It is also the one departure from Go: an
-/// unconfigured gauge there has a base of zero and reports nothing at all.
+/// An uncalibrated gauge, against a device that really is one: it measures normally and
+/// reports `base_distance` and `snow_depth` as null. Every occurrence still produces a
+/// reading, because the distance is the series `/snow`'s history is made of and the
+/// missing depth is fixed at the device's own web interface.
 #[tokio::test]
 #[ignore = "needs a Go toolchain; `cargo xtask emulator-tests` runs it"]
-async fn an_unconfigured_gauge_still_reports_its_distance() {
-    let (_emulator, endpoint) = start(&["-trim-after", "2", "-fault", "3"]).await;
-    let admissions = poll(endpoint, None, 9).await;
-    assert_eq!(admissions.len(), 9, "nine occurrences, nine readings");
-    assert!(
-        admissions
-            .iter()
-            .filter_map(|a| a.batch[0].values.snow_distance)
-            .any(|mm| mm > BASE),
-        "the faults are in the recorded readings, so the discard above was doing something"
-    );
+async fn an_uncalibrated_gauge_reports_a_distance_and_no_depth() {
+    let (_emulator, endpoint) = start(&["-trim-after", "2", "-calibrated=false"]).await;
+    let admissions = poll(endpoint, 5).await;
+    assert_eq!(admissions.len(), 5, "an uncalibrated gauge still reports");
+    for admission in &admissions {
+        let r = &admission.batch[0].values;
+        assert!(r.snow_distance.is_some(), "it measures normally");
+        assert_eq!(r.snow_depth, None, "and has nothing to subtract from");
+    }
 }
 
 /// A gauge that **rebooted** between two occurrences: `uptime_ms` drops and `readings`
@@ -267,7 +271,7 @@ async fn an_unconfigured_gauge_still_reports_its_distance() {
 #[ignore = "needs a Go toolchain; `cargo xtask emulator-tests` runs it"]
 async fn a_gauge_that_reboots_keeps_reporting() {
     let (_emulator, endpoint) = start(&["-trim-after", "1", "-reboot", "3"]).await;
-    let admissions = poll(endpoint, Some(BASE), 9).await;
+    let admissions = poll(endpoint, 9).await;
     assert_eq!(
         admissions.len(),
         9,
@@ -283,11 +287,7 @@ async fn a_gauge_that_reboots_keeps_reporting() {
 async fn old_firmware_is_named_as_an_upgrade_rather_than_a_not_found() {
     let (_emulator, endpoint) = start(&["-firmware", "old"]).await;
     let ingress = RecordingIngress::accepting();
-    let mut body = driver(
-        endpoint,
-        Some(BASE),
-        Arc::clone(&ingress) as Arc<dyn Ingress>,
-    );
+    let mut body = driver(endpoint, Arc::clone(&ingress) as Arc<dyn Ingress>);
     let (context, _token) = cx();
     let e = body
         .tick(&context)
