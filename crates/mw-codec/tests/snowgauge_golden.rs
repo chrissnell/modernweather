@@ -1,108 +1,177 @@
-//! Level 1 of W3 **D-82**'s three, for the snow gauge: the pure codec against a **captured**
-//! protobuf message.
+//! Level 1 of W3 **D-82**'s three, for the snow gauge: the pure codec against **captured**
+//! `/data` and `/health` bodies.
 //!
-//! The fixture was produced by `protocols/snowgauge`'s own generated marshaller at the
-//! pinned commit — vendored verbatim in `tests/emulators/snowgauge` and digest-verified by
-//! the `driver-emulators` gate. That is what makes this file worth having at all.
+//! The four fixtures came off `tests/emulators/snowgauge`, whose payload shapes are the ones
+//! `chrissnell/snowgauge-rs`'s `docs/integration.md` prints — `tests/emulators/README.md`
+//! has the recipe that reproduces each one, and `frames/README.md` records what that
+//! provenance is and is not worth.
 //!
-//! # What it checks that nothing else did
+//! # What it checks that the unit tests do not
 //!
-//! `mw_codec::SnowGaugeProto` declares **two fields of a four-field message by hand**, with
-//! `#[prost(string, tag = "1")]` and `#[prost(int32, tag = "2")]` written out in Rust —
-//! because `ci/layers.toml` puts `mw-proto` in `mw-codec`'s own layer, so the codec cannot
-//! use a generated type. A wrong tag or a wrong wire type there is a distance of zero on
-//! every reading, for ever, with nothing failing.
+//! The unit tests in `src/snowgauge.rs` build their bodies with `format!`, so they assert
+//! the decoder against a document **this repository wrote**. These four are documents a
+//! device wrote, in the field order and with the spellings it writes them in, and they cover
+//! the three states one poll can be in: a measurement, a gauge whose trailing window has
+//! not filled, and a gauge whose sensor has never spoken.
 //!
-//! This asserts that declaration against bytes the reference's own `protoc` output wrote.
-//! It needs no socket, no gRPC and no Go toolchain, which is what makes it level 1 rather
-//! than a second copy of `crates/mw-grpc/tests/emulator_snowgauge.rs`.
+//! The one that matters most is `snowgauge-no-data.json`, because it is the body that used
+//! to be a reading. `distance` is `0` there and the gRPC predecessor would have stored it —
+//! a `snowdistance` of zero millimetres, which under this station's 1500 mm base distance is
+//! a 1500 mm snowpack the moment `snowdepth` stops being NULL.
+//!
+//! It needs no socket, no HTTP and no Go toolchain, which is what makes it level 1 rather
+//! than a second copy of `crates/mw-station/tests/emulator_snowgauge.rs`.
 
-use mw_codec::{Codec, CodecError, Frame, SnowGaugeProto};
+use mw_codec::{snow_health, Codec, CodecError, Frame, SnowGaugeData, SnowLiveness};
 
-/// One `snowgauge.Reading`: `stationName = "roof-gauge"`, `distance = 1352`, and both
-/// `google.protobuf.Duration` uptimes at 42 s.
-const READING: &[u8] = include_bytes!("frames/snowgauge-reading.bin");
+/// `GET /data` from a gauge whose sensor is reporting and whose trailing window has filled.
+const DATA: &str = include_str!("frames/snowgauge-data.json");
 
-/// The distance the captured message carries, in millimetres.
-const DISTANCE: f32 = 1352.0;
+/// The same gauge a few hundred milliseconds after boot: one frame in, so `trim_mean` is
+/// still `null` and the raw `distance` is the only number there is.
+const WARMING: &str = include_str!("frames/snowgauge-warming.json");
 
-fn decode(base: Option<f32>) -> Result<Vec<mw_types::PartialReading>, CodecError> {
-    SnowGaugeProto::new(base).decode(&Frame::new(READING.to_vec()))
+/// A gauge whose sensor has never spoken: `status` is `no_data` and `distance` is zero.
+/// **Calibrated**, so it still reports its `base_distance` — that number is NVS's, not the
+/// sensor's, which is what makes reading it off the device worth doing at all.
+const NO_DATA: &str = include_str!("frames/snowgauge-no-data.json");
+
+/// A gauge nobody has calibrated: it measures normally and reports `base_distance` and
+/// `snow_depth` as null.
+const UNCALIBRATED: &str = include_str!("frames/snowgauge-uncalibrated.json");
+
+/// `GET /health` from the same gauge.
+const HEALTH: &str = include_str!("frames/snowgauge-health.json");
+
+fn decode(body: &str) -> Result<Vec<mw_types::PartialReading>, CodecError> {
+    SnowGaugeData.decode(&Frame::new(body.as_bytes().to_vec()))
 }
 
-/// **The hand-written field tags are the generated schema's.** A wrong tag is a zero
-/// distance; a wrong wire type does not decode at all.
+/// The trimmed mean is the measurement, and the raw `distance` in the same body is a
+/// different number — so a codec reading the wrong field is visible rather than merely
+/// untested.
 #[test]
-fn the_captured_message_decodes_to_the_distance_the_marshaller_wrote() {
-    let batch = decode(Some(1500.0)).expect("a captured message decodes");
+fn a_captured_body_decodes_to_the_trimmed_mean_and_not_the_raw_distance() {
+    let batch = decode(DATA).expect("a captured body decodes");
     assert_eq!(batch.len(), 1);
-    assert_eq!(
-        batch[0].values.snow_distance,
-        Some(DISTANCE),
-        "the bytes carry 1352 mm; a wrong `tag = \"2\"` would be zero"
-    );
+    assert_eq!(batch[0].values.snow_distance, Some(1351.4));
     assert_eq!(
         batch[0].observed_at, None,
-        "the gauge streams a current distance and no instant"
+        "`/data` is the gauge's current state and carries no instant"
     );
-    // The depth is the enrich stage's subtraction (DEV-9), not the codec's.
-    assert_eq!(batch[0].values.snow_depth, None);
+    // **The device's depth**, where it used to be the enrich stage's subtraction of a
+    // configured base distance (DEV-9). 1500 - round(1351.4) = 149, which is the
+    // firmware's arithmetic in the firmware's order.
+    assert_eq!(batch[0].values.snow_depth, Some(149.0));
     // And nothing else: a gauge measures one thing.
     assert_eq!(batch[0].values.out_temp, None);
     assert_eq!(batch[0].values.barometer, None);
-}
 
-/// **The two fields the codec declares no tag for are discarded**, which is the property the
-/// hand-written declaration rests on: `systemUptime` and `applicationUptime` are in the
-/// captured bytes and in no registry entry.
-#[test]
-fn the_undeclared_duration_fields_are_discarded_rather_than_refused() {
-    // The fixture really does carry them -- field 3 and field 4, each a two-byte
-    // length-delimited submessage -- so the assertion below is not vacuous.
-    assert!(
-        READING.windows(4).any(|w| w == [0x1a, 0x02, 0x08, 0x2a]),
-        "field 3 is in the capture: {READING:02x?}"
-    );
-    assert!(
-        READING.windows(4).any(|w| w == [0x22, 0x02, 0x08, 0x2a]),
-        "and field 4: {READING:02x?}"
-    );
-    // And it still decodes, which is what "prost discards what is not declared" means.
-    decode(Some(1500.0)).expect("the two uptimes cost nothing");
-}
-
-/// **DEV-9's discard**, against bytes a real gauge's marshaller wrote: the same message
-/// against a base distance below it is a counted fault rather than a negative depth.
-#[test]
-fn the_same_message_is_a_fault_against_a_base_distance_below_it() {
-    let e = decode(Some(1300.0)).expect_err("1352 mm is past a 1300 mm base");
-    let CodecError::Implausible { value, limit, .. } = e else {
-        panic!("expected an implausible distance, got {e}");
-    };
-    assert_eq!(value, f64::from(DISTANCE));
-    assert_eq!(limit, 1300.0);
-    // Bare ground is the boundary and is not a fault.
-    assert!(decode(Some(DISTANCE)).is_ok());
-}
-
-/// A gauge whose base distance is not configured discards nothing — the one departure from
-/// Go, where an unconfigured gauge has a base of zero and reports nothing at all.
-#[test]
-fn an_unconfigured_gauge_admits_the_captured_distance() {
-    for base in [None, Some(0.0), Some(-1.0), Some(f32::NAN)] {
-        let batch = decode(base).unwrap_or_else(|e| panic!("{base:?}: {e}"));
-        assert_eq!(batch[0].values.snow_distance, Some(DISTANCE), "{base:?}");
-    }
-}
-
-#[test]
-fn decoding_is_a_function_of_the_message_alone() {
-    let first = decode(Some(1500.0)).expect("decodes");
-    let again = decode(Some(1500.0)).expect("decodes");
-    assert_eq!(first, again);
-    assert_eq!(SnowGaugeProto::new(Some(1500.0)).name(), "snowgauge-proto");
+    // The liveness pair the driver carries across occurrences comes out of the same parse.
+    let (data, _) = SnowGaugeData
+        .read(&Frame::new(DATA.as_bytes().to_vec()))
+        .expect("decodes");
     assert_eq!(
-        mw_codec::STREAM_READING,
-        "/snowgauge.SnowGaugeService/StreamReading"
+        data.liveness(),
+        SnowLiveness {
+            readings: 4,
+            uptime_ms: 20_000
+        }
     );
+    assert!(data.is_ok());
+    assert_eq!(data.distance, 1351, "the raw field is in the body too");
+}
+
+/// The first minute after a boot, as a body a device wrote: `trim_mean` is `null` and the
+/// raw distance stands in.
+#[test]
+fn a_gauge_whose_window_has_not_filled_falls_back_to_the_raw_distance() {
+    let batch = decode(WARMING).expect("a captured body decodes");
+    assert_eq!(batch[0].values.snow_distance, Some(1384.0));
+    let (data, _) = SnowGaugeData
+        .read(&Frame::new(WARMING.as_bytes().to_vec()))
+        .expect("decodes");
+    assert_eq!(data.trim_mean, None, "`null`, which is the fixture's value");
+    assert_eq!(data.readings, 1);
+}
+
+/// **The body that used to be a reading.** `status` is `no_data`, `distance` is zero, and
+/// under a 1500 mm base distance a stored zero is a 1500 mm snowpack.
+#[test]
+fn a_gauge_whose_sensor_has_never_spoken_carries_no_reading() {
+    let e = decode(NO_DATA).expect_err("no measurement");
+    let CodecError::Incomplete { what } = e else {
+        panic!("expected an incomplete body, got {e}");
+    };
+    assert!(what.contains("no_data"), "{what}");
+    assert!(what.contains("power and wiring"), "{what}");
+    // An unconfigured gauge is refused for the same reason: the base distance is what the
+    // discard needs and this is about the gauge having nothing to give.
+    assert!(matches!(
+        decode(NO_DATA),
+        Err(CodecError::Incomplete { .. })
+    ));
+}
+
+/// A gauge nobody has calibrated, as a body a device wrote: a distance, and no depth.
+#[test]
+fn an_uncalibrated_gauge_carries_a_distance_and_no_depth() {
+    let batch = decode(UNCALIBRATED).expect("a captured body decodes");
+    assert_eq!(batch[0].values.snow_distance, Some(1383.6));
+    assert_eq!(batch[0].values.snow_depth, None);
+    let (data, _) = SnowGaugeData
+        .read(&Frame::new(UNCALIBRATED.as_bytes().to_vec()))
+        .expect("decodes");
+    assert!(!data.is_calibrated());
+    assert_eq!(data.rssi, Some(-63));
+}
+
+/// **The calibration is NVS's, not the sensor's.** A gauge whose sensor has never spoken
+/// still reports what it is calibrated to — so the number an operator wants to see is
+/// readable off a gauge that is not currently measuring anything, which is exactly when
+/// they would go looking for it.
+#[test]
+fn a_calibrated_gauge_reports_its_base_distance_even_with_a_dead_sensor() {
+    // The READING is refused, and rightly: `status` is `no_data`, so there is no distance
+    // to store. What survives the refusal is the body, so this asserts over the parse
+    // rather than over the batch.
+    assert!(decode(NO_DATA).is_err(), "no measurement in it");
+    let data: mw_codec::SnowData = serde_json::from_str(NO_DATA).expect("the body is JSON");
+    assert!(data.is_calibrated());
+    assert_eq!(
+        data.base_distance,
+        Some(1500),
+        "the calibration the fixtures' emulator was given"
+    );
+    assert_eq!(data.snow_depth, None, "no reading to subtract from");
+    assert_eq!(data.rssi, Some(-63), "the WiFi driver's, not the sensor's");
+}
+
+/// `/health` is telemetry and not a reading, and the captured body carries every field the
+/// fault paths quote.
+#[test]
+fn the_captured_health_body_carries_the_fields_a_fault_path_quotes() {
+    let health = snow_health(&Frame::new(HEALTH.as_bytes().to_vec())).expect("decodes");
+    assert_eq!(health.bytes_rx, Some(32), "the sensor cross-check");
+    assert_eq!(health.fw_version.as_deref(), Some("0.1.0"));
+    assert_eq!(health.fw_slot.as_deref(), Some("ota_0"));
+    assert_eq!(health.hostname.as_deref(), Some("snowgauge-f878"));
+    assert_eq!(health.rssi, Some(-56));
+    assert_eq!(health.heap_free, Some(164_228));
+    assert_eq!(health.wifi.as_deref(), Some("connected"));
+
+    // And it is **not** a `/data` body: the endpoints are not interchangeable, and a driver
+    // that polled the wrong one gets a counted drop rather than a plausible reading.
+    assert!(matches!(decode(HEALTH), Err(CodecError::Json { .. })));
+    assert!(snow_health(&Frame::new(DATA.as_bytes().to_vec())).is_ok(),);
+}
+
+#[test]
+fn decoding_is_a_function_of_the_body_alone() {
+    let first = decode(DATA).expect("decodes");
+    let again = decode(DATA).expect("decodes");
+    assert_eq!(first, again);
+    assert_eq!(SnowGaugeData.name(), "snowgauge-data");
+    assert_eq!(mw_codec::SNOW_DATA, "/data");
+    assert_eq!(mw_codec::SNOW_HEALTH, "/health");
 }

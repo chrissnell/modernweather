@@ -197,7 +197,7 @@ impl StationRow {
     /// The snow gauge's base distance as the codec takes it.
     ///
     /// `f32` because the column the depth lands in is `float4`; a base distance that is not
-    /// a positive number is no base distance, which `mw_codec::SnowGaugeProto::new` is what
+    /// a positive number is no base distance, which `mw_codec::SnowGaugeData::new` is what
     /// decides.
     pub fn snow_base_distance_mm(&self) -> Option<f32> {
         self.snow_base_distance_mm.map(|mm| mm as f32)

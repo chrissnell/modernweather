@@ -772,13 +772,29 @@ All of them resolve identity before emitting (§4a.6), so all of them require `S
 |---|---|---|---|---|
 | `station:davis:<id>` | `Service` | `StationRegistry` H | — | Wake + `LOOP n` session; decode packets; emit envelopes. |
 | `station:campbell:<id>` | `Service` | `StationRegistry` H | — | Command/response session; decode; emit. |
-| `station:snowgauge:<id>` | `Service` | `StationRegistry` H | — | gRPC client stream; decode; emit. |
+| `station:snowgauge:<id>` | `Every { 5s, 5s }` | `StationRegistry` H | — | One HTTP GET of `/data`; decode; emit. **Amended** — see below. |
 | `station:airgradient:<id>` | `Every { 3s, 2s }` | `StationRegistry` H | — | One HTTP GET; decode; emit. |
 | `station:ambient` | `Service` | `StationRegistry` H | `HttpRoutes` | **One** component for N stations; identity from `?ID=`. |
 | `station:wll:<id>` (broadcast) | `Service` | `StationRegistry` H | — | UDP listener; identity from the DSN in the packet. |
 | `station:wll:<id>:rearm` | `Every { 0.8 × duration }` | `ConfigStore` H | — | Outbound control call that arms the device's broadcast. Emits no readings. |
 | `station:wll:<id>` (poll) | `Every { ≥30s }` | `StationRegistry` H | — | One HTTP GET of `current_conditions`; same codec as broadcast. |
 | `station:grpcrx` | `Service` | `StationRegistry` H W | `HttpRoutes` | **One** component for N peers; identity from registration; mTLS. W7 §2 owns provenance. |
+
+**One amendment to this table, after the fact.** The snow gauge is listed above as
+`Every { 5s, 5s }` and this document originally gave it `GrpcOut { streaming: true }`,
+`Service`, and a gRPC client stream — which is what the device spoke when §4a.5 was written.
+That firmware was decommissioned; `chrissnell/snowgauge-rs` serves two unauthenticated JSON
+endpoints over plain HTTP on port 80, poll only, with no stream and no push. So the gauge
+became an ordinary `HttpOut`/`Fixed`/`Every` row, which is the shape this table already had
+for the AirGradient monitor.
+
+Nothing else in §4a moved, and that is the interesting part: the transport changed, the
+component model did not. What the change *removed* is all exception: the gauge was the one
+station type whose driver lived in `mw-grpc` because `ci/layers.toml` forbids `mw-station`
+from naming `tonic`, so it needed a second station registrar in the binary, a second
+function minting the same component id, and a `check_snowgauge` that existed only so the two
+could not disagree. `mw_station::snowgauge`, `mw_codec::snowgauge` and
+`crates/mw-station/src/plan.rs` carry the whole of it now.
 
 Two shapes to note. `station:ambient` and `station:grpcrx` are **one component serving N stations**,
 which is the §4a.4 cardinality rule showing up in the plan: the component is per *endpoint*, not per
@@ -1082,7 +1098,7 @@ from the registry rather than the device row.
 |---|---|---|---|---|---|---|
 | Davis | `Serial` \| `TcpOut` | wake + `LOOP n`, re-issue | `DavisLoop` — fixed little-endian struct + CRC16, decoded with `zerocopy` (D-32) | `Fixed` | `Service` | 1 |
 | Campbell | `Serial` \| `TcpOut` | command/response | `CampbellAscii` | `Fixed` | `Service` | 1 |
-| Snow gauge | `GrpcOut { streaming: true }` | stream establish | `SnowGaugeProto` | `Fixed` | `Service` | 1 |
+| Snow gauge | `HttpOut { /data }` | none | `SnowGaugeData` | `Fixed` | `Every { 5s }` — the slow end of the device's own range (**amended**, see below) | 1 |
 | AirGradient | `HttpOut { /measures/current }` | none | `AirGradientJson` | `Fixed` | `Every { 3s }` — the measured default | 1 |
 | Ambient | `HttpIn { /ingest/ambient }` | none | `AmbientQuery` | `FromQuery { id: "ID", secret: Some("PASSWORD") }` | `Service` | **N** |
 | WeatherLink Live (broadcast) | `UdpIn { 22222 }` | none | `WllConditions` | `FromPayload(did)` | `Service` | **N** |
@@ -1090,7 +1106,11 @@ from the registry rather than the device row.
 | WeatherLink Live (poll) | `HttpOut { /v1/current_conditions }` | none | `WllConditions` | `Fixed` | `Every { ≥30s }` | 1 |
 | gRPC receiver | `GrpcIn` | none | `WeatherV1Proto` | `FromRegistration` | `Service` | **N** |
 
-No driver fails to fit, but two need comment.
+No driver fails to fit, but two need comment. (The snow gauge's row is **amended** — it was
+`GrpcOut { streaming: true }`, `Service`, when this table was written, and that firmware has
+been decommissioned. §4.1's note after the station-component table has the whole of it. The
+row above is the only thing that moved: the four-part decomposition this section is about
+absorbed a transport change without any other column changing.)
 
 **WeatherLink Live is two transports feeding one codec family, plus a control call.** The prompt
 predicts the first half and the mapping confirms it: `WllConditions` decodes both the UDP broadcast

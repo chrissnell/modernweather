@@ -926,6 +926,54 @@ mod tests {
         }
     }
 
+    /// **The seam the device-side calibration rests on.**
+    ///
+    /// A snow gauge running firmware v0.1.0 holds its calibration in NVS and reports the
+    /// depth it derived from it, so `mw_codec::snowgauge` fills `snow_depth` before the
+    /// reading ever reaches this stage. Two writers of one column would be two numbers free
+    /// to disagree, and the device's is the one with the calibration behind it — so this
+    /// stage must not recompute it. `derive`'s `only_if_absent` invariant already says so;
+    /// nothing asserted it for this field, and the whole refactor depends on it.
+    #[test]
+    fn a_station_reported_snow_depth_is_not_recomputed_from_the_configured_base() {
+        let reading = Reading {
+            snow_distance: Some(1700.0),
+            snow_depth: Some(71.0),
+            ..Reading::default()
+        };
+        // Deliberately inconsistent with the reading: a stale configured base of 1500
+        // would derive -200, so if this stage used it the disagreement would be visible.
+        let meta = denver();
+        assert_eq!(meta.snow_base_distance_mm, Some(1500.0));
+
+        let derived = derive(&reading, &meta);
+        assert_eq!(
+            derived.snow_depth, None,
+            "the slot was filled, so nothing is derived"
+        );
+        let mut reading = reading;
+        apply(&mut reading, derived);
+        assert_eq!(
+            reading.snow_depth,
+            Some(71.0),
+            "the device's number survives"
+        );
+    }
+
+    /// And the other half, which is what keeps a pre-v0.1.0 gauge working: a reading that
+    /// carries no depth still gets one derived from the configured base distance. That is
+    /// what makes the firmware upgrade orderless — a gauge that has not been reflashed is
+    /// stored exactly as it was before.
+    #[test]
+    fn a_reading_with_no_depth_still_gets_one_from_the_configured_base() {
+        let reading = Reading {
+            snow_distance: Some(1200.0),
+            ..Reading::default()
+        };
+        let derived = derive(&reading, &denver());
+        assert_eq!(derived.snow_depth, Some(300.0), "1500 - 1200");
+    }
+
     /// The Go read path's arithmetic (`controller.go:903`) and its guard
     /// (`controller.go:902`).
     #[test]

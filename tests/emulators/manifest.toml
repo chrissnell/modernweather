@@ -39,12 +39,15 @@
 #                       catch a misunderstanding the emulator and the driver share.
 #
 #                       An entry with this origin may STILL carry `[emulator.files]`, and
-#                       two do: the snow gauge's and the satellite's generated protobuf
-#                       stubs are the reference's own, vendored and digest-verified, so
-#                       their PROTOCOL is independently defined and only their numbers are
-#                       not. `origin` describes the behaviour; `files` describes which
-#                       files came from the pin. `cargo xtask emulator-tests` prints which
-#                       half is which on every run.
+#                       one does: the satellite's generated protobuf stubs are the
+#                       reference's own, vendored and digest-verified, so its PROTOCOL is
+#                       independently defined and only its numbers are not. `origin`
+#                       describes the behaviour; `files` describes which files came from the
+#                       pin. `cargo xtask emulator-tests` prints which half is which on
+#                       every run.
+#
+#                       The snow gauge's entry used to be the second, for the same reason,
+#                       and its note below records what dropping those stubs cost.
 #
 #   reference           checked out of the pinned repository at test time. Nothing is this,
 #                       for the reason above; the value exists so that an entry which
@@ -58,12 +61,21 @@
 # AirGradient, Ambient, snow gauge or satellite emulator there, so those five are written
 # here; the repository is read-only to this programme, so one cannot be added there.
 #
-# **Two emulators are not standard-library-only.** `snowgauge` and `grpcrx` speak gRPC, so
-# `go build` needs a populated module cache or the network; each commits its `go.sum`, so the
-# build is reproducible but not offline on a machine that has never fetched `grpc-go`. The
-# alternative was hand-rolling HTTP/2 and HPACK from the standard library, which would not
-# exercise a gRPC client or a gRPC service at all. Recorded here because it is the one
-# property the other five have and these two do not.
+# The snow gauge's case is now stronger than "read-only": the reference tree is the GO
+# daemon, and the gauge it spoke to has been decommissioned. The device's own repository is
+# `chrissnell/snowgauge-rs`, and that is where its emulator belongs.
+#
+# **One emulator is not standard-library-only.** `grpcrx` speaks gRPC, so `go build` needs a
+# populated module cache or the network; it commits its `go.sum`, so the build is
+# reproducible but not offline on a machine that has never fetched `grpc-go`. The alternative
+# was hand-rolling HTTP/2 and HPACK from the standard library, which would not exercise a
+# gRPC service at all. Recorded here because it is the one property the other six have and
+# this one does not.
+#
+# **`snowgauge` used to be the second**, and its entry below has what changed: the gauge's
+# firmware replaced a gRPC server stream with two JSON endpoints over plain HTTP, so that
+# emulator is now `net/http` and nothing else -- and it lost the vendored protobuf stubs that
+# were the independently-defined half of it.
 #
 # **For the WeatherLink Live that remains a decision for the programme owner.** The honest
 # fix is a `cmd/weatherlink-live-emulator` in the reference tree, written against the vendor
@@ -310,58 +322,92 @@ real spool. Only the configuration rows and the clock are stood in for.
 
 [[emulator]]
 id = "snowgauge"
-emulates = "The snow gauge -- `SnowGaugeService/StreamReading`, a gRPC server stream"
-driver = "mw_grpc::snowgauge + mw_codec::SnowGaugeProto (implementation-plan.md M6-1)"
+emulates = "The snow gauge -- `GET /data` and `GET /health` on a `snowgauge-rs` gauge"
+driver = "mw_station::snowgauge + mw_codec::SnowGaugeData (implementation-plan.md M6-1)"
 origin = "this-repository"
 path = "tests/emulators/snowgauge"
-package = "mw-grpc"
+package = "mw-station"
 test_target = "emulator_snowgauge"
 test_names = [
-    "every_message_becomes_a_reading_with_the_distance_the_gauge_sent",
-    "a_distance_past_the_base_is_discarded_and_the_stream_continues",
-    "an_unconfigured_gauge_still_reports_its_distance",
-    "a_gauge_that_closes_its_stream_is_a_retryable_failure",
-    "a_gauge_that_is_not_listening_is_a_build_failure",
+    "every_occurrence_produces_a_reading_and_the_values_move",
+    "a_calibrated_gauge_reports_a_depth_the_device_computed",
+    "an_uncalibrated_gauge_reports_a_distance_and_no_depth",
+    "a_gauge_whose_sensor_stops_stores_nothing_further_and_then_fails_the_station",
+    "a_gauge_with_no_sensor_stores_no_zero_distance",
+    "a_gauge_that_reboots_keeps_reporting",
+    "old_firmware_is_named_as_an_upgrade_rather_than_a_not_found",
 ]
 note = """
-`origin = "this-repository"` and **half of it is not**: the reference tree has no snow gauge
-emulator at the pinned commit, but it does have the generated stubs, and those are vendored
-here byte for byte and digest-verified below. So the PROTOCOL -- the service name, the method
-name, the field numbers, the wire types -- is the reference's own `protoc` output, and only
-the behaviour is written here. README.md in that directory has why that split is the one
-that matters: `mw_codec::SnowGaugeProto` declares two fields of a four-field message BY HAND
-(the layer rule puts `mw-proto` in its own layer), and nothing had checked that declaration
-against the schema a real gauge was generated from.
+**Firmware v0.1.0: the gauge computes its own depth.** The device persists a calibrated
+base distance in NVS and reports both it and the signed `snow_depth` on `/data`, so this
+emulator does that subtraction too -- see `a_calibrated_gauge_reports_a_depth_the_device_computed`
+for why it is asserted to the millimetre. `-fault` remains, and no longer has a discard to
+trigger: a distance past the calibration is now a NEGATIVE depth the owner has asked to
+record rather than a reading to drop (2026-11-21).
 
-**It is also the first of two emulators here that are not standard-library-only.** It speaks
-gRPC, so `go build` needs a populated module cache or the network; `go.sum` is committed, so
-it is reproducible but not offline on a machine that has never fetched `grpc-go`. The
-alternative was hand-rolling HTTP/2 and HPACK, which would not exercise a gRPC client at all.
+**Rewritten once before, and the entry lost its `[emulator.files]`.** The gauge used to speak gRPC, so
+this entry carried the reference tree's own generated protobuf stubs -- vendored byte for
+byte and digest-verified -- which made its PROTOCOL independently defined even though its
+behaviour was not. `mw_codec::SnowGaugeProto` declared two fields of a four-field message BY
+HAND (the layer rule puts `mw-proto` in `mw-codec`'s own layer) and nothing else in the
+programme had checked that declaration against the schema a real gauge was generated from.
 
-  every_message_becomes_a_reading_with_the_distance_the_gauge_sent
-      five messages, five readings, with the distances in the range the emulator sends -- a
-      wrong field tag would be zero and a wrong wire type would not decode.
-  a_distance_past_the_base_is_discarded_and_the_stream_continues
-      `-fault 3`, which sends a distance GREATER than the configured base every third
-      reading. **DEV-9's constraint on this item**: `snowgauge/station.go:171` discards it at
-      the device, and M3-3 moved `snowdepth` to ingest -- so without the discard such a
-      reading stores a NEGATIVE depth into a column with min/mean/max aggregates over it.
-  an_unconfigured_gauge_still_reports_its_distance
-      and the same emulator flags with no base distance configured DO admit the faults, which
-      is what makes the test above non-vacuous. It is also the one departure from Go: an
-      unconfigured gauge there has a base of zero and reports nothing at all.
-  a_gauge_that_closes_its_stream_is_a_retryable_failure
-      `-hangup`. A gauge that has stopped reporting is not a gauge that has finished, so the
-      body returns an error the supervisor reconnects from (D-27) rather than `Ok`.
-  a_gauge_that_is_not_listening_is_a_build_failure
-      the emulator is killed and the driver dials its port. `BuildError::Resource` naming the
-      station and the address, which is a backoff -- where
-      `logger.Fatalf("SnowGauge station [%s] must define a hostname and port")` takes the
-      whole daemon down."""
+The firmware is now `chrissnell/snowgauge-rs`: two unauthenticated JSON endpoints over plain
+HTTP, poll only, no stream. There is no generated artefact to vendor -- the firmware ships no
+schema file -- so the field names and types in `main.go` and in `mw_codec::snowgauge` both
+come from reading the same page of its `docs/integration.md`, and a misreading shared by the
+two would pass. That is the same gap the `weatherlink-live`, `airgradient` and `ambient`
+entries have and the honest fix is the one stated for them: an emulator in the device's own
+tree, written by somebody who is not writing the driver. It is recorded here rather than left
+to be noticed.
 
-[emulator.files]
-"remoteweather/protocols/snowgauge/snowgauge.pb.go" = "7ea347c3b76445a80e95e7b4a10c2275dc6bdcfa6bc97570f28797ecdc45a3ec"
-"remoteweather/protocols/snowgauge/snowgauge_grpc.pb.go" = "ab2f0708777dc87377af9238b342f92767986aeda85d3a66b0d1e535c09e4878"
+**What the rewrite gains**: this emulator is now standard-library-only, so `go build` needs
+no module cache and no network -- `grpcrx` is the only entry here that still does. And the
+device has something none of the others has, a published error table, so each flag below is
+one of its rows rather than a case somebody imagined.
+
+  every_occurrence_produces_a_reading_and_the_values_move
+      five occurrences, five readings, with the distances moving -- the polling-driver shape
+      of the Davis "stops after one batch" defect. `-trim-after 2` puts the gauge past its
+      trailing window, so the number asserted is the `trim_mean` the firmware documentation
+      says to prefer and not the raw `distance` in the same body.
+  a_gauge_whose_sensor_stops_stores_nothing_further_and_then_fails_the_station
+      **the defect this redesign exists to prevent.** `-sensor stalled -stall-after 3`: the
+      sensor produces three frames and stops, and the gauge KEEPS ANSWERING -- same
+      `trim_mean`, growing `uptime_ms`, frozen `readings`, which is the firmware's own
+      liveness test. A driver that admitted every successful response would store a frozen
+      depth for ever and a flat line in a snow chart reads as settled weather. Three
+      readings, then nothing, then a FAILED occurrence whose message carries
+      `/health.bytes_rx`.
+  a_gauge_with_no_sensor_stores_no_zero_distance
+      `-sensor dead`: `status: "no_data"` and `distance: 0` on every response. Zero is
+      documented to mean "no reading has arrived yet", and stored under a 1500 mm base
+      distance it is a 1500 mm snowpack -- so it is a counted drop and not a reading. The
+      gRPC predecessor stored it.
+  a_calibrated_gauge_reports_a_depth_the_device_computed
+      **the firmware v0.1.0 change.** The gauge holds its calibration in NVS and reports
+      `snow_depth` derived from it, so the driver carries that number instead of subtracting
+      a configured one. Asserted as EQUALITY against `base as i32 - reading.round() as i32`
+      -- the firmware's arithmetic in the firmware's order -- because a tolerance would hide
+      the millimetre that rounding the subtraction instead would cost, and hiding a
+      millimetre of drift is the one thing this oracle exists to prevent.
+  an_uncalibrated_gauge_reports_a_distance_and_no_depth
+      `-calibrated=false`: a gauge nobody has calibrated. It MEASURES normally and reports
+      `base_distance` and `snow_depth` as null, and every occurrence still produces a
+      reading -- the distance is the series `/snow`'s history is made of, and the missing
+      depth is fixed at the device's own web interface rather than in this daemon. The two
+      flags are separate for a reason the first draft got wrong: overloading `-base 0` as
+      "uncalibrated" underflowed the u16 distance the snowpack model derives from it.
+  a_gauge_that_reboots_keeps_reporting
+      `-reboot 3`. A reboot resets `readings` to zero as well as `uptime_ms`, so a driver
+      that asked "did the sensor advance" before "did it reboot" would call a rebooted gauge
+      a dead one and store nothing from then on. Nine occurrences, three reboots, nine
+      readings.
+  old_firmware_is_named_as_an_upgrade_rather_than_a_not_found
+      `-firmware old`: `404` on `/data`, which the firmware documentation says means a gauge
+      whose only reading surface was the `/events` SSE stream removed in v0.1.x. The driver
+      reads `/health`, names the version running, and says to upgrade -- where a bare `404`
+      reads as a wrong address."""
 
 [[emulator]]
 id = "grpcrx"

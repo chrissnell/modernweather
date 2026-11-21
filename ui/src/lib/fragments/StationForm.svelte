@@ -158,10 +158,19 @@
         mount: mount || null,
         // `streaming` belongs to **`grpc_out` alone**. W2a §4a.3 is `HttpOut { auth }` and
         // `GrpcOut { streaming: bool }`, and the configuration database enforces exactly
-        // that -- so sending it with an `http_out` station is a refusal, not a default.
-        // The value is a fact about the hardware rather than a choice, which is why it
-        // comes from the kind table and not from a control.
-        streaming: transportKind === 'grpc_out' ? shape.streams : null,
+        // that -- `CHECK (transport_streaming IS NULL OR COALESCE(transport_kind, '') =
+        // 'grpc_out')` -- so sending it with an `http_out` station is a refusal, not a
+        // default, and omitting it for a `grpc_out` one is a 422.
+        //
+        // **The STORED value, not the kind table's.** No kind in `SHAPES` is `grpc_out`
+        // any more (the snow gauge was the one, and its firmware serves HTTP now), so
+        // `shape.streams` is `false` for every kind -- and reading it here would quietly
+        // rewrite a stored `1` to `0` on any save of a row written by an older version.
+        // That is the opposite of what this branch is for: it exists so such a row stays
+        // editable, and `mw_station::plan` is what refuses to RUN it, with a sentence
+        // naming the columns to change.
+        streaming:
+          transportKind === 'grpc_out' ? (station?.transport?.streaming ?? shape.streams) : null,
         // The rest are carried rather than offered: this form has no control for them, and
         // a `PUT` that omitted them would null whatever is stored.
         topic: topic || null,

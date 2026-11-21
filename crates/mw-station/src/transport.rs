@@ -67,7 +67,15 @@ pub enum Transport {
         /// A credential for a vendor cloud API (§4a.7). Never logged (**D-33**).
         auth: Option<SecretString>,
     },
-    /// An outbound gRPC channel. The snow gauge (M6-3).
+    /// An outbound gRPC channel.
+    ///
+    /// **No driver in this build has a mode for it.** The snow gauge was the one, and its
+    /// firmware now serves JSON over plain HTTP (`crate::snowgauge`), so `crate::plan`
+    /// refuses a `grpc_out` station row by name. The variant stays because the schema still
+    /// admits the column value — W2a §4a.3's union is what the configuration database
+    /// holds, and a reader that could not represent a storable row would have to guess at
+    /// one — and because `shape` is what makes the `streaming`/trigger implication checkable
+    /// for whatever outbound gRPC station arrives next (§4a.7 offers four).
     GrpcOut {
         /// The peer's address.
         endpoint: Endpoint,

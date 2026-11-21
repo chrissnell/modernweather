@@ -36,26 +36,36 @@ The golden inputs for `tests/davis_golden.rs`, `tests/campbell_golden.rs`,
 
 **Provenance, stated exactly.** Unlike the WeatherLink Live frames above, all but one of
 these was **captured from a running emulator** — the process `cargo xtask emulator-tests`
-drives — by `tests/emulators/README.md`'s own instructions. Three therefore come from the
+drives — by `tests/emulators/README.md`'s own instructions. Two therefore come from the
 reference tree's own code at the pinned commit, and **one came off a physical device**:
 
 | File | Captured from | What that makes it |
 |---|---|---|
 | `davis-loop-1.bin`, `-2`, `-3` | `cmd/davis-emulator`, vendored verbatim | the reference's own `LOOP` writer, including its CRC-16 |
 | `campbell-packets.jsonl` | `cmd/campbell-emulator`, vendored verbatim | the reference's own `json.Encoder` output |
-| `snowgauge-reading.bin` | `protocols/snowgauge`'s generated marshaller, vendored verbatim | a real gauge's wire bytes, field numbers and all |
 | `airgradient-current.json`, `-old-firmware`, `-no-sensor` | `tests/emulators/airgradient`, written here | the device's published `/measures/current` shape |
 | `airgradient-o-1pst.json` | **the AirGradient Open Air ModernWeather collects in production**, `GET /measures/current` over the LAN, 2026-11-16 | one real firmware's real output, including the five keys no emulator body sends. `serialno` is substituted — see below |
 | `ambient-upload.txt` | `tests/emulators/ambient`, written here | the vendor's `updateraw` vocabulary |
+| `snowgauge-data.json`, `-warming`, `-no-data`, `-uncalibrated`, `snowgauge-health.json` | `tests/emulators/snowgauge`, written here | the shapes `chrissnell/snowgauge-rs` firmware v0.1.0 serves |
 
-So the first three pin a decoder against **the reference implementation's own encoder**,
-which is the strongest thing a fixture in this repository can be: a byte offset or a field
-number that drifted is a failing test with no hardware and no Go toolchain involved. The
-emulator-captured AirGradient and Ambient bodies pin it against an emulator written beside
-the driver, which cannot catch a misunderstanding the two share —
+So the first two pin a decoder against **the reference implementation's own encoder**, which
+is the strongest thing a fixture in this repository can be: a byte offset or a field number
+that drifted is a failing test with no hardware and no Go toolchain involved. The
+emulator-captured AirGradient, Ambient and snow gauge bodies pin it against an emulator
+written beside the driver, which cannot catch a misunderstanding the two share —
 `tests/emulators/manifest.toml` records which is which and the gate prints it on every run.
 `airgradient-o-1pst.json` is the one fixture here with no such gap, and is why the
 AirGradient row is split: a device answered it.
+
+**The snow gauge row used to be in the first group and is not any more**, which is a loss
+worth naming rather than a tidy-up. It was `snowgauge-reading.bin`, one `snowgauge.Reading`
+written by `protocols/snowgauge`'s own generated marshaller — so the *protocol* behind it was
+independently defined, which mattered because `mw_codec::SnowGaugeProto` declared two fields
+of a four-field protobuf message by hand. The gauge's firmware now serves JSON over plain
+HTTP and ships no schema file, so there is no generated artefact to vendor: the four JSON
+bodies and the decoder that reads them come from two readings of the same page, and a
+misreading shared by both would pass. `tests/emulators/snowgauge/README.md` has the same
+note and names the honest fix.
 
 **Why these are files and not literals in the test.** A 99-byte binary packet written as a
 Rust array is unreadable and unreviewable; a captured file can be re-derived, and
@@ -74,4 +84,8 @@ this crate may not name the filesystem.
 | `airgradient-no-sensor.json` | A monitor whose temperature/humidity module is not reporting: no `atmp` and no `rhum` at all. |
 | `airgradient-o-1pst.json` | `GET /measures/current` from the production monitor — an Open Air `O-1PST` on firmware `3.7.1`, a model and a firmware the emulator does not reproduce. **Seven of its twenty-six keys have no field on the decoder's `Measures`**, and five of those are in no emulator body: `pm01Standard`, `pm02Standard`, `pm10Standard`, `boot`, `bootCount`. (The other two, `tvocRaw` and `noxRaw`, are undeclared in every AirGradient fixture, so `deny_unknown_fields` would fail all four — what this one adds is a decoder that tolerates those two and not the rest.) Also a `pm02Compensated` of exactly **0**, which is clean air rather than a missing sensor. **`serialno` is substituted**: it is the device's WiFi MAC and this repository is public, so the file carries `d83bda000000` — the vendor OUI with the unique half zeroed. Every other key, value and spelling is the capture, and no assertion depends on the serial beyond its reaching `extratext1`. |
 | `ambient-upload.txt` | One `updateraw` query string, **percent-encoded exactly as the console sends it** — which is what makes the `+`-is-a-space and `%3A`-is-a-colon handling testable rather than assumed. |
-| `snowgauge-reading.bin` | One `snowgauge.Reading`, including the two `google.protobuf.Duration` fields the codec declares no field for — so "`prost` discards what is not declared" is asserted rather than assumed. |
+| `snowgauge-data.json` | `GET /data` from a calibrated gauge whose sensor is reporting and whose trailing window has filled. The `trim_mean` and the raw `distance` **disagree** in this body, so a codec reading the wrong field is visible rather than merely untested. `snow_depth` is 149 = `1500 - round(1351.4)`, the device's arithmetic in the device's order. |
+| `snowgauge-warming.json` | The same gauge a few hundred milliseconds after boot: one frame in, so `trim_mean` is `null` and the raw `distance` is the only number there is — which is the first minute of every start. |
+| `snowgauge-no-data.json` | A gauge whose sensor has never spoken: `status` is `no_data` and `distance` is `0`. **The body that used to be a reading** — stored, that zero is a 1500 mm snowpack. It is **calibrated**, so it still reports `base_distance: 1500` and `rssi`: neither comes from the sensor, which is what makes the calibration readable off a gauge that is not measuring. |
+| `snowgauge-uncalibrated.json` | A gauge nobody has calibrated. It measures normally — there is a distance and a trimmed mean — and reports `base_distance` and `snow_depth` as `null`, which is the state in which a reading carries a distance and no depth. |
+| `snowgauge-health.json` | `GET /health`. Telemetry and not a reading: `mw_station::snowgauge` reads it on two fault paths and quotes `bytes_rx` and `fw_version` in the sentence an operator gets. |

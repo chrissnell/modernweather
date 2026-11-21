@@ -694,10 +694,17 @@ impl TransportInput {
             // Requiring it for `http_out` as well made every `http_out` station
             // **unsatisfiable through this API**: omitting it was a 422 naming
             // `transport.streaming`, and supplying it was that `CHECK` failing with
-            // SQLite's own wording. Two of the six station types the schema admits --
-            // `weatherlink-live` and `snowgauge` -- are `http_out`, so neither could be
-            // created or edited at all. Found by implementation-plan.md M7-3's second
-            // Playwright flow, which is the first thing to create one.
+            // SQLite's own wording. Three of the six station types the schema admits --
+            // `weatherlink-live`, `airgradient` and `snowgauge` -- are reached that way,
+            // so none of them could be created or edited at all. Found by
+            // implementation-plan.md M7-3's second Playwright flow, which is the first
+            // thing to create one.
+            //
+            // The snow gauge counted for a different reason when that was written: it was
+            // `grpc_out` then, and the sentence named it because `weatherlink-live` and it
+            // were the two the flow covered. Its firmware serves HTTP now
+            // (`mw_station::snowgauge`), so it is an `http_out` row like the other two and
+            // the rule below is what it depends on.
             "http_out" => {
                 if self.url.as_deref().unwrap_or("").is_empty() {
                     v.push(FieldError::new(
@@ -1009,10 +1016,10 @@ impl ListenerInput {
 
 #[cfg(test)]
 mod tests {
-    /// The defect this test exists for made two of the six station types the schema
-    /// admits -- `weatherlink-live` and `snowgauge`, both `http_out` -- impossible to
-    /// create or edit through this API: omitting `streaming` was a `422` and supplying it
-    /// was the configuration database's `CHECK (transport_streaming IS NULL OR
+    /// The defect this test exists for made three of the six station types the schema
+    /// admits -- `weatherlink-live`, `airgradient` and `snowgauge`, all `http_out` --
+    /// impossible to create or edit through this API: omitting `streaming` was a `422` and
+    /// supplying it was the configuration database's `CHECK (transport_streaming IS NULL OR
     /// COALESCE(transport_kind, '') = 'grpc_out')` failing with SQLite's own wording.
     ///
     /// W2a §4a.3 is the authority and is unambiguous: `HttpOut { auth }` has no streaming
