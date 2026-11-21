@@ -195,6 +195,8 @@ fn row(key: &str) -> StationRow {
         altitude_m: Some(1609.0),
         timezone: Some("America/Denver".into()),
         snow_base_distance_mm: Some(1500.0),
+        snow_season_adjustment_mm: None,
+        snow_season_adjustment_set_at: None,
         wind_dir_correction_degrees: 0,
         transport_kind: Some("udp_in".into()),
         transport_dev: None,

@@ -2405,6 +2405,9 @@ pub fn translate(
             // configured" -- so a zero is an absent base distance rather than a gauge
             // mounted on the ground.
             snow_base_distance_mm: d.base_snow_distance.filter(|v| *v > 0.0),
+            // The Go daemon had no such setting, so a migrated station starts with none.
+            snow_season_adjustment_mm: None,
+            snow_season_adjustment_set_at: None,
             transport_kind: Some(w.kind.to_string()),
             transport_dev: w.dev,
             transport_baud: w.baud,

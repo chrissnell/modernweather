@@ -438,6 +438,21 @@ async fn station_write(
         }
     };
 
+    // What is already stored for the two season-adjustment columns, so that an edit which
+    // does not mention them leaves them alone. `(None, None)` for a station being created,
+    // and for one whose row cannot be read -- the write that follows would fail on its own
+    // terms in that case, and guessing here would not help it.
+    let stored_adjustment: (Option<f64>, Option<i64>) = sqlx::query_as(
+        "SELECT snow_season_adjustment_mm, snow_season_adjustment_set_at \
+         FROM stations WHERE station_key = ?",
+    )
+    .bind(&key)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or((None, None));
+
     Ok(mw_store::StationWrite {
         station_key: key,
         id: None,
@@ -455,6 +470,18 @@ async fn station_write(
         aprs_callsign: blank_to_none(&station.aprs_callsign),
         wind_dir_correction_degrees: station.wind_dir_correction_degrees,
         snow_base_distance_mm: station.snow_base_distance_mm,
+        // **Carried through, not rewritten.** `StationInput` has no field for the season
+        // adjustment yet, and `StationWrite` is every mutable column — so building this
+        // from nothing would silently clear an operator's missed-storm correction on any
+        // unrelated edit to the station, which is the worst outcome available for a
+        // setting whose whole job is to be remembered.
+        //
+        // Re-stamping `set_at` here would be just as wrong in the other direction: it
+        // would push last season's correction into this one the next time somebody renamed
+        // the station. So both columns are read back and written unchanged, and the
+        // stamping rule belongs with the input field when it lands.
+        snow_season_adjustment_mm: stored_adjustment.0,
+        snow_season_adjustment_set_at: stored_adjustment.1,
         transport_kind: blank_to_none(&station.transport.kind),
         transport_dev: blank_to_none(&station.transport.device),
         transport_baud: station.transport.baud,

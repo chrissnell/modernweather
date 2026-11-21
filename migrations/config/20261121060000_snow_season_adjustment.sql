@@ -1,0 +1,75 @@
+-- Two columns that let an operator add snowfall the gauge never measured to a season's
+-- total: the amount, and when it was entered.
+--
+-- D-8 as amended by A-W6-2: a schema change is a migration, there is no startup DDL, and
+-- `IF NOT EXISTS` does not appear. Additive `ALTER TABLE ... ADD COLUMN`, so applying this
+-- twice is an error rather than a tolerated no-op -- the ledger is what makes the second
+-- application a no-op, which is the property `cargo xtask gate db-migrate-twice` checks.
+--
+-- # The case this exists for
+--
+-- The owner's, stated 2026-11-21: the sensor is deployed late and misses the first storm of
+-- the season. That snow fell, the season total is the number a reader cares about, and no
+-- amount of arithmetic over the measured series can recover a storm that happened before
+-- the gauge was on the roof. So the correction is configuration, and the alternative --
+-- editing the stored observations to invent readings -- would put fabricated measurements
+-- into a column whose whole value is that it holds what the sensor saw.
+--
+-- # Why the amount is in millimetres
+--
+-- Every snow quantity below the serving layer is (`metrics/registry.toml`: `snow_distance`
+-- and `snow_depth` are both `mm`), and `mw_pipeline::snow::units` is the one place inches
+-- appear -- it divides by 25.4 on the way to the wire and zeroes anything under a tenth of
+-- an inch, which is the frozen contract's own threshold. An operator types inches, because
+-- that is what a storm report gives them and what the page shows; the management API
+-- converts once, here, so that the thresholding applies to the sum of the measured and the
+-- added rather than to each separately.
+--
+-- # Why there are two columns and not one
+--
+-- `snow_season_adjustment_set_at` is what scopes the amount to **one season**, and it is
+-- recorded rather than typed.
+--
+-- The owner declined per-adjustment dates ("I think it's easy to just have an amount"), and
+-- a bare amount has one failure mode that is worse than the inconvenience it avoids: the
+-- season rolls over on 1 October (`mw_pipeline::snow::units::season_start`), so a permanent
+-- constant would still be adding last year's missed storm to this year's total, for every
+-- season after, until somebody remembered it was there. An operator would open the page in
+-- October and see ten inches of snow before any had fallen.
+--
+-- So the amount applies to the season the instant below falls in, and stops counting when
+-- that season ends. From the operator's side it is still one number in one box: nothing
+-- asks them for a date, and `mw-api-mgmt` stamps this column from the clock on save. What
+-- it costs is the one edge this cannot get right -- an amount entered in early October for a
+-- storm from the *previous* season is attributed to the new one -- which is why the
+-- management surface shows which season an adjustment is counting toward rather than
+-- leaving the inference invisible.
+
+-- The snowfall to add to this station's season total, in millimetres.
+--
+-- `> 0` because this is snow that **fell** and was not measured, which is the case it was
+-- asked for; a downward correction is a different feature with a different argument behind
+-- it, and the season total is floored at zero anyway
+-- (`mw_pipeline::snow::season_total`'s `max(0.0)`), so a negative here would be a value the
+-- arithmetic above it silently discards. NULL is the ordinary state: no adjustment.
+ALTER TABLE stations ADD COLUMN snow_season_adjustment_mm REAL
+    CHECK (snow_season_adjustment_mm IS NULL OR snow_season_adjustment_mm > 0);
+
+-- When the amount was entered, as unix seconds, which is the clock every other timestamp
+-- in this schema uses (`registered_at`, `last_seen`, `created_at`).
+--
+-- Read by `mw_pipeline::snow` to decide which season the amount belongs to, in the
+-- **station's** zone -- D-24's rule that every calendar quantity is the station's, and the
+-- same reason `season_start` takes a `Zone`. The two columns are set and cleared together;
+-- an amount with no instant has no season to belong to, which the CHECK below makes
+-- unrepresentable rather than a state every reader has to handle.
+ALTER TABLE stations ADD COLUMN snow_season_adjustment_set_at INTEGER;
+
+-- Neither column means anything without the other.
+--
+-- SQLite cannot add a table-level CHECK by `ALTER TABLE`, so this is enforced by
+-- `mw_store::config_admin` on the write path and asserted by its tests. Recorded here
+-- because the schema is where a reader looks for the invariant, and because the day SQLite
+-- grows `ALTER TABLE ... ADD CONSTRAINT` this comment is the specification for it:
+--
+--   CHECK ((snow_season_adjustment_mm IS NULL) = (snow_season_adjustment_set_at IS NULL))

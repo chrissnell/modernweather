@@ -326,6 +326,44 @@ pub struct SnowStation {
     /// `None` is a station with no usable `config.stations.timezone`, which [`register`]
     /// refuses by name.
     pub zone: Option<Zone>,
+    /// Snowfall to add to this station's season total, and when the operator entered it.
+    ///
+    /// `config.stations.snow_season_adjustment_mm` and `..._set_at`: snow that fell before
+    /// the gauge was measuring it, which no arithmetic over the measured series can
+    /// recover. The instant is what scopes the amount to one season — its migration has
+    /// why — and both are `None` in the ordinary case.
+    pub season_adjustment: Option<SeasonAdjustment>,
+}
+
+/// An operator's correction to one season's snowfall total.
+///
+/// The case is the owner's, stated 2026-11-21: the sensor is deployed late and misses the
+/// first storm. That snow fell and the season total is the number a reader cares about, so
+/// the correction is configuration rather than a fabricated reading in a column whose
+/// value is that it holds what the sensor saw.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SeasonAdjustment {
+    /// How much, in millimetres — the unit every snow quantity below the serving layer is.
+    pub amount_mm: f64,
+    /// When it was entered, which decides the season it counts toward.
+    pub set_at: DateTime<Utc>,
+}
+
+impl SeasonAdjustment {
+    /// The amount, if it belongs to the season that began at `season_start`.
+    ///
+    /// **Scoped to one season on purpose.** The owner declined per-adjustment dates, and a
+    /// permanent constant has a worse failure mode than the inconvenience that avoids: the
+    /// season rolls over on 1 October, so last year's missed storm would still be inflating
+    /// this year's total, and every year's after, until somebody remembered the setting was
+    /// there. An operator would open the page in October and see snow before any fell.
+    ///
+    /// Nothing asks the operator for a date — `set_at` is stamped from the clock on save —
+    /// so from their side this is still one number in one box.
+    #[must_use]
+    pub fn within(&self, season_start: DateTime<Utc>) -> Option<f64> {
+        (self.set_at >= season_start).then_some(self.amount_mm)
+    }
 }
 
 /// What this crate needs from the configuration to plan the snow components.
@@ -387,6 +425,7 @@ pub fn register<C: SnowConfig + ?Sized>(
             key: station.key,
             base_distance_mm,
             zone,
+            season_adjustment: station.season_adjustment,
         });
     }
     if gauges.is_empty() {
@@ -442,6 +481,7 @@ struct Gauge {
     key: StationKey,
     base_distance_mm: f64,
     zone: Zone,
+    season_adjustment: Option<SeasonAdjustment>,
 }
 
 /// What goes into a shared component's [`ConfigDigest`].
@@ -456,6 +496,17 @@ fn digest_of(gauges: &[Gauge]) -> ConfigDigest {
         s.push_str(&format!("{:.3}", gauge.base_distance_mm));
         s.push('@');
         s.push_str(gauge.zone.name());
+        // **In the digest**, because the season total is a function of it: an operator who
+        // enters a missed storm and sees nothing change for fifteen minutes would enter it
+        // again. A changed digest restarts the components that serve the number.
+        if let Some(adjustment) = gauge.season_adjustment {
+            s.push('+');
+            s.push_str(&format!(
+                "{:.3}@{}",
+                adjustment.amount_mm,
+                adjustment.set_at.timestamp()
+            ));
+        }
         s.push(';');
     }
     ConfigDigest::of(&s)
@@ -1044,7 +1095,9 @@ impl Smoothing {
         // column's daily recomputation; this is the same expression over the same handle,
         // and the module documentation has why both exist.
         let season = match units::season_start(now, gauge.zone) {
-            Some(start) => season_total(&self.cache, &gauge.key, start).await?,
+            Some(start) => {
+                season_total(&self.cache, &gauge.key, start, gauge.season_adjustment).await?
+            }
             None => None,
         };
         // **No `source_through`.** It has one owner, `snow:depth`, and the handle's own
@@ -1140,17 +1193,47 @@ async fn season_total(
     cache: &Arc<dyn SnowCache>,
     station: &StationKey,
     start: DateTime<Utc>,
+    adjustment: Option<SeasonAdjustment>,
 ) -> Result<Option<f32>, StoreError> {
+    // The operator's correction for snow that fell before the gauge measured it, in
+    // inches, and only if it belongs to the season being totalled
+    // ([`SeasonAdjustment::within`]).
+    //
+    // **Stays an `Option` rather than becoming a zero**, which is `ci/layers.toml`'s
+    // `one-zero-fill` rule and is right here for its own reason as well as the rule's:
+    // "there is no adjustment" and "the adjustment is zero" are different facts, the
+    // second is unrepresentable (the column's `CHECK` is `> 0`), and the branches below
+    // read differently for each.
+    let added_in: Option<f64> = adjustment
+        .and_then(|a| a.within(start))
+        .map(units::inches_from_mm);
+
     let Some(window) = cache.estimate_window(station, start).await? else {
-        return match cache.newest_estimate(station).await? {
+        return match (cache.newest_estimate(station).await?, added_in) {
+            // Nothing measured in this season, so an adjustment is the whole of the total.
+            // This covers both the gauge with a series that predates the season and the
+            // gauge the smoother has never run for -- the deployed-late case, which is the
+            // one this setting exists for, and where the correction is an answer precisely
+            // because it does not depend on the sensor.
+            (_, Some(added)) => Ok(Some(units::serving_from_inches(added))),
             // A series exists and none of it is in this season: nothing has fallen yet.
-            Some(_) => Ok(Some(0.0)),
-            // The smoother has never run for this gauge, so the total is unknown.
-            None => Ok(None),
+            (Some(_), None) => Ok(Some(0.0)),
+            // The smoother has never run for this gauge, so the total is unknown and the
+            // stored one is left alone rather than overwritten.
+            (None, None) => Ok(None),
         };
     };
     let accumulated = f64::from(window.max_in) - f64::from(window.first_in);
-    Ok(Some(units::serving_from_inches(accumulated.max(0.0))))
+    let measured = accumulated.max(0.0);
+    // **Added before the serving threshold, not after.** `serving_from_inches` zeroes
+    // anything under a tenth of an inch, and applying that to the measured and the added
+    // separately would let a hundredth of an inch of correction survive where a hundredth
+    // of an inch of snow does not. One sum, one threshold.
+    let total = match added_in {
+        Some(added) => measured + added,
+        None => measured,
+    };
+    Ok(Some(units::serving_from_inches(total)))
 }
 
 /// `snow:events`' body: the classified accumulation segments per chart range.
@@ -1292,17 +1375,22 @@ impl Tick for Season {
                 // Unreachable: `register` refuses a gauge with no zone.
                 return Ok(());
             };
-            let season = season_total(&self.cache, &self.gauge.key, start)
-                .await
-                .map_err(|e| {
-                    ComponentError::tick(
-                        format!(
-                            "read snow gauge `{}`'s estimated depth series",
-                            self.gauge.key
-                        ),
-                        e,
-                    )
-                })?;
+            let season = season_total(
+                &self.cache,
+                &self.gauge.key,
+                start,
+                self.gauge.season_adjustment,
+            )
+            .await
+            .map_err(|e| {
+                ComponentError::tick(
+                    format!(
+                        "read snow gauge `{}`'s estimated depth series",
+                        self.gauge.key
+                    ),
+                    e,
+                )
+            })?;
             let patch = SnowPatch {
                 season,
                 ..SnowPatch::NOTHING

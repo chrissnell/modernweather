@@ -146,6 +146,20 @@ pub struct StationWrite {
     pub wind_dir_correction_degrees: i64,
     /// `snow_base_distance_mm`.
     pub snow_base_distance_mm: Option<f64>,
+    /// `snow_season_adjustment_mm`: snowfall to add to the season total, in millimetres,
+    /// because it fell before the gauge was measuring.
+    ///
+    /// **Paired with the instant below**: the amount has no season to belong to without
+    /// it, so [`ConfigAdmin`]'s write path refuses one without the other rather than
+    /// storing a half-written adjustment every reader has to interpret. SQLite cannot add
+    /// a table-level CHECK by `ALTER TABLE`, which is why the invariant is enforced here
+    /// and recorded in the migration.
+    pub snow_season_adjustment_mm: Option<f64>,
+    /// `snow_season_adjustment_set_at`: when the amount was entered, as unix seconds.
+    ///
+    /// Stamped from the clock by the management API rather than typed: the owner asked for
+    /// an amount and no dates, and this is what stops the amount outliving its season.
+    pub snow_season_adjustment_set_at: Option<i64>,
     /// `transport_kind`.
     pub transport_kind: Option<String>,
     /// `transport_dev`.
@@ -181,6 +195,26 @@ pub struct StationWrite {
     pub wll_sensor_mapping: Option<String>,
     /// `wll_poll_interval_seconds`.
     pub wll_poll_interval_seconds: Option<i64>,
+}
+
+impl StationWrite {
+    /// The season adjustment as the two columns are written: **both, or neither**.
+    ///
+    /// The amount has no season to belong to without the instant, and the instant means
+    /// nothing without an amount, so a half-written pair is stored as no adjustment rather
+    /// than as a state every reader below has to interpret. SQLite cannot add a
+    /// table-level `CHECK` by `ALTER TABLE` — the migration records the constraint it would
+    /// write — so this is where the pairing holds, and it is one function rather than two
+    /// `bind` sites free to disagree.
+    fn season_adjustment(&self) -> (Option<f64>, Option<i64>) {
+        match (
+            self.snow_season_adjustment_mm,
+            self.snow_season_adjustment_set_at,
+        ) {
+            (Some(mm), Some(at)) => (Some(mm), Some(at)),
+            _ => (None, None),
+        }
+    }
 }
 
 /// One `website` row, as a write supplies it.
@@ -635,6 +669,7 @@ async fn put_station(
                  presented_key = ?, ingest_secret_hash = ?, latitude = ?, longitude = ?, \
                  altitude_m = ?, timezone = ?, aprs_callsign = ?, \
                  wind_dir_correction_degrees = ?, snow_base_distance_mm = ?, \
+                 snow_season_adjustment_mm = ?, snow_season_adjustment_set_at = ?, \
                  transport_kind = ?, transport_dev = ?, transport_baud = ?, \
                  transport_host = ?, transport_port = ?, transport_url = ?, \
                  transport_method = ?, transport_auth = ?, transport_streaming = ?, \
@@ -657,6 +692,8 @@ async fn put_station(
             .bind(&s.aprs_callsign)
             .bind(s.wind_dir_correction_degrees)
             .bind(s.snow_base_distance_mm)
+            .bind(s.season_adjustment().0)
+            .bind(s.season_adjustment().1)
             .bind(&s.transport_kind)
             .bind(&s.transport_dev)
             .bind(s.transport_baud)
@@ -702,13 +739,14 @@ async fn put_station(
             "INSERT INTO stations (id, station_key, owning_node_id, name, type, enabled, \
              identity_kind, presented_key, ingest_secret_hash, latitude, longitude, \
              altitude_m, timezone, aprs_callsign, wind_dir_correction_degrees, \
-             snow_base_distance_mm, transport_kind, transport_dev, transport_baud, \
+             snow_base_distance_mm, snow_season_adjustment_mm, \
+             snow_season_adjustment_set_at, transport_kind, transport_dev, transport_baud, \
              transport_host, transport_port, transport_url, transport_method, \
              transport_auth, transport_streaming, transport_mount, transport_group, \
              transport_topic, transport_tls_ca_path, transport_tls_cert_path, \
              transport_tls_key_path, wll_sensor_mapping, wll_poll_interval_seconds) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(s.id)
         .bind(&s.station_key)
@@ -726,6 +764,8 @@ async fn put_station(
         .bind(&s.aprs_callsign)
         .bind(s.wind_dir_correction_degrees)
         .bind(s.snow_base_distance_mm)
+        .bind(s.season_adjustment().0)
+        .bind(s.season_adjustment().1)
         .bind(&s.transport_kind)
         .bind(&s.transport_dev)
         .bind(s.transport_baud)
@@ -1087,7 +1127,9 @@ pub async fn snapshot(conn: &mut SqliteConnection) -> Result<Vec<Change>, Config
         "SELECT id, station_key, owning_node_id, name, type, enabled, identity_kind, \
                 presented_key, ingest_secret_hash, latitude, longitude, altitude_m, \
                 timezone, aprs_callsign, wind_dir_correction_degrees, \
-                snow_base_distance_mm, transport_kind, transport_dev, transport_baud, \
+                snow_base_distance_mm, snow_season_adjustment_mm, \
+                snow_season_adjustment_set_at, transport_kind, transport_dev, \
+                transport_baud, \
                 transport_host, transport_port, transport_url, transport_method, \
                 transport_auth, transport_streaming, transport_mount, transport_group, \
                 transport_topic, transport_tls_ca_path, transport_tls_cert_path, \
@@ -1115,6 +1157,8 @@ pub async fn snapshot(conn: &mut SqliteConnection) -> Result<Vec<Change>, Config
             aprs_callsign: r.get("aprs_callsign"),
             wind_dir_correction_degrees: r.get("wind_dir_correction_degrees"),
             snow_base_distance_mm: r.get("snow_base_distance_mm"),
+            snow_season_adjustment_mm: r.get("snow_season_adjustment_mm"),
+            snow_season_adjustment_set_at: r.get("snow_season_adjustment_set_at"),
             transport_kind: r.get("transport_kind"),
             transport_dev: r.get("transport_dev"),
             transport_baud: r.get("transport_baud"),
@@ -1339,6 +1383,39 @@ pub async fn restore(
 
 #[cfg(test)]
 mod tests {
+
+    /// **Both columns or neither.** A half-written adjustment is stored as none: the amount
+    /// has no season to belong to without the instant, and the instant means nothing
+    /// without an amount. SQLite cannot express that as a `CHECK` added by `ALTER TABLE`,
+    /// so it holds here — and this is the test that says so, because the two `bind` sites
+    /// would otherwise be free to drift.
+    #[test]
+    fn a_half_written_season_adjustment_is_stored_as_none() {
+        let mut write = a_station(0);
+        write.snow_season_adjustment_mm = Some(304.8);
+        write.snow_season_adjustment_set_at = None;
+        assert_eq!(
+            write.season_adjustment(),
+            (None, None),
+            "an amount with no instant"
+        );
+
+        write.snow_season_adjustment_mm = None;
+        write.snow_season_adjustment_set_at = Some(1_763_000_000);
+        assert_eq!(
+            write.season_adjustment(),
+            (None, None),
+            "an instant with no amount"
+        );
+
+        write.snow_season_adjustment_mm = Some(304.8);
+        write.snow_season_adjustment_set_at = Some(1_763_000_000);
+        assert_eq!(
+            write.season_adjustment(),
+            (Some(304.8), Some(1_763_000_000)),
+            "the pair survives"
+        );
+    }
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};

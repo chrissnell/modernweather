@@ -48,6 +48,7 @@ fn gauge_row(key: &str, base_distance_mm: Option<f64>) -> SnowStation {
     SnowStation {
         key: StationKey::new(key),
         base_distance_mm,
+        season_adjustment: None,
         zone: Some(denver()),
     }
 }
@@ -55,6 +56,7 @@ fn gauge_row(key: &str, base_distance_mm: Option<f64>) -> SnowStation {
 fn gauge(key: &str) -> Gauge {
     Gauge {
         key: StationKey::new(key),
+        season_adjustment: None,
         base_distance_mm: 1500.0,
         zone: denver(),
     }
@@ -470,6 +472,7 @@ fn the_only_gauge_having_no_base_distance_plans_nothing() {
 fn a_gauge_with_no_time_zone_is_refused_by_name() {
     let cfg = Cfg {
         stations: vec![SnowStation {
+            season_adjustment: None,
             key: StationKey::new("snowgauge"),
             base_distance_mm: Some(1500.0),
             zone: None,
@@ -1243,10 +1246,160 @@ mod driven {
             &(Arc::clone(&cache) as Arc<dyn SnowCache>),
             &StationKey::new("snowgauge"),
             season,
+            None,
         )
         .await
         .expect("a successful read");
         assert_eq!(total, Some(20.0), "thirty less the ten it started with");
+    }
+
+    /// **The owner's missed-storm correction** (2026-11-21): snowfall the gauge never
+    /// measured, added to the season total.
+    ///
+    /// Ten inches measured plus a twelve-inch correction is twenty-two. The amount is
+    /// stored in millimetres and the total is served in inches, so this also pins the one
+    /// conversion.
+    #[tokio::test]
+    async fn an_operators_adjustment_is_added_to_the_measured_season_total() {
+        let cache = Arc::new(Cache::default());
+        let season = units::season_start(now(), denver()).expect("a real boundary");
+        cache.seed(season, 2, 0.0);
+        cache.seed(season + chrono::Duration::days(20), 2, 10.0);
+        let adjustment = SeasonAdjustment {
+            amount_mm: 12.0 * units::MM_PER_INCH,
+            // Entered during the season it corrects, which is the ordinary case.
+            set_at: season + chrono::Duration::days(30),
+        };
+        let total = season_total(
+            &(Arc::clone(&cache) as Arc<dyn SnowCache>),
+            &StationKey::new("snowgauge"),
+            season,
+            Some(adjustment),
+        )
+        .await
+        .expect("a successful read");
+        assert_eq!(total, Some(22.0), "ten measured plus twelve added");
+    }
+
+    /// **It stops at the season boundary**, which is the whole reason the amount carries an
+    /// instant the operator never typed. A correction entered last season is not this
+    /// season's snow, and a permanent constant would have gone on inflating every total
+    /// after it until somebody remembered the setting existed.
+    #[tokio::test]
+    async fn an_adjustment_from_a_previous_season_is_not_counted() {
+        let cache = Arc::new(Cache::default());
+        let season = units::season_start(now(), denver()).expect("a real boundary");
+        cache.seed(season, 2, 0.0);
+        cache.seed(season + chrono::Duration::days(20), 2, 10.0);
+        let stale = SeasonAdjustment {
+            amount_mm: 12.0 * units::MM_PER_INCH,
+            // One day before this season began: last season's correction.
+            set_at: season - chrono::Duration::days(1),
+        };
+        assert_eq!(
+            stale.within(season),
+            None,
+            "outside the season being totalled"
+        );
+        let total = season_total(
+            &(Arc::clone(&cache) as Arc<dyn SnowCache>),
+            &StationKey::new("snowgauge"),
+            season,
+            Some(stale),
+        )
+        .await
+        .expect("a successful read");
+        assert_eq!(total, Some(10.0), "the measured total, untouched");
+    }
+
+    /// A gauge deployed late has **no measured series in this season at all** — which is
+    /// exactly the case the correction exists for, so it must be the whole of the total
+    /// rather than discarded beside a zero.
+    #[tokio::test]
+    async fn an_adjustment_is_the_total_when_nothing_has_been_measured_yet() {
+        let cache = Arc::new(Cache::default());
+        let season = units::season_start(now(), denver()).expect("a real boundary");
+        // A series exists, and all of it predates this season.
+        cache.seed(season - chrono::Duration::days(40), 2, 5.0);
+        let adjustment = SeasonAdjustment {
+            amount_mm: 12.0 * units::MM_PER_INCH,
+            set_at: season + chrono::Duration::days(3),
+        };
+        let total = season_total(
+            &(Arc::clone(&cache) as Arc<dyn SnowCache>),
+            &StationKey::new("snowgauge"),
+            season,
+            Some(adjustment),
+        )
+        .await
+        .expect("a successful read");
+        assert_eq!(total, Some(12.0));
+
+        // And with no series whatsoever — a gauge the smoother has never run for — the
+        // adjustment is still an answer, because it does not depend on the sensor. That is
+        // the one place this changes the meaning of `None`, and it is the deployed-late
+        // case: the correction is entered before the gauge has produced anything.
+        let empty = Arc::new(Cache::default());
+        let total = season_total(
+            &(empty as Arc<dyn SnowCache>),
+            &StationKey::new("snowgauge"),
+            season,
+            Some(adjustment),
+        )
+        .await
+        .expect("a successful read");
+        assert_eq!(total, Some(12.0));
+    }
+
+    /// The tenth-of-an-inch serving floor applies **once, to the sum**. Two hundredths of
+    /// an inch of correction on top of two hundredths measured is still nothing; a tenth
+    /// either way is a tenth.
+    #[tokio::test]
+    async fn the_serving_threshold_applies_to_the_sum_and_not_to_each_half() {
+        let cache = Arc::new(Cache::default());
+        let season = units::season_start(now(), denver()).expect("a real boundary");
+        cache.seed(season, 2, 0.0);
+        cache.seed(season + chrono::Duration::days(1), 2, 0.02);
+        let tiny = SeasonAdjustment {
+            amount_mm: 0.02 * units::MM_PER_INCH,
+            set_at: season + chrono::Duration::days(2),
+        };
+        let total = season_total(
+            &(Arc::clone(&cache) as Arc<dyn SnowCache>),
+            &StationKey::new("snowgauge"),
+            season,
+            Some(tiny),
+        )
+        .await
+        .expect("a successful read");
+        assert_eq!(total, Some(0.0), "0.04 in is under the threshold");
+    }
+
+    /// An edited amount restarts the components that serve the number, so an operator who
+    /// enters a missed storm does not watch an unchanged total for fifteen minutes and
+    /// enter it again.
+    #[test]
+    fn changing_the_adjustment_changes_the_digest() {
+        let plain = gauge("snowgauge");
+        let mut corrected = gauge("snowgauge");
+        corrected.season_adjustment = Some(SeasonAdjustment {
+            amount_mm: 300.0,
+            set_at: now(),
+        });
+        assert_ne!(
+            digest_of(std::slice::from_ref(&plain)),
+            digest_of(std::slice::from_ref(&corrected))
+        );
+        // And the same amount is the same digest, so a reconfiguration that changed
+        // nothing does not restart anything.
+        assert_eq!(
+            digest_of(std::slice::from_ref(&corrected)),
+            digest_of(std::slice::from_ref(&corrected))
+        );
+        assert_eq!(
+            digest_of(std::slice::from_ref(&plain)),
+            digest_of(std::slice::from_ref(&plain))
+        );
     }
 
     /// **The Critical the review found.** A gauge whose history is older than the 5-minute
@@ -1350,6 +1503,7 @@ mod driven {
             &(Arc::clone(&cache) as Arc<dyn SnowCache>),
             &StationKey::new("snowgauge"),
             season,
+            None,
         )
         .await
         .expect("a successful read");
@@ -1360,6 +1514,7 @@ mod driven {
             &(fresh as Arc<dyn SnowCache>),
             &StationKey::new("snowgauge"),
             season,
+            None,
         )
         .await
         .expect("a successful read");
