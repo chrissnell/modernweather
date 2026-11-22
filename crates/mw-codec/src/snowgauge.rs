@@ -8,8 +8,10 @@
 //! So the gauge is `HttpOut`, `Fixed` identity and `Every`, exactly like the AirGradient
 //! monitor, and one response is one observation.
 //!
-//! The depth is `base_distance - distance` and remains the enrich stage's
-//! (`mw_pipeline::enrich::snow_depth`, **R1**).
+//! The depth is the **device's**: it holds its calibration in NVS and reports
+//! `snow_depth` derived from it, which this codec carries. `mw_pipeline::enrich` derives
+//! one only for a reading that carries none, which is a gauge on firmware older than
+//! v0.1.0.
 //!
 //! # The predecessor, and why none of it is kept
 //!
@@ -34,6 +36,9 @@
 //! | `distance` | the measurement until `trim_mean` lands, about a minute after boot |
 //! | `status` | `"no_data"` means the sensor has sent no frames since boot, and there is **no reading** |
 //! | `readings`, `uptime_ms` | not measurements: the liveness pair [`SnowLiveness`] carries to the driver |
+//! | `base_distance` | the gauge's own calibration, in mm. `null` until somebody calibrates it |
+//! | `snow_depth` | the gauge's own `base_distance − reading`, **signed**, and what reaches the `snow_depth` metric |
+//! | `rssi` | signal strength in dBm, not stored. `0` is the firmware's "lookup failed" |
 //!
 //! # Zero is not a distance, and that is the one behavioural change
 //!
@@ -111,8 +116,9 @@ pub const SNOW_STATUS_NO_DATA: &str = "no_data";
 /// `GET /data`, as this build reads it.
 ///
 /// `distance` is a `u16` on the wire and a `u32` here, so that a firmware fault reporting a
-/// wider number is a value the discard below can *name* rather than a parse failure that
-/// says only "not the JSON this codec decodes". `trim_mean` defaults, because `null` and
+/// wider number decodes rather than failing the parse with a sentence that says only "not
+/// the JSON this codec decodes" — the guards below then refuse it by what it is.
+/// `trim_mean` defaults, because `null` and
 /// absent mean the same thing — "not yet" — and a firmware that stopped sending the key
 /// should degrade to the raw distance rather than stop the station.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -222,7 +228,11 @@ impl SnowData {
     /// this is a state to surface, not a reading to refuse.
     #[must_use]
     pub fn is_calibrated(&self) -> bool {
-        self.base_distance.is_some()
+        // `> 0` for the reason `mw_pipeline::enrich::snow_depth` and the backfill migration
+        // both guard it: a zero base distance is not a calibration, and if the firmware's
+        // NVS read ever yields one for "unset" rather than omitting the key, treating it as
+        // calibrated would mean the uncalibrated path never fires.
+        self.base_distance.is_some_and(|mm| mm > 0)
     }
 }
 

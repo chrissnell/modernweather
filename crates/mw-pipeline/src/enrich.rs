@@ -468,12 +468,33 @@ fn index(table: &[Breakpoint], concentration: f32) -> Option<i32> {
 /// non-positive base distance is a station that has not been configured — the
 /// configuration column's own `CHECK` is `> 0`.
 ///
-/// A distance *greater* than the base gives a negative depth and is returned as one. The
-/// Go snow-gauge driver discards such a reading at the device
-/// (`snowgauge/station.go:172`), which this stage cannot do — it is handed a reading that
-/// is already admitted, and dropping a metric here would make enrich a filter. A negative
-/// depth is visibly wrong, which is the right failure for a mis-set base distance; a
-/// clamp to zero would make it look like bare ground.
+/// # A distance past the base derives no depth, and that reverses an earlier decision
+///
+/// This used to return the negative. The reasoning was that a negative depth is visibly
+/// wrong, which is the right failure for a mis-set base distance, where a clamp to zero
+/// would look like bare ground — and that was sound while a configured base distance was
+/// the *only* source of a depth.
+///
+/// It is not any more. A snow gauge on firmware v0.1.0 holds its own calibration and
+/// reports a **signed** depth, where a negative means a stable reading overshot the
+/// calibration — frost heave, or a calibration coming due — and the owner's instruction is
+/// to record it (2026-11-21). So the column now carries negatives that are measurements,
+/// and a derived negative is no longer distinguishable from one.
+///
+/// The two are not the same fact. A device negative says *the snow is below where this
+/// gauge was calibrated*. A derived negative says *the number in this configuration is
+/// smaller than the distance the sensor is reading*, which is a statement about the
+/// configuration and not about the snow. Storing it would put a fabricated measurement
+/// beside real ones, and the case is not hypothetical: an **uncalibrated** v0.1.0 gauge
+/// reports a distance and no depth, so a station row still carrying the base distance its
+/// operator typed before the firmware changed derives one from a number nothing else reads
+/// any more. `mw_codec::SnowGaugeData`'s DEV-9 discard used to refuse exactly this reading
+/// and was retired with the firmware.
+///
+/// So the disagreement is reported by storing nothing, and the depth arrives when the gauge
+/// is calibrated. What is lost is the loud wrong number for an operator who mis-typed a
+/// base distance on *old* firmware; what is gained is that every stored negative is a
+/// measurement. `a_derived_depth_below_zero_is_a_configuration_disagreement` is the test.
 #[must_use]
 pub fn snow_depth(snow_distance_mm: f32, base_distance_mm: f64) -> Option<f32> {
     if !usable(snow_distance_mm) || !base_distance_mm.is_finite() {
@@ -482,7 +503,8 @@ pub fn snow_depth(snow_distance_mm: f32, base_distance_mm: f64) -> Option<f32> {
     if snow_distance_mm <= 0.0 || base_distance_mm <= 0.0 {
         return None;
     }
-    Some(base_distance_mm as f32 - snow_distance_mm)
+    let derived = base_distance_mm as f32 - snow_distance_mm;
+    (derived >= 0.0).then_some(derived)
 }
 
 /// Clear-sky shortwave radiation, W/m² — the ASCE model of `pkg/solar/asce.go`.
@@ -934,6 +956,31 @@ mod tests {
     /// to disagree, and the device's is the one with the calibration behind it — so this
     /// stage must not recompute it. `derive`'s `only_if_absent` invariant already says so;
     /// nothing asserted it for this field, and the whole refactor depends on it.
+    /// **An uncalibrated v0.1.0 gauge beside a stale configured base distance.**
+    ///
+    /// The gauge reports a distance and no depth, because nobody has calibrated it. A
+    /// station row still carrying the number its operator typed before the firmware
+    /// changed would otherwise derive a depth of −271 mm from it and store that next to
+    /// the device's own signed depths, where it is indistinguishable from the frost-heave
+    /// signal those exist to carry.
+    #[test]
+    fn a_derived_depth_below_zero_is_a_configuration_disagreement() {
+        // 1500 mm configured, 1771 mm measured: the configuration is smaller than the
+        // distance, which is a statement about the configuration.
+        assert_eq!(snow_depth(1771.0, 1500.0), None);
+
+        let reading = Reading {
+            snow_distance: Some(1771.0),
+            ..Reading::default()
+        };
+        let derived = derive(&reading, &denver());
+        assert_eq!(derived.snow_depth, None, "nothing is stored");
+
+        // Bare ground is still bare ground, and a real depth is unaffected.
+        assert_eq!(snow_depth(1500.0, 1500.0), Some(0.0));
+        assert_eq!(snow_depth(1200.0, 1500.0), Some(300.0));
+    }
+
     #[test]
     fn a_station_reported_snow_depth_is_not_recomputed_from_the_configured_base() {
         let reading = Reading {
@@ -980,11 +1027,10 @@ mod tests {
     fn snow_depth_is_the_base_distance_less_the_measured_distance() {
         assert_eq!(snow_depth(1200.0, 1500.0), Some(300.0));
         assert_eq!(snow_depth(1500.0, 1500.0), Some(0.0), "bare ground");
-        assert_eq!(
-            snow_depth(1600.0, 1500.0),
-            Some(-100.0),
-            "a mis-set base distance is visibly wrong rather than clamped to bare ground"
-        );
+        // **No depth**, where this used to be -100.0. The doc comment above has why the
+        // decision reversed: the column now carries the device's own signed depths, so a
+        // derived negative would be a fabricated measurement beside real ones.
+        assert_eq!(snow_depth(1600.0, 1500.0), None);
         assert_eq!(snow_depth(0.0, 1500.0), None, "a zero distance is a fault");
         assert_eq!(snow_depth(-3.0, 1500.0), None);
         assert_eq!(

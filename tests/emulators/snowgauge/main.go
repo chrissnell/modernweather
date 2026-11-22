@@ -176,9 +176,14 @@ func (g *gauge) tick() Data {
 		// arithmetic verbatim (`server.rs`: `(b as i32 - m.round() as i32)`). Rounding the
 		// SUBTRACTION instead would differ by up to a millimetre, and an oracle that is a
 		// millimetre off the device is an oracle that hides a millimetre of drift.
+		// The **unrounded** trimmed mean, which is what the firmware's own `m` is: `/data`
+		// formats it to one decimal for the wire and computes the depth from the f32. Taking
+		// the formatted value back would differ by a millimetre wherever one-decimal
+		// rounding crosses a half, and an oracle a millimetre off the device hides a
+		// millimetre of drift.
 		reading := float64(d.Distance)
 		if d.TrimMean != nil {
-			reading = *d.TrimMean
+			reading = trimmed
 		}
 		depth := int32(base) - int32(math.Round(reading))
 		d.SnowDepth = &depth
@@ -227,6 +232,14 @@ func main() {
 	case "all", "dead", "stalled":
 	default:
 		log.Fatalf("-sensor must be `all`, `dead` or `stalled`, not %q", *sensor)
+	}
+
+	// `distance` and `base_distance` are u16 millimetres on the wire, and the snowpack model
+	// subtracts up to 150 mm from the base. A base outside this range would silently wrap
+	// the uint16 conversion in `tick` and hand the driver a reading no device can produce --
+	// which is how a test asserting the wrong thing gets written and believed.
+	if *base < 200 || *base > 65535 {
+		log.Fatalf("-base must be between 200 and 65535 mm (u16 on the wire), not %v", *base)
 	}
 
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", *port))

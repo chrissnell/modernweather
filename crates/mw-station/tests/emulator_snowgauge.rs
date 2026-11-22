@@ -264,6 +264,45 @@ async fn an_uncalibrated_gauge_reports_a_distance_and_no_depth() {
     }
 }
 
+/// **A depth below zero, from the device, stored as the device reported it.** The gauge's
+/// sensor sees past bare ground — a mis-set NVRAM calibration, or a sensor that moved — so
+/// `distance` is greater than the base it is calibrated to and the depth it computes is
+/// negative. The owner's decision (2026-11-21) is that this is stored rather than discarded:
+/// the device is reporting that its own calibration is wrong, and a visibly wrong number is
+/// the failure an operator can act on where a gap is one nobody notices.
+///
+/// Level 3 is where this belongs. The codec decodes a signed `snow_depth` and the unit tests
+/// assert that; what only a real device can show is that nothing between the socket and
+/// `Ingress` — not the driver's liveness tests, not the admission path — quietly drops the
+/// reading on the way, which is `mw_pipeline::enrich`'s rule for a depth it derives ITSELF
+/// and deliberately not the rule for this one.
+#[tokio::test]
+#[ignore = "needs a Go toolchain; `cargo xtask emulator-tests` runs it"]
+async fn a_depth_the_device_reports_below_zero_is_stored_as_reported() {
+    let (_emulator, endpoint) = start(&["-trim-after", "1", "-base", "1500", "-fault", "1"]).await;
+    let admissions = poll(endpoint, 4).await;
+    assert_eq!(admissions.len(), 4, "a negative depth is still a reading");
+    for admission in &admissions {
+        let r = &admission.batch[0].values;
+        let distance = r
+            .snow_distance
+            .expect("the fault is a distance, not an absence");
+        let depth = r
+            .snow_depth
+            .expect("the device computed one and we keep it");
+        assert!(
+            distance > BASE as f32,
+            "the emulator's fault is a distance past the base: {distance}"
+        );
+        assert_eq!(
+            depth,
+            (BASE as i32 - distance.round() as i32) as f32,
+            "the device's own arithmetic, sign included"
+        );
+        assert!(depth < 0.0, "which is negative: {depth}");
+    }
+}
+
 /// A gauge that **rebooted** between two occurrences: `uptime_ms` drops and `readings`
 /// restarts at zero. A driver that tested the sensor before the uptime would call that a
 /// dead sensor and store nothing from then on.

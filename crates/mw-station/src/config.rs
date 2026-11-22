@@ -122,11 +122,10 @@ impl Hash for StationRow {
         self.wll_sensor_mapping.hash(state);
         self.wll_poll_interval_seconds.hash(state);
         self.wind_dir_correction_degrees.hash(state);
-        // `f64` is not `Hash`, and the bit pattern is: two base distances that compare
-        // equal have the same bits, which is what a digest needs. `NaN` would hash
-        // differently from itself through `to_bits` only if two distinct `NaN`s were
-        // written, and the column's own `CHECK (> 0)` rejects one.
-        self.snow_base_distance_mm.map(f64::to_bits).hash(state);
+        // **Not the base distance.** It was hashed here when the codec discarded against
+        // it; the gauge holds its own calibration now and no station driver reads the
+        // column, so hashing it would restart this component for a number it does not
+        // use. `mw_pipeline::snow` dropped it from its own digest for the same reason.
         self.has_ingest_secret.hash(state);
         match &self.transport {
             None => false.hash(state),
@@ -192,15 +191,6 @@ impl StationRow {
         mw_codec::WindDirCorrection::new(
             i16::try_from(self.wind_dir_correction_degrees).unwrap_or(0),
         )
-    }
-
-    /// The snow gauge's base distance as the codec takes it.
-    ///
-    /// `f32` because the column the depth lands in is `float4`; a base distance that is not
-    /// a positive number is no base distance, which `mw_codec::SnowGaugeData::new` is what
-    /// decides.
-    pub fn snow_base_distance_mm(&self) -> Option<f32> {
-        self.snow_base_distance_mm.map(|mm| mm as f32)
     }
 }
 
@@ -276,6 +266,10 @@ mod tests {
 
     #[test]
     fn the_digest_follows_every_value_a_builder_closes_over() {
+        // **`snow_base_distance_mm` is deliberately not in this list.** No station driver
+        // reads it since the gauge began holding its own calibration, so a builder closes
+        // over nothing that depends on it and restarting the component for a change to it
+        // would be restarting it for a number it does not use.
         let base = ConfigDigest::of(&row());
         assert_eq!(base, ConfigDigest::of(&row()), "stable for equal input");
         for changed in [
@@ -301,10 +295,6 @@ mod tests {
             },
             StationRow {
                 wind_dir_correction_degrees: 10,
-                ..row()
-            },
-            StationRow {
-                snow_base_distance_mm: Some(1500.0),
                 ..row()
             },
             StationRow {

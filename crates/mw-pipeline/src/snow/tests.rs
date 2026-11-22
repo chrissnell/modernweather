@@ -553,9 +553,12 @@ fn the_needs_are_the_tables_and_the_season_total_declares_only_what_it_uses() {
     }
 }
 
-/// A digest that did not move is a component the plan diff does not restart.
+/// A digest that did not move is a component the plan diff does not restart. The gauges and
+/// their zones here; the season adjustment in
+/// `changing_the_adjustment_changes_the_digest`; **and no calibration, because there is not
+/// one on this side any more** — `digest_of` says why.
 #[test]
-fn the_digest_follows_the_gauges_their_calibration_and_their_zones() {
+fn the_digest_follows_the_gauges_and_their_zones() {
     let digest_of = |cfg: &Cfg| {
         let mut out = Vec::new();
         register(cfg, &mut out).expect("a plannable configuration");
@@ -603,16 +606,20 @@ fn depth_body(series: Series, cache: Arc<Cache>) -> Depth {
 /// thirty minutes ago, extrapolated from half an hour to an hour.
 #[test]
 fn the_snowfall_rate_is_the_half_hour_delta_doubled() {
-    // Two samples: one at now-30m reading 1300 mm, one at now-1m reading 1275 mm. Twenty
-    // five millimetres in half an hour is 50 mm an hour, which is 2.0 inches.
+    // Two samples of stored **depth**: 200 mm half an hour ago, 225 mm a minute ago.
+    // Twenty-five millimetres in half an hour is 50 mm an hour, which is 2.0 inches.
+    //
+    // These used to be distances -- 1300 falling to 1275 -- and the series this reads
+    // became depths when `/snow` moved onto the stored column. Seeded the old way this
+    // test asserted that a pack getting SHALLOWER was snowing at two inches an hour.
     let series = vec![
         MeanBucket {
             bucket: now() - chrono::Duration::minutes(30),
-            mean: Some(1300.0),
+            mean: Some(200.0),
         },
         MeanBucket {
             bucket: now() - chrono::Duration::minutes(1),
-            mean: Some(1275.0),
+            mean: Some(225.0),
         },
     ];
     assert_eq!(rate(&series, now()), Some(2.0));
@@ -624,11 +631,11 @@ fn the_snowfall_rate_is_the_half_hour_delta_doubled() {
 fn the_rate_needs_both_samples_and_is_absent_rather_than_zero_without_them() {
     let fresh = MeanBucket {
         bucket: now() - chrono::Duration::minutes(1),
-        mean: Some(1275.0),
+        mean: Some(225.0),
     };
     let lagged = MeanBucket {
         bucket: now() - chrono::Duration::minutes(30),
-        mean: Some(1300.0),
+        mean: Some(200.0),
     };
     assert_eq!(rate(&[fresh], now()), None, "no older sample");
     assert_eq!(rate(&[lagged], now()), None, "no fresh sample");
@@ -636,7 +643,7 @@ fn the_rate_needs_both_samples_and_is_absent_rather_than_zero_without_them() {
     // A fresh sample that is not fresh enough is not a sample.
     let stale = MeanBucket {
         bucket: now() - chrono::Duration::minutes(6),
-        mean: Some(1275.0),
+        mean: Some(225.0),
     };
     assert_eq!(
         rate(&[lagged, stale], now()),
@@ -646,7 +653,7 @@ fn the_rate_needs_both_samples_and_is_absent_rather_than_zero_without_them() {
     // And an older sample outside the two-minute tolerance is not one either.
     let drifted = MeanBucket {
         bucket: now() - chrono::Duration::minutes(34),
-        mean: Some(1300.0),
+        mean: Some(200.0),
     };
     assert_eq!(rate(&[drifted, fresh], now()), None);
 }
@@ -654,14 +661,15 @@ fn the_rate_needs_both_samples_and_is_absent_rather_than_zero_without_them() {
 /// Settling is not negative snowfall: Go's `if snowfall_30min <= 0 then return 0`.
 #[test]
 fn a_shrinking_pack_has_a_rate_of_zero_and_not_a_negative_one() {
+    // A depth of 225 mm settling to 200: the pack lost 25 mm, which is not snowfall.
     let series = vec![
         MeanBucket {
             bucket: now() - chrono::Duration::minutes(30),
-            mean: Some(1275.0),
+            mean: Some(225.0),
         },
         MeanBucket {
             bucket: now() - chrono::Duration::minutes(1),
-            mean: Some(1300.0),
+            mean: Some(200.0),
         },
     ];
     assert_eq!(rate(&series, now()), Some(0.0));
@@ -904,12 +912,16 @@ mod driven {
         assert!(cache.patches().is_empty());
     }
 
-    /// The storm total uses the **station's** base distance.
+    /// The storm total is the stored depth series, walked by the quick rule.
     ///
-    /// `calculate_storm_snowfall` carries `base_dist := 1798.0; -- TODO: Pass this as parameter
-    /// from application`, so under Go every station's storm total is computed against the
-    /// owner's own gauge height. At 1500 mm the same readings give a different depth series
-    /// entirely, and this asserts the station's number is used.
+    /// **What this test used to be about.** `calculate_storm_snowfall` carries
+    /// `base_dist := 1798.0; -- TODO: Pass this as parameter from application`, so under Go
+    /// every station's storm total was computed against the owner's own gauge height; this
+    /// asserted that the *station's* base distance was used instead. There is no base
+    /// distance in this path any more -- the gauge subtracts its own, in NVRAM -- so what is
+    /// left to assert is the walk itself over the depths the column holds, and the bucket
+    /// that used to prove the station's number was read now proves the bare-ground filter
+    /// still drops what it dropped.
     #[tokio::test]
     async fn the_storm_total_is_computed_from_the_stored_depth() {
         // Hourly buckets of **stored depth**, where this used to seed distances and subtract a
@@ -1289,6 +1301,32 @@ mod driven {
         assert_eq!(total, Some(10.0), "the measured total, untouched");
     }
 
+    /// **The boundary itself belongs to the season it opens.** `within` is `>=`, and the
+    /// instant that decides it is a season start computed in the station's own zone — so an
+    /// adjustment stamped at exactly local midnight on 1 October counts toward the season
+    /// beginning then and not the one ending. One second earlier it does not. Asserted
+    /// because the two sides of this comparison are a configuration write and a calendar
+    /// boundary, and nothing else in the file pins which way the equal case falls.
+    #[test]
+    fn the_season_boundary_instant_counts_toward_the_season_it_opens() {
+        let season = units::season_start(now(), denver()).expect("a real boundary");
+        let at = |set_at| SeasonAdjustment {
+            amount_mm: 50.0,
+            set_at,
+        };
+        assert_eq!(at(season).within(season), Some(50.0), "the boundary itself");
+        assert_eq!(
+            at(season + chrono::Duration::seconds(1)).within(season),
+            Some(50.0),
+            "after it"
+        );
+        assert_eq!(
+            at(season - chrono::Duration::seconds(1)).within(season),
+            None,
+            "one second before the season opened is the previous season"
+        );
+    }
+
     /// A gauge deployed late has **no measured series in this season at all** — which is
     /// exactly the case the correction exists for, so it must be the whole of the total
     /// rather than discarded beside a zero.
@@ -1335,10 +1373,14 @@ mod driven {
     async fn the_serving_threshold_applies_to_the_sum_and_not_to_each_half() {
         let cache = Arc::new(Cache::default());
         let season = units::season_start(now(), denver()).expect("a real boundary");
+        // **The discriminating case**, which the first version of this test did not have:
+        // two sub-threshold halves that sum ABOVE the threshold. At 0.02 + 0.02 both
+        // orders of operation answer zero, so that fixture could not tell the
+        // implementation from the bug it is named after.
         cache.seed(season, 2, 0.0);
-        cache.seed(season + chrono::Duration::days(1), 2, 0.02);
+        cache.seed(season + chrono::Duration::days(1), 2, 0.06);
         let tiny = SeasonAdjustment {
-            amount_mm: 0.02 * units::MM_PER_INCH,
+            amount_mm: 0.06 * units::MM_PER_INCH,
             set_at: season + chrono::Duration::days(2),
         };
         let total = season_total(
@@ -1346,6 +1388,27 @@ mod driven {
             &StationKey::new("snowgauge"),
             season,
             Some(tiny),
+        )
+        .await
+        .expect("a successful read");
+        // One sum, one threshold: 0.12 in rounds to 0.1. Thresholding each half first
+        // would zero both and answer 0.0.
+        assert_eq!(total, Some(0.1));
+
+        // And genuinely-negligible halves are still nothing, which is the other half of
+        // the property.
+        let cache = Arc::new(Cache::default());
+        cache.seed(season, 2, 0.0);
+        cache.seed(season + chrono::Duration::days(1), 2, 0.02);
+        let negligible = SeasonAdjustment {
+            amount_mm: 0.02 * units::MM_PER_INCH,
+            set_at: season + chrono::Duration::days(2),
+        };
+        let total = season_total(
+            &(Arc::clone(&cache) as Arc<dyn SnowCache>),
+            &StationKey::new("snowgauge"),
+            season,
+            Some(negligible),
         )
         .await
         .expect("a successful read");

@@ -242,6 +242,11 @@ mod tests {
             (4, Some(100.0)), // kept
             (5, None),        // no reading in the bucket -- dropped
             (6, Some(200.0)), // kept
+            // **A depth below zero**, which the device reports when its own NVRAM
+            // calibration is wrong and which is stored rather than discarded (owner
+            // decision, 2026-11-21). It is further from snow than bare ground is, so this
+            // filter is what keeps a mis-calibrated gauge out of the totals.
+            (7, Some(-271.0)), // dropped
         ];
         assert_eq!(depths(&series), vec![100.0, 200.0]);
     }

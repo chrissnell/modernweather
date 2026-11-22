@@ -332,6 +332,7 @@ test_names = [
     "every_occurrence_produces_a_reading_and_the_values_move",
     "a_calibrated_gauge_reports_a_depth_the_device_computed",
     "an_uncalibrated_gauge_reports_a_distance_and_no_depth",
+    "a_depth_the_device_reports_below_zero_is_stored_as_reported",
     "a_gauge_whose_sensor_stops_stores_nothing_further_and_then_fails_the_station",
     "a_gauge_with_no_sensor_stores_no_zero_distance",
     "a_gauge_that_reboots_keeps_reporting",

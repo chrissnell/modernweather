@@ -837,9 +837,17 @@ fn rate(minutes: &[MeanBucket], now: DateTime<Utc>) -> Option<f32> {
         .iter()
         .filter(|b| b.mean.is_some() && (b.bucket - target).abs() <= tolerance)
         .min_by_key(|b| (b.bucket - target).abs())?;
-    // Distances, so the subtraction is the other way round from a depth: the snow got
-    // deeper when the sensor's distance to it got shorter.
-    let fell_mm = past.mean? - current.mean?;
+    // **Depths**, so the newer sample less the older one. This read the distance series
+    // until `/snow` moved onto the stored depth column, and the subtraction was the other
+    // way round for it -- the snow got deeper as the sensor's distance to it shrank.
+    //
+    // It is the one consumer of this series that takes no base distance, so it was the one
+    // the conversion did not reach by following that parameter: it is handed the same
+    // `minutes` vector the depth and the liveness checks use. Getting it wrong inverted
+    // `snowfallrate` on a frozen endpoint -- fresh snow reported as zero, a settling pack
+    // reported as snowfall -- and the two fixtures below are seeded as depths so that they
+    // assert what their names say.
+    let fell_mm = current.mean? - past.mean?;
     if fell_mm <= 0.0 {
         return Some(0.0);
     }
@@ -857,7 +865,7 @@ fn rate(minutes: &[MeanBucket], now: DateTime<Utc>) -> Option<f32> {
 /// # The predicate is "did the gauge report", **not** "did the filter keep anything"
 ///
 /// `threshold::depths_from` drops a bucket for two unrelated reasons — no reading in it, and
-/// a distance within 2 mm of the base (bare ground, which migration 011 excludes so that a
+/// a depth within 2 mm of bare ground (bare ground, which migration 011 excludes so that a
 /// zero depth cannot re-base the walk). Treating an empty *filtered* series as "unknown"
 /// conflates them, and the conflation is not harmless on `snowtoday`: that window **resets
 /// at local midnight**, so a gauge that is reporting bare ground all day never produces a
