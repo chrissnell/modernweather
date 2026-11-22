@@ -876,7 +876,6 @@ impl mw_pipeline::snow::SnowConfig for Config {
             .filter(|r| r.kind == "snowgauge" && r.enabled && r.transport_kind.is_some())
             .map(|r| mw_pipeline::snow::SnowStation {
                 key: StationKey::new(r.station_key.as_str()),
-                base_distance_mm: r.snow_base_distance_mm,
                 zone: zones
                     .get(r.station_key.as_str())
                     .copied()
