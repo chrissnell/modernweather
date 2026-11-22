@@ -167,10 +167,12 @@ pub struct StationView {
     ///
     /// Inches and not millimetres, unlike the column behind it: this is the number an
     /// operator typed, and a storm report is in inches. The conversion happens once, at the
-    /// boundary, so the form shows back what was entered.
+    /// boundary, and is **rounded to two decimals** so that the form shows back the number
+    /// that was entered rather than the float it was stored as -- `12` and not
+    /// `11.999999999999998`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snow_season_adjustment_in: Option<f64>,
-    /// Which snow season the adjustment above is counting toward — `"2025–26"`.
+    /// Which snow season the adjustment above is counting toward — `"2025-26"`.
     ///
     /// **Shown because the operator never typed a date.** The amount is scoped to the
     /// season it was entered in (its migration has why), and that inference has exactly one

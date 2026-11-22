@@ -3178,7 +3178,8 @@
         "description": "One snow gauge's own account of itself.",
         "required": [
           "reachable",
-          "calibration"
+          "calibration",
+          "sensor_ok"
         ],
         "properties": {
           "base_distance_mm": {
@@ -3226,6 +3227,17 @@
             ],
             "format": "int32",
             "description": "Signal strength in dBm.\n\nAbsent rather than zero when the device could not look it up: the firmware's\n`sta_rssi()` yields `0` for that, which would read as a very strong signal."
+          },
+          "sensor_detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One line about the sensor, when it is not producing readings."
+          },
+          "sensor_ok": {
+            "type": "boolean",
+            "description": "Whether the **sensor** behind the gauge is producing readings.\n\nA gauge whose ultrasonic sensor has stopped keeps serving HTTP perfectly: it answers\n`/data` with `status: \"no_data\"`, a frozen `readings` count and `bytes_rx: 0`, and it\nstill reports what it is calibrated to. So `reachable` cannot carry this — a panel\nthat showed only reachability would render a dead sensor as a healthy device, which\nis precisely the state an operator opens this panel in."
           },
           "snow_depth_mm": {
             "type": [
@@ -4595,7 +4607,7 @@
               "null"
             ],
             "format": "double",
-            "description": "Snowfall to add to this gauge's season total, in **inches**.\n\nWhat the operator types, which is why it is inches: a storm report is in inches and\nso is the page. The binary converts to the column's millimetres and decides whether\nthe season stamp moves — it moves only when this amount *changes*, so editing a\nstation for any other reason cannot drag last winter's correction into this winter.\n\n`None` clears it, which clears the stamp with it: an amount and its season are\nstored both or neither."
+            "description": "Snowfall to add to this gauge's season total, in **inches**.\n\nWhat the operator types, which is why it is inches: a storm report is in inches and\nso is the page. The binary converts to the column's millimetres.\n\n**Three states, and the outer `Option` is the one that matters.** The amount is\nstamped with the instant it was entered, and that stamp is what scopes it to one\nseason — so the stamp has to move exactly when an operator enters an amount, and at\nno other time:\n\n* **absent** — not supplied. The stored amount and its season are left alone, which\n  is what every edit to an unrelated field must do; stamping on those would push\n  last winter's correction into this winter the next time somebody renamed the\n  station.\n* **`null`** — the operator emptied the box. The amount and the stamp both go.\n* **a number** — the operator entered this, now. It is stamped now, *including when\n  it is the same number as last time*: an operator who misses a storm of the same\n  size two winters running types the same amount, and that is an entry rather than\n  a no-op. Comparing against the stored value cannot tell those apart, which is why\n  this field is three-state and not two.\n\nThe form sends it only when the operator touched the box, which is the same\nconvention a credential field uses here (`of`'s module documentation in the binary)."
           },
           "timezone": {
             "type": [

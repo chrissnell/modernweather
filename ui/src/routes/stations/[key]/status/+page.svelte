@@ -175,6 +175,18 @@
           {#if device.snow_depth_mm !== undefined}
             <tr><td>{copy.status.device.depth}</td><td>{device.snow_depth_mm} mm</td></tr>
           {/if}
+          <!-- A gauge whose sensor has stopped answers every request perfectly, so
+               reachability alone would render it as healthy. -->
+          <tr>
+            <td>{copy.status.device.sensor}</td>
+            <td>
+              {#if device.sensor_ok}
+                {copy.status.device.sensorOk}
+              {:else}
+                <span class="err">{device.sensor_detail ?? 'Not reporting'}</span>
+              {/if}
+            </td>
+          </tr>
           <tr>
             <td>{copy.status.device.calibration}</td>
             <td>
@@ -198,7 +210,12 @@
         <p class="note">{copy.status.device.calibrateHint}</p>
       {/if}
     {/if}
-    <button type="button" onclick={() => void readDevice()} disabled={deviceLoading}>
+    <button
+      type="button"
+      class="btn btn-primary"
+      onclick={() => void readDevice()}
+      disabled={deviceLoading}
+    >
       {copy.status.device.reread}
     </button>
   </Box>

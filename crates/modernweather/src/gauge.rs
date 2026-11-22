@@ -104,13 +104,15 @@ impl GaugeProbe for Gauges {
                 Err(e) => return Ok(GaugeDeviceView::unreachable(DisplayChain(&e).to_string())),
             };
 
-            // Additive: a gauge that answered `/data` is reachable whatever these do.
-            let health = get(&endpoint, mw_codec::SNOW_HEALTH, HEALTH_TIMEOUT)
-                .await
-                .ok()
-                .and_then(|f| mw_codec::snow_health(&f).ok());
-            let calibration = get(&endpoint, mw_codec::SNOW_CALIBRATION, HEALTH_TIMEOUT)
-                .await
+            // Additive: a gauge that answered `/data` is reachable whatever these do. Both
+            // at once, because they are independent and an operator waiting on a management
+            // request should wait for the slower of the two rather than their sum.
+            let (health, calibration) = tokio::join!(
+                get(&endpoint, mw_codec::SNOW_HEALTH, HEALTH_TIMEOUT),
+                get(&endpoint, mw_codec::SNOW_CALIBRATION, HEALTH_TIMEOUT),
+            );
+            let health = health.ok().and_then(|f| mw_codec::snow_health(&f).ok());
+            let calibration = calibration
                 .ok()
                 .and_then(|f| mw_codec::snow_calibration(&f).ok());
 
@@ -178,7 +180,11 @@ fn view_of(
     };
     GaugeDeviceView {
         reachable: true,
-        base_distance_mm: data.base_distance,
+        // **The same `> 0` test `is_calibrated` applies**, and applied here for the same
+        // reason: the firmware's NVS read can yield `0` for "unset", and publishing that
+        // raw would render "calibrated distance to the ground: 0 mm" beside "this gauge has
+        // never been calibrated" -- the panel contradicting itself in two adjacent lines.
+        base_distance_mm: data.base_distance.filter(|mm| *mm > 0),
         snow_depth_mm: data.snow_depth,
         calibration: state.to_string(),
         calibration_detail: detail,
@@ -190,8 +196,44 @@ fn view_of(
             .rssi
             .or_else(|| health.and_then(|h| h.rssi))
             .filter(|dbm| *dbm != 0),
+        sensor_ok: data.is_ok(),
+        sensor_detail: sensor_detail(data, health),
         unreachable_because: None,
     }
+}
+
+/// Why the gauge is not producing readings, when it is not.
+///
+/// `status` is the firmware's own verdict and `readings`/`bytes_rx` are the evidence behind
+/// it: a sensor that never spoke has both at zero, and one whose UART died mid-run has a
+/// non-zero `readings` that has stopped moving. The second cannot be told from one response
+/// -- that is what the driver's own liveness state is for -- so this says what this response
+/// shows and no more.
+fn sensor_detail(
+    data: &mw_codec::SnowData,
+    health: Option<&mw_codec::SnowHealth>,
+) -> Option<String> {
+    if data.is_ok() {
+        return None;
+    }
+    let bytes = health.and_then(|h| h.bytes_rx);
+    Some(match (data.readings, bytes) {
+        (0, Some(0) | None) => format!(
+            "the gauge reports `{}` and has parsed no sensor frames since booting -- \
+             check the sensor's wiring",
+            data.status
+        ),
+        (0, Some(rx)) => format!(
+            "the gauge reports `{}`: {rx} bytes arrived from the sensor but no frame \
+             parsed from them",
+            data.status
+        ),
+        (n, _) => format!(
+            "the gauge reports `{}` after {n} sensor frames: the sensor stopped rather \
+             than never started",
+            data.status
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -283,6 +325,101 @@ mod tests {
             .contains("never been calibrated"));
     }
 
+    /// **The NVS "unset" sentinel.** `base_distance: 0` is what the firmware's NVS read can
+    /// yield for a gauge that has never been calibrated, and it is the same `> 0` test
+    /// `is_calibrated` applies — so the panel must not publish it as a calibration. Without
+    /// the filter the two lines beside each other read "calibrated distance to the ground:
+    /// 0 mm" and "this gauge has never been calibrated".
+    #[test]
+    fn a_zero_base_distance_is_absent_rather_than_a_calibration() {
+        let view = view_of(
+            &data(
+                r#"{"distance":1771,"status":"ok","readings":1288,"trim_mean":1771.0,
+                    "base_distance":0,"snow_depth":null,"rssi":-63,"uptime_ms":1}"#,
+            ),
+            None,
+            Some(&mw_codec::SnowCalibration::Idle),
+        );
+        assert_eq!(view.base_distance_mm, None, "not `Some(0)`");
+        assert_eq!(view.calibration, "idle");
+        assert!(
+            view.calibration_detail
+                .as_deref()
+                .expect("a sentence")
+                .contains("never been calibrated"),
+            "and the two agree"
+        );
+    }
+
+    /// **A dead sensor behind a healthy web server**, which is the state the panel is most
+    /// often opened in and the one `reachable` cannot express. The gauge answers every
+    /// request, reports what it is calibrated to, and is measuring nothing.
+    #[test]
+    fn a_gauge_whose_sensor_is_dead_is_reachable_and_not_ok() {
+        let view = view_of(
+            &data(
+                r#"{"distance":0,"status":"no_data","readings":0,"trim_mean":null,
+                    "base_distance":1771,"snow_depth":null,"rssi":-63,"uptime_ms":90000}"#,
+            ),
+            Some(
+                &mw_codec::snow_health(&mw_codec::Frame::new(
+                    br#"{"wifi":"connected","ip":"10.50.0.138","rssi":-63,
+                         "hostname":"snowgauge-de18","bytes_rx":0,"heap_free":162428,
+                         "fw_version":"0.1.0","fw_slot":"ota_0"}"#
+                        .to_vec(),
+                ))
+                .expect("decodes"),
+            ),
+            None,
+        );
+        assert!(view.reachable, "it answered everything");
+        assert!(!view.sensor_ok, "and measured nothing");
+        assert_eq!(
+            view.base_distance_mm,
+            Some(1771),
+            "which is the number the operator came for"
+        );
+        let detail = view.sensor_detail.expect("a sentence about the sensor");
+        assert!(detail.contains("no_data"), "{detail}");
+        assert!(detail.contains("wiring"), "{detail}");
+    }
+
+    /// A sensor that spoke and **then** stopped: `readings` is not zero, so the sentence
+    /// says so rather than sending the operator to check wiring that worked this morning.
+    #[test]
+    fn a_sensor_that_stopped_is_distinguished_from_one_that_never_started() {
+        let view = view_of(
+            &data(
+                r#"{"distance":1771,"status":"no_data","readings":412,"trim_mean":1771.0,
+                    "base_distance":1771,"snow_depth":0,"rssi":-63,"uptime_ms":900000}"#,
+            ),
+            None,
+            None,
+        );
+        assert!(!view.sensor_ok);
+        let detail = view.sensor_detail.expect("a sentence");
+        assert!(detail.contains("412"), "{detail}");
+        assert!(
+            detail.contains("stopped rather than never started"),
+            "{detail}"
+        );
+    }
+
+    /// A working sensor has nothing to explain.
+    #[test]
+    fn a_working_sensor_carries_no_apology() {
+        let view = view_of(
+            &data(
+                r#"{"distance":1771,"status":"ok","readings":1288,"trim_mean":1771.0,
+                    "base_distance":1771,"snow_depth":0,"rssi":-63,"uptime_ms":1}"#,
+            ),
+            None,
+            None,
+        );
+        assert!(view.sensor_ok);
+        assert_eq!(view.sensor_detail, None);
+    }
+
     /// **The firmware's RSSI sentinel.** `0` means the access-point lookup failed, so
     /// rendering it would show a dead gauge as the strongest possible signal.
     #[test]
@@ -353,5 +490,124 @@ mod tests {
             .as_deref()
             .expect("a sentence")
             .contains("did not answer"));
+    }
+
+    // -----------------------------------------------------------------------------------
+    // `Gauges::read`'s four station branches, which decide 404 against 200 before any
+    // socket is opened. The rule they encode: **"not a gauge I can address" is a 404 and
+    // "a gauge that is not answering" is a 200**, because only one of the two is a question
+    // this route cannot answer.
+
+    /// A configuration store with one `stations` row, holding only the two columns the
+    /// probe reads. In memory, so this is a unit test with a database in it rather than a
+    /// fixture.
+    async fn store(kind: &str, url: Option<&str>) -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("an in-memory database");
+        sqlx::query("CREATE TABLE stations (station_key TEXT, type TEXT, transport_url TEXT)")
+            .execute(&pool)
+            .await
+            .expect("the table is creatable");
+        sqlx::query("INSERT INTO stations (station_key, type, transport_url) VALUES (?, ?, ?)")
+            .bind("snowgauge")
+            .bind(kind)
+            .bind(url)
+            .execute(&pool)
+            .await
+            .expect("the row is insertable");
+        pool
+    }
+
+    #[tokio::test]
+    async fn a_station_that_is_not_a_gauge_is_a_404() {
+        let probe = Gauges::new(store("davis", Some("http://10.50.0.138")).await);
+        let e = probe.read("snowgauge").await.expect_err("not a gauge");
+        assert!(
+            matches!(e, ApiError::NotFound { what, .. } if what == "a snow gauge"),
+            "{e:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_station_that_does_not_exist_is_a_404() {
+        let probe = Gauges::new(store("snowgauge", Some("http://10.50.0.138")).await);
+        let e = probe
+            .read("nothing-here")
+            .await
+            .expect_err("no such station");
+        assert!(
+            matches!(e, ApiError::NotFound { what, .. } if what == "a snow gauge"),
+            "{e:?}"
+        );
+    }
+
+    /// A gauge with no address: configured, not yet told where it is. The 404 names the
+    /// address rather than the gauge, because the station does exist.
+    #[tokio::test]
+    async fn a_gauge_with_no_address_is_a_404_that_says_which_half_is_missing() {
+        for url in [None, Some(""), Some("   ")] {
+            let probe = Gauges::new(store("snowgauge", url).await);
+            let e = probe.read("snowgauge").await.expect_err("no address");
+            assert!(
+                matches!(e, ApiError::NotFound { what, .. } if what.contains("an address")),
+                "{url:?}: {e:?}"
+            );
+        }
+    }
+
+    /// An address this build cannot turn into a request at all. `Endpoint::parse` refuses
+    /// userinfo (a credential it must not quote back), a path (the paths here are fixed
+    /// constants) and text with no scheme — and none of those is a gauge being off, so none
+    /// of them is a `200`.
+    #[tokio::test]
+    async fn an_address_that_cannot_be_parsed_is_a_404() {
+        for url in [
+            "http://user:pass@snowgauge.local",
+            "http://snowgauge.local/data",
+            "not a url at all",
+        ] {
+            let probe = Gauges::new(store("snowgauge", Some(url)).await);
+            let e = probe.read("snowgauge").await.expect_err("unparseable");
+            assert!(
+                matches!(e, ApiError::NotFound { what, .. } if what.contains("this build can read")),
+                "{url}: {e:?}"
+            );
+        }
+    }
+
+    /// **An `https://` address parses and then fails at the request**, so it is a `200`
+    /// whose reason names TLS. That is the useful answer: the operator has a configuration
+    /// mistake, and the panel is where they will read about it, whereas a `404` would say
+    /// only that there is no gauge here.
+    #[tokio::test]
+    async fn an_https_address_is_reported_on_the_panel_rather_than_as_a_404() {
+        let probe = Gauges::new(store("snowgauge", Some("https://snowgauge.local")).await);
+        let view = probe.read("snowgauge").await.expect("an answer");
+        assert!(!view.reachable);
+        let why = view.unreachable_because.expect("a sentence");
+        assert!(why.contains("HTTPS"), "{why}");
+    }
+
+    /// **The case that is a `200`.** A real address with nothing behind it: the station is
+    /// a gauge, this build can address it, and it is not answering. That is the panel's
+    /// "unreachable" state and not an error, so a station whose sensor is unplugged does
+    /// not render as a broken daemon.
+    #[tokio::test]
+    async fn a_gauge_that_is_not_answering_is_a_200() {
+        // Port 1 on the loopback: a connection refused rather than a timeout, so the test
+        // does not wait out `REQUEST_TIMEOUT`.
+        let probe = Gauges::new(store("snowgauge", Some("http://127.0.0.1:1")).await);
+        let view = probe
+            .read("snowgauge")
+            .await
+            .expect("an answer, not an error");
+        assert!(!view.reachable);
+        assert!(!view.sensor_ok);
+        assert_eq!(view.base_distance_mm, None);
+        assert!(
+            view.unreachable_because.is_some(),
+            "and it says why: {view:?}"
+        );
     }
 }

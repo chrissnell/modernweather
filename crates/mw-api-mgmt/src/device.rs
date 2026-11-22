@@ -20,6 +20,19 @@
 //! second poller for a number that changes when somebody presses a button would be spending
 //! that budget on nothing. Nothing here is stored: a calibration an operator can read off
 //! the device is not a measurement, and `metrics/registry.toml` describes no metric for it.
+//!
+//! # Why a route that fetches a configured address is not a hole
+//!
+//! Stated once so that the next reader does not have to derive it. This is an outbound
+//! request to an address the request body does not choose: the target is the station's own
+//! `transport_url`, which the collection path already polls every five seconds, and the
+//! paths are the three constants in `mw_codec`. It is behind the admin session guard, and an
+//! operator who can reach it can already set `transport_url` to anything -- so the route adds
+//! no reach that the configuration page does not already have. `mw_station::http` is what
+//! bounds the rest: no redirects followed, a 1 MiB body ceiling, the status checked before
+//! the body is read, TLS refused, and `Endpoint::parse` refusing userinfo, a path and
+//! anything it cannot resolve. The residue is that an admin can use the panel to learn
+//! whether a port on the LAN answers, which is true of the configuration page too.
 
 use mw_component::BoxFuture;
 
@@ -61,6 +74,17 @@ pub struct GaugeDeviceView {
     /// `sta_rssi()` yields `0` for that, which would read as a very strong signal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rssi_dbm: Option<i32>,
+    /// Whether the **sensor** behind the gauge is producing readings.
+    ///
+    /// A gauge whose ultrasonic sensor has stopped keeps serving HTTP perfectly: it answers
+    /// `/data` with `status: "no_data"`, a frozen `readings` count and `bytes_rx: 0`, and it
+    /// still reports what it is calibrated to. So `reachable` cannot carry this — a panel
+    /// that showed only reachability would render a dead sensor as a healthy device, which
+    /// is precisely the state an operator opens this panel in.
+    pub sensor_ok: bool,
+    /// One line about the sensor, when it is not producing readings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensor_detail: Option<String>,
     /// Why the device could not be read, when it could not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unreachable_because: Option<String>,
@@ -83,6 +107,11 @@ impl GaugeDeviceView {
             firmware_version: None,
             firmware_slot: None,
             rssi_dbm: None,
+            // A device that did not answer is not delivering readings either, so `false` is
+            // true as far as anything can tell. The panel reads `reachable` first and says
+            // the gauge is unreachable, so this does not become a second claim about why.
+            sensor_ok: false,
+            sensor_detail: None,
             unreachable_because: Some(because.into()),
         }
     }

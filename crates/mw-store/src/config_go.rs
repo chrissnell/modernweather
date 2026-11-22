@@ -72,7 +72,8 @@ use std::fmt::Write as _;
 use sqlx::{Row, SqliteConnection};
 
 use crate::config_admin::{
-    self, AerisWrite, Change, ListenerWrite, Pairing, ServiceWrite, StationWrite, WebsiteWrite,
+    self, AerisWrite, Change, ListenerWrite, Pairing, SeasonAdjustmentWrite, ServiceWrite,
+    StationWrite, WebsiteWrite,
 };
 
 /// The RF beacon floor, in seconds: **O-8**, answered 600 s by the owner.
@@ -2405,9 +2406,10 @@ pub fn translate(
             // configured" -- so a zero is an absent base distance rather than a gauge
             // mounted on the ground.
             snow_base_distance_mm: d.base_snow_distance.filter(|v| *v > 0.0),
-            // The Go daemon had no such setting, so a migrated station starts with none.
-            snow_season_adjustment_mm: None,
-            snow_season_adjustment_set_at: None,
+            // The Go daemon had no such setting, so a migrated station starts with none --
+            // `Keep` rather than `Clear`, because an import re-run over a database an
+            // operator has already corrected a season total in should not undo that.
+            season_adjustment: SeasonAdjustmentWrite::Keep,
             transport_kind: Some(w.kind.to_string()),
             transport_dev: w.dev,
             transport_baud: w.baud,

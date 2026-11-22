@@ -34,6 +34,20 @@
 
 use crate::error::FieldError;
 
+/// Deserialize a nullable field so that **absent** and **`null`** stay distinguishable.
+///
+/// `#[serde(default)]` on an `Option<Option<T>>` gives `None` for an absent field, and this
+/// gives `Some(None)` for an explicit `null` — which is the difference between "I am not
+/// talking about this field" and "clear it". Serde has no attribute for it because the outer
+/// `Option` is the one it would otherwise collapse.
+fn supplied<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
+}
+
 /// Every `transport_kind` the schema admits, and the fields each one requires.
 ///
 /// The list is the column's own `CHECK`. Duplicated here on purpose and only for the
@@ -164,14 +178,28 @@ pub struct StationInput {
     /// Snowfall to add to this gauge's season total, in **inches**.
     ///
     /// What the operator types, which is why it is inches: a storm report is in inches and
-    /// so is the page. The binary converts to the column's millimetres and decides whether
-    /// the season stamp moves — it moves only when this amount *changes*, so editing a
-    /// station for any other reason cannot drag last winter's correction into this winter.
+    /// so is the page. The binary converts to the column's millimetres.
     ///
-    /// `None` clears it, which clears the stamp with it: an amount and its season are
-    /// stored both or neither.
-    #[serde(default)]
-    pub snow_season_adjustment_in: Option<f64>,
+    /// **Three states, and the outer `Option` is the one that matters.** The amount is
+    /// stamped with the instant it was entered, and that stamp is what scopes it to one
+    /// season — so the stamp has to move exactly when an operator enters an amount, and at
+    /// no other time:
+    ///
+    /// * **absent** — not supplied. The stored amount and its season are left alone, which
+    ///   is what every edit to an unrelated field must do; stamping on those would push
+    ///   last winter's correction into this winter the next time somebody renamed the
+    ///   station.
+    /// * **`null`** — the operator emptied the box. The amount and the stamp both go.
+    /// * **a number** — the operator entered this, now. It is stamped now, *including when
+    ///   it is the same number as last time*: an operator who misses a storm of the same
+    ///   size two winters running types the same amount, and that is an entry rather than
+    ///   a no-op. Comparing against the stored value cannot tell those apart, which is why
+    ///   this field is three-state and not two.
+    ///
+    /// The form sends it only when the operator touched the box, which is the same
+    /// convention a credential field uses here (`of`'s module documentation in the binary).
+    #[serde(default, deserialize_with = "supplied")]
+    pub snow_season_adjustment_in: Option<Option<f64>>,
     /// How it is connected.
     #[serde(default)]
     pub transport: TransportInput,
@@ -644,13 +672,19 @@ impl StationInput {
                 ));
             }
         }
-        if let Some(inches) = self.snow_season_adjustment_in {
+        if let Some(Some(inches)) = self.snow_season_adjustment_in {
             // `> 0` matches the column's own `CHECK`, and the reason is the meaning: this
             // is snow that **fell** and was not measured. A zero is an adjustment that
             // does nothing, which is what clearing the field is for, and the season total
             // is floored at zero anyway -- so a negative here is a value the arithmetic
             // above would discard without saying so.
-            if !inches.is_finite() || inches <= 0.0 {
+            //
+            // The upper bound is the one every other numeric field here has: Mount Baker's
+            // 1990-91 season, the snowiest ever recorded anywhere, was 1140 inches, so a
+            // four-figure correction is a decimal point in the wrong place rather than a
+            // missed storm. Refusing it on the field beats storing a season total nobody
+            // can explain.
+            if !inches.is_finite() || inches <= 0.0 || inches > 1200.0 {
                 v.push(FieldError::new(
                     "snow_season_adjustment_in",
                     "Enter how much unmeasured snow to add, in inches, or leave it empty.",

@@ -49,8 +49,8 @@ pub mod writer;
 
 pub use crate::admin_auth::{AuthStoreError, Claimed, Credential, NewAccount, SessionRow};
 pub use crate::config_admin::{
-    restore, snapshot, AerisWrite, Change, ConfigAdminError, ListenerWrite, Pairing, ServiceWrite,
-    StationWrite, WebsiteWrite,
+    restore, snapshot, AerisWrite, Change, ConfigAdminError, ListenerWrite, Pairing,
+    SeasonAdjustmentWrite, ServiceWrite, StationWrite, WebsiteWrite,
 };
 pub use crate::coverage::{Configured, CoverageProblem, Recorded};
 pub use crate::frozen::FrozenReads;

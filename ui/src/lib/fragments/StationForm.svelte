@@ -76,16 +76,19 @@
   let snowBase = $state(seed?.snow_base_distance_mm?.toString() ?? '');
   // Inches, which is what the operator typed and what the view hands back.
   let snowAdjustment = $state(seed?.snow_season_adjustment_in?.toString() ?? '');
+  // Whether the operator has typed in the box this visit -- see `build`.
+  let snowAdjustmentTouched = $state(false);
   // **Which season the stored amount is counting toward**, from the server, because the
   // operator never typed a date and the scoping would otherwise be invisible. `ended` is
   // an amount whose season has rolled over: it counts toward nothing now, which is the cue
   // to clear it or enter it again.
   const storedSeason = seed?.snow_season_adjustment_season;
   const seasonNote =
-    storedSeason === undefined
+    storedSeason === undefined || storedSeason === null
       ? 'inches'
       : storedSeason === 'ended'
-        ? 'inches \u2014 the season this was entered for has ended, so it is no longer counted'
+        ? 'inches \u2014 the season this was entered for has ended, so it is no longer' +
+          ' counted. Retype the amount to count it toward this season, or clear the box.'
         : `inches \u2014 counting toward the ${storedSeason} season`;
   let pollInterval = $state(seed?.poll_interval_seconds?.toString() ?? '');
   let callsign = $state(seed?.aprs_callsign ?? '');
@@ -146,6 +149,17 @@
 
   function build(): Schemas['StationInput'] {
     return {
+      // **Sent only when the operator touched the box.** The amount is stamped with the
+      // instant it was entered and that stamp is what scopes it to one season, so an
+      // omitted field means "leave the amount and its season alone" -- which is what every
+      // edit to another field on this form has to do -- and a sent one means "entered now",
+      // including when it is the same number as last time. The server cannot tell those
+      // apart from the value, so the form has to say which it is.
+      ...(shape.snow
+        ? snowAdjustmentTouched
+          ? { snow_season_adjustment_in: num(snowAdjustment) }
+          : {}
+        : { snow_season_adjustment_in: null }),
       name,
       kind,
       identity_kind: station?.identity_kind ?? (shape.presentsIdentity ? 'from_query' : 'fixed'),
@@ -157,10 +171,6 @@
       timezone: timezone || null,
       wind_dir_correction_degrees: shape.wind ? (num(windCorrection) ?? 0) : 0,
       snow_base_distance_mm: shape.snow ? num(snowBase) : null,
-      // The server decides whether the season stamp moves, and it moves only when this
-      // amount changes -- so re-saving this form for any other reason cannot drag last
-      // winter's correction into this winter.
-      snow_season_adjustment_in: shape.snow ? num(snowAdjustment) : null,
       poll_interval_seconds: shape.polled ? num(pollInterval) : null,
       aprs_callsign: callsign || null,
       sensor_mapping: shape.sensorMapping ? sensorMapping || null : null,
@@ -572,8 +582,13 @@
               <Input
                 {id}
                 type="number"
+                min="0"
+                step="0.1"
                 value={snowAdjustment}
-                oninput={(e) => (snowAdjustment = (e.currentTarget as HTMLInputElement).value)}
+                oninput={(e) => {
+                  snowAdjustment = (e.currentTarget as HTMLInputElement).value;
+                  snowAdjustmentTouched = true;
+                }}
                 aria-describedby={describedBy}
               />
             {/snippet}
