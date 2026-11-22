@@ -199,6 +199,11 @@ export const stations = {
       hint: 'Millimetres from your snow sensor down to bare ground.',
       more: 'Measure it when there is no snow under the sensor. Snow depth is this distance minus whatever the sensor currently reads, so a wrong base makes every depth wrong by the same amount.'
     }),
+    snowSeasonAdjustment: field({
+      label: 'Snow missed by the sensor',
+      hint: 'Inches to add to this season\u2019s total.',
+      more: 'For snow that fell before the sensor was measuring \u2014 a storm you missed because the gauge was not up yet. It is added to the season total only, never to today or the last 24 hours, and never to the current depth, which the sensor measures for itself. It counts toward the season you enter it in and stops when that season ends on 1 October.'
+    }),
     aprsCallsign: field({
       label: 'Callsign',
       hint: 'The amateur-radio callsign this station reports under, if it has one.'

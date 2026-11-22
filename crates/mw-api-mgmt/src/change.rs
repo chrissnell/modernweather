@@ -161,6 +161,17 @@ pub struct StationInput {
     /// The distance a snow gauge reads with no snow under it, in millimetres.
     #[serde(default)]
     pub snow_base_distance_mm: Option<f64>,
+    /// Snowfall to add to this gauge's season total, in **inches**.
+    ///
+    /// What the operator types, which is why it is inches: a storm report is in inches and
+    /// so is the page. The binary converts to the column's millimetres and decides whether
+    /// the season stamp moves — it moves only when this amount *changes*, so editing a
+    /// station for any other reason cannot drag last winter's correction into this winter.
+    ///
+    /// `None` clears it, which clears the stamp with it: an amount and its season are
+    /// stored both or neither.
+    #[serde(default)]
+    pub snow_season_adjustment_in: Option<f64>,
     /// How it is connected.
     #[serde(default)]
     pub transport: TransportInput,
@@ -630,6 +641,19 @@ impl StationInput {
                 v.push(FieldError::new(
                     "snow_base_distance_mm",
                     "Enter how far the sensor is above bare ground, in millimetres.",
+                ));
+            }
+        }
+        if let Some(inches) = self.snow_season_adjustment_in {
+            // `> 0` matches the column's own `CHECK`, and the reason is the meaning: this
+            // is snow that **fell** and was not measured. A zero is an adjustment that
+            // does nothing, which is what clearing the field is for, and the season total
+            // is floored at zero anyway -- so a negative here is a value the arithmetic
+            // above would discard without saying so.
+            if !inches.is_finite() || inches <= 0.0 {
+                v.push(FieldError::new(
+                    "snow_season_adjustment_in",
+                    "Enter how much unmeasured snow to add, in inches, or leave it empty.",
                 ));
             }
         }

@@ -4465,6 +4465,14 @@
             "format": "double",
             "description": "The distance a snow gauge reads with no snow under it, in millimetres."
           },
+          "snow_season_adjustment_in": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Snowfall to add to this gauge's season total, in **inches**.\n\nWhat the operator types, which is why it is inches: a storm report is in inches and\nso is the page. The binary converts to the column's millimetres and decides whether\nthe season stamp moves — it moves only when this amount *changes*, so editing a\nstation for any other reason cannot drag last winter's correction into this winter.\n\n`None` clears it, which clears the stamp with it: an amount and its season are\nstored both or neither."
+          },
           "timezone": {
             "type": [
               "string",
@@ -4600,6 +4608,21 @@
             ],
             "format": "double",
             "description": "The distance a snow gauge reads with no snow under it, in millimetres."
+          },
+          "snow_season_adjustment_in": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Snowfall added to this gauge's season total by hand, in **inches**.\n\nInches and not millimetres, unlike the column behind it: this is the number an\noperator typed, and a storm report is in inches. The conversion happens once, at the\nboundary, so the form shows back what was entered."
+          },
+          "snow_season_adjustment_season": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which snow season the adjustment above is counting toward — `\"2025–26\"`.\n\n**Shown because the operator never typed a date.** The amount is scoped to the\nseason it was entered in (its migration has why), and that inference has exactly one\ncase it gets wrong: an amount entered in early October for a storm from the previous\nwinter lands on the new season. Printing the season is what makes that visible and\ncorrectable instead of a silent surprise.\n\n`None` when there is no adjustment, and `\"ended\"` for one whose season has rolled\nover — which is no longer counting toward anything and is the operator's cue to\nclear or re-enter it."
           },
           "timezone": {
             "type": [

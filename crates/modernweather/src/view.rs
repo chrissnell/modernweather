@@ -17,6 +17,7 @@
 //! means "keep the stored one", never "clear it". That is why no `PUT` can erase a secret and
 //! why clearing one is an action of its own.
 
+use chrono::{Datelike as _, Utc};
 use std::collections::{BTreeMap, BTreeSet};
 
 use mw_api_mgmt::change::{Change as ApiChange, ServiceInput, StationInput};
@@ -133,6 +134,14 @@ pub fn of(cfg: &Config, generation: u64) -> ConfigView {
                 aprs_callsign: r.aprs_callsign.clone(),
                 wind_dir_correction_degrees: r.wind_dir_correction_degrees,
                 snow_base_distance_mm: r.snow_base_distance_mm,
+                snow_season_adjustment_in: r
+                    .snow_season_adjustment_mm
+                    .map(|mm| mm / mw_pipeline::snow::units::MM_PER_INCH),
+                snow_season_adjustment_season: season_adjustment_label(
+                    r.snow_season_adjustment_mm,
+                    r.snow_season_adjustment_set_at,
+                    r.timezone.as_deref(),
+                ),
                 transport: TransportView {
                     kind: r.transport_kind.clone(),
                     device: r.transport_dev.clone(),
@@ -388,6 +397,80 @@ fn blank_to_none(value: &Option<String>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Which snow season an adjustment is counting toward, for the operator to read.
+///
+/// **This exists because the operator never typed a date.** The amount is scoped to the
+/// season it was entered in, and that inference has one case it gets wrong: an amount
+/// entered in early October for a storm from the previous winter lands on the new season.
+/// Printing the season makes that visible and correctable rather than a silent surprise in
+/// a total.
+///
+/// `"ended"` for an adjustment whose season has rolled over. It is no longer counting
+/// toward anything — which is the whole point of scoping it — and the operator's cue to
+/// clear it or enter it again.
+///
+/// The season boundary is computed in the **station's** zone, which is D-24's rule that
+/// every calendar quantity is the station's. A station with no usable zone gets no label
+/// rather than a wrong one: such a station has no snow components planned either
+/// (`mw_pipeline::snow::register` refuses it by name), so there is no total for the
+/// adjustment to be counting toward in the first place.
+fn season_adjustment_label(
+    amount_mm: Option<f64>,
+    set_at: Option<i64>,
+    timezone: Option<&str>,
+) -> Option<String> {
+    let (_, set_at) = amount_mm.zip(set_at)?;
+    let set_at = chrono::DateTime::from_timestamp_secs(set_at)?;
+    let zone = mw_component::Zone::new(timezone?).ok()?;
+    let entered_in = mw_pipeline::snow::units::season_start(set_at, zone)?;
+    let current = mw_pipeline::snow::units::season_start(Utc::now(), zone)?;
+    if entered_in != current {
+        return Some("ended".to_string());
+    }
+    // `2025-26`, from the October the season began in.
+    let year = entered_in.with_timezone(&chrono::Utc).year();
+    Some(format!("{year}-{:02}", (year + 1) % 100))
+}
+
+/// The two season-adjustment columns a save writes: the amount, and the season stamp.
+///
+/// **The stamp moves only when the amount changes**, which is the rule the owner signed off
+/// on 2026-11-22, and the alternative is a bug with a year's fuse on it: stamping on every
+/// save would push last winter's correction into this winter the next time somebody renamed
+/// the station or moved its coordinates. Nothing in the form says "this is still last
+/// year's number", so the server has to notice that for itself.
+///
+/// `entered` is inches, because that is what an operator types; the column is millimetres.
+/// The comparison is in millimetres with a hundredth-of-a-millimetre tolerance, which is
+/// four orders of magnitude below anything an operator can mean and comfortably above the
+/// float noise of an inches round trip — so re-saving an untouched form is not a change.
+///
+/// Both columns or neither, which `mw_store::StationWrite::season_adjustment` enforces on
+/// the way to SQLite and this agrees with: clearing the field clears the season with it,
+/// because an amount with no season has nothing to belong to.
+fn season_adjustment_write(
+    entered: Option<f64>,
+    stored: (Option<f64>, Option<i64>),
+    now: i64,
+) -> (Option<f64>, Option<i64>) {
+    /// Below this, two amounts are the same amount.
+    const SAME_MM: f64 = 0.01;
+
+    let Some(inches) = entered.filter(|v| v.is_finite() && *v > 0.0) else {
+        // Cleared, or never set. The season goes with it.
+        return (None, None);
+    };
+    let mm = inches * mw_pipeline::snow::units::MM_PER_INCH;
+    match stored {
+        // Unchanged: keep the season it was entered for. This is the case that happens on
+        // every unrelated edit, and the one the rule exists for.
+        (Some(before), Some(at)) if (before - mm).abs() < SAME_MM => (Some(mm), Some(at)),
+        // Changed, or new, or recovering from a half-written pair: this is the operator
+        // entering a number now, so it counts toward the season they are in now.
+        _ => (Some(mm), Some(now)),
+    }
+}
+
 async fn station_write(
     key: String,
     station: &StationInput,
@@ -438,10 +521,9 @@ async fn station_write(
         }
     };
 
-    // What is already stored for the two season-adjustment columns, so that an edit which
-    // does not mention them leaves them alone. `(None, None)` for a station being created,
-    // and for one whose row cannot be read -- the write that follows would fail on its own
-    // terms in that case, and guessing here would not help it.
+    // What is already stored for the two season-adjustment columns. `(None, None)` for a
+    // station being created, and for one whose row cannot be read -- the write that follows
+    // would fail on its own terms in that case, and guessing here would not help it.
     let stored_adjustment: (Option<f64>, Option<i64>) = sqlx::query_as(
         "SELECT snow_season_adjustment_mm, snow_season_adjustment_set_at \
          FROM stations WHERE station_key = ?",
@@ -452,6 +534,11 @@ async fn station_write(
     .ok()
     .flatten()
     .unwrap_or((None, None));
+    let season_adjustment = season_adjustment_write(
+        station.snow_season_adjustment_in,
+        stored_adjustment,
+        Utc::now().timestamp(),
+    );
 
     Ok(mw_store::StationWrite {
         station_key: key,
@@ -470,18 +557,8 @@ async fn station_write(
         aprs_callsign: blank_to_none(&station.aprs_callsign),
         wind_dir_correction_degrees: station.wind_dir_correction_degrees,
         snow_base_distance_mm: station.snow_base_distance_mm,
-        // **Carried through, not rewritten.** `StationInput` has no field for the season
-        // adjustment yet, and `StationWrite` is every mutable column — so building this
-        // from nothing would silently clear an operator's missed-storm correction on any
-        // unrelated edit to the station, which is the worst outcome available for a
-        // setting whose whole job is to be remembered.
-        //
-        // Re-stamping `set_at` here would be just as wrong in the other direction: it
-        // would push last season's correction into this one the next time somebody renamed
-        // the station. So both columns are read back and written unchanged, and the
-        // stamping rule belongs with the input field when it lands.
-        snow_season_adjustment_mm: stored_adjustment.0,
-        snow_season_adjustment_set_at: stored_adjustment.1,
+        snow_season_adjustment_mm: season_adjustment.0,
+        snow_season_adjustment_set_at: season_adjustment.1,
         transport_kind: blank_to_none(&station.transport.kind),
         transport_dev: blank_to_none(&station.transport.device),
         transport_baud: station.transport.baud,
@@ -556,6 +633,120 @@ fn service_write(service: &str, s: &ServiceInput) -> mw_store::ServiceWrite {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The rule the owner signed off on 2026-11-22**: the season stamp moves only when
+    /// the amount changes.
+    ///
+    /// The case this protects is a year out: without it, renaming the station next
+    /// November would re-stamp last winter's correction into this winter, and nothing on
+    /// the form would have said so.
+    #[test]
+    fn the_season_stamp_moves_only_when_the_amount_changes() {
+        const DEC_2025: i64 = 1_765_000_000;
+        const NOV_2026: i64 = 1_795_000_000;
+        let twelve_in_mm = 12.0 * mw_pipeline::snow::units::MM_PER_INCH;
+
+        // An unrelated edit: the same twelve inches, saved again a year later. The amount
+        // is kept and so is the season it was entered for.
+        let (mm, at) = super::season_adjustment_write(
+            Some(12.0),
+            (Some(twelve_in_mm), Some(DEC_2025)),
+            NOV_2026,
+        );
+        assert_eq!(at, Some(DEC_2025), "last winter's season, untouched");
+        assert_eq!(mm, Some(twelve_in_mm));
+
+        // A real change: the operator corrects twelve to eighteen. That is them entering a
+        // number now, so it counts toward the season they are in now.
+        let (mm, at) = super::season_adjustment_write(
+            Some(18.0),
+            (Some(twelve_in_mm), Some(DEC_2025)),
+            NOV_2026,
+        );
+        assert_eq!(at, Some(NOV_2026));
+        assert_eq!(mm, Some(18.0 * mw_pipeline::snow::units::MM_PER_INCH));
+
+        // First time: nothing stored.
+        let (mm, at) = super::season_adjustment_write(Some(12.0), (None, None), NOV_2026);
+        assert_eq!((mm, at), (Some(twelve_in_mm), Some(NOV_2026)));
+    }
+
+    /// Clearing the box clears the season with it: an amount with no season has nothing to
+    /// belong to, and a season with no amount means nothing.
+    #[test]
+    fn clearing_the_amount_clears_the_season_stamp() {
+        const DEC_2025: i64 = 1_765_000_000;
+        let stored = (Some(304.8), Some(DEC_2025));
+        assert_eq!(
+            super::season_adjustment_write(None, stored, 1_795_000_000),
+            (None, None)
+        );
+        // And so does a value that is not a quantity of snow, which the API refuses with a
+        // sentence before it gets here -- asserted because this function is what the
+        // database sees and it must not depend on that check having run.
+        for bad in [0.0, -5.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                super::season_adjustment_write(Some(bad), stored, 1_795_000_000),
+                (None, None),
+                "{bad}"
+            );
+        }
+    }
+
+    /// A re-saved form is not a change, even though the amount has been through inches and
+    /// back. Without the tolerance, float noise alone would re-stamp the season.
+    #[test]
+    fn an_inches_round_trip_is_not_a_change() {
+        const DEC_2025: i64 = 1_765_000_000;
+        for inches in [0.1, 1.0, 7.3, 12.0, 18.75, 99.9] {
+            let stored_mm = inches * mw_pipeline::snow::units::MM_PER_INCH;
+            // What the view hands the form, and what the form hands back.
+            let shown = stored_mm / mw_pipeline::snow::units::MM_PER_INCH;
+            let (_, at) = super::season_adjustment_write(
+                Some(shown),
+                (Some(stored_mm), Some(DEC_2025)),
+                1_795_000_000,
+            );
+            assert_eq!(at, Some(DEC_2025), "{inches} in re-saved unchanged");
+        }
+    }
+
+    /// The label is what makes the scoping visible, since the operator never typed a date.
+    #[test]
+    fn the_season_label_names_the_season_or_says_it_ended() {
+        // Entered in December 2025, which is the 2025-26 season in Denver.
+        let label = super::season_adjustment_label(
+            Some(304.8),
+            Some(1_765_000_000),
+            Some("America/Denver"),
+        );
+        // Either the season it was entered for, or `ended` once the clock has moved past
+        // it -- this test runs at an unknown date, so both are correct answers and what is
+        // asserted is that it is one of them and never a wrong season.
+        let label = label.expect("an adjustment has a label");
+        assert!(label == "2025-26" || label == "ended", "{label}");
+
+        // No adjustment, no label.
+        assert_eq!(
+            super::season_adjustment_label(None, None, Some("America/Denver")),
+            None
+        );
+        // An amount with no stamp is a half-written pair, which has no season.
+        assert_eq!(
+            super::season_adjustment_label(Some(304.8), None, Some("America/Denver")),
+            None
+        );
+        // A station with no usable zone gets no label rather than a wrong one. It has no
+        // snow components planned either, so there is no total to be counting toward.
+        assert_eq!(
+            super::season_adjustment_label(Some(304.8), Some(1_765_000_000), None),
+            None
+        );
+        assert_eq!(
+            super::season_adjustment_label(Some(304.8), Some(1_765_000_000), Some("Mars/Olympus")),
+            None
+        );
+    }
     use super::*;
 
     /// **The password never leaves this function.** The storage screen shows the host and

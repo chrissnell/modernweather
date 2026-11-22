@@ -1618,6 +1618,18 @@ export interface components {
        */
       snow_base_distance_mm?: (number | null);
       /**
+       * Snowfall to add to this gauge's season total, in **inches**.
+       *
+       * What the operator types, which is why it is inches: a storm report is in inches and
+       * so is the page. The binary converts to the column's millimetres and decides whether
+       * the season stamp moves — it moves only when this amount *changes*, so editing a
+       * station for any other reason cannot drag last winter's correction into this winter.
+       *
+       * `None` clears it, which clears the stamp with it: an amount and its season are
+       * stored both or neither.
+       */
+      snow_season_adjustment_in?: (number | null);
+      /**
        * An IANA time-zone name.
        */
       timezone?: (string | null);
@@ -1719,6 +1731,28 @@ export interface components {
        * The distance a snow gauge reads with no snow under it, in millimetres.
        */
       snow_base_distance_mm?: (number | null);
+      /**
+       * Snowfall added to this gauge's season total by hand, in **inches**.
+       *
+       * Inches and not millimetres, unlike the column behind it: this is the number an
+       * operator typed, and a storm report is in inches. The conversion happens once, at the
+       * boundary, so the form shows back what was entered.
+       */
+      snow_season_adjustment_in?: (number | null);
+      /**
+       * Which snow season the adjustment above is counting toward — `"2025–26"`.
+       *
+       * **Shown because the operator never typed a date.** The amount is scoped to the
+       * season it was entered in (its migration has why), and that inference has exactly one
+       * case it gets wrong: an amount entered in early October for a storm from the previous
+       * winter lands on the new season. Printing the season is what makes that visible and
+       * correctable instead of a silent surprise.
+       *
+       * `None` when there is no adjustment, and `"ended"` for one whose season has rolled
+       * over — which is no longer counting toward anything and is the operator's cue to
+       * clear or re-enter it.
+       */
+      snow_season_adjustment_season?: (string | null);
       /**
        * An IANA time-zone name. `None` is a station whose day boundaries happen in UTC.
        */

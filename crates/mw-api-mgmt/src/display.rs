@@ -663,6 +663,8 @@ mod tests {
             aprs_callsign: None,
             wind_dir_correction_degrees: 0,
             snow_base_distance_mm: None,
+            snow_season_adjustment_in: None,
+            snow_season_adjustment_season: None,
             transport: TransportView::default(),
             sensor_mapping: None,
             poll_interval_seconds: None,

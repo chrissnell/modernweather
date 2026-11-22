@@ -74,6 +74,19 @@
   let timezone = $state(seed?.timezone ?? '');
   let windCorrection = $state((seed?.wind_dir_correction_degrees ?? 0).toString());
   let snowBase = $state(seed?.snow_base_distance_mm?.toString() ?? '');
+  // Inches, which is what the operator typed and what the view hands back.
+  let snowAdjustment = $state(seed?.snow_season_adjustment_in?.toString() ?? '');
+  // **Which season the stored amount is counting toward**, from the server, because the
+  // operator never typed a date and the scoping would otherwise be invisible. `ended` is
+  // an amount whose season has rolled over: it counts toward nothing now, which is the cue
+  // to clear it or enter it again.
+  const storedSeason = seed?.snow_season_adjustment_season;
+  const seasonNote =
+    storedSeason === undefined
+      ? 'inches'
+      : storedSeason === 'ended'
+        ? 'inches \u2014 the season this was entered for has ended, so it is no longer counted'
+        : `inches \u2014 counting toward the ${storedSeason} season`;
   let pollInterval = $state(seed?.poll_interval_seconds?.toString() ?? '');
   let callsign = $state(seed?.aprs_callsign ?? '');
   let sensorMapping = $state(seed?.sensor_mapping ?? '');
@@ -144,6 +157,10 @@
       timezone: timezone || null,
       wind_dir_correction_degrees: shape.wind ? (num(windCorrection) ?? 0) : 0,
       snow_base_distance_mm: shape.snow ? num(snowBase) : null,
+      // The server decides whether the season stamp moves, and it moves only when this
+      // amount changes -- so re-saving this form for any other reason cannot drag last
+      // winter's correction into this winter.
+      snow_season_adjustment_in: shape.snow ? num(snowAdjustment) : null,
       poll_interval_seconds: shape.polled ? num(pollInterval) : null,
       aprs_callsign: callsign || null,
       sensor_mapping: shape.sensorMapping ? sensorMapping || null : null,
@@ -542,6 +559,21 @@
                 type="number"
                 value={snowBase}
                 oninput={(e) => (snowBase = (e.currentTarget as HTMLInputElement).value)}
+                aria-describedby={describedBy}
+              />
+            {/snippet}
+          </Field>
+          <Field
+            copy={copy.fields.snowSeasonAdjustment}
+            note={seasonNote}
+            error={err('snow_season_adjustment_in')}
+          >
+            {#snippet children({ id, describedBy })}
+              <Input
+                {id}
+                type="number"
+                value={snowAdjustment}
+                oninput={(e) => (snowAdjustment = (e.currentTarget as HTMLInputElement).value)}
                 aria-describedby={describedBy}
               />
             {/snippet}
