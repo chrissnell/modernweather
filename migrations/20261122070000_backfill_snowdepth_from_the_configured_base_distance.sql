@@ -65,11 +65,51 @@
 -- name says "configured" and a reader checking the configuration store for the number this
 -- used may find NULL there and a depth here, and that is not a bug.
 --
+-- # What it actually did on the owner's database, which was nothing
+--
+-- Recorded here because the next reader's first question is what this changed, and on the
+-- one database that matters the answer is **no rows**. The imported history does not have a
+-- NULL `snowdepth` to fill: the Go daemon's `SnowDepth` was a non-nullable `float32`, so
+-- the import wrote **`0.0`** for all 137 541 snow readings (`docs/reconciliation.md`
+-- DEV-16, the zero-fill this programme refuses), and the station has no configured base
+-- distance for the join to find either. `WHERE snowdepth IS NULL` matches none of it, and
+-- `snowdepth = 0` could not be used instead: a stored zero is also what bare ground looks
+-- like, so the two are indistinguishable from inside a migration.
+--
+-- That history is therefore not recoverable by this file. It is also not *lost* by the read
+-- path moving onto the stored depth, because it was never being served: with no configured
+-- base distance the old `snow:*` planner skipped the gauge entirely, so `snow_totals_cache`
+-- was empty and `/snow` answered zero. Re-deriving it needs somebody to decide the base
+-- distance the sensor was at, which is a decision and not a migration.
+-- `docs/reconciliation.md` A-GRA811-2 carries the same correction.
+--
 -- # Idempotent, which is what the gate checks
 --
 -- `WHERE snowdepth IS NULL` makes a second application match nothing. `cargo xtask gate
 -- db-migrate-twice` applies every migration twice and asserts the second is a no-op; this
 -- one is, and not because the ledger stopped it.
+
+-- # Writing to history means decompressing it, and TimescaleDB refuses by default
+--
+-- `observations` compresses after 7 days, so almost every chunk this touches is compressed
+-- and a DML statement against one decompresses the tuples it has to evaluate. TimescaleDB
+-- caps that at 100 000 per transaction (`max_tuples_decompressed_per_dml_transaction`) and
+-- **aborts the statement** when the cap is passed -- which a backfill over a season of
+-- minute-resolution readings passes immediately. Applying this migration to the owner's
+-- database aborted on exactly that, with 137 541 tuples decompressed, before the cap was
+-- lifted here.
+--
+-- Lifted for this transaction only. The cost is real and is the inherent cost of writing to
+-- compressed history: the chunks this statement touches come out of their compressed form
+-- and the compression policy (`compress_after => 7 days`) recompresses them on a later run.
+-- A database where the `WHERE` below matches nothing pays the scan and no more.
+--
+-- The `db-migrate-twice` gate cannot catch this, which is worth knowing: it applies every
+-- migration to a scratch database it has just built, and nothing in it is old enough for a
+-- compression policy to have touched. The monthly `ci/db/restore-rehearsal.sh` is the one
+-- that would have found it, by applying migrations over a restored -- and therefore
+-- compressed -- copy.
+SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0;
 
 UPDATE observations o
    SET snowdepth = (s.snow_base_distance_mm - o.snowdistance)::float4
