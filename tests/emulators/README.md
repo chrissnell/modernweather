@@ -12,7 +12,7 @@ the `driver-emulators` gate.
 | `campbell/` | Campbell Scientific datalogger | `reference-vendored` | yes |
 | `airgradient/` | AirGradient ONE | `this-repository` | yes |
 | `ambient/` | Ambient Weather console (a **client**) | `this-repository` | yes |
-| `snowgauge/` | the snow gauge | `this-repository`, stubs vendored | **no** — gRPC |
+| `snowgauge/` | the snow gauge | `this-repository` | yes |
 | `grpcrx/` | a Go-era satellite (a **client**) | `this-repository`, stubs vendored | **no** — gRPC |
 
 Each directory has its own `README.md` with what the emulator does, its flags, and — for a
@@ -21,10 +21,10 @@ commit.
 
 ## Re-deriving a captured frame
 
-`crates/mw-codec/tests/frames/` holds the level-1 golden inputs, and five of them were
-captured from the emulators here rather than written by hand. The recipes are below so that
-a reader can check a fixture against the device, and so that replacing one after a pin bump
-is a command rather than an investigation.
+`crates/mw-codec/tests/frames/` holds the level-1 golden inputs, and most of them were
+captured from the emulators here rather than written by hand. The five recipes below — one
+per device — are here so that a reader can check a fixture against the device, and so that
+replacing one after a pin bump is a command rather than an investigation.
 
 Every recipe assumes the emulator has been built: `go build -o /tmp/<name> .` inside its
 directory.
@@ -75,12 +75,28 @@ socat -u TCP-LISTEN:24713,reuseaddr - | head -1 &   # the request line
 # then take everything after the `?` and before the space
 ```
 
-**`snowgauge-reading.bin`** — through the reference tree's own generated marshaller, so that
-the fixture is a real gauge's field numbers rather than a hand-written encoder's. A six-line
-Go program in a scratch module that `replace`s `github.com/chrissnell/remoteweather` at
-`snowgauge/remoteweather`, marshals a `snowgauge.Reading` and writes it to stdout; the one
-committed here carries `stationName: "roof-gauge"`, `distance: 1352` and both uptimes at
-42 s.
+**`snowgauge-*.json`** — the gauge is a server too, so these are four `GET`s. `/data`
+**advances the device on every request**, which is what makes the first and the fourth
+different bodies rather than the same one twice:
+
+```sh
+/tmp/sg -port 0 -trim-after 3 &                    # the port is on `ready http=<port>`
+F=crates/mw-codec/tests/frames
+curl -s "http://127.0.0.1:<port>/data" > $F/snowgauge-warming.json   # 1 frame: no trim_mean
+curl -s "http://127.0.0.1:<port>/data" > /dev/null                   # 2
+curl -s "http://127.0.0.1:<port>/data" > /dev/null                   # 3: the window fills
+curl -s "http://127.0.0.1:<port>/data" > $F/snowgauge-data.json      # 4: a trimmed mean
+curl -s "http://127.0.0.1:<port>/health" > $F/snowgauge-health.json
+
+/tmp/sg -port 0 -sensor dead &                     # a sensor that never speaks
+curl -s "http://127.0.0.1:<port>/data" > $F/snowgauge-no-data.json
+
+/tmp/sg -port 0 -trim-after 1 -calibrated=false &  # a gauge nobody has calibrated
+curl -s "http://127.0.0.1:<port>/data" > $F/snowgauge-uncalibrated.json
+```
+
+`uptime_ms` in these is a multiple of 5000 rather than a wall-clock figure, which is the
+emulator's `-uptime-step` and not a captured oddity: `snowgauge/README.md` has why.
 
 ## Why there is no recipe for the WeatherLink Live frames
 

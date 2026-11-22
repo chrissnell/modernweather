@@ -681,6 +681,72 @@ export interface components {
       stations: string[];
     };
     /**
+     * One snow gauge's own account of itself.
+     */
+    GaugeDeviceView: {
+      /**
+       * The gauge's calibrated sensor-to-ground distance, in millimetres.
+       *
+       * **Read, never written.** Absent is a gauge that has never been calibrated, which is
+       * the state in which it reports a distance and no depth.
+       */
+      base_distance_mm?: (number | null);
+      /**
+       * `idle`, `running`, `complete`, `failed`, or `unknown` for a firmware newer than
+       * this daemon.
+       */
+      calibration: string;
+      /**
+       * One line about that state: how many samples it used, how long is left, or why it
+       * failed.
+       */
+      calibration_detail?: (string | null);
+      /**
+       * From `/health.fw_slot` — which OTA partition is running.
+       */
+      firmware_slot?: (string | null);
+      /**
+       * From `/health.fw_version`.
+       */
+      firmware_version?: (string | null);
+      /**
+       * Whether the device answered at all.
+       */
+      reachable: boolean;
+      /**
+       * Signal strength in dBm.
+       *
+       * Absent rather than zero when the device could not look it up: the firmware's
+       * `sta_rssi()` yields `0` for that, which would read as a very strong signal.
+       */
+      rssi_dbm?: (number | null);
+      /**
+       * One line about the sensor, when it is not producing readings.
+       */
+      sensor_detail?: (string | null);
+      /**
+       * Whether the **sensor** behind the gauge is producing readings.
+       *
+       * A gauge whose ultrasonic sensor has stopped keeps serving HTTP perfectly: it answers
+       * `/data` with `status: "no_data"`, a frozen `readings` count and `bytes_rx: 0`, and it
+       * still reports what it is calibrated to. So `reachable` cannot carry this — a panel
+       * that showed only reachability would render a dead sensor as a healthy device, which
+       * is precisely the state an operator opens this panel in.
+       */
+      sensor_ok: boolean;
+      /**
+       * The depth the device last derived, in millimetres.
+       *
+       * Signed: a negative is a stable reading that overshot the calibrated base, which the
+       * firmware documents as frost heave or a calibration coming due.
+       */
+      snow_depth_mm?: (number | null);
+      /**
+       * Why the device could not be read, when it could not.
+       */
+      unreachable_because?: (string | null);
+    };
+    /**
      * One station's latest reading, as the Home tiles and §0.7 step 3 render it.
      *
      * A handful of named fields rather than the 212-column reading: these are the ones §0.7's
@@ -1618,6 +1684,32 @@ export interface components {
        */
       snow_base_distance_mm?: (number | null);
       /**
+       * Snowfall to add to this gauge's season total, in **inches**.
+       *
+       * What the operator types, which is why it is inches: a storm report is in inches and
+       * so is the page. The binary converts to the column's millimetres.
+       *
+       * **Three states, and the outer `Option` is the one that matters.** The amount is
+       * stamped with the instant it was entered, and that stamp is what scopes it to one
+       * season — so the stamp has to move exactly when an operator enters an amount, and at
+       * no other time:
+       *
+       * * **absent** — not supplied. The stored amount and its season are left alone, which
+       *   is what every edit to an unrelated field must do; stamping on those would push
+       *   last winter's correction into this winter the next time somebody renamed the
+       *   station.
+       * * **`null`** — the operator emptied the box. The amount and the stamp both go.
+       * * **a number** — the operator entered this, now. It is stamped now, *including when
+       *   it is the same number as last time*: an operator who misses a storm of the same
+       *   size two winters running types the same amount, and that is an entry rather than
+       *   a no-op. Comparing against the stored value cannot tell those apart, which is why
+       *   this field is three-state and not two.
+       *
+       * The form sends it only when the operator touched the box, which is the same
+       * convention a credential field uses here (`of`'s module documentation in the binary).
+       */
+      snow_season_adjustment_in?: (number | null);
+      /**
        * An IANA time-zone name.
        */
       timezone?: (string | null);
@@ -1719,6 +1811,28 @@ export interface components {
        * The distance a snow gauge reads with no snow under it, in millimetres.
        */
       snow_base_distance_mm?: (number | null);
+      /**
+       * Snowfall added to this gauge's season total by hand, in **inches**.
+       *
+       * Inches and not millimetres, unlike the column behind it: this is the number an
+       * operator typed, and a storm report is in inches. The conversion happens once, at the
+       * boundary, so the form shows back what was entered.
+       */
+      snow_season_adjustment_in?: (number | null);
+      /**
+       * Which snow season the adjustment above is counting toward — `"2025–26"`.
+       *
+       * **Shown because the operator never typed a date.** The amount is scoped to the
+       * season it was entered in (its migration has why), and that inference has exactly one
+       * case it gets wrong: an amount entered in early October for a storm from the previous
+       * winter lands on the new season. Printing the season is what makes that visible and
+       * correctable instead of a silent surprise.
+       *
+       * `None` when there is no adjustment, and `"ended"` for one whose season has rolled
+       * over — which is no longer counting toward anything and is the operator's cue to
+       * clear or re-enter it.
+       */
+      snow_season_adjustment_season?: (string | null);
       /**
        * An IANA time-zone name. `None` is a station whose day boundaries happen in UTC.
        */
@@ -2777,6 +2891,25 @@ export interface paths {
         200: { content: { "application/json": components["schemas"]["Applied"] } };
         404: { content: { "application/json": components["schemas"]["ErrorBody"] } };
         422: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+      };
+    };
+  };
+  "/api/v1/stations/{key}/device": {
+    /**
+     * What one snow gauge says about itself: its calibration, its firmware, its signal.
+     */
+    get: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path: { key: string };
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        200: { content: { "application/json": components["schemas"]["GaugeDeviceView"] } };
+        404: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+        501: { content: { "application/json": components["schemas"]["ErrorBody"] } };
       };
     };
   };

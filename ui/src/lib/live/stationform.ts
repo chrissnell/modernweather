@@ -14,7 +14,7 @@
  * | `campbellscientific` | `serial` or `tcp_out` |
  * | `airgradient` | `http_out`, polling `/measures/current` |
  * | `ambient-customized` | `http_in` |
- * | `snowgauge` | `grpc_out` |
+ * | `snowgauge` | `http_out`, polling `/data` |
  *
  * §7.3's worst offender: today's form shows **every** field of `DeviceData` -- 50-plus
  * columns spanning Davis serial settings, PWS credentials, APRS KISS TNC paths and
@@ -48,10 +48,18 @@ export interface KindShape {
   /**
    * Whether this hardware's outbound transport streams rather than polls.
    *
-   * **Not optional, and not cosmetic.** `http_out` and `grpc_out` are refused without
+   * **Not optional, and not cosmetic.** `grpc_out` is refused without
    * `transport.streaming` -- W2a §4a.3's trigger-implication table reads it at plan time
-   * to decide whether the component is `OnReading` or `Every` -- so a form that leaves it
-   * unset can never save a WeatherLink Live or a snow gauge at all.
+   * to decide whether the component is `Service` or `Every` -- and `http_out` is refused
+   * *with* it, because the configuration database carries
+   * `CHECK (transport_streaming IS NULL OR COALESCE(transport_kind, '') = 'grpc_out')`.
+   *
+   * **No kind here is `grpc_out` any more.** The snow gauge was the one, and its firmware
+   * serves JSON over plain HTTP now, so every entry below is `false`. `StationForm.svelte`
+   * therefore does NOT read this field for a stored `grpc_out` row -- it carries that row's
+   * own `streaming` through, because reading a `false` from here would rewrite a stored `1`
+   * to `0` on any save. This field is the default for a kind that streams, and there is not
+   * one; it stays because the next outbound-gRPC station (§4a.7 offers four) needs it.
    */
   readonly streams: boolean;
   /** The baud rate this hardware actually uses, offered as the default. */
@@ -122,11 +130,14 @@ const SHAPES: Record<string, KindShape> = {
     streams: false
   },
   snowgauge: {
-    // `grpc_out`, which `mw-grpc` plans -- `mw-station` validates the row and emits
-    // nothing, because that crate may not name `tonic`. It is the one kind whose transport
-    // carries `streaming`, and `mw_station::plan` requires it **set**: "a snow gauge
-    // streams readings, so the flag has to be set; `transport_streaming = 0` would declare
-    // one request per occurrence and no stream". Not polled, therefore, and not a choice.
+    // `http_out`, polling `/data` -- `chrissnell/snowgauge-rs` serves two unauthenticated
+    // JSON endpoints over plain HTTP on port 80 and offers no stream and no push at all.
+    // It used to be the one `grpc_out` kind here, with `streams: true`, because the gauge
+    // spoke `SnowGaugeService/StreamReading`; that firmware is decommissioned.
+    //
+    // `polled: false` for the AirGradient monitor's reason and not because it streams: the
+    // period is the driver's constant (five seconds), and the schema's only interval
+    // column is `wll_poll_interval_seconds`, so there is nothing for a control to write.
     connection: 'network',
     wind: false,
     snow: true,
@@ -134,8 +145,8 @@ const SHAPES: Record<string, KindShape> = {
     sensorMapping: false,
     presentsIdentity: false,
     located: true,
-    defaultTransport: 'grpc_out',
-    streams: true
+    defaultTransport: 'http_out',
+    streams: false
   }
 };
 

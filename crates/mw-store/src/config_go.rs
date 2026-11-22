@@ -72,7 +72,8 @@ use std::fmt::Write as _;
 use sqlx::{Row, SqliteConnection};
 
 use crate::config_admin::{
-    self, AerisWrite, Change, ListenerWrite, Pairing, ServiceWrite, StationWrite, WebsiteWrite,
+    self, AerisWrite, Change, ListenerWrite, Pairing, SeasonAdjustmentWrite, ServiceWrite,
+    StationWrite, WebsiteWrite,
 };
 
 /// The RF beacon floor, in seconds: **O-8**, answered 600 s by the owner.
@@ -1753,7 +1754,7 @@ fn device_url(host: &str, port: i64) -> String {
 /// The conditions are `pkg/config/provider.go`'s own validation, read as a table rather than
 /// reinvented: a serial device, or a hostname **and** a port, or -- for three types -- one of
 /// those two alone. Each arm then has to produce a transport the row's driver accepts, which
-/// is `mw_station::plan`'s table and `mw_grpc`'s one row.
+/// is `mw_station::plan`'s table.
 fn wire(
     d: &GoDevice,
     kind: &'static str,
@@ -1809,21 +1810,38 @@ fn wire(
                 ))
             }
         }
-        // A snow gauge streams over gRPC. Go dials `dns:host:port`; the column here is an
-        // endpoint, and `transport_streaming` is load-bearing rather than descriptive --
-        // `mw_grpc` refuses a gauge with the flag clear, because no gauge answers one
-        // request per occurrence.
+        // **One `GET /data` per occurrence, and the port is NOT carried.** The Go daemon
+        // dialled a gauge over gRPC at `dns:host:port` -- 50051 in the owner's own
+        // configuration -- and that firmware is decommissioned. `chrissnell/snowgauge-rs`
+        // serves two JSON endpoints over plain HTTP on **port 80**, so the migrated row is
+        // `http_out` at 80 and the Go `port` column has no successor: carrying it forward
+        // would produce a station whose every occurrence fails against a port nothing
+        // listens on, which is exactly the silent-station defect this migration reports
+        // rather than reproduces.
+        //
+        // `hostname` IS carried, and it is the whole of what an operator needs: the device
+        // always requests the same hostname, so a DHCP reservation or a `.local` name
+        // resolves it (`mw_station::snowgauge`).
         "snowgauge" => {
-            let (Some(host), Some(port)) = (d.hostname.clone(), port) else {
+            let Some(host) = d.hostname.clone() else {
                 return Err(no_transport(
-                    "a snow gauge is reached over gRPC and `hostname`/`port` do not both \
-                     have a value"
-                        .to_string(),
+                    "a snow gauge is polled over HTTP and `hostname` is empty".to_string(),
                 ));
             };
-            let mut w = base("grpc_out", "fixed");
-            w.url = Some(device_url(&host, port));
-            w.streaming = Some(true);
+            if let Some(p) = &d.port {
+                report.push(
+                    NoteKind::NotCarried,
+                    key,
+                    format!(
+                        "the snow gauge's gRPC port ({p}) has no successor: that firmware \
+                         has been decommissioned, and the gauge this daemon polls serves \
+                         `GET /data` over plain HTTP on port 80. The migrated station polls \
+                         `{host}` on port 80; nothing else about the station changes."
+                    ),
+                );
+            }
+            let mut w = base("http_out", "fixed");
+            w.url = Some(device_url(&host, 80));
             Ok(w)
         }
         // One `GET /measures/current` per occurrence. Go defaults the port to 80 when the
@@ -2388,6 +2406,10 @@ pub fn translate(
             // configured" -- so a zero is an absent base distance rather than a gauge
             // mounted on the ground.
             snow_base_distance_mm: d.base_snow_distance.filter(|v| *v > 0.0),
+            // The Go daemon had no such setting, so a migrated station starts with none --
+            // `Keep` rather than `Clear`, because an import re-run over a database an
+            // operator has already corrected a season total in should not undo that.
+            season_adjustment: SeasonAdjustmentWrite::Keep,
             transport_kind: Some(w.kind.to_string()),
             transport_dev: w.dev,
             transport_baud: w.baud,
@@ -3613,7 +3635,11 @@ mod tests {
                     "snow".to_string(),
                     "snowgauge".to_string(),
                     3,
-                    "grpc_out".to_string()
+                    // `grpc_out` in the Go deployment, on port 50051. That firmware is
+                    // decommissioned and the gauge serves `GET /data` over plain HTTP on
+                    // port 80, so the migrated row is a poll and the port is reported as
+                    // having no successor.
+                    "http_out".to_string()
                 ),
             ]
         );
@@ -4321,6 +4347,72 @@ mod tests {
             .report
             .of(NoteKind::NotCarried)
             .any(|n| n.subject == "console" && n.message.contains("8081")));
+        pool.close().await;
+    }
+
+    /// The snow gauge loses its gRPC port, because the protocol behind it no longer exists.
+    ///
+    /// The Go daemon dialled `dns:10.50.0.41:50051` and streamed `snowgauge.Reading`;
+    /// `chrissnell/snowgauge-rs` serves `GET /data` over plain HTTP on port 80. Carrying the
+    /// old port forward would migrate a station whose every occurrence fails against a port
+    /// nothing listens on -- the silent-station defect this migration exists to report --
+    /// so the hostname survives, the port is replaced by 80, and the substitution is a line
+    /// the operator reads.
+    #[tokio::test]
+    async fn a_snow_gauge_is_migrated_as_an_http_poll_and_loses_its_grpc_port() {
+        let scratch = Scratch::new("snowgauge");
+        let (pool, migrated) = migrate(
+            &scratch,
+            &[
+                "INSERT INTO devices (id, config_id, name, type, enabled, hostname, port,
+                                      timezone, base_snow_distance)
+               VALUES (1, 1, 'snow', 'snowgauge', 1, '10.50.0.41', '50051',
+                       'America/Denver', 1500.0);",
+            ],
+        )
+        .await;
+        let row: (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<f64>,
+        ) = sqlx::query_as(
+            "SELECT transport_kind, transport_url, transport_port, transport_streaming,
+                        snow_base_distance_mm
+                 FROM stations",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the station");
+        assert_eq!(row.0, "http_out");
+        assert_eq!(
+            row.1.as_deref(),
+            Some("http://10.50.0.41:80"),
+            "the hostname survives and the port is the one the firmware serves"
+        );
+        assert_eq!(row.2, None);
+        assert_eq!(
+            row.3, None,
+            "`transport_streaming` belongs to `grpc_out` alone, and the gauge is a poll"
+        );
+        assert_eq!(
+            row.4,
+            Some(1500.0),
+            "the calibration is unchanged: the codec still discards against it (DEV-9)"
+        );
+        let note = migrated
+            .report
+            .of(NoteKind::NotCarried)
+            .find(|n| n.subject == "snow")
+            .expect("the port substitution is reported");
+        assert!(note.message.contains("50051"), "{}", note.message);
+        assert!(note.message.contains("port 80"), "{}", note.message);
+        assert!(
+            note.message.contains("decommissioned"),
+            "the operator is told WHY, not just what: {}",
+            note.message
+        );
         pool.close().await;
     }
 

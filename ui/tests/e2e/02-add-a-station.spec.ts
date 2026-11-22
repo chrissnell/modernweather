@@ -126,9 +126,10 @@ test('a type whose transport the plan validates differently also saves', async (
 
   await page.getByLabel('Name', { exact: true }).fill('Driveway');
   await page.getByLabel('Short name').fill('driveway');
-  // A snow gauge is `grpc_out` -- `mw-station/src/plan.rs`'s table is the authority on
+  // A snow gauge is `http_out` -- `mw-station/src/plan.rs`'s table is the authority on
   // which transport each driver has a mode for, and offering one it does not is a Save
-  // that cannot succeed.
+  // that cannot succeed. It was `grpc_out` until its firmware was replaced by one that
+  // serves `GET /data` over plain HTTP.
   await page.getByLabel('Address to read from').fill('http://127.0.0.1:9000');
   await page.getByLabel('Base snow distance').fill('1422');
   await page.getByLabel('Latitude').fill('40.47571');
@@ -146,13 +147,16 @@ test('a type whose transport the plan validates differently also saves', async (
   const station = await stored.json();
   expect(station.kind).toBe('snowgauge');
   expect(station.snow_base_distance_mm).toBeCloseTo(1422, 1);
-  expect(station.transport.kind).toBe('grpc_out');
+  expect(station.transport.kind).toBe('http_out');
   expect(station.transport.url).toBe('http://127.0.0.1:9000');
   // **The field no control offers.** W2a §4a.3 gives `streaming` to `GrpcOut` and not to
-  // `HttpOut`, and the configuration database enforces exactly that -- so this kind must
-  // carry one and an `http_out` kind must not. Asserted because the API used to demand it
-  // of both, which made the two `http_out` station types impossible to store at all.
-  expect(station.transport.streaming).toBe(true);
+  // `HttpOut`, and the configuration database enforces exactly that with
+  // `CHECK (transport_streaming IS NULL OR COALESCE(transport_kind, '') = 'grpc_out')` --
+  // so an `http_out` station must carry none. Asserted because the API used to demand it
+  // of every outbound transport, which made every `http_out` station type impossible to
+  // store at all; this assertion used to read `true`, when the gauge was the one
+  // `grpc_out` kind.
+  expect(station.transport.streaming).toBeNull();
 });
 
 /**

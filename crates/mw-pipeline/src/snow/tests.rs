@@ -26,7 +26,7 @@ impl Default for Cfg {
     fn default() -> Self {
         Self {
             database: true,
-            stations: vec![gauge_row("snowgauge", Some(1500.0))],
+            stations: vec![gauge_row("snowgauge")],
         }
     }
 }
@@ -44,10 +44,10 @@ fn denver() -> Zone {
     Zone::new("America/Denver").expect("a real zone")
 }
 
-fn gauge_row(key: &str, base_distance_mm: Option<f64>) -> SnowStation {
+fn gauge_row(key: &str) -> SnowStation {
     SnowStation {
         key: StationKey::new(key),
-        base_distance_mm,
+        season_adjustment: None,
         zone: Some(denver()),
     }
 }
@@ -55,7 +55,7 @@ fn gauge_row(key: &str, base_distance_mm: Option<f64>) -> SnowStation {
 fn gauge(key: &str) -> Gauge {
     Gauge {
         key: StationKey::new(key),
-        base_distance_mm: 1500.0,
+        season_adjustment: None,
         zone: denver(),
     }
 }
@@ -382,10 +382,7 @@ fn one_gauge_is_three_shared_components_and_one_season_total() {
 #[test]
 fn two_gauges_share_three_components_and_have_two_season_totals() {
     let cfg = Cfg {
-        stations: vec![
-            gauge_row("snowgauge", Some(1500.0)),
-            gauge_row("summit", Some(2000.0)),
-        ],
+        stations: vec![gauge_row("snowgauge"), gauge_row("summit")],
         ..Cfg::default()
     };
     let mut out = Vec::new();
@@ -425,15 +422,17 @@ fn no_snow_gauge_plans_nothing() {
     assert!(out.is_empty(), "the ordinary case");
 }
 
-/// A gauge with no base distance is **skipped** — the schema makes that state
-/// representable on purpose — and the other gauge is still planned.
+/// **Every enabled gauge is planned**, where a gauge with no configured base distance used
+/// to be skipped.
+///
+/// The skip existed because every depth was `base - snowdistance` computed on this side. The
+/// gauge reports its own depth now, so the configured number decides nothing here — and a
+/// gauge calibrated after the daemon started gets its totals without a configuration
+/// change, which the skip made impossible.
 #[test]
-fn a_gauge_with_no_base_distance_is_skipped_and_the_others_are_planned() {
+fn every_gauge_is_planned_whatever_the_configuration_says_about_a_base_distance() {
     let cfg = Cfg {
-        stations: vec![
-            gauge_row("uncalibrated", None),
-            gauge_row("snowgauge", Some(1500.0)),
-        ],
+        stations: vec![gauge_row("uncalibrated"), gauge_row("snowgauge")],
         ..Cfg::default()
     };
     let mut out = Vec::new();
@@ -445,22 +444,11 @@ fn a_gauge_with_no_base_distance_is_skipped_and_the_others_are_planned() {
             "snow:depth",
             "snow:smoothing",
             "snow:events",
+            "snow:season:uncalibrated",
             "snow:season:snowgauge",
         ],
-        "no season total for the uncalibrated gauge"
+        "a season total for each, in the order the stations are configured"
     );
-}
-
-/// A gauge with no base distance **and nothing else** plans nothing at all.
-#[test]
-fn the_only_gauge_having_no_base_distance_plans_nothing() {
-    let cfg = Cfg {
-        stations: vec![gauge_row("uncalibrated", None)],
-        ..Cfg::default()
-    };
-    let mut out = Vec::new();
-    register(&cfg, &mut out).expect("not an error");
-    assert!(out.is_empty());
 }
 
 /// A gauge with no usable zone is a refusal naming the station: "today" and "this season"
@@ -470,8 +458,8 @@ fn the_only_gauge_having_no_base_distance_plans_nothing() {
 fn a_gauge_with_no_time_zone_is_refused_by_name() {
     let cfg = Cfg {
         stations: vec![SnowStation {
+            season_adjustment: None,
             key: StationKey::new("snowgauge"),
-            base_distance_mm: Some(1500.0),
             zone: None,
         }],
         ..Cfg::default()
@@ -565,9 +553,12 @@ fn the_needs_are_the_tables_and_the_season_total_declares_only_what_it_uses() {
     }
 }
 
-/// A digest that did not move is a component the plan diff does not restart.
+/// A digest that did not move is a component the plan diff does not restart. The gauges and
+/// their zones here; the season adjustment in
+/// `changing_the_adjustment_changes_the_digest`; **and no calibration, because there is not
+/// one on this side any more** — `digest_of` says why.
 #[test]
-fn the_digest_follows_the_gauges_their_calibration_and_their_zones() {
+fn the_digest_follows_the_gauges_and_their_zones() {
     let digest_of = |cfg: &Cfg| {
         let mut out = Vec::new();
         register(cfg, &mut out).expect("a plannable configuration");
@@ -581,17 +572,9 @@ fn the_digest_follows_the_gauges_their_calibration_and_their_zones() {
     assert_ne!(
         base,
         digest_of(&Cfg {
-            stations: vec![gauge_row("snowgauge", Some(1501.0))],
-            ..Cfg::default()
-        }),
-        "a re-measured gauge"
-    );
-    assert_ne!(
-        base,
-        digest_of(&Cfg {
             stations: vec![SnowStation {
                 zone: Some(Zone::new("America/Phoenix").expect("a real zone")),
-                ..gauge_row("snowgauge", Some(1500.0))
+                ..gauge_row("snowgauge")
             }],
             ..Cfg::default()
         }),
@@ -600,10 +583,7 @@ fn the_digest_follows_the_gauges_their_calibration_and_their_zones() {
     assert_ne!(
         base,
         digest_of(&Cfg {
-            stations: vec![
-                gauge_row("snowgauge", Some(1500.0)),
-                gauge_row("summit", Some(2000.0)),
-            ],
+            stations: vec![gauge_row("snowgauge"), gauge_row("summit"),],
             ..Cfg::default()
         }),
         "a second gauge"
@@ -626,16 +606,20 @@ fn depth_body(series: Series, cache: Arc<Cache>) -> Depth {
 /// thirty minutes ago, extrapolated from half an hour to an hour.
 #[test]
 fn the_snowfall_rate_is_the_half_hour_delta_doubled() {
-    // Two samples: one at now-30m reading 1300 mm, one at now-1m reading 1275 mm. Twenty
-    // five millimetres in half an hour is 50 mm an hour, which is 2.0 inches.
+    // Two samples of stored **depth**: 200 mm half an hour ago, 225 mm a minute ago.
+    // Twenty-five millimetres in half an hour is 50 mm an hour, which is 2.0 inches.
+    //
+    // These used to be distances -- 1300 falling to 1275 -- and the series this reads
+    // became depths when `/snow` moved onto the stored column. Seeded the old way this
+    // test asserted that a pack getting SHALLOWER was snowing at two inches an hour.
     let series = vec![
         MeanBucket {
             bucket: now() - chrono::Duration::minutes(30),
-            mean: Some(1300.0),
+            mean: Some(200.0),
         },
         MeanBucket {
             bucket: now() - chrono::Duration::minutes(1),
-            mean: Some(1275.0),
+            mean: Some(225.0),
         },
     ];
     assert_eq!(rate(&series, now()), Some(2.0));
@@ -647,11 +631,11 @@ fn the_snowfall_rate_is_the_half_hour_delta_doubled() {
 fn the_rate_needs_both_samples_and_is_absent_rather_than_zero_without_them() {
     let fresh = MeanBucket {
         bucket: now() - chrono::Duration::minutes(1),
-        mean: Some(1275.0),
+        mean: Some(225.0),
     };
     let lagged = MeanBucket {
         bucket: now() - chrono::Duration::minutes(30),
-        mean: Some(1300.0),
+        mean: Some(200.0),
     };
     assert_eq!(rate(&[fresh], now()), None, "no older sample");
     assert_eq!(rate(&[lagged], now()), None, "no fresh sample");
@@ -659,7 +643,7 @@ fn the_rate_needs_both_samples_and_is_absent_rather_than_zero_without_them() {
     // A fresh sample that is not fresh enough is not a sample.
     let stale = MeanBucket {
         bucket: now() - chrono::Duration::minutes(6),
-        mean: Some(1275.0),
+        mean: Some(225.0),
     };
     assert_eq!(
         rate(&[lagged, stale], now()),
@@ -669,7 +653,7 @@ fn the_rate_needs_both_samples_and_is_absent_rather_than_zero_without_them() {
     // And an older sample outside the two-minute tolerance is not one either.
     let drifted = MeanBucket {
         bucket: now() - chrono::Duration::minutes(34),
-        mean: Some(1300.0),
+        mean: Some(200.0),
     };
     assert_eq!(rate(&[drifted, fresh], now()), None);
 }
@@ -677,14 +661,15 @@ fn the_rate_needs_both_samples_and_is_absent_rather_than_zero_without_them() {
 /// Settling is not negative snowfall: Go's `if snowfall_30min <= 0 then return 0`.
 #[test]
 fn a_shrinking_pack_has_a_rate_of_zero_and_not_a_negative_one() {
+    // A depth of 225 mm settling to 200: the pack lost 25 mm, which is not snowfall.
     let series = vec![
         MeanBucket {
             bucket: now() - chrono::Duration::minutes(30),
-            mean: Some(1275.0),
+            mean: Some(225.0),
         },
         MeanBucket {
             bucket: now() - chrono::Duration::minutes(1),
-            mean: Some(1300.0),
+            mean: Some(200.0),
         },
     ];
     assert_eq!(rate(&series, now()), Some(0.0));
@@ -845,20 +830,20 @@ mod driven {
     /// The four columns `snow:depth` owns, and only those four.
     #[tokio::test]
     async fn the_depth_refresh_writes_its_four_columns_and_no_others() {
-        // A gauge 1500 mm above bare ground, currently reading 1246.0 mm -- so 254 mm of snow,
-        // which is ten inches.
+        // Stored **depth** buckets, where this used to seed distances against a 1500 mm
+        // configured base: currently 254 mm of snow, which is ten inches.
         let minutes = buckets(
             now() - chrono::Duration::minutes(59),
             chrono::Duration::minutes(1),
             &(0..60)
-                .map(|i| Some(if i < 30 { 1300.0 } else { 1246.0 }))
+                .map(|i| Some(if i < 30 { 200.0 } else { 254.0 }))
                 .collect::<Vec<_>>(),
         );
         // Since midnight, at the five-minute level: a 60 mm step, which the quick rule counts.
         let five = buckets(
             midnight(),
             chrono::Duration::minutes(5),
-            &[Some(1306.0), Some(1306.0), Some(1246.0), Some(1246.0)],
+            &[Some(194.0), Some(194.0), Some(254.0), Some(254.0)],
         );
         let cache = Arc::new(Cache::default());
         let series = Series::default()
@@ -927,34 +912,39 @@ mod driven {
         assert!(cache.patches().is_empty());
     }
 
-    /// The storm total uses the **station's** base distance.
+    /// The storm total is the stored depth series, walked by the quick rule.
     ///
-    /// `calculate_storm_snowfall` carries `base_dist := 1798.0; -- TODO: Pass this as parameter
-    /// from application`, so under Go every station's storm total is computed against the
-    /// owner's own gauge height. At 1500 mm the same readings give a different depth series
-    /// entirely, and this asserts the station's number is used.
+    /// **What this test used to be about.** `calculate_storm_snowfall` carries
+    /// `base_dist := 1798.0; -- TODO: Pass this as parameter from application`, so under Go
+    /// every station's storm total was computed against the owner's own gauge height; this
+    /// asserted that the *station's* base distance was used instead. There is no base
+    /// distance in this path any more -- the gauge subtracts its own, in NVRAM -- so what is
+    /// left to assert is the walk itself over the depths the column holds, and the bucket
+    /// that used to prove the station's number was read now proves the bare-ground filter
+    /// still drops what it dropped.
     #[tokio::test]
-    async fn the_storm_total_is_computed_against_the_stations_own_calibration() {
-        // Hourly buckets: flat at 1300, then a step to 1200 -- a hundred millimetres, which the
-        // quick rule counts whole. Against Go's hard-coded 1798 the depths would be 498 and 598
-        // and the ACCUMULATION would be the same 100 mm; what differs is the bare-ground filter,
-        // so the case that separates them is a reading just inside this station's base.
+    async fn the_storm_total_is_computed_from_the_stored_depth() {
+        // Hourly buckets of **stored depth**, where this used to seed distances and subtract a
+        // configured base: flat at 200 mm, then a step to 300 -- a hundred millimetres, which
+        // the quick rule counts whole.
         let hourly = buckets(
             now() - chrono::Duration::hours(23),
             chrono::Duration::hours(1),
             &[
-                // 1499 is within 2 mm of this station's 1500 base, so it is bare ground and is
-                // dropped. Under Go's 1798 it would be 299 mm of snow.
-                Some(1499.0),
-                Some(1300.0),
-                Some(1200.0),
+                // 1 mm is within the 2 mm bare-ground threshold, so it is dropped. This used
+                // to be a distance of 1499 against a 1500 base, which is the same bucket --
+                // `threshold::the_bare_ground_filter_is_the_same_test_it_always_was` is where
+                // that equivalence is pinned.
+                Some(1.0),
+                Some(200.0),
+                Some(300.0),
             ],
         );
         let cache = Arc::new(Cache::default());
         let minutes = buckets(
             now() - chrono::Duration::minutes(1),
             chrono::Duration::minutes(1),
-            &[Some(1200.0)],
+            &[Some(300.0)],
         );
         let mut body = depth_body(
             Series::default()
@@ -964,7 +954,7 @@ mod driven {
         );
         body.tick(&cx()).await.expect("a successful occurrence");
         let patch = cache.only_patch();
-        // 1300 -> 1200 is a 100 mm step: 3.9 inches. The dropped 1499 contributes nothing.
+        // 200 -> 300 is a 100 mm step: 3.9 inches. The dropped 1 mm contributes nothing.
         assert_eq!(patch.storm, Some(3.9));
     }
 
@@ -986,7 +976,9 @@ mod driven {
         assert!(asked[1].starts_with("5m "), "{}", asked[1]);
         assert!(asked[2].starts_with("1h "), "{}", asked[2]);
         for query in &asked {
-            assert!(query.contains("SnowDistance"), "{query}");
+            // **The stored depth, not the distance.** This is the assertion that would
+            // have caught the read path being switched without the backfill behind it.
+            assert!(query.contains("SnowDepth"), "{query}");
             let limit: usize = query
                 .rsplit("limit=")
                 .next()
@@ -1003,7 +995,7 @@ mod driven {
         // Twelve hours of five-minute buckets ending now: a hundred millimetres accumulating.
         let count = 144;
         let values: Vec<Option<f64>> = (0..count)
-            .map(|i| Some(1500.0 - 100.0 * f64::from(i) / f64::from(count)))
+            .map(|i| Some(100.0 * f64::from(i) / f64::from(count)))
             .collect();
         let five = buckets(
             now() - chrono::Duration::hours(12),
@@ -1068,7 +1060,7 @@ mod driven {
         let five = buckets(
             now() - chrono::Duration::hours(7),
             chrono::Duration::minutes(5),
-            &(0..84).map(|_| Some(1400.0)).collect::<Vec<_>>(),
+            &(0..84).map(|_| Some(100.0)).collect::<Vec<_>>(),
         );
         let mut body = smoothing_body(
             Series::default().with(BucketLevel::FiveMinute, five),
@@ -1141,12 +1133,12 @@ mod driven {
     async fn a_storm_is_written_as_contributing_events_only() {
         // Twelve hours of hourly buckets with a 150 mm accumulation in the middle, long enough
         // for the 72-hour window's hour level to see it.
-        let mut values: Vec<Option<f64>> = vec![Some(1500.0 - 1.0); 24];
+        let mut values: Vec<Option<f64>> = vec![Some(1.0); 24];
         for (i, value) in values.iter_mut().enumerate().skip(8).take(8) {
-            *value = Some(1499.0 - 20.0 * f64::from(i as i32 - 7));
+            *value = Some(1.0 + 20.0 * f64::from(i as i32 - 7));
         }
         for value in values.iter_mut().skip(16) {
-            *value = Some(1499.0 - 160.0);
+            *value = Some(161.0);
         }
         let hourly = buckets(
             now() - chrono::Duration::hours(24),
@@ -1243,10 +1235,211 @@ mod driven {
             &(Arc::clone(&cache) as Arc<dyn SnowCache>),
             &StationKey::new("snowgauge"),
             season,
+            None,
         )
         .await
         .expect("a successful read");
         assert_eq!(total, Some(20.0), "thirty less the ten it started with");
+    }
+
+    /// **The owner's missed-storm correction** (2026-11-21): snowfall the gauge never
+    /// measured, added to the season total.
+    ///
+    /// Ten inches measured plus a twelve-inch correction is twenty-two. The amount is
+    /// stored in millimetres and the total is served in inches, so this also pins the one
+    /// conversion.
+    #[tokio::test]
+    async fn an_operators_adjustment_is_added_to_the_measured_season_total() {
+        let cache = Arc::new(Cache::default());
+        let season = units::season_start(now(), denver()).expect("a real boundary");
+        cache.seed(season, 2, 0.0);
+        cache.seed(season + chrono::Duration::days(20), 2, 10.0);
+        let adjustment = SeasonAdjustment {
+            amount_mm: 12.0 * units::MM_PER_INCH,
+            // Entered during the season it corrects, which is the ordinary case.
+            set_at: season + chrono::Duration::days(30),
+        };
+        let total = season_total(
+            &(Arc::clone(&cache) as Arc<dyn SnowCache>),
+            &StationKey::new("snowgauge"),
+            season,
+            Some(adjustment),
+        )
+        .await
+        .expect("a successful read");
+        assert_eq!(total, Some(22.0), "ten measured plus twelve added");
+    }
+
+    /// **It stops at the season boundary**, which is the whole reason the amount carries an
+    /// instant the operator never typed. A correction entered last season is not this
+    /// season's snow, and a permanent constant would have gone on inflating every total
+    /// after it until somebody remembered the setting existed.
+    #[tokio::test]
+    async fn an_adjustment_from_a_previous_season_is_not_counted() {
+        let cache = Arc::new(Cache::default());
+        let season = units::season_start(now(), denver()).expect("a real boundary");
+        cache.seed(season, 2, 0.0);
+        cache.seed(season + chrono::Duration::days(20), 2, 10.0);
+        let stale = SeasonAdjustment {
+            amount_mm: 12.0 * units::MM_PER_INCH,
+            // One day before this season began: last season's correction.
+            set_at: season - chrono::Duration::days(1),
+        };
+        assert_eq!(
+            stale.within(season),
+            None,
+            "outside the season being totalled"
+        );
+        let total = season_total(
+            &(Arc::clone(&cache) as Arc<dyn SnowCache>),
+            &StationKey::new("snowgauge"),
+            season,
+            Some(stale),
+        )
+        .await
+        .expect("a successful read");
+        assert_eq!(total, Some(10.0), "the measured total, untouched");
+    }
+
+    /// **The boundary itself belongs to the season it opens.** `within` is `>=`, and the
+    /// instant that decides it is a season start computed in the station's own zone — so an
+    /// adjustment stamped at exactly local midnight on 1 October counts toward the season
+    /// beginning then and not the one ending. One second earlier it does not. Asserted
+    /// because the two sides of this comparison are a configuration write and a calendar
+    /// boundary, and nothing else in the file pins which way the equal case falls.
+    #[test]
+    fn the_season_boundary_instant_counts_toward_the_season_it_opens() {
+        let season = units::season_start(now(), denver()).expect("a real boundary");
+        let at = |set_at| SeasonAdjustment {
+            amount_mm: 50.0,
+            set_at,
+        };
+        assert_eq!(at(season).within(season), Some(50.0), "the boundary itself");
+        assert_eq!(
+            at(season + chrono::Duration::seconds(1)).within(season),
+            Some(50.0),
+            "after it"
+        );
+        assert_eq!(
+            at(season - chrono::Duration::seconds(1)).within(season),
+            None,
+            "one second before the season opened is the previous season"
+        );
+    }
+
+    /// A gauge deployed late has **no measured series in this season at all** — which is
+    /// exactly the case the correction exists for, so it must be the whole of the total
+    /// rather than discarded beside a zero.
+    #[tokio::test]
+    async fn an_adjustment_is_the_total_when_nothing_has_been_measured_yet() {
+        let cache = Arc::new(Cache::default());
+        let season = units::season_start(now(), denver()).expect("a real boundary");
+        // A series exists, and all of it predates this season.
+        cache.seed(season - chrono::Duration::days(40), 2, 5.0);
+        let adjustment = SeasonAdjustment {
+            amount_mm: 12.0 * units::MM_PER_INCH,
+            set_at: season + chrono::Duration::days(3),
+        };
+        let total = season_total(
+            &(Arc::clone(&cache) as Arc<dyn SnowCache>),
+            &StationKey::new("snowgauge"),
+            season,
+            Some(adjustment),
+        )
+        .await
+        .expect("a successful read");
+        assert_eq!(total, Some(12.0));
+
+        // And with no series whatsoever — a gauge the smoother has never run for — the
+        // adjustment is still an answer, because it does not depend on the sensor. That is
+        // the one place this changes the meaning of `None`, and it is the deployed-late
+        // case: the correction is entered before the gauge has produced anything.
+        let empty = Arc::new(Cache::default());
+        let total = season_total(
+            &(empty as Arc<dyn SnowCache>),
+            &StationKey::new("snowgauge"),
+            season,
+            Some(adjustment),
+        )
+        .await
+        .expect("a successful read");
+        assert_eq!(total, Some(12.0));
+    }
+
+    /// The tenth-of-an-inch serving floor applies **once, to the sum**. Two hundredths of
+    /// an inch of correction on top of two hundredths measured is still nothing; a tenth
+    /// either way is a tenth.
+    #[tokio::test]
+    async fn the_serving_threshold_applies_to_the_sum_and_not_to_each_half() {
+        let cache = Arc::new(Cache::default());
+        let season = units::season_start(now(), denver()).expect("a real boundary");
+        // **The discriminating case**, which the first version of this test did not have:
+        // two sub-threshold halves that sum ABOVE the threshold. At 0.02 + 0.02 both
+        // orders of operation answer zero, so that fixture could not tell the
+        // implementation from the bug it is named after.
+        cache.seed(season, 2, 0.0);
+        cache.seed(season + chrono::Duration::days(1), 2, 0.06);
+        let tiny = SeasonAdjustment {
+            amount_mm: 0.06 * units::MM_PER_INCH,
+            set_at: season + chrono::Duration::days(2),
+        };
+        let total = season_total(
+            &(Arc::clone(&cache) as Arc<dyn SnowCache>),
+            &StationKey::new("snowgauge"),
+            season,
+            Some(tiny),
+        )
+        .await
+        .expect("a successful read");
+        // One sum, one threshold: 0.12 in rounds to 0.1. Thresholding each half first
+        // would zero both and answer 0.0.
+        assert_eq!(total, Some(0.1));
+
+        // And genuinely-negligible halves are still nothing, which is the other half of
+        // the property.
+        let cache = Arc::new(Cache::default());
+        cache.seed(season, 2, 0.0);
+        cache.seed(season + chrono::Duration::days(1), 2, 0.02);
+        let negligible = SeasonAdjustment {
+            amount_mm: 0.02 * units::MM_PER_INCH,
+            set_at: season + chrono::Duration::days(2),
+        };
+        let total = season_total(
+            &(Arc::clone(&cache) as Arc<dyn SnowCache>),
+            &StationKey::new("snowgauge"),
+            season,
+            Some(negligible),
+        )
+        .await
+        .expect("a successful read");
+        assert_eq!(total, Some(0.0), "0.04 in is under the threshold");
+    }
+
+    /// An edited amount restarts the components that serve the number, so an operator who
+    /// enters a missed storm does not watch an unchanged total for fifteen minutes and
+    /// enter it again.
+    #[test]
+    fn changing_the_adjustment_changes_the_digest() {
+        let plain = gauge("snowgauge");
+        let mut corrected = gauge("snowgauge");
+        corrected.season_adjustment = Some(SeasonAdjustment {
+            amount_mm: 300.0,
+            set_at: now(),
+        });
+        assert_ne!(
+            digest_of(std::slice::from_ref(&plain)),
+            digest_of(std::slice::from_ref(&corrected))
+        );
+        // And the same amount is the same digest, so a reconfiguration that changed
+        // nothing does not restart anything.
+        assert_eq!(
+            digest_of(std::slice::from_ref(&corrected)),
+            digest_of(std::slice::from_ref(&corrected))
+        );
+        assert_eq!(
+            digest_of(std::slice::from_ref(&plain)),
+            digest_of(std::slice::from_ref(&plain))
+        );
     }
 
     /// **The Critical the review found.** A gauge whose history is older than the 5-minute
@@ -1268,7 +1461,7 @@ mod driven {
             season,
             chrono::Duration::hours(1),
             &(0..hours)
-                .map(|i| Some(1500.0 - 100.0 * i as f64 / hours as f64))
+                .map(|i| Some(100.0 * i as f64 / hours as f64))
                 .collect::<Vec<_>>(),
         );
         let cache = Arc::new(Cache::default());
@@ -1295,17 +1488,17 @@ mod driven {
     /// total is served for ever.
     #[tokio::test]
     async fn a_snow_free_day_reports_no_new_snow_rather_than_yesterdays() {
-        // Buckets since midnight, every one within 2 mm of the 1500 mm base: bare ground,
+        // Buckets since midnight, every one a depth within the 2 mm bare-ground threshold,
         // which `depths_from` filters out entirely.
         let five = buckets(
             midnight(),
             chrono::Duration::minutes(5),
-            &[Some(1499.0), Some(1500.0), Some(1499.5), Some(1499.0)],
+            &[Some(1.0), Some(0.0), Some(0.5), Some(1.0)],
         );
         let minutes = buckets(
             now() - chrono::Duration::minutes(1),
             chrono::Duration::minutes(1),
-            &[Some(1499.0)],
+            &[Some(1.0)],
         );
         let cache = Arc::new(Cache::default());
         let mut body = depth_body(
@@ -1350,6 +1543,7 @@ mod driven {
             &(Arc::clone(&cache) as Arc<dyn SnowCache>),
             &StationKey::new("snowgauge"),
             season,
+            None,
         )
         .await
         .expect("a successful read");
@@ -1360,6 +1554,7 @@ mod driven {
             &(fresh as Arc<dyn SnowCache>),
             &StationKey::new("snowgauge"),
             season,
+            None,
         )
         .await
         .expect("a successful read");

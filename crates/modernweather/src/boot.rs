@@ -75,18 +75,23 @@ use crate::spool;
 /// down to its `if con.Type == "management" { continue }`.
 ///
 /// Rule 2's own wording is "each component crate contributes one `fn register(cfg, out)`",
-/// and three crates here contribute more than one: `mw-pipeline` through `Rollup`, `Snow`,
-/// `Almanac` and `Snapshot`, `mw-output` through `Outputs` and `Aeris`, and `mw-station` through
-/// `Stations` and `SnowGauges`. Each split is one configuration table against another --
-/// `uploader` against `aeris_account`, the station rows against the ingest rows -- and the
+/// and two crates here contribute more than one: `mw-pipeline` through `Rollup`, `Snow`,
+/// `Almanac` and `Snapshot`, and `mw-output` through `Outputs` and `Aeris`. Each split is one
+/// configuration table against another -- `uploader` against `aeris_account` -- and the
 /// reason is the same every time: one registrar reading two tables is one `RegisterError`
 /// for two unrelated refusals, so an operator who mistyped a credential is told about a
 /// coordinate. The order is not load-bearing: `Phase::Spread` is derived from a hash of the
 /// component id and `plan()` orders by the hard-edge digraph, so position affects only
 /// which refusal surfaces first.
+///
+/// **`mw-station` used to be a third**, through a `SnowGauges` registrar that called
+/// `mw_grpc::snowgauge::register`: the gauge spoke gRPC and `ci/layers.toml` forbids
+/// `mw-station` from naming `tonic`, so one station type was planned by another crate from
+/// the same table. The gauge's firmware serves JSON over HTTP now, so `Stations` plans it
+/// with the rest and the id it is planned under is minted by the one function
+/// `mw_station::fixed_receivers` mints it with.
 const REGISTRARS: &[&dyn Registrar<Config>] = &[
     &Stations,
-    &SnowGauges,
     &ReadingReceiver,
     &Collector,
     &Uplinks,
@@ -126,38 +131,6 @@ impl Registrar<Config> for Stations {
         // `PlanError::Registrar` carries a `reason: String`, so a `#[source]` chain that
         // was not walked here would lose every level but the first.
         mw_station::register(cfg, out)
-            .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
-    }
-}
-
-/// `mw-grpc`'s snow gauge registrar.
-///
-/// **A second station registrar, and `ci/layers.toml` is why.** `mw-station` may not name
-/// `tonic`, so the component that dials a gauge cannot live there — what lives there is
-/// everything about the gauge that is not gRPC: the `type` value, the component id, and the
-/// plan-time validation of the row (`mw_station::snowgauge`). So `mw_station::register`
-/// checks a `snowgauge` row and emits nothing, and this emits the component for the rows it
-/// checked.
-///
-/// The two therefore read the **same** rows and mint the **same** ids, which is the one
-/// property that has to hold: the registry resolves a `Fixed` frame *by its receiver*, so
-/// an id mismatch would be a gauge whose every reading is `unknown_station` with nothing
-/// naming it. `mw_station::fixed_receivers` is the third caller of that same function, and
-/// `crates/mw-station/tests/plan.rs` asserts the three agree.
-#[derive(Debug)]
-struct SnowGauges;
-
-impl Registrar<Config> for SnowGauges {
-    fn name(&self) -> &'static str {
-        "mw-grpc:snowgauge"
-    }
-
-    fn register(
-        &self,
-        cfg: &Config,
-        out: &mut Vec<mw_component::ComponentSpec>,
-    ) -> Result<(), RegisterError> {
-        mw_grpc::snowgauge::register(cfg, out)
             .map_err(|e| RegisterError::new(mw_types::DisplayChain(&e).to_string()))
     }
 }
@@ -2045,7 +2018,11 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
         Arc::clone(&rings),
         Arc::new(crate::hostinfo::Host::new()),
     )
-    .with_live(Arc::clone(&live));
+    .with_live(Arc::clone(&live))
+    // The live read of a snow gauge's own calibration. Always attached in the daemon --
+    // the request path is `mw_station::http`'s and needs nothing a serving node lacks --
+    // and absent only in the `oneshot` tests, where the route answers `501`.
+    .with_gauge_probe(Arc::new(crate::gauge::Gauges::new(pool.clone())));
     // A node with neither a spool nor peers has nothing to report, and the route says so
     // rather than answering an object whose every field is absent.
     if fanout.is_some() || peer_store.is_some() {

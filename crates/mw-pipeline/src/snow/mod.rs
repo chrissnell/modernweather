@@ -98,7 +98,7 @@ use mw_component::{
     SnowPatch, Store, StoreError, Tick, Trigger, TzSource, Zone,
 };
 use mw_types::{MetricKey, StationKey};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::clock::{Clock, SystemClock};
 
@@ -315,17 +315,49 @@ pub const EVENT_WINDOWS: [EventWindow; 4] = [
 pub struct SnowStation {
     /// Whose.
     pub key: StationKey,
-    /// `config.stations.snow_base_distance_mm` — the distance from the sensor to bare
-    /// ground. Every depth is `base - snowdistance`.
-    ///
-    /// `None` is a gauge with no calibration, which has no computable depth. See
-    /// [`register`].
-    pub base_distance_mm: Option<f64>,
     /// The station's resolved zone, for the local midnight and the season's boundary.
     ///
     /// `None` is a station with no usable `config.stations.timezone`, which [`register`]
     /// refuses by name.
     pub zone: Option<Zone>,
+    /// Snowfall to add to this station's season total, and when the operator entered it.
+    ///
+    /// `config.stations.snow_season_adjustment_mm` and `..._set_at`: snow that fell before
+    /// the gauge was measuring it, which no arithmetic over the measured series can
+    /// recover. The instant is what scopes the amount to one season — its migration has
+    /// why — and both are `None` in the ordinary case.
+    pub season_adjustment: Option<SeasonAdjustment>,
+}
+
+/// An operator's correction to one season's snowfall total.
+///
+/// The case is the owner's, stated 2026-11-21: the sensor is deployed late and misses the
+/// first storm. That snow fell and the season total is the number a reader cares about, so
+/// the correction is configuration rather than a fabricated reading in a column whose
+/// value is that it holds what the sensor saw.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SeasonAdjustment {
+    /// How much, in millimetres — the unit every snow quantity below the serving layer is.
+    pub amount_mm: f64,
+    /// When it was entered, which decides the season it counts toward.
+    pub set_at: DateTime<Utc>,
+}
+
+impl SeasonAdjustment {
+    /// The amount, if it belongs to the season that began at `season_start`.
+    ///
+    /// **Scoped to one season on purpose.** The owner declined per-adjustment dates, and a
+    /// permanent constant has a worse failure mode than the inconvenience that avoids: the
+    /// season rolls over on 1 October, so last year's missed storm would still be inflating
+    /// this year's total, and every year's after, until somebody remembered the setting was
+    /// there. An operator would open the page in October and see snow before any fell.
+    ///
+    /// Nothing asks the operator for a date — `set_at` is stamped from the clock on save —
+    /// so from their side this is still one number in one box.
+    #[must_use]
+    pub fn within(&self, season_start: DateTime<Utc>) -> Option<f64> {
+        (self.set_at >= season_start).then_some(self.amount_mm)
+    }
 }
 
 /// What this crate needs from the configuration to plan the snow components.
@@ -341,17 +373,19 @@ pub trait SnowConfig {
 
 /// Declare the four snow components.
 ///
-/// # A gauge with no base distance is skipped, and a gauge with no zone is refused
+/// # Every enabled gauge gets components, and a gauge with no zone is refused
 ///
-/// The two absences look alike and are not, which is why they get different answers:
+/// **A gauge with no configured base distance used to be skipped here**, with a `warn`,
+/// because every depth was `base - snowdistance` computed on this side and there was
+/// nothing to compute without it. That is no longer true: the gauge holds its own
+/// calibration and reports the depth, `crate::enrich` stores it, and these components read
+/// the stored depth. So the configured base distance decides nothing here and the gauge is
+/// planned either way.
 ///
-/// - **No `snow_base_distance_mm`** is a *representable* state the schema went out of its
-///   way to allow: the column is nullable with a `CHECK (> 0)` precisely so that "not
-///   configured" can be told from "configured as zero", and `crate::enrich` already derives
-///   no depth from such a reading (`docs/reconciliation.md` DEV-16, part f). There is
-///   nothing to compute, so the gauge contributes no component — logged at `warn`, because
-///   an operator who installed a gauge and did not measure its height gets zeros forever
-///   and the Go daemon told them nothing at all.
+/// That is also a better answer to the case the skip existed for. A gauge calibrated after
+/// the daemon started used to need a configuration change to get its components; now the
+/// depth simply starts arriving and the totals start filling, with nothing to restart.
+///
 /// - **No usable `timezone`** is a plan error naming the station, because every number
 ///   except the depth depends on a local boundary — "today" and "this season" are both
 ///   station-local (**D-24**) — and a silent fallback to UTC is the defect W3 §2.5's
@@ -368,16 +402,6 @@ pub fn register<C: SnowConfig + ?Sized>(
     }
     let mut gauges = Vec::new();
     for station in cfg.snow_stations() {
-        let Some(base_distance_mm) = station.base_distance_mm else {
-            warn!(
-                station = %station.key,
-                "not planning snow calculations for this gauge: it has no \
-                 `snow_base_distance_mm`, so there is no bare-ground reference to measure a \
-                 depth against and every total would be zero. Measure the sensor's height \
-                 above bare ground and set the column."
-            );
-            continue;
-        };
         let Some(zone) = station.zone else {
             return Err(SnowPlanError::MissingTimeZone {
                 station: station.key.to_string(),
@@ -385,8 +409,8 @@ pub fn register<C: SnowConfig + ?Sized>(
         };
         gauges.push(Gauge {
             key: station.key,
-            base_distance_mm,
             zone,
+            season_adjustment: station.season_adjustment,
         });
     }
     if gauges.is_empty() {
@@ -440,22 +464,37 @@ pub enum SnowPlanError {
 #[derive(Debug, Clone, PartialEq)]
 struct Gauge {
     key: StationKey,
-    base_distance_mm: f64,
     zone: Zone,
+    season_adjustment: Option<SeasonAdjustment>,
 }
 
 /// What goes into a shared component's [`ConfigDigest`].
 ///
-/// The gauges, their calibration and their zones: a gauge added, re-measured or moved to
-/// another zone restarts the component, and a change elsewhere does not.
+/// The gauges, their zones and their season adjustments: a gauge added, moved to another
+/// zone, or given a missed-storm correction restarts the component, and a change elsewhere
+/// does not.
+///
+/// **The calibration is not in here any more.** It used to be — every depth was
+/// `base - snowdistance` computed on this side — and the gauge holds its own calibration
+/// now and reports the depth from it, so re-measuring a gauge changes nothing these
+/// components compute and has nothing to restart.
 fn digest_of(gauges: &[Gauge]) -> ConfigDigest {
     let mut s = String::new();
     for gauge in gauges {
         s.push_str(gauge.key.as_str());
         s.push('=');
-        s.push_str(&format!("{:.3}", gauge.base_distance_mm));
-        s.push('@');
         s.push_str(gauge.zone.name());
+        // **In the digest**, because the season total is a function of it: an operator who
+        // enters a missed storm and sees nothing change for fifteen minutes would enter it
+        // again. A changed digest restarts the components that serve the number.
+        if let Some(adjustment) = gauge.season_adjustment {
+            s.push('+');
+            s.push_str(&format!(
+                "{:.3}@{}",
+                adjustment.amount_mm,
+                adjustment.set_at.timestamp()
+            ));
+        }
         s.push(';');
     }
     ConfigDigest::of(&s)
@@ -702,7 +741,7 @@ impl Depth {
             .store
             .mean_series(MeanSeriesQuery {
                 station: gauge.key.clone(),
-                metric: MetricKey::SnowDistance,
+                metric: MetricKey::SnowDepth,
                 level: BucketLevel::Minute,
                 since: now - DEPTH_LOOKBACK,
                 until: None,
@@ -714,10 +753,10 @@ impl Depth {
         // A tick that finds no reading writes **no depth column**, which is what makes the
         // row's persistence reproduce "an offline gauge returns its last known depth
         // indefinitely" (W1 Decision 16) without a recency filter anywhere.
-        let depth = newest.and_then(|bucket| {
-            let distance = bucket.mean?;
-            Some(units::serving_inches(gauge.base_distance_mm - distance))
-        });
+        // The bucket **is** the depth: the gauge derives it from its own calibration and
+        // `enrich` stores it, where this used to subtract a configured base distance from
+        // the measured distance.
+        let depth = newest.and_then(|bucket| bucket.mean.map(units::serving_inches));
         let fall_rate = rate(&minutes, now);
 
         // Today, from the station's own local midnight -- not the database server's, and
@@ -728,14 +767,14 @@ impl Depth {
                     .store
                     .mean_series(MeanSeriesQuery {
                         station: gauge.key.clone(),
-                        metric: MetricKey::SnowDistance,
+                        metric: MetricKey::SnowDepth,
                         level: BucketLevel::FiveMinute,
                         since: midnight,
                         until: None,
                         limit: buckets_in(Duration::from_secs(25 * 3600), BucketLevel::FiveMinute),
                     })
                     .await?;
-                accumulated(&series, gauge.base_distance_mm)
+                accumulated(&series)
             }
             // Unreachable: `register` refuses a gauge with no zone. Answered rather than
             // asserted, because a component body may not panic over a configuration value.
@@ -754,14 +793,14 @@ impl Depth {
             .store
             .mean_series(MeanSeriesQuery {
                 station: gauge.key.clone(),
-                metric: MetricKey::SnowDistance,
+                metric: MetricKey::SnowDepth,
                 level: BucketLevel::Hour,
                 since: now - STORM_WINDOW,
                 until: None,
                 limit: buckets_in(STORM_WINDOW, BucketLevel::Hour),
             })
             .await?;
-        let storm = accumulated(&storm_series, gauge.base_distance_mm);
+        let storm = accumulated(&storm_series);
 
         Ok(SnowPatch {
             depth,
@@ -798,9 +837,17 @@ fn rate(minutes: &[MeanBucket], now: DateTime<Utc>) -> Option<f32> {
         .iter()
         .filter(|b| b.mean.is_some() && (b.bucket - target).abs() <= tolerance)
         .min_by_key(|b| (b.bucket - target).abs())?;
-    // Distances, so the subtraction is the other way round from a depth: the snow got
-    // deeper when the sensor's distance to it got shorter.
-    let fell_mm = past.mean? - current.mean?;
+    // **Depths**, so the newer sample less the older one. This read the distance series
+    // until `/snow` moved onto the stored depth column, and the subtraction was the other
+    // way round for it -- the snow got deeper as the sensor's distance to it shrank.
+    //
+    // It is the one consumer of this series that takes no base distance, so it was the one
+    // the conversion did not reach by following that parameter: it is handed the same
+    // `minutes` vector the depth and the liveness checks use. Getting it wrong inverted
+    // `snowfallrate` on a frozen endpoint -- fresh snow reported as zero, a settling pack
+    // reported as snowfall -- and the two fixtures below are seeded as depths so that they
+    // assert what their names say.
+    let fell_mm = current.mean? - past.mean?;
     if fell_mm <= 0.0 {
         return Some(0.0);
     }
@@ -818,7 +865,7 @@ fn rate(minutes: &[MeanBucket], now: DateTime<Utc>) -> Option<f32> {
 /// # The predicate is "did the gauge report", **not** "did the filter keep anything"
 ///
 /// `threshold::depths_from` drops a bucket for two unrelated reasons — no reading in it, and
-/// a distance within 2 mm of the base (bare ground, which migration 011 excludes so that a
+/// a depth within 2 mm of bare ground (bare ground, which migration 011 excludes so that a
 /// zero depth cannot re-base the walk). Treating an empty *filtered* series as "unknown"
 /// conflates them, and the conflation is not harmless on `snowtoday`: that window **resets
 /// at local midnight**, so a gauge that is reporting bare ground all day never produces a
@@ -830,13 +877,13 @@ fn rate(minutes: &[MeanBucket], now: DateTime<Utc>) -> Option<f32> {
 /// So the emptiness that means "unknown" is counted on the **unfiltered** series, and bare
 /// ground is a known zero. Go answers `0.0` for both, which is the other half of the same
 /// trade: its gauge that goes offline at noon reports no snow today by one o'clock.
-fn accumulated(series: &[MeanBucket], base_distance_mm: f64) -> Option<f32> {
+fn accumulated(series: &[MeanBucket]) -> Option<f32> {
     if !series.iter().any(|bucket| bucket.mean.is_some()) {
         return None;
     }
     let pairs: Vec<(DateTime<Utc>, Option<f64>)> =
         series.iter().map(|b| (b.bucket, b.mean)).collect();
-    let depths: Vec<f64> = threshold::depths_from(&pairs, base_distance_mm)
+    let depths: Vec<f64> = threshold::depths_from(&pairs)
         .into_iter()
         .map(|(_, mm)| mm)
         .collect();
@@ -1002,7 +1049,7 @@ impl Smoothing {
                     .store
                     .mean_series(MeanSeriesQuery {
                         station: gauge.key.clone(),
-                        metric: MetricKey::SnowDistance,
+                        metric: MetricKey::SnowDepth,
                         level,
                         since: from,
                         until: Some(until),
@@ -1012,7 +1059,7 @@ impl Smoothing {
                 // The rate limiter's carried state: the newest estimate from **before** this
                 // pass's window. Re-read per pass, because the previous pass wrote one.
                 let previous = self.cache.estimate_before(&gauge.key, from).await?;
-                let rows = estimates(&series, gauge.base_distance_mm, previous);
+                let rows = estimates(&series, previous);
                 // **The replace is bounded above as well as below**, which the one-level
                 // version did not need: a coarse phase must not delete the finer estimates
                 // that follow it, and `until` is where the next phase begins.
@@ -1044,7 +1091,9 @@ impl Smoothing {
         // column's daily recomputation; this is the same expression over the same handle,
         // and the module documentation has why both exist.
         let season = match units::season_start(now, gauge.zone) {
-            Some(start) => season_total(&self.cache, &gauge.key, start).await?,
+            Some(start) => {
+                season_total(&self.cache, &gauge.key, start, gauge.season_adjustment).await?
+            }
             None => None,
         };
         // **No `source_through`.** It has one owner, `snow:depth`, and the handle's own
@@ -1086,15 +1135,11 @@ fn overlap() -> chrono::Duration {
     chrono::Duration::from_std(SMOOTHING_OVERLAP).unwrap_or_else(|_| chrono::Duration::hours(6))
 }
 
-/// One pass's estimates: the distance series, converted, smoothed and rate-limited.
-fn estimates(
-    series: &[MeanBucket],
-    base_distance_mm: f64,
-    previous: Option<DepthEstimate>,
-) -> Vec<DepthEstimate> {
+/// One pass's estimates: the stored depth series, converted, smoothed and rate-limited.
+fn estimates(series: &[MeanBucket], previous: Option<DepthEstimate>) -> Vec<DepthEstimate> {
     let pairs: Vec<(DateTime<Utc>, Option<f64>)> =
         series.iter().map(|b| (b.bucket, b.mean)).collect();
-    let samples: Vec<smoothing::Sample> = threshold::depths_from(&pairs, base_distance_mm)
+    let samples: Vec<smoothing::Sample> = threshold::depths_from(&pairs)
         .into_iter()
         .map(|(at, depth_mm)| smoothing::Sample {
             at,
@@ -1140,17 +1185,47 @@ async fn season_total(
     cache: &Arc<dyn SnowCache>,
     station: &StationKey,
     start: DateTime<Utc>,
+    adjustment: Option<SeasonAdjustment>,
 ) -> Result<Option<f32>, StoreError> {
+    // The operator's correction for snow that fell before the gauge measured it, in
+    // inches, and only if it belongs to the season being totalled
+    // ([`SeasonAdjustment::within`]).
+    //
+    // **Stays an `Option` rather than becoming a zero**, which is `ci/layers.toml`'s
+    // `one-zero-fill` rule and is right here for its own reason as well as the rule's:
+    // "there is no adjustment" and "the adjustment is zero" are different facts, the
+    // second is unrepresentable (the column's `CHECK` is `> 0`), and the branches below
+    // read differently for each.
+    let added_in: Option<f64> = adjustment
+        .and_then(|a| a.within(start))
+        .map(units::inches_from_mm);
+
     let Some(window) = cache.estimate_window(station, start).await? else {
-        return match cache.newest_estimate(station).await? {
+        return match (cache.newest_estimate(station).await?, added_in) {
+            // Nothing measured in this season, so an adjustment is the whole of the total.
+            // This covers both the gauge with a series that predates the season and the
+            // gauge the smoother has never run for -- the deployed-late case, which is the
+            // one this setting exists for, and where the correction is an answer precisely
+            // because it does not depend on the sensor.
+            (_, Some(added)) => Ok(Some(units::serving_from_inches(added))),
             // A series exists and none of it is in this season: nothing has fallen yet.
-            Some(_) => Ok(Some(0.0)),
-            // The smoother has never run for this gauge, so the total is unknown.
-            None => Ok(None),
+            (Some(_), None) => Ok(Some(0.0)),
+            // The smoother has never run for this gauge, so the total is unknown and the
+            // stored one is left alone rather than overwritten.
+            (None, None) => Ok(None),
         };
     };
     let accumulated = f64::from(window.max_in) - f64::from(window.first_in);
-    Ok(Some(units::serving_from_inches(accumulated.max(0.0))))
+    let measured = accumulated.max(0.0);
+    // **Added before the serving threshold, not after.** `serving_from_inches` zeroes
+    // anything under a tenth of an inch, and applying that to the measured and the added
+    // separately would let a hundredth of an inch of correction survive where a hundredth
+    // of an inch of snow does not. One sum, one threshold.
+    let total = match added_in {
+        Some(added) => measured + added,
+        None => measured,
+    };
+    Ok(Some(units::serving_from_inches(total)))
 }
 
 /// `snow:events`' body: the classified accumulation segments per chart range.
@@ -1223,7 +1298,7 @@ impl Events {
             .store
             .mean_series(MeanSeriesQuery {
                 station: gauge.key.clone(),
-                metric: MetricKey::SnowDistance,
+                metric: MetricKey::SnowDepth,
                 level: window.level,
                 since: now - chrono::Duration::days(window.days),
                 until: None,
@@ -1232,7 +1307,7 @@ impl Events {
             .await?;
         let pairs: Vec<(DateTime<Utc>, Option<f64>)> =
             series.iter().map(|b| (b.bucket, b.mean)).collect();
-        let depths = threshold::depths_from(&pairs, gauge.base_distance_mm);
+        let depths = threshold::depths_from(&pairs);
         if depths.is_empty() {
             // No usable readings in the window, so no events -- and the empty write above
             // is what removes the ones the last pass found. A chart that kept drawing a
@@ -1292,17 +1367,22 @@ impl Tick for Season {
                 // Unreachable: `register` refuses a gauge with no zone.
                 return Ok(());
             };
-            let season = season_total(&self.cache, &self.gauge.key, start)
-                .await
-                .map_err(|e| {
-                    ComponentError::tick(
-                        format!(
-                            "read snow gauge `{}`'s estimated depth series",
-                            self.gauge.key
-                        ),
-                        e,
-                    )
-                })?;
+            let season = season_total(
+                &self.cache,
+                &self.gauge.key,
+                start,
+                self.gauge.season_adjustment,
+            )
+            .await
+            .map_err(|e| {
+                ComponentError::tick(
+                    format!(
+                        "read snow gauge `{}`'s estimated depth series",
+                        self.gauge.key
+                    ),
+                    e,
+                )
+            })?;
             let patch = SnowPatch {
                 season,
                 ..SnowPatch::NOTHING

@@ -155,18 +155,6 @@ pub enum CodecError {
         found: i64,
     },
 
-    /// The frame is not the protobuf message this codec decodes.
-    ///
-    /// Distinct from [`CodecError::Json`] for its reason: two wire formats, two parsers, and
-    /// a decoder that reported "not JSON" for a protobuf frame would send a reader to the
-    /// wrong half of the system.
-    #[error("the frame is not the protobuf message this codec decodes")]
-    Protobuf {
-        /// The decode failure.
-        #[source]
-        source: prost::DecodeError,
-    },
-
     /// The frame decoded, and what it decoded to is a fault the station's own configuration
     /// says it cannot be.
     ///
@@ -195,7 +183,7 @@ pub enum CodecError {
 }
 
 impl mw_types::Classify for CodecError {
-    /// All ten are [`mw_types::Class::Ignorable`], and that is the whole of this impl's
+    /// All nine are [`mw_types::Class::Ignorable`], and that is the whole of this impl's
     /// content: retrying a decode of the same bytes against the same codec cannot change
     /// the answer, and a frame the device sent wrong is not a failure of the component that
     /// received it (§4.4's canonical example).
@@ -246,18 +234,6 @@ pub trait Codec: fmt::Debug + Send + Sync + 'static {
 mod tests {
     use super::*;
     use mw_types::{Class, Classify};
-
-    /// A real `CodecError::Protobuf`, from the codec that produces them.
-    ///
-    /// Constructed by decoding rather than by hand: `prost::DecodeError::new` is deprecated
-    /// -- `prost` intends to remove it -- and a hand-built error would also be asserting
-    /// this module's own `From` impl rather than what a malformed frame actually produces.
-    /// The bytes are field 1 with a length that runs off the end.
-    fn protobuf_failure() -> CodecError {
-        crate::SnowGaugeProto::default()
-            .decode(&Frame::new(vec![0x0a, 0x40, 0x01]))
-            .expect_err("a truncated protobuf message")
-    }
 
     #[test]
     fn a_frame_hides_its_payload_from_debug() {
@@ -318,7 +294,6 @@ mod tests {
             .class(),
             Class::Ignorable
         );
-        assert_eq!(protobuf_failure().class(), Class::Ignorable);
         assert_eq!(
             CodecError::Implausible {
                 what: "a snow-gauge distance",
@@ -328,12 +303,24 @@ mod tests {
             .class(),
             Class::Ignorable
         );
+        assert_eq!(
+            CodecError::Json {
+                source: serde_json::from_str::<u8>("nope").expect_err("not a number")
+            }
+            .class(),
+            Class::Ignorable
+        );
     }
 
-    /// `Protobuf` and `Implausible` carry a sentence too, because both are reasons an
-    /// operator reads off a counter and then has to act on.
+    /// `Implausible` carries a sentence too, because it is a reason an operator reads off
+    /// a counter and then has to act on.
+    ///
+    /// **There used to be a second half to this test**, over `CodecError::Protobuf`. The
+    /// snow gauge was the one protobuf frame in this crate; its firmware now serves JSON
+    /// (`crate::snowgauge`), so the variant, `prost` and this crate's hand-declared
+    /// message are gone rather than kept for a protocol nothing speaks.
     #[test]
-    fn the_protobuf_and_implausible_failures_name_what_they_refused() {
+    fn the_implausible_failure_names_what_it_refused() {
         assert_eq!(
             CodecError::Implausible {
                 what: "a snow-gauge distance",
@@ -343,19 +330,21 @@ mod tests {
             .to_string(),
             "a snow-gauge distance is 3000 and the station's own limit is 2000"
         );
-        // `Protobuf`'s own sentence names the format and not the fault -- `prost`'s
-        // message is the `#[source]`, which is where `DisplayChain` finds it. Asserted in
-        // both halves, because a reader who sees only the top line gets "not protobuf" and
-        // has to be able to rely on the detail being one link down.
-        let e = protobuf_failure();
+        // `Json`'s own sentence names the format and not the fault -- `serde_json`'s
+        // message, with its position, is the `#[source]`, which is where `DisplayChain`
+        // finds it. Asserted in both halves, because a reader who sees only the top line
+        // gets "not JSON" and has to be able to rely on the detail being one link down.
+        let e = crate::AirGradientJson
+            .decode(&Frame::new(b"{\"atmp\": }".to_vec()))
+            .expect_err("a malformed document");
         assert_eq!(
             e.to_string(),
-            "the frame is not the protobuf message this codec decodes"
+            "the frame is not the JSON this codec decodes"
         );
         let source = std::error::Error::source(&e)
-            .expect("the decode failure is the source")
+            .expect("the parse failure is the source")
             .to_string();
-        assert!(source.contains("buffer underflow"), "{source}");
+        assert!(source.contains("line 1 column"), "{source}");
     }
 
     /// Each of the three framing-class variants says which it is, because `undecodable`

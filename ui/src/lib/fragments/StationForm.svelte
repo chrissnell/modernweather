@@ -74,6 +74,22 @@
   let timezone = $state(seed?.timezone ?? '');
   let windCorrection = $state((seed?.wind_dir_correction_degrees ?? 0).toString());
   let snowBase = $state(seed?.snow_base_distance_mm?.toString() ?? '');
+  // Inches, which is what the operator typed and what the view hands back.
+  let snowAdjustment = $state(seed?.snow_season_adjustment_in?.toString() ?? '');
+  // Whether the operator has typed in the box this visit -- see `build`.
+  let snowAdjustmentTouched = $state(false);
+  // **Which season the stored amount is counting toward**, from the server, because the
+  // operator never typed a date and the scoping would otherwise be invisible. `ended` is
+  // an amount whose season has rolled over: it counts toward nothing now, which is the cue
+  // to clear it or enter it again.
+  const storedSeason = seed?.snow_season_adjustment_season;
+  const seasonNote =
+    storedSeason === undefined || storedSeason === null
+      ? 'inches'
+      : storedSeason === 'ended'
+        ? 'inches \u2014 the season this was entered for has ended, so it is no longer' +
+          ' counted. Retype the amount to count it toward this season, or clear the box.'
+        : `inches \u2014 counting toward the ${storedSeason} season`;
   let pollInterval = $state(seed?.poll_interval_seconds?.toString() ?? '');
   let callsign = $state(seed?.aprs_callsign ?? '');
   let sensorMapping = $state(seed?.sensor_mapping ?? '');
@@ -133,6 +149,17 @@
 
   function build(): Schemas['StationInput'] {
     return {
+      // **Sent only when the operator touched the box.** The amount is stamped with the
+      // instant it was entered and that stamp is what scopes it to one season, so an
+      // omitted field means "leave the amount and its season alone" -- which is what every
+      // edit to another field on this form has to do -- and a sent one means "entered now",
+      // including when it is the same number as last time. The server cannot tell those
+      // apart from the value, so the form has to say which it is.
+      ...(shape.snow
+        ? snowAdjustmentTouched
+          ? { snow_season_adjustment_in: num(snowAdjustment) }
+          : {}
+        : { snow_season_adjustment_in: null }),
       name,
       kind,
       identity_kind: station?.identity_kind ?? (shape.presentsIdentity ? 'from_query' : 'fixed'),
@@ -158,10 +185,19 @@
         mount: mount || null,
         // `streaming` belongs to **`grpc_out` alone**. W2a §4a.3 is `HttpOut { auth }` and
         // `GrpcOut { streaming: bool }`, and the configuration database enforces exactly
-        // that -- so sending it with an `http_out` station is a refusal, not a default.
-        // The value is a fact about the hardware rather than a choice, which is why it
-        // comes from the kind table and not from a control.
-        streaming: transportKind === 'grpc_out' ? shape.streams : null,
+        // that -- `CHECK (transport_streaming IS NULL OR COALESCE(transport_kind, '') =
+        // 'grpc_out')` -- so sending it with an `http_out` station is a refusal, not a
+        // default, and omitting it for a `grpc_out` one is a 422.
+        //
+        // **The STORED value, not the kind table's.** No kind in `SHAPES` is `grpc_out`
+        // any more (the snow gauge was the one, and its firmware serves HTTP now), so
+        // `shape.streams` is `false` for every kind -- and reading it here would quietly
+        // rewrite a stored `1` to `0` on any save of a row written by an older version.
+        // That is the opposite of what this branch is for: it exists so such a row stays
+        // editable, and `mw_station::plan` is what refuses to RUN it, with a sentence
+        // naming the columns to change.
+        streaming:
+          transportKind === 'grpc_out' ? (station?.transport?.streaming ?? shape.streams) : null,
         // The rest are carried rather than offered: this form has no control for them, and
         // a `PUT` that omitted them would null whatever is stored.
         topic: topic || null,
@@ -533,6 +569,26 @@
                 type="number"
                 value={snowBase}
                 oninput={(e) => (snowBase = (e.currentTarget as HTMLInputElement).value)}
+                aria-describedby={describedBy}
+              />
+            {/snippet}
+          </Field>
+          <Field
+            copy={copy.fields.snowSeasonAdjustment}
+            note={seasonNote}
+            error={err('snow_season_adjustment_in')}
+          >
+            {#snippet children({ id, describedBy })}
+              <Input
+                {id}
+                type="number"
+                min="0"
+                step="0.1"
+                value={snowAdjustment}
+                oninput={(e) => {
+                  snowAdjustment = (e.currentTarget as HTMLInputElement).value;
+                  snowAdjustmentTouched = true;
+                }}
                 aria-describedby={describedBy}
               />
             {/snippet}

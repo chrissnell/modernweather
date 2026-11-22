@@ -54,6 +54,7 @@ use crate::change::{
     Change, ForecastsInput, ListenerInput, PairingInput, RadarInput, ServiceInput, StationInput,
     StorageInput, TransportInput, WebsiteInput,
 };
+use crate::device::{GaugeDeviceView, GaugeProbe};
 use crate::display::{Badge, Display, Section, Vocabulary};
 use crate::error::{ApiError, Body, ErrorBody, FieldError};
 use crate::events::{self, ChannelsInput, ChannelsView, Live};
@@ -88,6 +89,10 @@ pub struct Mgmt {
     live: Option<Arc<Live>>,
     /// **N-11**'s fleet numbers. `None` on a node with no spool and no peers.
     fleet: Option<Arc<dyn Fleet>>,
+    /// The live read of a snow gauge's own calibration. `None` in a build with no outbound
+    /// request path behind it -- every `oneshot` test -- and the route then answers `501`,
+    /// which is `live`'s precedent for the same shape of thing.
+    gauge: Option<Arc<dyn GaugeProbe>>,
 }
 
 impl std::fmt::Debug for Mgmt {
@@ -115,6 +120,7 @@ impl Mgmt {
             machine,
             live: None,
             fleet: None,
+            gauge: None,
         }
     }
 
@@ -130,6 +136,16 @@ impl Mgmt {
     #[must_use]
     pub fn with_fleet(mut self, fleet: Arc<dyn Fleet>) -> Self {
         self.fleet = Some(fleet);
+        self
+    }
+
+    /// Attach the live read of a snow gauge's own calibration.
+    ///
+    /// Separate from [`Mgmt::new`] for `with_live`'s reason: a router without one is a
+    /// valid router, and forty-odd operations do not need it.
+    #[must_use]
+    pub fn with_gauge_probe(mut self, gauge: Arc<dyn GaugeProbe>) -> Self {
+        self.gauge = Some(gauge);
         self
     }
 }
@@ -189,6 +205,8 @@ fn configured(state: Arc<Mgmt>) -> Router {
         .route("/api/v1/config/revert", post(post_revert))
         // §1.2 -- my weather stations.
         .route("/api/v1/stations", get(get_stations).post(post_station))
+        // §1.9 -- the snow gauge's own account of itself, read when the page is opened.
+        .route("/api/v1/stations/{key}/device", get(get_station_device))
         .route(
             "/api/v1/stations/{key}",
             get(get_station).put(put_station).delete(delete_station),
@@ -315,6 +333,7 @@ fn configured(state: Arc<Mgmt>) -> Router {
         get_logs,
         get_system_info,
         get_serial_ports,
+        get_station_device,
         get_events,
         post_event_channels,
         get_fleet,
@@ -1343,6 +1362,35 @@ async fn get_logs(State(s): State<Arc<Mgmt>>, Query(q): Query<LogQuery>) -> Repl
 )]
 async fn get_system_info(State(s): State<Arc<Mgmt>>) -> Reply<SystemInfoView> {
     Ok(Json(s.machine.info()))
+}
+
+/// What one snow gauge says about itself: its calibration, its firmware, its signal.
+///
+/// Read from the device when this is called, not from storage: the calibration is the
+/// gauge's own property, set from its own web interface, and nothing here is a measurement
+/// (`crate::device`). A gauge that is off answers `200` with `reachable: false`, because
+/// that is an answer rather than a failure of this daemon.
+#[utoipa::path(
+    get,
+    path = "/api/v1/stations/{key}/device",
+    tag = "stations",
+    params(("key" = String, Path, description = "The station's key")),
+    responses(
+        (status = 200, description = "What the gauge reports", body = GaugeDeviceView),
+        (status = 404, description = "No such station, or it is not a snow gauge", body = ErrorBody),
+        (status = 501, description = "This build cannot read a device", body = ErrorBody),
+    )
+)]
+async fn get_station_device(
+    State(s): State<Arc<Mgmt>>,
+    Path(key): Path<String>,
+) -> Reply<GaugeDeviceView> {
+    let Some(gauge) = s.gauge.as_ref() else {
+        return Err(ApiError::Unsupported {
+            summary: "This build cannot read a device directly.".to_string(),
+        });
+    };
+    Ok(Json(gauge.read(&key).await?))
 }
 
 /// Every serial port a station could be plugged into.

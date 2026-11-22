@@ -1311,6 +1311,12 @@ mod tests {
                     .to_string(),
             ),
             (
+                // The schema still admits `grpc_out`, and no station driver has a mode for
+                // it: the snow gauge was the one and its firmware serves HTTP now, so
+                // `mw_station::plan` refuses such a row by name. What this case is about is
+                // the CHECK, which has to keep holding for whatever outbound gRPC station
+                // arrives next -- a storable row with no flag for `plan()` to read is the
+                // thing being made unrepresentable.
                 "a grpc_out transport with no streaming flag for plan() to read (W2a §4a.3)",
                 format!(
                     "INSERT INTO stations (station_key, owning_node_id, name, type,
@@ -1523,6 +1529,16 @@ pub struct StationRow {
     pub timezone: Option<String>,
     /// `snow_base_distance_mm`: the distance the gauge reads with no snow under it.
     pub snow_base_distance_mm: Option<f64>,
+    /// `snow_season_adjustment_mm`: snowfall to add to this station's season total,
+    /// because it fell before the gauge was measuring.
+    ///
+    /// Millimetres, like every snow quantity below the serving layer. `None` is the
+    /// ordinary state. Its migration has the whole of why it exists and why it is scoped
+    /// to one season.
+    pub snow_season_adjustment_mm: Option<f64>,
+    /// `snow_season_adjustment_set_at`: when the amount above was entered, as unix
+    /// seconds, which is what scopes it to the season that instant falls in.
+    pub snow_season_adjustment_set_at: Option<i64>,
     /// `wind_dir_correction_degrees`: the vane's offset from north.
     ///
     /// Three drivers apply it -- Davis, Campbell and Ambient, which is the set that applies
@@ -1600,7 +1616,8 @@ where
         "SELECT id, station_key, owning_node_id, name, type, enabled, identity_kind, \
                 presented_key, aprs_callsign, \
                 ingest_secret_hash, latitude, longitude, altitude_m, timezone, \
-                snow_base_distance_mm, wind_dir_correction_degrees, \
+                snow_base_distance_mm, snow_season_adjustment_mm, \
+                snow_season_adjustment_set_at, wind_dir_correction_degrees, \
                 transport_kind, transport_dev, transport_baud, \
                 transport_host, transport_port, transport_url, transport_method, \
                 transport_auth, transport_streaming, transport_mount, transport_group, \
@@ -1632,6 +1649,8 @@ where
                 altitude_m: r.get("altitude_m"),
                 timezone: r.get("timezone"),
                 snow_base_distance_mm: r.get("snow_base_distance_mm"),
+                snow_season_adjustment_mm: r.get("snow_season_adjustment_mm"),
+                snow_season_adjustment_set_at: r.get("snow_season_adjustment_set_at"),
                 wind_dir_correction_degrees: r.get("wind_dir_correction_degrees"),
                 transport_kind: r.get("transport_kind"),
                 transport_dev: r.get("transport_dev"),

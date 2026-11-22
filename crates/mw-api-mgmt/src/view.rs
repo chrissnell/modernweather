@@ -163,6 +163,28 @@ pub struct StationView {
     /// The distance a snow gauge reads with no snow under it, in millimetres.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snow_base_distance_mm: Option<f64>,
+    /// Snowfall added to this gauge's season total by hand, in **inches**.
+    ///
+    /// Inches and not millimetres, unlike the column behind it: this is the number an
+    /// operator typed, and a storm report is in inches. The conversion happens once, at the
+    /// boundary, and is **rounded to two decimals** so that the form shows back the number
+    /// that was entered rather than the float it was stored as -- `12` and not
+    /// `11.999999999999998`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snow_season_adjustment_in: Option<f64>,
+    /// Which snow season the adjustment above is counting toward — `"2025-26"`.
+    ///
+    /// **Shown because the operator never typed a date.** The amount is scoped to the
+    /// season it was entered in (its migration has why), and that inference has exactly one
+    /// case it gets wrong: an amount entered in early October for a storm from the previous
+    /// winter lands on the new season. Printing the season is what makes that visible and
+    /// correctable instead of a silent surprise.
+    ///
+    /// `None` when there is no adjustment, and `"ended"` for one whose season has rolled
+    /// over — which is no longer counting toward anything and is the operator's cue to
+    /// clear or re-enter it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snow_season_adjustment_season: Option<String>,
     /// How it is connected.
     pub transport: TransportView,
     /// "Which sensor is which", as the stored mapping (§1.6). Opaque here; the picker

@@ -4120,3 +4120,144 @@ defect in the work item.
    **nothing on screen said what it had done**. That is §2.1's defect — "saved means
    running" inverted into "one click means stopped" — reintroduced by the one control that
    skipped §2.4's sequence.
+
+## GRA-811's deviations, as implemented
+
+The snow gauge's firmware (`chrissnell/snowgauge-rs` v0.1.0) now holds its base distance in
+NVRAM and reports a `snow_depth` of its own, and the owner's instruction for this work item
+was that the legacy gauge protocol is decommissioned and not to be kept working. Five of the
+things that follow from that contradict what two earlier entries say, so they are amended
+here rather than left for a reader to discover from the code.
+
+### A-GRA811-1 — `/snow` reads the stored `snowdepth`, and nothing in the read path knows a base distance
+
+**Amends DEV-9 part (3).** That entry says the depth is "computed per request in Go from a
+per-website cache" and that the column "and every aggregate bucket are NULL today". The first
+half is still true of Go; the second half is no longer true here, and the reason it mattered
+has inverted. The four `snow:*` components read `MetricKey::SnowDepth` per bucket now, where
+they read `MetricKey::SnowDistance` and subtracted `stations.snow_base_distance_mm`. The
+configured base distance has no consumer in the read path at all, which is the whole point:
+the only calibration is the one in the device's NVRAM, set through the device's own web
+interface, and a number in our configuration store cannot disagree with it any more.
+
+It survives at **ingest** only, and only as a fallback: `mw_pipeline::enrich::snow_depth`
+derives `base - distance` for a reading that carries a distance and no depth — a gauge on
+firmware older than v0.1.0, which this daemon no longer polls, or an import. A reading that
+carries the device's own depth keeps it; the derivation is `only_if_absent`, asserted in both
+directions.
+
+### A-GRA811-2 — the backfill, the rebuild it needs, and the `/span` bytes it moves
+
+`migrations/20261122070000_backfill_snowdepth_from_the_configured_base_distance.sql` fills
+the column for the migrated history, because A-GRA811-1 would otherwise blank every
+pre-cutover total. Its own header carries the arithmetic, the two guards, the one case where
+a bucket mean does not reproduce what `/snow` served (a bucket holding a `snowdistance = 0`
+fault), and which base distance it actually reads — the ingest writer's projection, which
+`coalesce` never clears, and so the base that was in force rather than whatever the
+configuration store holds now.
+
+**The deploy step, stated here because a SQL comment is not a runbook.** A migration cannot
+call `refresh_continuous_aggregate` — it cannot run inside a transaction and `sqlx` wraps
+every migration in one — so the raw rows are correct on commit and the 1-minute, 5-minute,
+hourly and daily levels still hold their NULLs. The components read the levels. So after
+deploying this:
+
+```
+DATABASE_URL=... ci/db/rebuild-aggregates.sh
+```
+
+Until that runs, `/snow`'s history is zero and the current season's total is only what this
+daemon has stored itself. It is safe to run against a serving database.
+
+**And it is byte-visible on the frozen surface, for historical windows.** `/span`'s
+`snowdepth` is `mean(MetricKey::SnowDepth)` (`crates/mw-api-legacy/src/span.rs:511`), so a
+pre-cutover window served `0.0` — NULL column, zero-filled by `mw_api_legacy::zf` — and after
+the rebuild serves a depth. That is a change to bytes on an endpoint this programme froze, in
+the direction of the number the Go read path computed for the same instant, and it is the
+reason this is an entry and not a note. **The frozen conformance fixtures cannot see it**: all
+three gauges in `ci/conformance/rust-seed/01-config.sql` are `enabled = 0` (lines 94, 107,
+111), and `/snow`'s fixtures are served from a hand-seeded `snow_totals_cache`
+(`ci/conformance/rust-seed/04-caches.sql:71-74`). Had this work blanked every `/snow` number to zero, all five
+fixtures would still be green. What covers these numbers is the unit and component tests in
+`crates/mw-pipeline/src/snow/`, and nothing else does.
+
+### A-GRA811-3 — a depth below zero is stored when the device reports it and refused when we derive it
+
+**Amends DEV-9 part (3)'s closing paragraph and closes the constraint it recorded on M6-1.**
+That paragraph says Go never stored a negative depth and "this will", and recorded the Go
+driver's discard as a constraint on the new driver. The answer came out in two halves, and
+they go opposite ways on purpose:
+
+* **The device's own signed `snow_depth` is stored as reported, negative included** — owner
+  decision, 2026-11-21. The firmware computes it from its own NVRAM base and a trimmed mean
+  of its own readings; if that is negative, the device is telling us its calibration is wrong
+  and the right place to see that is the chart, not a gap. The gauge driver does not discard
+  it and the constraint on M6-1 is therefore **not** implemented as DEV-9 anticipated.
+* **A depth we derive ourselves is refused when it comes out negative** —
+  `mw_pipeline::enrich::snow_depth`. Here the two inputs are a live reading and a base
+  distance in *our* configuration store, and when they disagree there is no reason to prefer
+  the stale one. The case that forced this: an uncalibrated v0.1.0 gauge reports
+  `snow_depth: null` with a real distance, and a base distance left behind in our
+  configuration from the Go era turned that into a fabricated `-271 mm`.
+* **The backfill keeps negatives**, for A-GRA811-3's first reason applied to history: there
+  the configuration is all there is, and a visible wrong number beats an invented right one.
+
+`threshold::depths_from`'s bare-ground filter — `depth <= 2 mm`, which is the same test as the
+old `distance >= base - 2`, proved equal in a unit test rather than argued — keeps those
+buckets out of the season and storm totals in every one of the three cases.
+
+### A-GRA811-4 — an uncalibrated gauge, which is now the device's state and not ours
+
+**Amends DEV-16 part (f).** That entry contrasts Go discarding every reading from a gauge
+with no configured base against this daemon storing the distance and deriving nothing. Both
+halves still describe real code, but "no base distance" has moved: it is now a property of the
+**device**, reported by `GET /data` as `base_distance: null` with `snow_depth: null`, and
+visible to the operator on the station's status panel next to the distance the gauge is
+actually reading. We store the distance, we store no depth, and — per A-GRA811-3 — a base
+distance stranded in our own configuration no longer manufactures one. The nullable column
+with its `CHECK (> 0)` is still how "not configured" is expressed, and it is still the ingest
+fallback; it is no longer the thing an operator sets to make the gauge work.
+
+### A-GRA811-5 — the season adjustment, which has no Go counterpart and expires with its season
+
+`snow_season_adjustment_mm` is a new configuration column with no equivalent anywhere in the
+Go daemon: an amount of snowfall the gauge never measured, added to the season total, for the
+case the owner described — the sensor went up after the season's first storm. Owner decisions
+it implements: **no monthly total** ("I don't need a monthly total, skip it") and **no dates**
+("just have an amount that gets added to the totals rather than assign the dates"), so it is
+not an observation, nothing is written to `observations`, and it appears in exactly one
+number.
+
+The deviation worth signing: it is **season-scoped by a stamp** rather than permanent. The
+stamp records the season the amount was entered for, moves only when the amount actually
+changes, and the adjustment stops being applied once that season ends — so last winter's
+missed storm does not quietly inflate this winter's total. The cost is the mirror image: an
+amount an operator typed in April is still in the box in November and is no longer in the
+total. The station form labels the box with the season the stored amount counts toward, or
+says that season has ended and the amount is no longer counted
+(`ui/src/lib/fragments/StationForm.svelte:83`) — that label is the whole of the warning an
+operator gets, and it is only visible to an operator who opens the form.
+
+### A-GRA811-6 — two pages the W5 inventory does not describe this way any more
+
+`docs/management-ui-design.md` is the authority for the management surface at the time it was
+written, and this work item moved two of its entries. Recorded here rather than edited there,
+which is this programme's rule for a design document.
+
+* **§1537's `/stations/{id}` row** lists the settings page's fields and ends at "snow base
+  distance". There is now a second snow field beside it — the season adjustment of
+  A-GRA811-5 — and the base distance's own meaning has changed: §0.6's worked hint for it
+  ("Distance in millimetres from your snow sensor down to bare ground, measured when there is
+  no snow") described the number every depth was computed from, and it is now an ingest
+  fallback for a gauge that reports no depth of its own. The shipped hint says so, and says
+  to leave the box empty unless you know you need it, because a stale value in it is worse
+  than an empty one (A-GRA811-3).
+* **§1537's `/stations/{id}/status` row** lists a live reading panel, a schedule sentence,
+  counters and the last error. A snow gauge's status page now also carries **what the device
+  reports about itself** — its calibrated base distance, the depth it derived, its
+  calibration state, firmware, signal, and whether its sensor is delivering readings at all.
+  It is read on open and on a button, never polled, and nothing on it is stored: a
+  calibration an operator can read off the device is not a measurement, and
+  `metrics/registry.toml` describes no metric for it. Reading it is also the only reason this
+  daemon makes an outbound request to a gauge outside the collection path, which is why it is
+  a `GaugeProbe` the binary implements rather than a query inside `mw-api-mgmt`.

@@ -170,6 +170,21 @@ describe('§7.3’s station form', () => {
     const gauge = shapeFor('snowgauge');
     expect(gauge.snow).toBe(true);
     expect(gauge.wind).toBe(false);
+    // The gauge is polled over HTTP. It used to be the one `grpc_out` kind here, and its
+    // firmware now serves `GET /data` over plain HTTP -- so `streaming` must NOT be sent,
+    // which is the half the configuration database's own CHECK enforces.
+    expect(gauge.defaultTransport).toBe('http_out');
+    expect(gauge.streams).toBe(false);
+  });
+
+  it('offers no transport the station plan has no mode for', () => {
+    // `crates/mw-station/src/plan.rs`'s table is the authority, and a form that defaulted
+    // to a transport outside it is a Save that cannot succeed. Nothing is `grpc_out` now:
+    // the snow gauge was the one, and `plan()` refuses such a row by name.
+    const transports = knownKinds.map((kind) => shapeFor(kind).defaultTransport);
+    expect(transports).not.toContain('grpc_out');
+    // And `streaming` belongs to `grpc_out` alone, so no kind may ask for it.
+    expect(knownKinds.filter((kind) => shapeFor(kind).streams)).toEqual([]);
   });
 
   it('keeps an unknown kind editable rather than blank', () => {

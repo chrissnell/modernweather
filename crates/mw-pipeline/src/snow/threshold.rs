@@ -107,24 +107,39 @@ pub fn accumulated_mm(depths: &[f64]) -> f64 {
     total
 }
 
-/// A distance series as a depth series, with bare ground and absent buckets dropped.
+/// A **depth** series, with bare ground and absent buckets dropped.
 ///
-/// `base_distance_mm - snowdistance`, which is the source query's `$2 - snowdistance`, with
-/// the two filters the query carries: `snowdistance IS NOT NULL` (a bucket no reading fell
-/// in, which is `None` here) and `snowdistance < base - 2` ([`BARE_GROUND_MM`]).
+/// # This used to do the subtraction, and no longer does
+///
+/// It was `base_distance_mm - snowdistance` over a distance series — the Go read path's
+/// `$2 - snowdistance`, with the station's configured base distance as `$2`. The snow gauge
+/// holds its own calibration now and reports the depth derived from it
+/// (`mw_codec::snowgauge`), and `mw_pipeline::enrich` stores that depth, so the series this
+/// is handed is already depths and the configured base distance is read nowhere on this
+/// path. The migration that backfilled `snowdepth` for the pre-cutover history is what
+/// made that switch lossless.
+///
+/// The two filters are the ones the old query carried, restated over the depth:
+///
+/// * an absent bucket — one no reading fell in — is `None` here and is dropped rather than
+///   interpolated;
+/// * bare ground is `depth <= 2 mm` ([`BARE_GROUND_MM`]), which is exactly the old
+///   `snowdistance >= base - 2`: subtract both sides from the base and the two are the same
+///   test. **That equivalence is the whole correctness argument for this change** and
+///   `the_bare_ground_filter_is_the_same_test_it_always_was` is where it is asserted.
 ///
 /// The input is `(instant, Option<f64>)` because that is what a bucket series is, and the
 /// instants come back with the depths because [`super::pelt`] needs them to label a
 /// segment. The walk above does not.
-pub fn depths_from<T: Copy>(series: &[(T, Option<f64>)], base_distance_mm: f64) -> Vec<(T, f64)> {
+pub fn depths_from<T: Copy>(series: &[(T, Option<f64>)]) -> Vec<(T, f64)> {
     series
         .iter()
-        .filter_map(|&(at, distance)| {
-            let distance = distance?;
-            if !distance.is_finite() || distance >= base_distance_mm - BARE_GROUND_MM {
+        .filter_map(|&(at, depth)| {
+            let depth = depth?;
+            if !depth.is_finite() || depth <= BARE_GROUND_MM {
                 return None;
             }
-            Some((at, base_distance_mm - distance))
+            Some((at, depth))
         })
         .collect()
 }
@@ -133,11 +148,8 @@ pub fn depths_from<T: Copy>(series: &[(T, Option<f64>)], base_distance_mm: f64) 
 mod tests {
     use super::*;
 
-    fn depths(series: &[(i32, Option<f64>)], base: f64) -> Vec<f64> {
-        depths_from(series, base)
-            .into_iter()
-            .map(|(_, d)| d)
-            .collect()
+    fn depths(series: &[(i32, Option<f64>)]) -> Vec<f64> {
+        depths_from(series).into_iter().map(|(_, d)| d).collect()
     }
 
     /// A NaN in the series is a datum and not the start of it, which is what the PL/pgSQL's
@@ -223,29 +235,54 @@ mod tests {
     /// re-based the baseline and made the next snowfall count twice.
     #[test]
     fn bare_ground_is_dropped_from_the_series_rather_than_entered_as_zero() {
-        let base = 1500.0;
         let series = [
-            (1, Some(1500.0)), // depth 0 -- bare ground, dropped
-            (2, Some(1499.0)), // depth 1 -- within 2 mm of base, dropped
-            (3, Some(1498.0)), // depth 2 -- also within 2 mm, dropped
-            (4, Some(1400.0)), // depth 100 -- kept
-            (5, None),         // no reading in the bucket -- dropped
-            (6, Some(1300.0)), // depth 200 -- kept
+            (1, Some(0.0)),   // bare ground, dropped
+            (2, Some(1.0)),   // within 2 mm of bare ground, dropped
+            (3, Some(2.0)),   // the boundary, also dropped
+            (4, Some(100.0)), // kept
+            (5, None),        // no reading in the bucket -- dropped
+            (6, Some(200.0)), // kept
+            // **A depth below zero**, which the device reports when its own NVRAM
+            // calibration is wrong and which is stored rather than discarded (owner
+            // decision, 2026-11-21). It is further from snow than bare ground is, so this
+            // filter is what keeps a mis-calibrated gauge out of the totals.
+            (7, Some(-271.0)), // dropped
         ];
-        assert_eq!(depths(&series, base), vec![100.0, 200.0]);
+        assert_eq!(depths(&series), vec![100.0, 200.0]);
     }
 
     #[test]
-    fn a_non_finite_distance_is_dropped() {
-        let series = [(1, Some(f64::NAN)), (2, Some(1400.0))];
-        assert_eq!(depths(&series, 1500.0), vec![100.0]);
+    fn a_non_finite_depth_is_dropped() {
+        let series = [(1, Some(f64::NAN)), (2, Some(100.0))];
+        assert_eq!(depths(&series), vec![100.0]);
+    }
+
+    /// **The equivalence this whole change rests on.** The filter used to be
+    /// `snowdistance >= base - 2` over a distance series; it is now `depth <= 2` over a
+    /// depth series. Subtract both sides of the old test from the base and they are the
+    /// same test — so switching the read path from the distance to the stored depth drops
+    /// exactly the buckets it always dropped, and the totals do not move.
+    #[test]
+    fn the_bare_ground_filter_is_the_same_test_it_always_was() {
+        let base = 1500.0;
+        for distance in [1500.0, 1499.0, 1498.0, 1497.9, 1400.0, 1300.0, 0.5] {
+            let depth = base - distance;
+            // What the old code did: drop when `distance >= base - BARE_GROUND_MM`.
+            let dropped_before = distance >= base - BARE_GROUND_MM;
+            // What this code does, over the depth the device (or the backfill) stored.
+            let dropped_now = depths(&[(0, Some(depth))]).is_empty();
+            assert_eq!(
+                dropped_before, dropped_now,
+                "distance {distance} -> depth {depth}"
+            );
+        }
     }
 
     /// The instants travel with the depths, which is what the changepoint classifier needs
     /// and the walk does not.
     #[test]
     fn the_filter_keeps_each_depths_own_instant() {
-        let series = [(7, Some(1400.0)), (9, Some(1300.0))];
-        assert_eq!(depths_from(&series, 1500.0), vec![(7, 100.0), (9, 200.0)]);
+        let series = [(7, Some(100.0)), (9, Some(200.0))];
+        assert_eq!(depths_from(&series), vec![(7, 100.0), (9, 200.0)]);
     }
 }

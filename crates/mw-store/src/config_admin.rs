@@ -146,6 +146,9 @@ pub struct StationWrite {
     pub wind_dir_correction_degrees: i64,
     /// `snow_base_distance_mm`.
     pub snow_base_distance_mm: Option<f64>,
+    /// `snow_season_adjustment_mm` and `snow_season_adjustment_set_at`, as the one decision
+    /// a write makes about them. [`SeasonAdjustmentWrite`] has the three cases.
+    pub season_adjustment: SeasonAdjustmentWrite,
     /// `transport_kind`.
     pub transport_kind: Option<String>,
     /// `transport_dev`.
@@ -181,6 +184,64 @@ pub struct StationWrite {
     pub wll_sensor_mapping: Option<String>,
     /// `wll_poll_interval_seconds`.
     pub wll_poll_interval_seconds: Option<i64>,
+}
+
+/// What a station write does to the two season-adjustment columns.
+///
+/// Three cases rather than two nullable numbers, because "the operator did not touch the
+/// box" and "the operator emptied the box" are different intentions and a single
+/// `Option<f64>` cannot hold both. That distinction is the same one [`StationWrite`]'s
+/// credentials already make — an omitted secret keeps the stored one — and it is what makes
+/// the season stamp correct: the stamp is "when the operator entered this amount", so it
+/// moves exactly when an amount is entered and at no other time.
+///
+/// The alternative, comparing the submitted amount against the stored one and moving the
+/// stamp only on a difference, has one case it cannot get right: an operator who misses a
+/// storm of the same size in two successive winters types the same number, so no difference
+/// is seen, the stamp stays in the first winter and the second winter's total silently omits
+/// the correction.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum SeasonAdjustmentWrite {
+    /// **The field was not supplied**: keep whatever is stored, stamp included. The default,
+    /// so a caller that has nothing to say about a snow gauge cannot accidentally clear one,
+    /// and the case every edit to an unrelated field takes.
+    ///
+    /// On an insert there is nothing to keep, so this stores no adjustment.
+    #[default]
+    Keep,
+    /// **The operator emptied the box.** Both columns go: an amount with no season has
+    /// nothing to belong to.
+    Clear,
+    /// **The operator entered this amount**, in millimetres, at this instant.
+    Set {
+        /// The amount, in millimetres. The column's `CHECK` is `> 0`.
+        amount_mm: f64,
+        /// When it was entered, as unix seconds — the clock's, never the operator's.
+        set_at: i64,
+    },
+}
+
+impl SeasonAdjustmentWrite {
+    /// The two columns to write, given what is already stored for them.
+    ///
+    /// **Both, or neither.** The amount has no season to belong to without the instant, and
+    /// the instant means nothing without an amount, so a half-written pair -- including one
+    /// read back out of a row that predates the pairing -- is stored as no adjustment rather
+    /// than as a state every reader below has to interpret. SQLite cannot add a table-level
+    /// `CHECK` by `ALTER TABLE` (the migration records the constraint it would write), so
+    /// this is where the pairing holds, and it is one function rather than four `bind` sites
+    /// free to disagree.
+    fn columns(self, kept: (Option<f64>, Option<i64>)) -> (Option<f64>, Option<i64>) {
+        let pair = match self {
+            Self::Keep => kept,
+            Self::Clear => (None, None),
+            Self::Set { amount_mm, set_at } => (Some(amount_mm), Some(set_at)),
+        };
+        match pair {
+            (Some(mm), Some(at)) => (Some(mm), Some(at)),
+            _ => (None, None),
+        }
+    }
 }
 
 /// One `website` row, as a write supplies it.
@@ -610,22 +671,39 @@ async fn put_station(
     conn: &mut SqliteConnection,
     s: &StationWrite,
 ) -> Result<(), ConfigAdminError> {
-    let existing: Option<(Option<String>, Option<String>)> = sqlx::query(
-        "SELECT ingest_secret_hash, transport_auth FROM stations WHERE station_key = ?",
+    // The read is one statement for three "keep what is stored" fields, and it is also what
+    // decides insert against update below. A failure here is an error rather than an assumed
+    // empty row: assuming empty would clear a credential and re-stamp a season adjustment
+    // into the current season, which are the two things this read exists to prevent.
+    #[allow(clippy::type_complexity)]
+    let existing: Option<(Option<String>, Option<String>, Option<f64>, Option<i64>)> = sqlx::query(
+        "SELECT ingest_secret_hash, transport_auth, snow_season_adjustment_mm, \
+             snow_season_adjustment_set_at FROM stations WHERE station_key = ?",
     )
     .bind(&s.station_key)
     .fetch_optional(&mut *conn)
     .await
     .map_err(|e| classify("stations", "reading the station being edited", e))?
-    .map(|r| (r.get("ingest_secret_hash"), r.get("transport_auth")));
+    .map(|r| {
+        (
+            r.get("ingest_secret_hash"),
+            r.get("transport_auth"),
+            r.get("snow_season_adjustment_mm"),
+            r.get("snow_season_adjustment_set_at"),
+        )
+    });
 
     // A credential the form did not retype keeps the stored value. `None` means "not
     // supplied", never "clear it": no endpoint returns a secret to retype (**D-67**), so
     // treating absence as a clear would erase a working credential on every save of the
     // page that holds it. Clearing is an action of its own.
-    let (kept_secret, kept_auth) = existing.clone().unwrap_or((None, None));
+    let (kept_secret, kept_auth, kept_mm, kept_at) =
+        existing.clone().unwrap_or((None, None, None, None));
     let secret = s.ingest_secret_hash.clone().or(kept_secret);
     let auth = s.transport_auth.clone().or(kept_auth);
+    // The same rule, for the same reason, on the field whose stamp decides which season it
+    // counts toward. `Keep` against an absent row is no adjustment.
+    let adjustment = s.season_adjustment.columns((kept_mm, kept_at));
 
     if existing.is_some() {
         exec(
@@ -635,6 +713,7 @@ async fn put_station(
                  presented_key = ?, ingest_secret_hash = ?, latitude = ?, longitude = ?, \
                  altitude_m = ?, timezone = ?, aprs_callsign = ?, \
                  wind_dir_correction_degrees = ?, snow_base_distance_mm = ?, \
+                 snow_season_adjustment_mm = ?, snow_season_adjustment_set_at = ?, \
                  transport_kind = ?, transport_dev = ?, transport_baud = ?, \
                  transport_host = ?, transport_port = ?, transport_url = ?, \
                  transport_method = ?, transport_auth = ?, transport_streaming = ?, \
@@ -657,6 +736,8 @@ async fn put_station(
             .bind(&s.aprs_callsign)
             .bind(s.wind_dir_correction_degrees)
             .bind(s.snow_base_distance_mm)
+            .bind(adjustment.0)
+            .bind(adjustment.1)
             .bind(&s.transport_kind)
             .bind(&s.transport_dev)
             .bind(s.transport_baud)
@@ -702,13 +783,14 @@ async fn put_station(
             "INSERT INTO stations (id, station_key, owning_node_id, name, type, enabled, \
              identity_kind, presented_key, ingest_secret_hash, latitude, longitude, \
              altitude_m, timezone, aprs_callsign, wind_dir_correction_degrees, \
-             snow_base_distance_mm, transport_kind, transport_dev, transport_baud, \
+             snow_base_distance_mm, snow_season_adjustment_mm, \
+             snow_season_adjustment_set_at, transport_kind, transport_dev, transport_baud, \
              transport_host, transport_port, transport_url, transport_method, \
              transport_auth, transport_streaming, transport_mount, transport_group, \
              transport_topic, transport_tls_ca_path, transport_tls_cert_path, \
              transport_tls_key_path, wll_sensor_mapping, wll_poll_interval_seconds) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(s.id)
         .bind(&s.station_key)
@@ -726,6 +808,8 @@ async fn put_station(
         .bind(&s.aprs_callsign)
         .bind(s.wind_dir_correction_degrees)
         .bind(s.snow_base_distance_mm)
+        .bind(adjustment.0)
+        .bind(adjustment.1)
         .bind(&s.transport_kind)
         .bind(&s.transport_dev)
         .bind(s.transport_baud)
@@ -1087,7 +1171,9 @@ pub async fn snapshot(conn: &mut SqliteConnection) -> Result<Vec<Change>, Config
         "SELECT id, station_key, owning_node_id, name, type, enabled, identity_kind, \
                 presented_key, ingest_secret_hash, latitude, longitude, altitude_m, \
                 timezone, aprs_callsign, wind_dir_correction_degrees, \
-                snow_base_distance_mm, transport_kind, transport_dev, transport_baud, \
+                snow_base_distance_mm, snow_season_adjustment_mm, \
+                snow_season_adjustment_set_at, transport_kind, transport_dev, \
+                transport_baud, \
                 transport_host, transport_port, transport_url, transport_method, \
                 transport_auth, transport_streaming, transport_mount, transport_group, \
                 transport_topic, transport_tls_ca_path, transport_tls_cert_path, \
@@ -1115,6 +1201,17 @@ pub async fn snapshot(conn: &mut SqliteConnection) -> Result<Vec<Change>, Config
             aprs_callsign: r.get("aprs_callsign"),
             wind_dir_correction_degrees: r.get("wind_dir_correction_degrees"),
             snow_base_distance_mm: r.get("snow_base_distance_mm"),
+            // A row read back for a backup carries the stored pair verbatim, so that
+            // `restore` writes the season it was entered for and not the season the
+            // restore happens in. A half-written pair cannot exist (`columns`), and is
+            // `Clear` here rather than a panic if one ever does.
+            season_adjustment: match (
+                r.get("snow_season_adjustment_mm"),
+                r.get("snow_season_adjustment_set_at"),
+            ) {
+                (Some(amount_mm), Some(set_at)) => SeasonAdjustmentWrite::Set { amount_mm, set_at },
+                _ => SeasonAdjustmentWrite::Clear,
+            },
             transport_kind: r.get("transport_kind"),
             transport_dev: r.get("transport_dev"),
             transport_baud: r.get("transport_baud"),
@@ -1339,6 +1436,60 @@ pub async fn restore(
 
 #[cfg(test)]
 mod tests {
+
+    /// **Both columns or neither, and the three cases of a write.** A half-written pair is
+    /// stored as none: the amount has no season to belong to without the instant, and the
+    /// instant means nothing without an amount. SQLite cannot express that as a `CHECK`
+    /// added by `ALTER TABLE`, so it holds here — and this is the test that says so,
+    /// because the four `bind` sites would otherwise be free to drift.
+    #[test]
+    fn the_three_season_adjustment_writes_and_the_pairing() {
+        let stored = (Some(304.8), Some(1_763_000_000));
+
+        // `Keep` is the shape of every edit to an unrelated field, and the one case the
+        // stamp's correctness rests on: it does not move.
+        assert_eq!(
+            SeasonAdjustmentWrite::Keep.columns(stored),
+            stored,
+            "an unrelated edit leaves the amount and its season alone"
+        );
+        assert_eq!(
+            SeasonAdjustmentWrite::Keep.columns((None, None)),
+            (None, None),
+            "and on an insert there is nothing to keep"
+        );
+
+        assert_eq!(
+            SeasonAdjustmentWrite::Clear.columns(stored),
+            (None, None),
+            "emptying the box clears the season with it"
+        );
+
+        // The operator entering the **same amount** in a later season: the stamp is the
+        // submitted one, so the correction counts toward the season they are in now. This
+        // is the case a stored-value comparison gets wrong.
+        assert_eq!(
+            SeasonAdjustmentWrite::Set {
+                amount_mm: 304.8,
+                set_at: 1_795_000_000,
+            }
+            .columns(stored),
+            (Some(304.8), Some(1_795_000_000)),
+            "the same amount entered again is entered again"
+        );
+
+        // The pairing, against a row that somehow holds half of one.
+        assert_eq!(
+            SeasonAdjustmentWrite::Keep.columns((Some(304.8), None)),
+            (None, None),
+            "an amount with no instant"
+        );
+        assert_eq!(
+            SeasonAdjustmentWrite::Keep.columns((None, Some(1_763_000_000))),
+            (None, None),
+            "an instant with no amount"
+        );
+    }
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};

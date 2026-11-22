@@ -20,7 +20,7 @@
 //! | `campbellscientific` | `serial` or `tcp_out` | `station:campbell:<key>`, the line reader |
 //! | `airgradient` | `http_out` | `station:airgradient:<key>`, polling `/measures/current` |
 //! | `ambient-customized` | `http_in` | **one** `station:ambient` for every such row |
-//! | `snowgauge` | `grpc_out` | validated here, planned by `mw-grpc` (see below) |
+//! | `snowgauge` | `http_out` | `station:snowgauge:<key>`, polling `/data` |
 //! | disabled, or `transport_kind IS NULL` | | nothing, and that is not an error |
 //!
 //! `transport_host` is what distinguishes a WeatherLink Live this node arms from one
@@ -45,15 +45,16 @@
 //!   the transport has, so a row with no stored secret is one whose uploads nothing can
 //!   check — which is exactly the Go behaviour §4a.6 calls a defect.
 //!
-//! # The snow gauge is validated here and planned elsewhere
+//! # The snow gauge used to be the exception here, and is not any more
 //!
-//! `ci/layers.toml` forbids this crate from naming `tonic` (§1.4: the gRPC socket and every
-//! gRPC service belong to `mw-http` and `mw-grpc`), so the component that dials a gauge
-//! cannot be built here. What this function does with a `snowgauge` row is **check its
-//! shape** — `grpc_out`, streaming, `Fixed` — so that a malformed one is refused by the same
-//! function and with the same sentences as every other station's, and then emit nothing.
-//! `crate::snowgauge` has the whole of that split, and `mw_grpc::snowgauge::register` is the
-//! other half.
+//! It was the one row this function **validated and did not plan**: the gauge spoke gRPC,
+//! `ci/layers.toml` forbids this crate from naming `tonic` (§1.4 gives the gRPC socket and
+//! every gRPC service to `mw-http` and `mw-grpc`), so the component that dialled it lived in
+//! `mw-grpc` behind a second station registrar in the binary, and `check_snowgauge` existed
+//! so that two crates could not disagree about the row's shape or its component id. The
+//! firmware now serves JSON over plain HTTP (`crate::snowgauge`), so the gauge is an
+//! ordinary `http_out` row here, the second registrar is gone, and `fixed_receivers` mints
+//! its id from the same function this one does — which is what that split was for.
 //!
 //! # A station whose driver has not landed is an error, not a silence
 //!
@@ -134,6 +135,34 @@ pub enum StationPlanError {
         kind: String,
         /// Its configured transport kind.
         transport: &'static str,
+    },
+
+    /// A station configured for a transport this build used to serve and no longer does.
+    ///
+    /// **One producer, and it exists for the operator rather than for the plan.** A
+    /// `snowgauge` row written before the gauge's firmware was replaced carries
+    /// `transport_kind = 'grpc_out'`; [`StationPlanError::WrongTransport`] would refuse it
+    /// correctly and say only that the driver has no mode for that transport, which leaves
+    /// somebody reading a startup failure to work out which two columns to change. A plan
+    /// refusal is a daemon that will not start, so the sentence has to be the whole
+    /// instruction.
+    #[error(
+        "station `{station}` is a `{kind}` with a `{transport}` transport, which it used \
+         to have and no longer does: {because}. Set `transport_kind = 'http_out'`, \
+         `transport_url` to `http://<host>` (the gauge serves port 80) and \
+         `transport_streaming` to NULL — `modernweather discover` will find the host, and \
+         `migrate-config` writes those three for a configuration migrated from the Go \
+         daemon."
+    )]
+    LegacyTransport {
+        /// Which station.
+        station: String,
+        /// Its configured type.
+        kind: String,
+        /// The transport it still names.
+        transport: &'static str,
+        /// What changed, in words that say why rather than what.
+        because: Because,
     },
 
     /// A `transport_*` column is not usable.
@@ -498,10 +527,14 @@ where
                 ));
             }
             crate::snowgauge::STATION_TYPE => {
-                // Checked and not planned: see this module's documentation and
-                // `crate::snowgauge`. `mw_grpc::snowgauge::register` emits the component,
-                // and calls this same function rather than trusting that this one ran.
-                check_snowgauge(row)?;
+                expect_identity(row, &identity, StationIdentity::Fixed)?;
+                out.push(snowgauge_spec(
+                    row,
+                    &transport,
+                    &identity,
+                    station,
+                    Arc::clone(ingress),
+                )?);
             }
             _ => {
                 return Err(StationPlanError::NoDriver {
@@ -545,61 +578,6 @@ where
         .filter(|row| row.is_collected_here() && row.kind == crate::ambient::STATION_TYPE)
         .filter_map(|row| row.transport.as_ref()?.mount.clone())
         .find(|mount| !mount.is_empty())
-}
-
-/// Validate a `snowgauge` row, returning the component id it will be planned under.
-///
-/// **Public because it has two callers and one of them is in another crate.**
-/// `mw_grpc::snowgauge::register` builds the component this row describes -- `ci/layers.toml`
-/// forbids `mw-station` from naming `tonic`, which is the whole of why the split exists --
-/// and it used to filter on `kind` alone and rely on [`plan`] having already refused a row
-/// of the wrong shape. That held only because `Stations` precedes `SnowGauges` in the
-/// binary's registrar list, which `crate::boot`'s own comment describes as having no effect
-/// on the plan; reordering the list would have produced a component declaring
-/// `GrpcOut { streaming: true }` for a row configured request/response, or a `from_path`
-/// row with no receiver entry and every reading `unknown_station`. One function, called by
-/// both, is the arrangement in which the two cannot disagree.
-pub fn check_snowgauge(row: &StationRow) -> Result<ComponentId, StationPlanError> {
-    let identity = StationIdentity::parse(&row.identity_kind).map_err(|source| {
-        StationPlanError::Identity {
-            station: row.key.clone(),
-            source,
-        }
-    })?;
-    expect_identity(row, &identity, StationIdentity::Fixed)?;
-    let columns = row
-        .transport
-        .as_ref()
-        .ok_or_else(|| StationPlanError::WrongTransport {
-            station: row.key.clone(),
-            kind: row.kind.clone(),
-            transport: "none",
-        })?;
-    let transport =
-        Transport::from_columns(columns).map_err(|source| StationPlanError::Transport {
-            station: row.key.clone(),
-            source,
-        })?;
-    let Transport::GrpcOut { streaming, .. } = &transport else {
-        return Err(StationPlanError::WrongTransport {
-            station: row.key.clone(),
-            kind: row.kind.clone(),
-            transport: transport.kind(),
-        });
-    };
-    if !streaming {
-        return Err(StationPlanError::Missing {
-            station: row.key.clone(),
-            kind: row.kind.clone(),
-            column: "transport_streaming",
-            because: Because(
-                "a snow gauge streams readings, so the flag has to be set: \
-                 `transport_streaming = 0` would declare one request per occurrence and no \
-                 gauge answers one",
-            ),
-        });
-    }
-    component_id(row, crate::snowgauge::station_id)
 }
 
 /// Refuse a row whose identity strategy its driver does not implement.
@@ -778,10 +756,7 @@ where
         //
         // Only a component that *emits readings* belongs here. The WeatherLink Live re-arm
         // is a control call and admits nothing, so it is deliberately absent: an entry for
-        // it would let a frame resolve through a component that never receives one. The
-        // snow gauge IS here, even though `register` does not emit its spec --
-        // `crate::snowgauge` has why, and `mw_grpc` mints the same id from the same
-        // function.
+        // it would let a frame resolve through a component that never receives one.
         let mint: fn(&str) -> Result<ComponentId, ComponentIdError> =
             match (row.kind.as_str(), columns.kind.as_str()) {
                 (wll::STATION_TYPE, "http_out") => wll::poll_id,
@@ -790,7 +765,7 @@ where
                     crate::campbell::station_id
                 }
                 (crate::airgradient::STATION_TYPE, "http_out") => crate::airgradient::station_id,
-                (crate::snowgauge::STATION_TYPE, "grpc_out") => crate::snowgauge::station_id,
+                (crate::snowgauge::STATION_TYPE, "http_out") => crate::snowgauge::station_id,
                 // Every other pairing is one `register` refuses, so there is no component
                 // for a frame to arrive at. Skipped rather than refused here, because
                 // `register` is where a configuration error gets its sentence and two
@@ -904,6 +879,68 @@ fn airgradient_spec(
         Builder::tick(move |_cx| {
             let body =
                 crate::airgradient::Poll::new(url.clone(), station.clone(), Arc::clone(&ingress));
+            async move { Ok(body) }
+        }),
+    )
+    .requires([Need::hard_write(mw_component::Capability::ReadingStream)])
+    .identity(transport.shape(identity))
+    .config_digest(ConfigDigest::of(row)))
+}
+
+/// One snow gauge: `HttpOut`, `Every { 5s }`.
+///
+/// The same shape as [`airgradient_spec`] and deliberately so — the gauge used to be the
+/// one `GrpcOut { streaming: true }` station and is now a poll like any other
+/// (`crate::snowgauge`). It carries nothing the AirGradient poll does not: the gauge holds
+/// its own calibration and reports the depth from it, so `snow_base_distance_mm` is read
+/// nowhere on this path any more.
+fn snowgauge_spec(
+    row: &StationRow,
+    transport: &Transport,
+    identity: &StationIdentity,
+    station: StationKey,
+    ingress: Arc<dyn mw_component::Ingress>,
+) -> Result<ComponentSpec, StationPlanError> {
+    let Transport::HttpOut { url, .. } = transport else {
+        // The one transport worth its own sentence: `grpc_out` is what every gauge row
+        // written before the firmware was replaced still says, and a startup failure that
+        // did not name the three columns to change would leave an operator guessing.
+        if let Transport::GrpcOut { .. } = transport {
+            return Err(StationPlanError::LegacyTransport {
+                station: row.key.clone(),
+                kind: row.kind.clone(),
+                transport: transport.kind(),
+                because: Because(
+                    "the gauge's gRPC firmware has been decommissioned and the device now \
+                     serves `GET /data` over plain HTTP",
+                ),
+            });
+        }
+        return Err(StationPlanError::WrongTransport {
+            station: row.key.clone(),
+            kind: row.kind.clone(),
+            transport: transport.kind(),
+        });
+    };
+    refuse_tls(row, url)?;
+    let id = component_id(row, crate::snowgauge::station_id)?;
+    let url = url.clone();
+    let trigger = Trigger::Every {
+        period: crate::snowgauge::DEFAULT_POLL,
+        // Equal to the period, which is the largest `plan()` permits; the request's own
+        // timeout is shorter still, so the message an operator reads names the gauge.
+        deadline: crate::snowgauge::DEFAULT_POLL,
+        first: mw_component::FirstRun::AtPhase,
+        phase: mw_component::Phase::Spread,
+        // Declared by the driver, enforced once here: W2a Decision 56.
+        floor: crate::snowgauge::POLL_FLOOR,
+    };
+    Ok(ComponentSpec::new(
+        id,
+        trigger,
+        Builder::tick(move |_cx| {
+            let body =
+                crate::snowgauge::Poll::new(url.clone(), station.clone(), Arc::clone(&ingress));
             async move { Ok(body) }
         }),
     )

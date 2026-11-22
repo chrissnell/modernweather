@@ -64,6 +64,8 @@ fn row(key: &str, claim: &str, hash: &str) -> StationRow {
         altitude_m: None,
         timezone: None,
         snow_base_distance_mm: None,
+        snow_season_adjustment_mm: None,
+        snow_season_adjustment_set_at: None,
         wind_dir_correction_degrees: 0,
         aprs_callsign: None,
         presented_key: Some(claim.to_string()),

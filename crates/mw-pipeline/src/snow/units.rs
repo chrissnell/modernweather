@@ -56,6 +56,23 @@ pub fn serving_inches(mm: f64) -> f32 {
     serving_from_inches(f64::from(mm as f32 / MM_PER_INCH as f32))
 }
 
+/// Millimetres to inches, with **no** threshold and no rounding.
+///
+/// For a quantity that is going to be added to another before either is served, which is
+/// the operator's season adjustment: thresholding it here and again in
+/// [`serving_from_inches`] would apply the tenth-of-an-inch floor twice, and let a
+/// hundredth of an inch of correction survive where a hundredth of an inch of measured snow
+/// does not. One sum, one threshold — `mw_pipeline::snow::season_total` is where the sum
+/// happens.
+///
+/// `f64` throughout, unlike [`serving_inches`]: this value never reaches the wire on its
+/// own, so there is no frozen `float32` arithmetic to reproduce. The narrowing happens once,
+/// in `serving_from_inches`, on the total.
+#[must_use]
+pub fn inches_from_mm(mm: f64) -> f64 {
+    mm / MM_PER_INCH
+}
+
 /// The same threshold and rounding, for a value already in inches.
 ///
 /// The smoothed series is stored in inches (the rate limit is expressed in inches per

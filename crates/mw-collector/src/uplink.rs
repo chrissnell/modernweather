@@ -109,9 +109,11 @@ pub enum UplinkError {
     /// The configured endpoint is not one `tonic` will dial.
     ///
     /// A configuration mistake rather than a transient failure, and carried as **text**
-    /// rather than as a `#[source]` for `mw_grpc::snowgauge::DialError::Address`'s reason:
-    /// what `Endpoint::from_shared` returns is an `http::uri::InvalidUri`, and the variant
-    /// would otherwise be the one place this enum names a type from two crates away.
+    /// rather than as a `#[source]`: what `Endpoint::from_shared` returns is an
+    /// `http::uri::InvalidUri`, and the variant would otherwise be the one place this enum
+    /// names a type from two crates away for a branch no configuration reaches. (The snow
+    /// gauge's gRPC client made the same choice for the same reason and is the one this
+    /// used to cite; it is gone -- that gauge serves HTTP now.)
     #[error("`{endpoint}` is not an address this build can dial: {why}")]
     Address {
         /// What was configured.

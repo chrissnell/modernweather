@@ -32,6 +32,12 @@
 //! station with no driver is a plan error that names the work item ([`plan`]) rather than a
 //! station that quietly reports nothing.
 //!
+//! **Every station driver in this programme now lives here.** The snow gauge was the
+//! exception — it spoke gRPC, and `ci/layers.toml` forbids this crate from naming `tonic`,
+//! so its body was in `mw-grpc` and only its names were here. Its firmware serves JSON over
+//! plain HTTP now, so [`snowgauge`] is a whole driver like the rest and `mw-grpc` holds
+//! only the two *services* §1.4 gives it.
+//!
 //! Two things in this crate exist for a constraint from outside W2a. [`mdns`] is an
 //! in-process multicast resolver, because **D-43**'s static musl linkage means
 //! `getaddrinfo` cannot answer a `.local` name in the shipped binary (W8 **OQ-4**); and
@@ -73,8 +79,7 @@ pub use endpoint::{Endpoint, EndpointError};
 pub use identity::{IdentityError, StationIdentity};
 pub use lines::Lines;
 pub use plan::{
-    ambient_mount, check_snowgauge, fixed_receivers, register, FixedReceiver, StationPlanError,
-    MAX_KEY_LEN,
+    ambient_mount, fixed_receivers, register, FixedReceiver, StationPlanError, MAX_KEY_LEN,
 };
 pub use session::{ByteStream, NoSession, Session, SessionError, MAX_FRAME_BYTES};
 pub use stream::{OpenError, SerialPort, TcpByteStream};

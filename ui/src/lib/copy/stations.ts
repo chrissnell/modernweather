@@ -113,6 +113,22 @@ export const stations = {
     deleteConfirm: 'Remove the station'
   },
   status: {
+    device: {
+      heading: 'What the gauge reports',
+      intro: 'Read from the sensor just now. These are the gauge\u2019s own settings, not this daemon\u2019s.',
+      baseDistance: 'Calibrated distance to the ground',
+      depth: 'Depth it last worked out',
+      calibration: 'Calibration',
+      firmware: 'Firmware',
+      signal: 'Signal',
+      slot: 'Running from',
+      notCalibrated: 'Not calibrated yet',
+      sensor: 'Sensor',
+      sensorOk: 'Reporting',
+      unreachable: 'The gauge did not answer.',
+      calibrateHint: 'Calibrate from the gauge\u2019s own web page. The depth starts arriving on the next reading, with nothing to change here.',
+      reread: 'Read it again'
+    },
     title: 'Status',
     livePanelHeading: 'Live Readings',
     noReadingsYet: 'No readings yet.',
@@ -197,7 +213,12 @@ export const stations = {
       // 98, so it is said in two lines instead of one over-long one -- which is what the
       // `more` disclosure is for.
       hint: 'Millimetres from your snow sensor down to bare ground.',
-      more: 'Measure it when there is no snow under the sensor. Snow depth is this distance minus whatever the sensor currently reads, so a wrong base makes every depth wrong by the same amount.'
+      more: 'Set this on the gauge itself, through its own web interface \u2014 it keeps the number and reports the depth from it, and the station page shows you what it is set to. This box is only a fallback for a gauge that reports a distance and no depth, and a stale number in it is worse than an empty one. Leave it empty unless you know you need it.'
+    }),
+    snowSeasonAdjustment: field({
+      label: 'Snow missed by the sensor',
+      hint: 'Inches to add to this season\u2019s total.',
+      more: 'For snow that fell before the sensor was measuring \u2014 a storm you missed because the gauge was not up yet. It is added to the season total only, never to today or the last 24 hours, and never to the current depth, which the sensor measures for itself. It counts toward the season you enter it in and stops when that season ends on 1 October; to carry it into a new season, type the amount in again.'
     }),
     aprsCallsign: field({
       label: 'Callsign',

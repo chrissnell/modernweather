@@ -1,54 +1,84 @@
 # The snow gauge emulator
 
-A snow gauge on a gRPC port: `snowgauge.SnowGaugeService/StreamReading`, and nothing else.
+A `snowgauge-rs` gauge on an HTTP port: `GET /data`, `GET /health`, and nothing else.
 
-| This tree | Reference tree, at `c3ec9f7d7dec2c5f71a1f48b8af2b9b0921b7bcf` |
-|---|---|
-| `remoteweather/protocols/snowgauge/snowgauge.pb.go` | `protocols/snowgauge/snowgauge.pb.go` |
-| `remoteweather/protocols/snowgauge/snowgauge_grpc.pb.go` | `protocols/snowgauge/snowgauge_grpc.pb.go` |
+`main.go` and `go.mod` are **ours**, and `go.mod` exists for the same reason the AirGradient
+one does — so that `go build .` resolves nothing and needs no network.
 
-Both are **byte-for-byte copies**, with their SHA-256 in `../manifest.toml` and verified by
-`cargo xtask emulator-tests`. `../davis/README.md` has the whole of why the reference's files
-are vendored rather than checked out, and what the digests are for.
+## What this emulator used to be, and what changed
 
-`main.go` and the two `go.mod` files are **ours**. `main.go` is the device's behaviour — the
-values, the cadence, the flags — and the `go.mod` files exist so that the vendored stubs
-resolve under the import path they were generated for.
+Until the firmware was replaced, the gauge spoke gRPC
+(`snowgauge.SnowGaugeService/StreamReading`) and this directory held:
 
-## What the split buys, and what it does not
+- the reference tree's **generated protobuf stubs**, vendored byte-for-byte at the pinned
+  commit, with their SHA-256 in `../manifest.toml`;
+- a `go.sum` and a `require` block for `google.golang.org/grpc`, which made this one of the
+  two emulators here that `go build` could not produce offline;
+- a `replace` directive so the vendored stubs resolved under the import path they were
+  generated for.
 
-The reference tree has **no snow gauge emulator** at the pinned commit: `cmd/` has four and
-none of them is one. What it does have is the **generated stubs**, which is the half that
-matters most here. `mw_codec::SnowGaugeProto` declares **two fields of a four-field message
-by hand** — `ci/layers.toml` puts `mw-proto` in `mw-codec`'s own layer, so the codec cannot
-use a generated type — and nothing in the programme had checked that hand-written
-declaration against the schema a real gauge was generated from.
+All three are gone. The new firmware's reading surface is two JSON endpoints over plain
+HTTP, so `net/http` and `encoding/json` are the whole of it.
 
-So:
+**That is a real loss and it is worth naming.** The vendored stubs were the half of this
+oracle that was *independently defined*: `mw_codec::SnowGaugeProto` declared two fields of a
+four-field protobuf message by hand, and the stubs were what checked that declaration
+against the schema a real gauge had been generated from. There is no equivalent artefact for
+a JSON API — the firmware ships no schema file, so the field names and types in `main.go`
+and in `mw_codec::snowgauge` both come from reading the same page of
+`chrissnell/snowgauge-rs`'s `docs/integration.md`, and a misreading shared by the two would
+pass. `../manifest.toml` records that as `origin = "this-repository"` with no
+`[emulator.files]`, and the honest fix is the same one it names for the WeatherLink Live: an
+emulator in the firmware's own tree, written by somebody who is not writing the driver.
 
-- the **protocol** is independently defined: the service name, the method name, the field
-  numbers and the wire types come from the reference's own `protoc` output;
-- the **behaviour** is not: the numbers this emulator sends were written here, beside the
-  driver, which is what `origin = "this-repository"` in the manifest records.
-
-## The one thing this emulator costs
-
-**It is the only emulator in this tree that is not standard-library-only.** It speaks gRPC,
-so it needs `google.golang.org/grpc` and `google.golang.org/protobuf`, and `go build`
-therefore needs a populated module cache or the network. `go.sum` is committed, so the build
-is reproducible; it is not *offline* on a machine that has never fetched those modules.
-
-The alternative was hand-rolling HTTP/2 and HPACK from the standard library, which is a
-worse emulator and a worse test: the thing under test is a gRPC client, and an oracle that
-did not use a real gRPC server would not exercise it.
+What the gauge *does* have that no other device here does is a published API document with
+an error table in it, and every flag below is a row of that table.
 
 ## Flags
 
 | Flag | What |
 |---|---|
-| `-port <n>` | the port; `0` lets the kernel choose and the port is printed as `ready grpc=<n>` |
-| `-interval <d>` | between readings |
-| `-count <n>` | how many to send; `0` is forever |
-| `-base <mm>` | the distance with no snow under it, which the daemon also has configured |
-| `-fault <n>` | every nth reading is a distance **greater** than `-base`, which is the fault **DEV-9** is about |
-| `-hangup` | close the stream after `-count` readings instead of holding it open |
+| `-port <n>` | the port; `0` lets the kernel choose and it is printed as `ready http=<n>` |
+| `-base <mm>` | the sensor-to-ground distance the snowpack model measures against, and what a calibrated gauge reports as `base_distance` |
+| `-calibrated` | whether the gauge has a calibration in NVS. `-calibrated=false` is a gauge nobody has calibrated: it **measures normally** and reports `base_distance` and `snow_depth` as `null`. Separate from `-base` for a reason the first draft got wrong — overloading `-base 0` underflowed the `u16` distance the snowpack model derives from it |
+| `-trim-after <n>` | how many sensor frames before `trim_mean` stops being `null`. **30 on a real gauge**, which is about a minute after boot; a test that wants the trimmed-mean regime in five polls passes `2` |
+| `-sensor all\|dead\|stalled` | `dead` is a sensor that never speaks — `status` stays `no_data`, `readings` stays `0`, `/health.bytes_rx` stays `0`. `stalled` is the UART link dying mid-run: `readings` freezes while `uptime_ms` keeps growing, which is the firmware documentation's own liveness test |
+| `-stall-after <n>` | how many frames `-sensor stalled` produces before it stops |
+| `-fault <n>` | every nth response reports a distance **greater** than `-base`. This used to trigger **DEV-9**'s discard; as of firmware v0.1.0 it is simply a **negative `snow_depth`**, which the owner has asked to record (2026-11-21) because the firmware reports the sign to mean frost heave or a calibration coming due |
+| `-reboot <n>` | reboot every nth response: `uptime_ms` drops and `readings` restarts at zero, which is the state a driver that tested the sensor before the uptime would call a dead sensor |
+| `-firmware current\|old` | `old` is a gauge that predates `/data`: `404` there, and a `fw_version` from before the endpoint existed |
+| `-uptime-step <ms>` | how much `uptime_ms` advances per response, default `5000` |
+
+## What the device computes, and what this emulator therefore computes
+
+Firmware v0.1.0 holds a calibrated base distance in NVS and reports `snow_depth` itself, so
+this emulator does that subtraction too — **in the firmware's order**:
+
+```go
+depth := int32(base) - int32(math.Round(reading))
+```
+
+`base − round(reading)`, not `round(base − reading)`. They differ by up to a millimetre, and
+an oracle a millimetre off the device is an oracle that hides a millimetre of drift.
+`a_calibrated_gauge_reports_a_depth_the_device_computed` asserts it as equality rather than
+a tolerance for that reason.
+
+Two fields are set **before** the no-reading early return, because neither comes from the
+sensor: `rssi` is the WiFi driver's and `base_distance` is NVS's. So a calibrated gauge with
+a dead UART still reports what it is calibrated to — which is exactly when an operator goes
+looking for that number. `snow_depth` is `null` there, matching the firmware's own
+`(Some(base), None, "no_data") => null` arm.
+
+## Why `uptime_ms` is not the wall clock
+
+A real gauge is polled seconds apart; this one answers in microseconds. Read off the wall
+clock, several consecutive responses in a test would carry the **same** millisecond — and a
+reboot, which the driver detects as `uptime_ms` *decreasing*, would be invisible between two
+responses that both read zero. So the emulator advances it one `-uptime-step` per response,
+defaulting to the driver's own poll period, and what the driver sees is what it would see
+from a device it was actually polling.
+
+## Re-deriving the captured bodies
+
+`crates/mw-codec/tests/frames/snowgauge-*.json` came off this emulator.
+`../README.md` has the recipe.

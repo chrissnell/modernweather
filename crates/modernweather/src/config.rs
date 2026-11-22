@@ -786,18 +786,6 @@ impl mw_station::StationConfig for Config {
     }
 }
 
-impl mw_grpc::SnowGaugeConfig for Config {
-    fn stations(&self) -> &[mw_station::StationRow] {
-        // The same rows `mw_station::register` dispatches over, because the two registrars
-        // dispatch on the same `type` column (`mw_grpc::config`).
-        &self.declared_stations
-    }
-
-    fn ingress(&self) -> Option<&Arc<dyn Ingress>> {
-        self.ingress.as_ref()
-    }
-}
-
 impl mw_grpc::GrpcIngestConfig for Config {
     fn ingest(&self) -> &[mw_grpc::IngestRow] {
         &self.declared_ingest
@@ -888,11 +876,26 @@ impl mw_pipeline::snow::SnowConfig for Config {
             .filter(|r| r.kind == "snowgauge" && r.enabled && r.transport_kind.is_some())
             .map(|r| mw_pipeline::snow::SnowStation {
                 key: StationKey::new(r.station_key.as_str()),
-                base_distance_mm: r.snow_base_distance_mm,
                 zone: zones
                     .get(r.station_key.as_str())
                     .copied()
                     .unwrap_or_default(),
+                // **Both columns or neither.** The amount has no season to belong to
+                // without the instant, and the instant means nothing without an amount, so
+                // a half-written pair is read as no adjustment rather than as a state every
+                // consumer below has to handle. `mw_store::config_admin` is what stops one
+                // being written without the other; this is the reader that must cope
+                // anyway, for a database written by something else.
+                season_adjustment: r
+                    .snow_season_adjustment_mm
+                    .zip(
+                        r.snow_season_adjustment_set_at
+                            .and_then(chrono::DateTime::from_timestamp_secs),
+                    )
+                    .map(|(amount_mm, set_at)| mw_pipeline::snow::SeasonAdjustment {
+                        amount_mm,
+                        set_at,
+                    }),
             })
             .collect()
     }

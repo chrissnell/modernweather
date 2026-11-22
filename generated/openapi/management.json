@@ -1329,6 +1329,59 @@
         }
       }
     },
+    "/api/v1/stations/{key}/device": {
+      "get": {
+        "tags": [
+          "stations"
+        ],
+        "summary": "What one snow gauge says about itself: its calibration, its firmware, its signal.",
+        "description": "Read from the device when this is called, not from storage: the calibration is the\ngauge's own property, set from its own web interface, and nothing here is a measurement\n(`crate::device`). A gauge that is off answers `200` with `reachable: false`, because\nthat is an answer rather than a failure of this daemon.",
+        "operationId": "get_station_device",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "The station's key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "What the gauge reports",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GaugeDeviceView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such station, or it is not a snow gauge",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "This build cannot read a device",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/stations/{key}/secret": {
       "delete": {
         "tags": [
@@ -3120,6 +3173,89 @@
           }
         }
       },
+      "GaugeDeviceView": {
+        "type": "object",
+        "description": "One snow gauge's own account of itself.",
+        "required": [
+          "reachable",
+          "calibration",
+          "sensor_ok"
+        ],
+        "properties": {
+          "base_distance_mm": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The gauge's calibrated sensor-to-ground distance, in millimetres.\n\n**Read, never written.** Absent is a gauge that has never been calibrated, which is\nthe state in which it reports a distance and no depth.",
+            "minimum": 0
+          },
+          "calibration": {
+            "type": "string",
+            "description": "`idle`, `running`, `complete`, `failed`, or `unknown` for a firmware newer than\nthis daemon."
+          },
+          "calibration_detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One line about that state: how many samples it used, how long is left, or why it\nfailed."
+          },
+          "firmware_slot": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "From `/health.fw_slot` — which OTA partition is running."
+          },
+          "firmware_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "From `/health.fw_version`."
+          },
+          "reachable": {
+            "type": "boolean",
+            "description": "Whether the device answered at all."
+          },
+          "rssi_dbm": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Signal strength in dBm.\n\nAbsent rather than zero when the device could not look it up: the firmware's\n`sta_rssi()` yields `0` for that, which would read as a very strong signal."
+          },
+          "sensor_detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One line about the sensor, when it is not producing readings."
+          },
+          "sensor_ok": {
+            "type": "boolean",
+            "description": "Whether the **sensor** behind the gauge is producing readings.\n\nA gauge whose ultrasonic sensor has stopped keeps serving HTTP perfectly: it answers\n`/data` with `status: \"no_data\"`, a frozen `readings` count and `bytes_rx: 0`, and it\nstill reports what it is calibrated to. So `reachable` cannot carry this — a panel\nthat showed only reachability would render a dead sensor as a healthy device, which\nis precisely the state an operator opens this panel in."
+          },
+          "snow_depth_mm": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The depth the device last derived, in millimetres.\n\nSigned: a negative is a stable reading that overshot the calibrated base, which the\nfirmware documents as frost heave or a calibration coming due."
+          },
+          "unreachable_because": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the device could not be read, when it could not."
+          }
+        }
+      },
       "LatestReading": {
         "type": "object",
         "description": "One station's latest reading, as the Home tiles and §0.7 step 3 render it.\n\nA handful of named fields rather than the 212-column reading: these are the ones §0.7's\npanel shows, and widening it later is additive under §4.4. The units are in the field\nnames because the frozen contract's are, and a unit carried in a name cannot be\nconverted twice.",
@@ -4465,6 +4601,14 @@
             "format": "double",
             "description": "The distance a snow gauge reads with no snow under it, in millimetres."
           },
+          "snow_season_adjustment_in": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Snowfall to add to this gauge's season total, in **inches**.\n\nWhat the operator types, which is why it is inches: a storm report is in inches and\nso is the page. The binary converts to the column's millimetres.\n\n**Three states, and the outer `Option` is the one that matters.** The amount is\nstamped with the instant it was entered, and that stamp is what scopes it to one\nseason — so the stamp has to move exactly when an operator enters an amount, and at\nno other time:\n\n* **absent** — not supplied. The stored amount and its season are left alone, which\n  is what every edit to an unrelated field must do; stamping on those would push\n  last winter's correction into this winter the next time somebody renamed the\n  station.\n* **`null`** — the operator emptied the box. The amount and the stamp both go.\n* **a number** — the operator entered this, now. It is stamped now, *including when\n  it is the same number as last time*: an operator who misses a storm of the same\n  size two winters running types the same amount, and that is an entry rather than\n  a no-op. Comparing against the stored value cannot tell those apart, which is why\n  this field is three-state and not two.\n\nThe form sends it only when the operator touched the box, which is the same\nconvention a credential field uses here (`of`'s module documentation in the binary)."
+          },
           "timezone": {
             "type": [
               "string",
@@ -4600,6 +4744,21 @@
             ],
             "format": "double",
             "description": "The distance a snow gauge reads with no snow under it, in millimetres."
+          },
+          "snow_season_adjustment_in": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Snowfall added to this gauge's season total by hand, in **inches**.\n\nInches and not millimetres, unlike the column behind it: this is the number an\noperator typed, and a storm report is in inches. The conversion happens once, at the\nboundary, so the form shows back what was entered."
+          },
+          "snow_season_adjustment_season": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which snow season the adjustment above is counting toward — `\"2025–26\"`.\n\n**Shown because the operator never typed a date.** The amount is scoped to the\nseason it was entered in (its migration has why), and that inference has exactly one\ncase it gets wrong: an amount entered in early October for a storm from the previous\nwinter lands on the new season. Printing the season is what makes that visible and\ncorrectable instead of a silent surprise.\n\n`None` when there is no adjustment, and `\"ended\"` for one whose season has rolled\nover — which is no longer counting toward anything and is the operator's cue to\nclear or re-enter it."
           },
           "timezone": {
             "type": [
