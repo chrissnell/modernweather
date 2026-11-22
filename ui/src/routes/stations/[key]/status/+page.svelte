@@ -15,6 +15,7 @@
   import { config } from '$lib/live/config.svelte';
   import { stream } from '$lib/sse/stream.svelte';
   import { isStale } from '$lib/sse/machine';
+  import { api, asFailure, unwrap, type Schemas } from '$lib/api/client';
   import StatusBadge from '$lib/components/StatusBadge.svelte';
   import ScheduleLine from '$lib/components/ScheduleLine.svelte';
 
@@ -31,6 +32,35 @@
   // start: "nothing has arrived since you started looking" is the operator's question.
   const openedAt = Date.now();
   const waitedLongEnough = $derived(!reading && stream.now - openedAt > 60_000);
+
+  // **What the gauge itself reports**, read when this page opens rather than polled: the
+  // calibration is a number somebody sets at the device and then leaves alone, and the
+  // gauge serves only seven sockets. `Read it again` is there for the one moment it does
+  // change -- just after a calibration.
+  let device = $state<Schemas['GaugeDeviceView'] | null>(null);
+  let deviceError = $state<string | null>(null);
+  let deviceLoading = $state(false);
+
+  async function readDevice(): Promise<void> {
+    deviceLoading = true;
+    try {
+      device = unwrap(
+        await api.GET('/api/v1/stations/{key}/device', { params: { path: { key } } })
+      );
+      deviceError = null;
+    } catch (e) {
+      device = null;
+      deviceError = asFailure(e).summary;
+    } finally {
+      deviceLoading = false;
+    }
+  }
+
+  $effect(() => {
+    if (station?.kind === 'snowgauge' && device === null && deviceError === null && !deviceLoading) {
+      void readDevice();
+    }
+  });
 </script>
 
 <Box title={copy.status.livePanelHeading}>
@@ -116,6 +146,61 @@
         </tr>
       </tbody>
     </Table>
+  </Box>
+{/if}
+
+{#if station?.kind === 'snowgauge'}
+  <Box title={copy.status.device.heading}>
+    <p class="note">{copy.status.device.intro}</p>
+    {#if deviceError}
+      <p class="diag err">{deviceError}</p>
+    {:else if device && !device.reachable}
+      <p class="diag">
+        {copy.status.device.unreachable}
+        {#if device.unreachable_because}{device.unreachable_because}{/if}
+      </p>
+    {:else if device}
+      <Table>
+        <tbody>
+          <tr>
+            <td>{copy.status.device.baseDistance}</td>
+            <td>
+              {#if device.base_distance_mm !== undefined}
+                {device.base_distance_mm} mm
+              {:else}
+                {copy.status.device.notCalibrated}
+              {/if}
+            </td>
+          </tr>
+          {#if device.snow_depth_mm !== undefined}
+            <tr><td>{copy.status.device.depth}</td><td>{device.snow_depth_mm} mm</td></tr>
+          {/if}
+          <tr>
+            <td>{copy.status.device.calibration}</td>
+            <td>
+              {device.calibration}{#if device.calibration_detail}
+                &nbsp;&mdash; {device.calibration_detail}
+              {/if}
+            </td>
+          </tr>
+          {#if device.firmware_version}
+            <tr><td>{copy.status.device.firmware}</td><td>{device.firmware_version}</td></tr>
+          {/if}
+          {#if device.firmware_slot}
+            <tr><td>{copy.status.device.slot}</td><td>{device.firmware_slot}</td></tr>
+          {/if}
+          {#if device.rssi_dbm !== undefined}
+            <tr><td>{copy.status.device.signal}</td><td>{device.rssi_dbm} dBm</td></tr>
+          {/if}
+        </tbody>
+      </Table>
+      {#if device.base_distance_mm === undefined}
+        <p class="note">{copy.status.device.calibrateHint}</p>
+      {/if}
+    {/if}
+    <button type="button" onclick={() => void readDevice()} disabled={deviceLoading}>
+      {copy.status.device.reread}
+    </button>
   </Box>
 {/if}
 

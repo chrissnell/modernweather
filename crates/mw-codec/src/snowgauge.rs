@@ -98,6 +98,10 @@ pub const SNOW_DATA: &str = "/data";
 /// `GET /health` — the telemetry endpoint.
 pub const SNOW_HEALTH: &str = "/health";
 
+/// `GET /calibration` — the calibration-state endpoint. Unauthenticated, like the two
+/// above: only `POST /calibrate` and `POST /ota` need the admin credential.
+pub const SNOW_CALIBRATION: &str = "/calibration";
+
 /// The `status` value a gauge with a working sensor reports.
 pub const SNOW_STATUS_OK: &str = "ok";
 
@@ -264,6 +268,67 @@ pub struct SnowHealth {
 /// returned an empty batch for a well-formed telemetry document would be a decoder whose
 /// success and whose failure look the same to the one counter that watches it.
 pub fn snow_health(frame: &Frame) -> Result<SnowHealth, CodecError> {
+    serde_json::from_str(frame.as_str()?).map_err(|source| CodecError::Json { source })
+}
+
+/// `GET /calibration` — the gauge's calibration state, as one of five shapes.
+///
+/// Four are the firmware's (`net/server.rs`'s `calibration_json`); the fifth is
+/// [`SnowCalibration::Other`], because this is read in order to be **shown** and a firmware
+/// newer than this daemon must not blank the panel that shows it.
+///
+/// The operator runs a calibration from the gauge's own web interface — this build only
+/// reads the result (the owner's instruction, 2026-11-21), which is why there is no
+/// encoder here and nothing that needs the admin credential `POST /calibrate` requires.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SnowCalibration {
+    /// Never calibrated, or cleared since boot.
+    Idle,
+    /// The sample window is open.
+    Running {
+        /// Milliseconds since the window opened.
+        elapsed_ms: u64,
+        /// Milliseconds left in it.
+        remaining_ms: u64,
+        /// Samples collected so far.
+        samples: u32,
+    },
+    /// Finished. The new base distance is live on `/data` immediately.
+    Complete {
+        /// The calibrated sensor-to-ground distance, in millimetres.
+        base_distance: u32,
+        /// How many samples the trimmed mean used.
+        samples_used: u32,
+        /// Device uptime when it finished — the same clock as `/data.uptime_ms`.
+        finished_at_ms: u64,
+    },
+    /// The window expired with nothing in it: the sensor is dark or disconnected.
+    Failed {
+        /// The firmware's own sentence.
+        reason: String,
+        /// Device uptime when it gave up.
+        finished_at_ms: u64,
+    },
+    /// A state this build does not know, from a firmware newer than it.
+    #[serde(other)]
+    Other,
+}
+
+/// Decode one `GET /data` body **without** asking it for a reading.
+///
+/// [`SnowGaugeData::read`] is the collection path and refuses a body that carries no
+/// storable measurement — a gauge whose sensor has not spoken, or one still showing a zero
+/// distance. An operator-facing read wants the body anyway: a gauge with a dead sensor
+/// still reports what it is calibrated to, and that is exactly the moment somebody goes
+/// looking for the number. So the parse is available on its own, and the refusal stays
+/// where the storing happens.
+pub fn snow_data(frame: &Frame) -> Result<SnowData, CodecError> {
+    serde_json::from_str(frame.as_str()?).map_err(|source| CodecError::Json { source })
+}
+
+/// Decode one `GET /calibration` body.
+pub fn snow_calibration(frame: &Frame) -> Result<SnowCalibration, CodecError> {
     serde_json::from_str(frame.as_str()?).map_err(|source| CodecError::Json { source })
 }
 
@@ -672,6 +737,66 @@ mod tests {
         assert_eq!(partial.fw_version.as_deref(), Some("0.0.9"));
         assert_eq!(partial.bytes_rx, None);
         assert!(snow_health(&Frame::new(b"not json".to_vec())).is_err());
+    }
+
+    /// The five shapes `/calibration` answers with. Four are the firmware's and the fifth
+    /// is this build's tolerance for a firmware newer than itself.
+    #[test]
+    fn every_calibration_shape_decodes_to_its_own_variant() {
+        let idle = snow_calibration(&Frame::new(br#"{"state":"idle"}"#.to_vec())).expect("decodes");
+        assert_eq!(idle, SnowCalibration::Idle);
+
+        let running = snow_calibration(&Frame::new(
+            br#"{"state":"running","elapsed_ms":12000,"remaining_ms":18000,"samples":7}"#.to_vec(),
+        ))
+        .expect("decodes");
+        assert_eq!(
+            running,
+            SnowCalibration::Running {
+                elapsed_ms: 12_000,
+                remaining_ms: 18_000,
+                samples: 7
+            }
+        );
+
+        let complete = snow_calibration(&Frame::new(
+            br#"{"state":"complete","base_distance":1771,"samples_used":10,
+                 "finished_at_ms":2342978}"#
+                .to_vec(),
+        ))
+        .expect("decodes");
+        assert_eq!(
+            complete,
+            SnowCalibration::Complete {
+                base_distance: 1771,
+                samples_used: 10,
+                finished_at_ms: 2_342_978
+            }
+        );
+
+        let failed = snow_calibration(&Frame::new(
+            br#"{"state":"failed","reason":"no samples collected","finished_at_ms":82000}"#
+                .to_vec(),
+        ))
+        .expect("decodes");
+        assert_eq!(
+            failed,
+            SnowCalibration::Failed {
+                reason: "no samples collected".to_string(),
+                finished_at_ms: 82_000
+            }
+        );
+
+        // **A state this build does not know is not a decode failure.** This is read to be
+        // shown, and a panel that went blank on a firmware upgrade would be worse than one
+        // that says it does not recognise the state.
+        assert_eq!(
+            snow_calibration(&Frame::new(br#"{"state":"warming_up"}"#.to_vec())).expect("decodes"),
+            SnowCalibration::Other
+        );
+        // Bytes that are not the document still are.
+        assert!(snow_calibration(&Frame::new(b"not json".to_vec())).is_err());
+        assert_eq!(SNOW_CALIBRATION, "/calibration");
     }
 
     #[test]

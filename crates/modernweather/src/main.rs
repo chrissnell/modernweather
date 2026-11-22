@@ -26,6 +26,7 @@ mod authstore;
 mod boot;
 mod config;
 mod discover;
+mod gauge;
 mod hostinfo;
 mod live;
 mod logctl;

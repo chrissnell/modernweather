@@ -2018,7 +2018,11 @@ pub async fn run(args: &Args) -> anyhow::Result<RunReport> {
         Arc::clone(&rings),
         Arc::new(crate::hostinfo::Host::new()),
     )
-    .with_live(Arc::clone(&live));
+    .with_live(Arc::clone(&live))
+    // The live read of a snow gauge's own calibration. Always attached in the daemon --
+    // the request path is `mw_station::http`'s and needs nothing a serving node lacks --
+    // and absent only in the `oneshot` tests, where the route answers `501`.
+    .with_gauge_probe(Arc::new(crate::gauge::Gauges::new(pool.clone())));
     // A node with neither a spool nor peers has nothing to report, and the route says so
     // rather than answering an object whose every field is absent.
     if fanout.is_some() || peer_store.is_some() {

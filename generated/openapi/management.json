@@ -1329,6 +1329,59 @@
         }
       }
     },
+    "/api/v1/stations/{key}/device": {
+      "get": {
+        "tags": [
+          "stations"
+        ],
+        "summary": "What one snow gauge says about itself: its calibration, its firmware, its signal.",
+        "description": "Read from the device when this is called, not from storage: the calibration is the\ngauge's own property, set from its own web interface, and nothing here is a measurement\n(`crate::device`). A gauge that is off answers `200` with `reachable: false`, because\nthat is an answer rather than a failure of this daemon.",
+        "operationId": "get_station_device",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "The station's key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "What the gauge reports",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GaugeDeviceView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such station, or it is not a snow gauge",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "This build cannot read a device",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/stations/{key}/secret": {
       "delete": {
         "tags": [
@@ -3117,6 +3170,77 @@
               "type": "string"
             },
             "description": "Which stations get forecasts and alerts."
+          }
+        }
+      },
+      "GaugeDeviceView": {
+        "type": "object",
+        "description": "One snow gauge's own account of itself.",
+        "required": [
+          "reachable",
+          "calibration"
+        ],
+        "properties": {
+          "base_distance_mm": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The gauge's calibrated sensor-to-ground distance, in millimetres.\n\n**Read, never written.** Absent is a gauge that has never been calibrated, which is\nthe state in which it reports a distance and no depth.",
+            "minimum": 0
+          },
+          "calibration": {
+            "type": "string",
+            "description": "`idle`, `running`, `complete`, `failed`, or `unknown` for a firmware newer than\nthis daemon."
+          },
+          "calibration_detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One line about that state: how many samples it used, how long is left, or why it\nfailed."
+          },
+          "firmware_slot": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "From `/health.fw_slot` — which OTA partition is running."
+          },
+          "firmware_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "From `/health.fw_version`."
+          },
+          "reachable": {
+            "type": "boolean",
+            "description": "Whether the device answered at all."
+          },
+          "rssi_dbm": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Signal strength in dBm.\n\nAbsent rather than zero when the device could not look it up: the firmware's\n`sta_rssi()` yields `0` for that, which would read as a very strong signal."
+          },
+          "snow_depth_mm": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The depth the device last derived, in millimetres.\n\nSigned: a negative is a stable reading that overshot the calibrated base, which the\nfirmware documents as frost heave or a calibration coming due."
+          },
+          "unreachable_because": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the device could not be read, when it could not."
           }
         }
       },

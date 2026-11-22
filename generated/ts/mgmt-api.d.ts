@@ -681,6 +681,58 @@ export interface components {
       stations: string[];
     };
     /**
+     * One snow gauge's own account of itself.
+     */
+    GaugeDeviceView: {
+      /**
+       * The gauge's calibrated sensor-to-ground distance, in millimetres.
+       *
+       * **Read, never written.** Absent is a gauge that has never been calibrated, which is
+       * the state in which it reports a distance and no depth.
+       */
+      base_distance_mm?: (number | null);
+      /**
+       * `idle`, `running`, `complete`, `failed`, or `unknown` for a firmware newer than
+       * this daemon.
+       */
+      calibration: string;
+      /**
+       * One line about that state: how many samples it used, how long is left, or why it
+       * failed.
+       */
+      calibration_detail?: (string | null);
+      /**
+       * From `/health.fw_slot` — which OTA partition is running.
+       */
+      firmware_slot?: (string | null);
+      /**
+       * From `/health.fw_version`.
+       */
+      firmware_version?: (string | null);
+      /**
+       * Whether the device answered at all.
+       */
+      reachable: boolean;
+      /**
+       * Signal strength in dBm.
+       *
+       * Absent rather than zero when the device could not look it up: the firmware's
+       * `sta_rssi()` yields `0` for that, which would read as a very strong signal.
+       */
+      rssi_dbm?: (number | null);
+      /**
+       * The depth the device last derived, in millimetres.
+       *
+       * Signed: a negative is a stable reading that overshot the calibrated base, which the
+       * firmware documents as frost heave or a calibration coming due.
+       */
+      snow_depth_mm?: (number | null);
+      /**
+       * Why the device could not be read, when it could not.
+       */
+      unreachable_because?: (string | null);
+    };
+    /**
      * One station's latest reading, as the Home tiles and §0.7 step 3 render it.
      *
      * A handful of named fields rather than the 212-column reading: these are the ones §0.7's
@@ -2811,6 +2863,25 @@ export interface paths {
         200: { content: { "application/json": components["schemas"]["Applied"] } };
         404: { content: { "application/json": components["schemas"]["ErrorBody"] } };
         422: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+      };
+    };
+  };
+  "/api/v1/stations/{key}/device": {
+    /**
+     * What one snow gauge says about itself: its calibration, its firmware, its signal.
+     */
+    get: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path: { key: string };
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        200: { content: { "application/json": components["schemas"]["GaugeDeviceView"] } };
+        404: { content: { "application/json": components["schemas"]["ErrorBody"] } };
+        501: { content: { "application/json": components["schemas"]["ErrorBody"] } };
       };
     };
   };

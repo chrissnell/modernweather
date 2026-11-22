@@ -61,8 +61,8 @@ pub use davis::{DavisLoop, CLICKS_PER_INCH, LOOP_BYTES, LOOP_HEADER};
 pub use frame::{Codec, CodecError, Frame};
 pub use query::QueryParams;
 pub use snowgauge::{
-    snow_health, SnowData, SnowGaugeData, SnowHealth, SnowLiveness, SNOW_DATA, SNOW_HEALTH,
-    SNOW_STATUS_NO_DATA, SNOW_STATUS_OK,
+    snow_calibration, snow_data, snow_health, SnowCalibration, SnowData, SnowGaugeData, SnowHealth,
+    SnowLiveness, SNOW_CALIBRATION, SNOW_DATA, SNOW_HEALTH, SNOW_STATUS_NO_DATA, SNOW_STATUS_OK,
 };
 pub use winddir::WindDirCorrection;
 pub use wll::{

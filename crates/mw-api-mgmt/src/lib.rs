@@ -75,6 +75,8 @@ pub mod auth;
 /// What a write sends, and the validation that answers in the operator's words (§7.2, §8.5).
 pub mod change;
 /// **D-36** as code: §0.2's table and §0.4's state, trigger and counter rendering.
+pub mod device;
+
 pub mod display;
 /// One error body, with field paths rather than a banner (§8.5).
 pub mod error;

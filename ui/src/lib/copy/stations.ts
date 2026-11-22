@@ -113,6 +113,20 @@ export const stations = {
     deleteConfirm: 'Remove the station'
   },
   status: {
+    device: {
+      heading: 'What the gauge reports',
+      intro: 'Read from the sensor just now. These are the gauge\u2019s own settings, not this daemon\u2019s.',
+      baseDistance: 'Calibrated distance to the ground',
+      depth: 'Depth it last worked out',
+      calibration: 'Calibration',
+      firmware: 'Firmware',
+      signal: 'Signal',
+      slot: 'Running from',
+      notCalibrated: 'Not calibrated yet',
+      unreachable: 'The gauge did not answer.',
+      calibrateHint: 'Calibrate from the gauge\u2019s own web page. The depth starts arriving on the next reading, with nothing to change here.',
+      reread: 'Read it again'
+    },
     title: 'Status',
     livePanelHeading: 'Live Readings',
     noReadingsYet: 'No readings yet.',
