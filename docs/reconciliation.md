@@ -4181,6 +4181,43 @@ three gauges in `ci/conformance/rust-seed/01-config.sql` are `enabled = 0` (line
 fixtures would still be green. What covers these numbers is the unit and component tests in
 `crates/mw-pipeline/src/snow/`, and nothing else does.
 
+#### Corrected 2026-11-22, on applying it — the backfill recovers nothing, because the history is not NULL
+
+Applying this against the owner's database found the premise wrong, and the correction is
+worth more than the entry it corrects. DEV-9 part (3) says the `snowdepth` column "and every
+aggregate bucket are NULL today", and this entry was written on that. **They are not NULL.
+They are `0.0`** — all 137 541 snow readings, every aggregate bucket above them, from
+2025-11-01 to 2026-10-02. The Go daemon's `SnowDepth` was a non-nullable `float32`, so the
+W9 import carried its zero-fill into the column rather than a NULL. That is DEV-16's entry
+happening to the one column DEV-9 claimed was empty.
+
+So `WHERE snowdepth IS NULL` matched **no rows**, and `snowdepth = 0` cannot be substituted:
+a stored zero is also exactly what bare ground looks like, and a migration cannot tell the
+two apart. The aggregate rebuild was not run either, for the same reason — every level
+already holds a `snowdepth` for every bucket that has a `snowdistance`, and re-materialising
+the same zeros changes nothing.
+
+**Nothing regressed, and that is the other half of the correction.** This entry warned that
+moving the read path onto the stored depth would blank pre-cutover history. It did not,
+because that history was never being served: the station has no configured base distance, so
+the old `snow:*` planner skipped the gauge by name, `snow_totals_cache` is empty, and `/snow`
+has been answering zero all along. Removing that gate is what gets the gauge planned at all.
+
+What is true: the imported season cannot be recovered without somebody deciding what the
+sensor's bare-ground distance was. The evidence for that decision, if it is ever taken: the
+stored distances run 1586–1781 mm and are capped at exactly **1781 mm**, which is what a
+bare-ground reading looks like; Go's `calculate_storm_snowfall` carried a hard-coded
+`base_dist := 1798.0`. It is a judgement about a physical installation, so it is the owner's
+and not a migration's.
+
+One operational finding came out of the same run and is fixed in the migration: a DML
+statement against a compressed chunk decompresses the tuples it evaluates, TimescaleDB caps
+that at 100 000 per transaction, and a backfill over a season of minute readings passes the
+cap and **aborts**. The migration now lifts the cap for its own transaction. The
+`db-migrate-twice` gate cannot see this — it applies to a scratch database nothing has had
+time to compress — and `ci/db/restore-rehearsal.sh`, which applies migrations over a
+restored and therefore compressed copy on the first of each month, is what would have.
+
 ### A-GRA811-3 — a depth below zero is stored when the device reports it and refused when we derive it
 
 **Amends DEV-9 part (3)'s closing paragraph and closes the constraint it recorded on M6-1.**
